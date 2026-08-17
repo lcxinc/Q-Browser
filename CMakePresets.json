@@ -1,0 +1,46 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 5
+  },
+  "configurePresets": [
+    {
+      "name": "dev-vs2022",
+      "displayName": "Windows development (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug",
+        "Qt6_DIR": {
+          "type": "PATH",
+          "value": "E:/DevEnv/qt/6.11.1/msvc2022_64/lib/cmake/Qt6"
+        },
+        "OPENSSL_ROOT_DIR": {
+          "type": "PATH",
+          "value": "E:/DevEnv/qt/Tools/OpenSSLv3/Win_x64"
+        },
+        "Q_BROWSER_BUILD_WEBENGINE": true
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev-debug",
+      "configurePreset": "dev-vs2022",
+      "configuration": "Debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev-debug",
+      "configurePreset": "dev-vs2022",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

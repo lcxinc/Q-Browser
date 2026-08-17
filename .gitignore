@@ -1,2 +1,11 @@
 .worktrees/
+build/
+.qbrowser-dev/
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+*.user
+CMakeUserPresets.json
 

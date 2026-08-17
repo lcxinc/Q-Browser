@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+  add_executable(q_browser_build_smoke
+    smoke/tst_build_smoke.cpp)
+
+  target_link_libraries(q_browser_build_smoke
+    PRIVATE
+      Qt6::Core
+      Qt6::Test)
+
+  q_browser_enable_strict_warnings(q_browser_build_smoke)
+
+  add_test(NAME build_smoke COMMAND q_browser_build_smoke)
+endif()
