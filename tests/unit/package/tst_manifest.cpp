@@ -4,7 +4,11 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QTest>
+
+#include <optional>
+#include <type_traits>
 
 namespace {
 
@@ -41,7 +45,21 @@ QByteArray withLimits(const QJsonObject &limits)
     return withTopLevelValue(QStringLiteral("limits"), limits);
 }
 
+QJsonObject manifestSchema()
+{
+    QFile file(QStringLiteral(Q_BROWSER_MANIFEST_SCHEMA_FILE));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    return QJsonDocument::fromJson(file.readAll()).object();
+}
+
 } // namespace
+
+static_assert(!std::is_default_constructible_v<Manifest>);
+static_assert(!std::is_default_constructible_v<ManifestParseResult>);
+static_assert(!std::is_constructible_v<ManifestParseResult, Manifest>);
+static_assert(!std::is_constructible_v<ManifestParseResult, QVector<ManifestError>>);
 
 class ManifestTest final : public QObject
 {
@@ -49,6 +67,7 @@ class ManifestTest final : public QObject
 
 private slots:
     void parsesValidManifest();
+    void parseResultStatesAreTotal();
     void rejectsMalformedJson();
     void rejectsNonObjectRoot();
     void rejectsMissingRequiredField();
@@ -63,11 +82,19 @@ private slots:
     void rejectsInvalidRuntimeRange();
     void rejectsMalformedRuntimeObject_data();
     void rejectsMalformedRuntimeObject();
+    void acceptsCompatibleRuntimeRange_data();
+    void acceptsCompatibleRuntimeRange();
+    void rejectsRuntimeMinimumAboveMaximumMajor();
     void rejectsUnsafeEntryPoint_data();
     void rejectsUnsafeEntryPoint();
+    void windowsEntryPointCorpusHasSchemaRuntimeParity_data();
+    void windowsEntryPointCorpusHasSchemaRuntimeParity();
     void rejectsUnsupportedAndDuplicateImports();
     void rejectsInvalidPermissionsDeterministically();
+    void emptyPermissionsDefaultToDeny();
     void rejectsNonCanonicalAndDuplicateNetworkHosts();
+    void canonicalHostCorpusHasSchemaRuntimeParity_data();
+    void canonicalHostCorpusHasSchemaRuntimeParity();
     void rejectsUnsupportedAndDuplicateNetworkMethods();
     void rejectsMissingNetworkFields();
     void rejectsMalformedNetworkArrays_data();
@@ -77,6 +104,8 @@ private slots:
     void rejectsMalformedLimits();
     void rejectsInvalidAndDuplicateRoutes();
     void rejectsEmptyRoutes();
+    void appIdBoundaryCorpusHasSchemaRuntimeParity_data();
+    void appIdBoundaryCorpusHasSchemaRuntimeParity();
     void schemaMatchesRuntimeContract();
 };
 
@@ -112,6 +141,19 @@ void ManifestTest::parsesValidManifest()
     QCOMPARE(result.value().limits().memoryMiB, 384);
     QCOMPARE(result.value().limits().processes, 1);
     QCOMPARE(result.value().routes().size(), 4);
+}
+
+void ManifestTest::parseResultStatesAreTotal()
+{
+    const ManifestParseResult success = Manifest::parse(fixture(QStringLiteral("valid.json")));
+    QVERIFY(success.hasValue());
+    QVERIFY(success.errors().isEmpty());
+
+    const ManifestParseResult failure =
+        Manifest::parse(fixture(QStringLiteral("invalid-json.json")));
+    QVERIFY(!failure.hasValue());
+    QVERIFY(!failure.errors().isEmpty());
+    QVERIFY_THROWS_EXCEPTION(std::bad_optional_access, static_cast<void>(failure.value()));
 }
 
 void ManifestTest::rejectsMalformedJson()
@@ -319,6 +361,42 @@ void ManifestTest::rejectsMalformedRuntimeObject()
     QCOMPARE(result.errors().front().path, path);
 }
 
+void ManifestTest::acceptsCompatibleRuntimeRange_data()
+{
+    QTest::addColumn<QString>("minimum");
+    QTest::addColumn<QString>("maximum");
+
+    QTest::newRow("same-major") << QStringLiteral("1.2.3") << QStringLiteral("1.x");
+    QTest::newRow("lower-major") << QStringLiteral("0.9.0") << QStringLiteral("1.x");
+    QTest::newRow("large-equal-major")
+        << QStringLiteral("999999999999999999999.0.0")
+        << QStringLiteral("999999999999999999999.x");
+}
+
+void ManifestTest::acceptsCompatibleRuntimeRange()
+{
+    QFETCH(QString, minimum);
+    QFETCH(QString, maximum);
+
+    const ManifestParseResult result = Manifest::parse(
+        withRuntime({{QStringLiteral("minVersion"), minimum},
+                     {QStringLiteral("maxVersion"), maximum}}));
+
+    QVERIFY(result.hasValue());
+    QVERIFY(result.errors().isEmpty());
+}
+
+void ManifestTest::rejectsRuntimeMinimumAboveMaximumMajor()
+{
+    const ManifestParseResult result =
+        Manifest::parse(fixture(QStringLiteral("invalid-runtime-relation.json")));
+
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.errors().size(), 1);
+    QCOMPARE(result.errors().front().code, ManifestErrorCode::InvalidRuntimeRange);
+    QCOMPARE(result.errors().front().path, QStringLiteral("$.runtime.maxVersion"));
+}
+
 void ManifestTest::rejectsUnsafeEntryPoint_data()
 {
     QTest::addColumn<QByteArray>("bytes");
@@ -352,6 +430,61 @@ void ManifestTest::rejectsUnsafeEntryPoint()
     QCOMPARE(result.errors().size(), 1);
     QCOMPARE(result.errors().front().code, ManifestErrorCode::InvalidEntryPoint);
     QCOMPARE(result.errors().front().path, QStringLiteral("$.entryPoint"));
+}
+
+void ManifestTest::windowsEntryPointCorpusHasSchemaRuntimeParity_data()
+{
+    QTest::addColumn<QString>("path");
+    QTest::addColumn<bool>("valid");
+
+    QTest::newRow("normal-dotted-file") << QStringLiteral("qml/pages/Main.view.qml") << true;
+    QTest::newRow("normal-dotted-directory") << QStringLiteral("qml/v1.2/Main.qml") << true;
+    QTest::newRow("device-prefix-is-normal") << QStringLiteral("qml/concept/Main.qml") << true;
+    QTest::newRow("com-zero-is-normal") << QStringLiteral("qml/COM0.qml") << true;
+    QTest::newRow("com-ten-is-normal") << QStringLiteral("qml/COM10.qml") << true;
+    QTest::newRow("lpt-ten-is-normal") << QStringLiteral("qml/LPT10.qml") << true;
+    QTest::newRow("directory-trailing-dot") << QStringLiteral("qml./Main.qml") << false;
+    QTest::newRow("directory-trailing-space") << QStringLiteral("qml /Main.qml") << false;
+    QTest::newRow("file-trailing-space") << QStringLiteral("qml/Main.qml ") << false;
+    QTest::newRow("con-directory") << QStringLiteral("CON/Main.qml") << false;
+    QTest::newRow("con-extension") << QStringLiteral("qml/con.qml") << false;
+    QTest::newRow("prn-mixed-case") << QStringLiteral("qml/PrN.txt/Main.qml") << false;
+    QTest::newRow("aux-extension") << QStringLiteral("qml/AUX.qml") << false;
+    QTest::newRow("nul-multiple-extensions") << QStringLiteral("qml/NUL.any.qml") << false;
+    QTest::newRow("clock-dollar") << QStringLiteral("qml/CLOCK$.qml") << false;
+    QTest::newRow("com-one") << QStringLiteral("qml/com1.qml") << false;
+    QTest::newRow("com-nine-directory") << QStringLiteral("qml/COM9/Main.qml") << false;
+    QTest::newRow("lpt-one") << QStringLiteral("qml/lpt1.qml") << false;
+    QTest::newRow("lpt-nine") << QStringLiteral("qml/LPT9.qml") << false;
+    QTest::newRow("device-base-padded-before-extension")
+        << QStringLiteral("qml/CON .qml") << false;
+}
+
+void ManifestTest::windowsEntryPointCorpusHasSchemaRuntimeParity()
+{
+    QFETCH(QString, path);
+    QFETCH(bool, valid);
+
+    const QJsonObject schema = manifestSchema();
+    QVERIFY(!schema.isEmpty());
+    const QString pattern = schema.value(QStringLiteral("properties"))
+                                .toObject()
+                                .value(QStringLiteral("entryPoint"))
+                                .toObject()
+                                .value(QStringLiteral("pattern"))
+                                .toString();
+    const QRegularExpression schemaPattern(pattern);
+    QVERIFY2(schemaPattern.isValid(), qPrintable(schemaPattern.errorString()));
+    QCOMPARE(schemaPattern.match(path).hasMatch(), valid);
+
+    const ManifestParseResult result =
+        Manifest::parse(withTopLevelValue(QStringLiteral("entryPoint"), path));
+    QCOMPARE(result.hasValue(), valid);
+    if (!valid) {
+        QCOMPARE(result.errors().size(), 1);
+        QCOMPARE(result.errors().front().code, ManifestErrorCode::InvalidEntryPoint);
+        QCOMPARE(result.errors().front().path, QStringLiteral("$.entryPoint"));
+    }
 }
 
 void ManifestTest::rejectsUnsupportedAndDuplicateImports()
@@ -397,6 +530,21 @@ void ManifestTest::rejectsInvalidPermissionsDeterministically()
     }
 }
 
+void ManifestTest::emptyPermissionsDefaultToDeny()
+{
+    const ManifestParseResult result =
+        Manifest::parse(withTopLevelValue(QStringLiteral("permissions"), QJsonObject{}));
+
+    QVERIFY(result.hasValue());
+    QVERIFY(result.errors().isEmpty());
+    QVERIFY(result.value().permissions().network.hosts.isEmpty());
+    QVERIFY(result.value().permissions().network.methods.isEmpty());
+    QCOMPARE(result.value().permissions().storage, StoragePermission::Disabled);
+    QCOMPARE(result.value().permissions().clipboardWrite, false);
+    QCOMPARE(result.value().permissions().clipboardRead, ClipboardReadPermission::Disabled);
+    QCOMPARE(result.value().permissions().fileOpen, FileOpenPermission::Disabled);
+}
+
 void ManifestTest::rejectsNonCanonicalAndDuplicateNetworkHosts()
 {
     const ManifestParseResult result =
@@ -413,6 +561,71 @@ void ManifestTest::rejectsNonCanonicalAndDuplicateNetworkHosts()
     QCOMPARE(result.errors().at(8).path, QStringLiteral("$.permissions.network.hosts[9]"));
     QCOMPARE(result.errors().at(9).code, ManifestErrorCode::WrongType);
     QCOMPARE(result.errors().at(9).path, QStringLiteral("$.permissions.network.hosts[10]"));
+}
+
+void ManifestTest::canonicalHostCorpusHasSchemaRuntimeParity_data()
+{
+    QTest::addColumn<QString>("host");
+    QTest::addColumn<bool>("valid");
+
+    const QString label63 = QStringLiteral("a") + QString(62, u'b');
+    const QString label64 = QStringLiteral("a") + QString(63, u'b');
+    const QString label61 = QStringLiteral("a") + QString(60, u'b');
+    const QString label62 = QStringLiteral("a") + QString(61, u'b');
+    const QString total253 =
+        label63 + u'.' + label63 + u'.' + label63 + u'.' + label61;
+    const QString total254 =
+        label63 + u'.' + label63 + u'.' + label63 + u'.' + label62;
+
+    QTest::newRow("one-character-hostname") << QStringLiteral("a") << true;
+    QTest::newRow("63-character-label") << (label63 + QStringLiteral(".com")) << true;
+    QTest::newRow("253-character-hostname") << total253 << true;
+    QTest::newRow("64-character-label") << (label64 + QStringLiteral(".com")) << false;
+    QTest::newRow("254-character-hostname") << total254 << false;
+    QTest::newRow("numeric-short-alias") << QStringLiteral("123") << false;
+    QTest::newRow("numeric-long-alias") << QStringLiteral("2130706433") << false;
+    QTest::newRow("canonical-ipv4") << QStringLiteral("127.0.0.1") << true;
+    QTest::newRow("noncanonical-ipv4") << QStringLiteral("127.00.0.1") << false;
+    QTest::newRow("empty-label") << QStringLiteral("api..example.com") << false;
+}
+
+void ManifestTest::canonicalHostCorpusHasSchemaRuntimeParity()
+{
+    QFETCH(QString, host);
+    QFETCH(bool, valid);
+
+    const QJsonObject schema = manifestSchema();
+    QVERIFY(!schema.isEmpty());
+    const QString pattern = schema.value(QStringLiteral("properties"))
+                                .toObject()
+                                .value(QStringLiteral("permissions"))
+                                .toObject()
+                                .value(QStringLiteral("properties"))
+                                .toObject()
+                                .value(QStringLiteral("network"))
+                                .toObject()
+                                .value(QStringLiteral("properties"))
+                                .toObject()
+                                .value(QStringLiteral("hosts"))
+                                .toObject()
+                                .value(QStringLiteral("items"))
+                                .toObject()
+                                .value(QStringLiteral("pattern"))
+                                .toString();
+    const QRegularExpression schemaPattern(pattern);
+    QVERIFY(schemaPattern.isValid());
+    QCOMPARE(schemaPattern.match(host).hasMatch(), valid);
+
+    const ManifestParseResult result = Manifest::parse(withNetwork(
+        {{QStringLiteral("hosts"), QJsonArray{host}},
+         {QStringLiteral("methods"), QJsonArray{QStringLiteral("GET")}}}));
+    QCOMPARE(result.hasValue(), valid);
+    if (!valid) {
+        QCOMPARE(result.errors().size(), 1);
+        QCOMPARE(result.errors().front().code, ManifestErrorCode::InvalidNetworkHost);
+        QCOMPARE(result.errors().front().path,
+                 QStringLiteral("$.permissions.network.hosts[0]"));
+    }
 }
 
 void ManifestTest::rejectsUnsupportedAndDuplicateNetworkMethods()
@@ -577,6 +790,55 @@ void ManifestTest::rejectsEmptyRoutes()
     QCOMPARE(result.errors().front().path, QStringLiteral("$.routes"));
 }
 
+void ManifestTest::appIdBoundaryCorpusHasSchemaRuntimeParity_data()
+{
+    QTest::addColumn<QString>("appId");
+    QTest::addColumn<bool>("valid");
+
+    const QString label63 = QStringLiteral("a") + QString(62, u'b');
+    const QString label64 = QStringLiteral("a") + QString(63, u'b');
+    const QString label61 = QStringLiteral("a") + QString(60, u'b');
+    const QString label62 = QStringLiteral("a") + QString(61, u'b');
+    const QString total253 =
+        label63 + u'.' + label63 + u'.' + label63 + u'.' + label61;
+    const QString total254 =
+        label63 + u'.' + label63 + u'.' + label63 + u'.' + label62;
+
+    QTest::newRow("minimal") << QStringLiteral("a.b") << true;
+    QTest::newRow("63-character-label") << (label63 + QStringLiteral(".b")) << true;
+    QTest::newRow("253-characters") << total253 << true;
+    QTest::newRow("64-character-label") << (label64 + QStringLiteral(".b")) << false;
+    QTest::newRow("254-characters") << total254 << false;
+    QTest::newRow("empty-label") << QStringLiteral("com..pilot") << false;
+}
+
+void ManifestTest::appIdBoundaryCorpusHasSchemaRuntimeParity()
+{
+    QFETCH(QString, appId);
+    QFETCH(bool, valid);
+
+    const QJsonObject schema = manifestSchema();
+    QVERIFY(!schema.isEmpty());
+    const QString pattern = schema.value(QStringLiteral("properties"))
+                                .toObject()
+                                .value(QStringLiteral("appId"))
+                                .toObject()
+                                .value(QStringLiteral("pattern"))
+                                .toString();
+    const QRegularExpression schemaPattern(pattern);
+    QVERIFY(schemaPattern.isValid());
+    QCOMPARE(schemaPattern.match(appId).hasMatch(), valid);
+
+    const ManifestParseResult result =
+        Manifest::parse(withTopLevelValue(QStringLiteral("appId"), appId));
+    QCOMPARE(result.hasValue(), valid);
+    if (!valid) {
+        QCOMPARE(result.errors().size(), 1);
+        QCOMPARE(result.errors().front().code, ManifestErrorCode::InvalidAppId);
+        QCOMPARE(result.errors().front().path, QStringLiteral("$.appId"));
+    }
+}
+
 void ManifestTest::schemaMatchesRuntimeContract()
 {
     QFile schemaFile(QStringLiteral(Q_BROWSER_MANIFEST_SCHEMA_FILE));
@@ -612,6 +874,18 @@ void ManifestTest::schemaMatchesRuntimeContract()
                  .value(QStringLiteral("const"))
                  .toInt(),
              1);
+    QCOMPARE(properties.value(QStringLiteral("appId"))
+                 .toObject()
+                 .value(QStringLiteral("maxLength"))
+                 .toInt(),
+             253);
+    QCOMPARE(properties.value(QStringLiteral("entryPoint"))
+                 .toObject()
+                 .value(QStringLiteral("x-windowsPathInvariants"))
+                 .toArray(),
+             QJsonArray({QStringLiteral("segments do not end in dot or space"),
+                         QStringLiteral(
+                             "Win32 device basenames are forbidden case-insensitively")}));
     for (const QString &requiredKey : expectedRequired) {
         QJsonObject manifest = QJsonDocument::fromJson(fixture(QStringLiteral("valid.json"))).object();
         manifest.remove(requiredKey);
@@ -633,6 +907,8 @@ void ManifestTest::schemaMatchesRuntimeContract()
                                           .toObject();
     const QJsonObject limitsSchema = properties.value(QStringLiteral("limits")).toObject();
     QCOMPARE(runtimeSchema.value(QStringLiteral("additionalProperties")).toBool(true), false);
+    QCOMPARE(runtimeSchema.value(QStringLiteral("x-runtimeInvariants")).toArray(),
+             QJsonArray({QStringLiteral("minVersion.major <= maxVersion.major")}));
     QCOMPARE(permissionsSchema.value(QStringLiteral("additionalProperties")).toBool(true), false);
     QCOMPARE(networkSchema.value(QStringLiteral("additionalProperties")).toBool(true), false);
     QCOMPARE(limitsSchema.value(QStringLiteral("additionalProperties")).toBool(true), false);
@@ -718,6 +994,15 @@ void ManifestTest::schemaMatchesRuntimeContract()
              QStringList({QStringLiteral("GET"),
                           QStringLiteral("POST"),
                           QStringLiteral("PUT")}));
+    QCOMPARE(networkSchema.value(QStringLiteral("properties"))
+                 .toObject()
+                 .value(QStringLiteral("hosts"))
+                 .toObject()
+                 .value(QStringLiteral("items"))
+                 .toObject()
+                 .value(QStringLiteral("maxLength"))
+                 .toInt(),
+             253);
 
     const QStringList expectedLimitKeys = {QStringLiteral("packageBytes"),
                                            QStringLiteral("memoryMiB"),

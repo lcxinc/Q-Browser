@@ -73,6 +73,8 @@ public:
     [[nodiscard]] const QStringList &routes() const noexcept;
 
 private:
+    Manifest() = default;
+
     int m_schemaVersion = 0;
     QString m_appId;
     QString m_version;
@@ -87,14 +89,16 @@ private:
 class ManifestParseResult final
 {
 public:
-    explicit ManifestParseResult(Manifest value);
-    explicit ManifestParseResult(QVector<ManifestError> errors);
-
     [[nodiscard]] bool hasValue() const noexcept;
     [[nodiscard]] const Manifest &value() const;
     [[nodiscard]] const QVector<ManifestError> &errors() const noexcept;
 
 private:
+    friend class Manifest;
+
+    explicit ManifestParseResult(Manifest value);
+    explicit ManifestParseResult(QVector<ManifestError> errors);
+
     std::optional<Manifest> m_value;
     QVector<ManifestError> m_errors;
 };

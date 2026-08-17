@@ -179,6 +179,14 @@ bool isStrictSemVer(const QString &version)
     return pattern.match(version).hasMatch();
 }
 
+bool decimalIntegerIsGreater(QStringView left, QStringView right)
+{
+    if (left.size() != right.size()) {
+        return left.size() > right.size();
+    }
+    return left > right;
+}
+
 QVector<ManifestError> validateRuntime(const QJsonObject &runtime)
 {
     QVector<ManifestError> errors;
@@ -211,7 +219,39 @@ QVector<ManifestError> validateRuntime(const QJsonObject &runtime)
                        QStringLiteral("$.runtime.maxVersion"),
                        QStringLiteral("maximum runtime must use the N.x range form")});
     }
+    if (errors.isEmpty()) {
+        const QString minimum = runtime.value(QStringLiteral("minVersion")).toString();
+        const QString maximum = runtime.value(QStringLiteral("maxVersion")).toString();
+        const QStringView minimumMajor = QStringView(minimum).first(minimum.indexOf(u'.'));
+        const QStringView maximumMajor = QStringView(maximum).first(maximum.indexOf(u'.'));
+        if (decimalIntegerIsGreater(minimumMajor, maximumMajor)) {
+            errors.append({ManifestErrorCode::InvalidRuntimeRange,
+                           QStringLiteral("$.runtime.maxVersion"),
+                           QStringLiteral("maximum runtime major cannot be below the minimum")});
+        }
+    }
     return errors;
+}
+
+bool isWindowsDeviceSegment(QStringView segment)
+{
+    const qsizetype extension = segment.indexOf(u'.');
+    QString basename = segment.first(extension < 0 ? segment.size() : extension).toString();
+    while (basename.endsWith(u' ') || basename.endsWith(u'.')) {
+        basename.chop(1);
+    }
+    const QString upper = basename.toUpper();
+    static const QSet<QString> fixedDevices = {QStringLiteral("CON"),
+                                               QStringLiteral("PRN"),
+                                               QStringLiteral("AUX"),
+                                               QStringLiteral("NUL"),
+                                               QStringLiteral("CLOCK$")};
+    if (fixedDevices.contains(upper)) {
+        return true;
+    }
+    static const QRegularExpression numberedDevices(
+        QStringLiteral(R"(^(?:COM|LPT)[1-9]$)"));
+    return numberedDevices.match(upper).hasMatch();
 }
 
 bool isValidEntryPoint(const QString &path)
@@ -224,7 +264,9 @@ bool isValidEntryPoint(const QString &path)
     }
     const QStringList segments = path.split(u'/', Qt::KeepEmptyParts);
     for (const QString &segment : segments) {
-        if (segment.isEmpty() || segment == QStringLiteral(".") || segment == QStringLiteral("..")) {
+        if (segment.isEmpty() || segment == QStringLiteral(".") || segment == QStringLiteral("..")
+            || segment.endsWith(u'.') || segment.endsWith(u' ')
+            || isWindowsDeviceSegment(segment)) {
             return false;
         }
         for (const QChar character : segment) {
@@ -392,7 +434,11 @@ bool isCanonicalHostname(const QString &host)
 {
     static const QRegularExpression pattern(QStringLiteral(
         R"(^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$)"));
-    if (host.isEmpty() || host.size() > 253 || !pattern.match(host).hasMatch()) {
+    const bool isPureNumeric = !host.isEmpty()
+        && std::ranges::all_of(host, [](const QChar character) {
+               return character >= u'0' && character <= u'9';
+           });
+    if (isPureNumeric || host.size() > 253 || !pattern.match(host).hasMatch()) {
         return false;
     }
     const QStringList labels = host.split(u'.');
@@ -815,6 +861,7 @@ ManifestParseResult::ManifestParseResult(Manifest value)
 ManifestParseResult::ManifestParseResult(QVector<ManifestError> errors)
     : m_errors(std::move(errors))
 {
+    Q_ASSERT(!m_errors.isEmpty());
 }
 
 bool ManifestParseResult::hasValue() const noexcept
