@@ -644,11 +644,22 @@ void ManifestTest::scannerStringAndMemberBounds_data()
     constexpr qsizetype escapedScalarBytes = 6;
     constexpr qsizetype rawEscapedScalars =
         ManifestResourceLimits::MaxJsonStringRawCharacters / escapedScalarBytes;
+    QByteArray rawEscapedAtLimit =
+        QByteArrayLiteral("\\u0061").repeated(rawEscapedScalars);
+    rawEscapedAtLimit.append(
+        QByteArray(ManifestResourceLimits::MaxJsonStringRawCharacters
+                       - rawEscapedAtLimit.size(),
+                   'a'));
+    QCOMPARE(rawEscapedAtLimit.size(), ManifestResourceLimits::MaxJsonStringRawCharacters);
+    QByteArray rawEscapedOverLimit = rawEscapedAtLimit;
+    rawEscapedOverLimit.append('a');
+    QCOMPARE(rawEscapedOverLimit.size(),
+             ManifestResourceLimits::MaxJsonStringRawCharacters + 1);
     QTest::newRow("raw-escaped-string-max")
-        << withUnknownString(QByteArrayLiteral("\\u0061").repeated(rawEscapedScalars))
+        << withUnknownString(rawEscapedAtLimit)
         << ManifestErrorCode::UnknownField << QStringLiteral("$.probe");
     QTest::newRow("raw-escaped-string-max-plus-one")
-        << withUnknownString(QByteArrayLiteral("\\u0061").repeated(rawEscapedScalars + 1))
+        << withUnknownString(rawEscapedOverLimit)
         << ManifestErrorCode::ResourceLimitExceeded << QStringLiteral("$.probe");
 
     QJsonObject object = QJsonDocument::fromJson(valid).object();
