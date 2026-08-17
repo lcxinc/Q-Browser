@@ -19,3 +19,17 @@ q_browser_enable_strict_warnings(tst_manifest)
 q_browser_add_qt_test(
   NAME manifest
   TARGET tst_manifest)
+
+add_executable(tst_archive
+  tst_archive.cpp)
+
+target_link_libraries(tst_archive
+  PRIVATE
+    q_browser_package
+    Qt6::Test)
+
+q_browser_enable_strict_warnings(tst_archive)
+
+q_browser_add_qt_test(
+  NAME archive
+  TARGET tst_archive)

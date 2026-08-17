@@ -1,4 +1,7 @@
 add_library(q_browser_package STATIC
+  Archive.cpp
+  Archive.h
+  ArchiveLimits.h
   JsonPreflight.cpp
   JsonPreflight.h
   Manifest.cpp
@@ -14,6 +17,7 @@ target_link_libraries(q_browser_package
   PUBLIC
     Qt6::Core
   PRIVATE
-    q_browser_router)
+    q_browser_router
+    miniz)
 
 q_browser_enable_strict_warnings(q_browser_package)
