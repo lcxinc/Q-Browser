@@ -10,6 +10,7 @@
 enum class RouteAddResult
 {
     Added,
+    InvalidEngine,
     InvalidPattern,
     DuplicateShape,
 };

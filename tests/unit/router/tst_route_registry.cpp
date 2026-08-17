@@ -35,6 +35,7 @@ private slots:
     void rejectsDuplicateNormalizedPattern();
     void rejectsConflictingParameterNamesAtSameShape();
     void distinguishesInvalidPatternFromDuplicateShape();
+    void rejectsInvalidEngineWithoutChangingState();
     void rejectsInvalidPattern_data();
     void rejectsInvalidPattern();
     void rejectsAmbiguousReservedStaticSegment_data();
@@ -228,6 +229,19 @@ void RouteRegistryTest::distinguishesInvalidPatternFromDuplicateShape()
     QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"))), RouteAddResult::Added);
     QCOMPARE(registry.add(route(QStringLiteral("/orders/:orderId"))),
              RouteAddResult::DuplicateShape);
+}
+
+void RouteRegistryTest::rejectsInvalidEngineWithoutChangingState()
+{
+    RouteRegistry registry;
+    RouteRecord invalidRecord;
+    invalidRecord.pattern = QStringLiteral("/orders");
+
+    QCOMPARE(registry.add(invalidRecord), RouteAddResult::InvalidEngine);
+    QVERIFY(!registry.match(QStringLiteral("/orders")).isValid());
+
+    QCOMPARE(registry.add(route(QStringLiteral("/orders"))), RouteAddResult::Added);
+    QVERIFY(registry.match(QStringLiteral("/orders")).isValid());
 }
 
 void RouteRegistryTest::rejectsInvalidPattern_data()

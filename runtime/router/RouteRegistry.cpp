@@ -74,6 +74,10 @@ RouteMatch::RouteMatch(RouteRecord routeRecord, QHash<QString, QString> routePar
 
 RouteAddResult RouteRegistry::add(RouteRecord record)
 {
+    if (record.engine == Engine::Invalid) {
+        return RouteAddResult::InvalidEngine;
+    }
+
     const QString &pattern = record.pattern;
     if (!pattern.startsWith(u'/') || pattern.contains(u'?') || pattern.contains(u'#')
         || pattern.contains(QStringLiteral("//"))
