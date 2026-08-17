@@ -1,4 +1,6 @@
 if(BUILD_TESTING)
+  add_subdirectory(unit/router)
+
   add_executable(q_browser_build_smoke
     smoke/tst_build_smoke.cpp)
 
