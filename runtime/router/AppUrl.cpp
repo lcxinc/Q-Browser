@@ -1,5 +1,7 @@
 #include "AppUrl.h"
 
+#include "NormalizedPath.h"
+
 #include <QChar>
 #include <QUrl>
 
@@ -7,67 +9,48 @@
 
 namespace {
 
-[[nodiscard]] bool isHexDigit(const QChar character) noexcept
+[[nodiscard]] bool isValidExpectedAuthority(const QStringView authority)
 {
-    const char16_t value = character.unicode();
-    return (value >= u'0' && value <= u'9') || (value >= u'A' && value <= u'F')
-        || (value >= u'a' && value <= u'f');
+    if (authority.isEmpty() || authority.size() > 253 || authority.startsWith(u'.')
+        || authority.endsWith(u'.')) {
+        return false;
+    }
+
+    const auto labels = authority.toString().split(u'.', Qt::KeepEmptyParts);
+    for (const QString &label : labels) {
+        if (label.isEmpty() || label.size() > 63 || label.startsWith(u'-') || label.endsWith(u'-')) {
+            return false;
+        }
+        for (const QChar character : label) {
+            const bool lowerLetter = character >= u'a' && character <= u'z';
+            const bool digit = character >= u'0' && character <= u'9';
+            if (!lowerLetter && !digit && character != u'-') {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
-[[nodiscard]] bool hasValidPercentEncoding(const QString &input) noexcept
+[[nodiscard]] bool isHexDigit(const QChar character) noexcept
 {
-    for (qsizetype index = 0; index < input.size(); ++index) {
-        if (input.at(index) != u'%') {
+    return (character >= u'0' && character <= u'9') || (character >= u'A' && character <= u'F')
+        || (character >= u'a' && character <= u'f');
+}
+
+[[nodiscard]] bool hasValidPercentEncoding(const QStringView encoded) noexcept
+{
+    for (qsizetype index = 0; index < encoded.size(); ++index) {
+        if (encoded.at(index) != u'%') {
             continue;
         }
-        if (index + 2 >= input.size() || !isHexDigit(input.at(index + 1))
-            || !isHexDigit(input.at(index + 2))) {
+        if (index + 2 >= encoded.size() || !isHexDigit(encoded.at(index + 1))
+            || !isHexDigit(encoded.at(index + 2))) {
             return false;
         }
         index += 2;
     }
     return true;
-}
-
-[[nodiscard]] int hexValue(const QChar character) noexcept
-{
-    const char16_t value = character.unicode();
-    if (value >= u'0' && value <= u'9') {
-        return static_cast<int>(value - u'0');
-    }
-    if (value >= u'A' && value <= u'F') {
-        return static_cast<int>(value - u'A') + 10;
-    }
-    return static_cast<int>(value - u'a') + 10;
-}
-
-[[nodiscard]] bool isUnreservedAscii(const int value) noexcept
-{
-    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
-        || (value >= '0' && value <= '9') || value == '-' || value == '.' || value == '_'
-        || value == '~';
-}
-
-[[nodiscard]] bool hasNonCanonicalEscape(const QString &path) noexcept
-{
-    for (qsizetype index = 0; index < path.size(); ++index) {
-        if (path.at(index) != u'%') {
-            continue;
-        }
-
-        const QChar high = path.at(index + 1);
-        const QChar low = path.at(index + 2);
-        if ((high >= u'a' && high <= u'f') || (low >= u'a' && low <= u'f')) {
-            return true;
-        }
-
-        const int byteValue = (hexValue(high) << 4) | hexValue(low);
-        if (isUnreservedAscii(byteValue)) {
-            return true;
-        }
-        index += 2;
-    }
-    return false;
 }
 
 [[nodiscard]] QString rawPath(const QString &input)
@@ -106,59 +89,64 @@ namespace {
     return input.mid(queryStart + 1, end - queryStart - 1);
 }
 
-[[nodiscard]] bool hasTraversalSegment(const QString &encodedPath)
+[[nodiscard]] AppUrlError appUrlError(const NormalizedPathError error) noexcept
 {
-    const auto segments = encodedPath.split(u'/', Qt::KeepEmptyParts);
-    for (const QString &segment : segments) {
-        const QString decoded = QUrl::fromPercentEncoding(segment.toLatin1());
-        if (decoded == QStringLiteral(".") || decoded == QStringLiteral("..")) {
-            return true;
-        }
+    switch (error) {
+    case NormalizedPathError::None:
+        return AppUrlError::None;
+    case NormalizedPathError::NotAbsolute:
+        return AppUrlError::PathNotAbsolute;
+    case NormalizedPathError::MalformedPercentEncoding:
+        return AppUrlError::MalformedPercentEncoding;
+    case NormalizedPathError::PathTraversal:
+        return AppUrlError::PathTraversal;
+    case NormalizedPathError::DuplicateSlash:
+        return AppUrlError::DuplicateSlash;
+    case NormalizedPathError::NonCanonicalEncoding:
+    case NormalizedPathError::InvalidUtf8:
+    case NormalizedPathError::ControlCharacter:
+    case NormalizedPathError::DecodedSeparator:
+    case NormalizedPathError::TrailingSlash:
+        return AppUrlError::NonNormalizedPath;
     }
-    return false;
+    return AppUrlError::NonNormalizedPath;
 }
 
 } // namespace
 
-AppUrl AppUrl::parse(const QString &input)
+AppUrl AppUrl::parse(const QStringView inputView, const QStringView expectedAuthority)
 {
-    if (!hasValidPercentEncoding(input)) {
-        return AppUrl(AppUrlError::MalformedPercentEncoding);
+    if (!isValidExpectedAuthority(expectedAuthority)) {
+        return AppUrl(AppUrlError::InvalidExpectedAuthority);
     }
 
+    const QString input = inputView.toString();
     const QUrl url(input, QUrl::StrictMode);
-    const QString path = rawPath(input);
-    if (url.scheme() == QStringLiteral("app") && path.contains(u'\\')) {
-        return AppUrl(AppUrlError::NonNormalizedPath);
+    if (url.scheme() != QStringLiteral("app")) {
+        return AppUrl(AppUrlError::WrongScheme);
+    }
+    if (url.isValid()
+        && (url.host() != expectedAuthority || !url.userInfo().isEmpty() || url.port() != -1)) {
+        return AppUrl(AppUrlError::WrongAuthority);
+    }
+    if (url.isValid() && url.hasFragment()) {
+        return AppUrl(AppUrlError::FragmentNotAllowed);
+    }
+
+    const NormalizedPath path = NormalizedPath::parse(rawPath(input));
+    if (!path.isValid()) {
+        return AppUrl(appUrlError(path.error()));
+    }
+
+    const QString query = rawQuery(input);
+    if (!hasValidPercentEncoding(query)) {
+        return AppUrl(AppUrlError::MalformedPercentEncoding);
     }
     if (!url.isValid()) {
         return AppUrl(AppUrlError::InvalidUrl);
     }
-    if (url.scheme() != QStringLiteral("app")) {
-        return AppUrl(AppUrlError::WrongScheme);
-    }
-    if (url.host() != QStringLiteral("pilot") || !url.userInfo().isEmpty() || url.port() != -1) {
-        return AppUrl(AppUrlError::WrongAuthority);
-    }
-    if (url.hasFragment()) {
-        return AppUrl(AppUrlError::FragmentNotAllowed);
-    }
 
-    if (!path.startsWith(u'/')) {
-        return AppUrl(AppUrlError::PathNotAbsolute);
-    }
-    if (hasTraversalSegment(path)) {
-        return AppUrl(AppUrlError::PathTraversal);
-    }
-    if (path.contains(QStringLiteral("//"))) {
-        return AppUrl(AppUrlError::DuplicateSlash);
-    }
-    if (path.contains(u'\\') || hasNonCanonicalEscape(path)
-        || url.path(QUrl::FullyEncoded) != path) {
-        return AppUrl(AppUrlError::NonNormalizedPath);
-    }
-
-    return AppUrl(AppUrlError::None, path, rawQuery(input));
+    return AppUrl(AppUrlError::None, path.encoded(), query);
 }
 
 bool AppUrl::isValid() const noexcept

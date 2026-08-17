@@ -34,22 +34,27 @@ private slots:
     void rejectsSlashContainingDecodedParameter();
     void rejectsDuplicateNormalizedPattern();
     void rejectsConflictingParameterNamesAtSameShape();
+    void distinguishesInvalidPatternFromDuplicateShape();
     void rejectsInvalidPattern_data();
     void rejectsInvalidPattern();
     void rejectsAmbiguousReservedStaticSegment_data();
     void rejectsAmbiguousReservedStaticSegment();
     void returnsNotFoundForInvalidOrUnknownPath_data();
     void returnsNotFoundForInvalidOrUnknownPath();
+    void rejectsUnsafeEncodedPath_data();
+    void rejectsUnsafeEncodedPath();
+    void invalidMatchHasInvalidEngine();
     void returnsIndependentValueObject();
 };
 
 void RouteRegistryTest::matchesExactStaticRoute()
 {
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/orders"),
-                               Engine::TrustedQml,
-                               QStringLiteral("com.qbrowser.shell"),
-                               QStringLiteral("Orders.qml"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders"),
+                                Engine::TrustedQml,
+                                QStringLiteral("com.qbrowser.shell"),
+                                QStringLiteral("Orders.qml"))),
+             RouteAddResult::Added);
 
     const auto match = registry.match(QStringLiteral("/orders"));
 
@@ -61,10 +66,11 @@ void RouteRegistryTest::matchesExactStaticRoute()
 void RouteRegistryTest::extractsParameterFromRoute()
 {
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/orders/:id"),
-                               Engine::QmlWorker,
-                               QStringLiteral("com.qbrowser.pilot"),
-                               QStringLiteral("OrderDetail.qml"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"),
+                                Engine::QmlWorker,
+                                QStringLiteral("com.qbrowser.pilot"),
+                                QStringLiteral("OrderDetail.qml"))),
+             RouteAddResult::Added);
 
     const auto match = registry.match(QStringLiteral("/orders/42"));
 
@@ -76,7 +82,8 @@ void RouteRegistryTest::extractsParameterFromRoute()
 void RouteRegistryTest::matchesMultipleSegmentsAndParameters()
 {
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/customers/:customerId/orders/:orderId/edit"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/customers/:customerId/orders/:orderId/edit"))),
+             RouteAddResult::Added);
 
     const auto match = registry.match(QStringLiteral("/customers/acme/orders/42/edit"));
 
@@ -107,8 +114,8 @@ void RouteRegistryTest::prefersStaticSegmentRegardlessOfRegistrationOrder()
                              QStringLiteral("com.qbrowser.shell"),
                              QStringLiteral("NewOrder.qml"));
 
-    QVERIFY(registry.add(staticFirst ? fixed : parameter));
-    QVERIFY(registry.add(staticFirst ? parameter : fixed));
+    QCOMPARE(registry.add(staticFirst ? fixed : parameter), RouteAddResult::Added);
+    QCOMPARE(registry.add(staticFirst ? parameter : fixed), RouteAddResult::Added);
 
     const auto match = registry.match(QStringLiteral("/orders/new/edit"));
 
@@ -143,7 +150,7 @@ void RouteRegistryTest::preservesEngineAndTargetMetadata()
     QFETCH(QString, entryPoint);
 
     RouteRegistry registry;
-    QVERIFY(registry.add(route(path, engine, packageId, entryPoint)));
+    QCOMPARE(registry.add(route(path, engine, packageId, entryPoint)), RouteAddResult::Added);
 
     const auto match = registry.match(path);
 
@@ -169,7 +176,7 @@ void RouteRegistryTest::percentDecodesParameterValues()
     QFETCH(QString, decoded);
 
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/customers/:name"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/customers/:name"))), RouteAddResult::Added);
 
     const auto match = registry.match(QStringLiteral("/customers/") + encoded);
 
@@ -190,7 +197,7 @@ void RouteRegistryTest::rejectsSlashContainingDecodedParameter()
     QFETCH(QString, encoded);
 
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/customers/:name"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/customers/:name"))), RouteAddResult::Added);
 
     QVERIFY(!registry.match(QStringLiteral("/customers/") + encoded).isValid());
 }
@@ -199,16 +206,28 @@ void RouteRegistryTest::rejectsDuplicateNormalizedPattern()
 {
     RouteRegistry registry;
 
-    QVERIFY(registry.add(route(QStringLiteral("/orders/:id"))));
-    QVERIFY(!registry.add(route(QStringLiteral("/orders/:id"), Engine::WebEngine)));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"))), RouteAddResult::Added);
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"), Engine::WebEngine)),
+             RouteAddResult::DuplicateShape);
 }
 
 void RouteRegistryTest::rejectsConflictingParameterNamesAtSameShape()
 {
     RouteRegistry registry;
 
-    QVERIFY(registry.add(route(QStringLiteral("/orders/:id/edit"))));
-    QVERIFY(!registry.add(route(QStringLiteral("/orders/:orderId/edit"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id/edit"))), RouteAddResult::Added);
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:orderId/edit"))),
+             RouteAddResult::DuplicateShape);
+}
+
+void RouteRegistryTest::distinguishesInvalidPatternFromDuplicateShape()
+{
+    RouteRegistry registry;
+
+    QCOMPARE(registry.add(route(QStringLiteral("orders/:id"))), RouteAddResult::InvalidPattern);
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"))), RouteAddResult::Added);
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:orderId"))),
+             RouteAddResult::DuplicateShape);
 }
 
 void RouteRegistryTest::rejectsInvalidPattern_data()
@@ -236,7 +255,7 @@ void RouteRegistryTest::rejectsInvalidPattern()
 
     RouteRegistry registry;
 
-    QVERIFY(!registry.add(route(pattern)));
+    QCOMPARE(registry.add(route(pattern)), RouteAddResult::InvalidPattern);
 }
 
 void RouteRegistryTest::rejectsAmbiguousReservedStaticSegment_data()
@@ -254,7 +273,7 @@ void RouteRegistryTest::rejectsAmbiguousReservedStaticSegment()
 
     RouteRegistry registry;
 
-    QVERIFY(!registry.add(route(pattern)));
+    QCOMPARE(registry.add(route(pattern)), RouteAddResult::InvalidPattern);
 }
 
 void RouteRegistryTest::returnsNotFoundForInvalidOrUnknownPath_data()
@@ -276,18 +295,59 @@ void RouteRegistryTest::returnsNotFoundForInvalidOrUnknownPath()
     QFETCH(QString, path);
 
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/orders/:id"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"))), RouteAddResult::Added);
 
     QVERIFY(!registry.match(path).isValid());
+}
+
+void RouteRegistryTest::rejectsUnsafeEncodedPath_data()
+{
+    QTest::addColumn<QString>("path");
+
+    QTest::newRow("invalid-utf8") << QStringLiteral("/orders/%FF");
+    QTest::newRow("decoded-forward-slash") << QStringLiteral("/orders/acme%2Fadmin");
+    QTest::newRow("decoded-backslash") << QStringLiteral("/orders/acme%5Cadmin");
+    QTest::newRow("encoded-nul") << QStringLiteral("/orders/%00");
+    QTest::newRow("encoded-control") << QStringLiteral("/orders/%1F");
+    QTest::newRow("encoded-unicode-control") << QStringLiteral("/orders/%C2%80");
+    QTest::newRow("illegal-literal") << QStringLiteral("/orders/[admin]");
+    QTest::newRow("trailing-slash") << QStringLiteral("/orders/");
+
+    QString literalControl = QStringLiteral("/orders/");
+    literalControl.append(QChar(0x1f));
+    QTest::newRow("literal-control") << literalControl;
+}
+
+void RouteRegistryTest::rejectsUnsafeEncodedPath()
+{
+    QFETCH(QString, path);
+
+    RouteRegistry registry;
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"))), RouteAddResult::Added);
+
+    QVERIFY(!registry.match(path).isValid());
+}
+
+void RouteRegistryTest::invalidMatchHasInvalidEngine()
+{
+    const RouteRecord defaultRecord;
+    QCOMPARE(defaultRecord.engine, Engine::Invalid);
+
+    const RouteRegistry registry;
+    const auto match = registry.match(QStringLiteral("/not-found"));
+
+    QVERIFY(!match.isValid());
+    QCOMPARE(match.record.engine, Engine::Invalid);
 }
 
 void RouteRegistryTest::returnsIndependentValueObject()
 {
     RouteRegistry registry;
-    QVERIFY(registry.add(route(QStringLiteral("/orders/:id"),
-                               Engine::QmlWorker,
-                               QStringLiteral("com.qbrowser.pilot"),
-                               QStringLiteral("OrderDetail.qml"))));
+    QCOMPARE(registry.add(route(QStringLiteral("/orders/:id"),
+                                Engine::QmlWorker,
+                                QStringLiteral("com.qbrowser.pilot"),
+                                QStringLiteral("OrderDetail.qml"))),
+             RouteAddResult::Added);
 
     auto first = registry.match(QStringLiteral("/orders/42"));
     static_assert(!std::is_pointer_v<decltype(first)>);

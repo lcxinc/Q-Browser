@@ -4,7 +4,17 @@
 
 #include <QHash>
 #include <QString>
+#include <QStringView>
 #include <QVector>
+
+enum class RouteAddResult
+{
+    Added,
+    InvalidPattern,
+    DuplicateShape,
+};
+
+Q_DECLARE_METATYPE(RouteAddResult)
 
 class RouteMatch final
 {
@@ -26,8 +36,8 @@ private:
 class RouteRegistry final
 {
 public:
-    bool add(RouteRecord record);
-    [[nodiscard]] RouteMatch match(const QString &path) const;
+    [[nodiscard]] RouteAddResult add(RouteRecord record);
+    [[nodiscard]] RouteMatch match(QStringView path) const;
 
 private:
     struct Segment

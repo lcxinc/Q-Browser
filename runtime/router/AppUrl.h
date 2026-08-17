@@ -2,11 +2,13 @@
 
 #include <QMetaType>
 #include <QString>
+#include <QStringView>
 
 enum class AppUrlError
 {
     None,
     InvalidUrl,
+    InvalidExpectedAuthority,
     WrongScheme,
     WrongAuthority,
     MalformedPercentEncoding,
@@ -22,7 +24,7 @@ Q_DECLARE_METATYPE(AppUrlError)
 class AppUrl final
 {
 public:
-    [[nodiscard]] static AppUrl parse(const QString &input);
+    [[nodiscard]] static AppUrl parse(QStringView input, QStringView expectedAuthority);
 
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] AppUrlError error() const noexcept;

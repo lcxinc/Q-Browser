@@ -1,9 +1,9 @@
 #include "RouteRegistry.h"
 
-#include <QByteArray>
+#include "NormalizedPath.h"
+
 #include <QChar>
 #include <QSet>
-#include <QStringConverter>
 
 #include <utility>
 
@@ -46,103 +46,6 @@ namespace {
     return true;
 }
 
-[[nodiscard]] int hexValue(const QChar character) noexcept
-{
-    if (character >= u'0' && character <= u'9') {
-        return static_cast<int>(character.unicode() - u'0');
-    }
-    if (character >= u'A' && character <= u'F') {
-        return static_cast<int>(character.unicode() - u'A') + 10;
-    }
-    if (character >= u'a' && character <= u'f') {
-        return static_cast<int>(character.unicode() - u'a') + 10;
-    }
-    return -1;
-}
-
-[[nodiscard]] bool isUnreservedAscii(const int value) noexcept
-{
-    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
-        || (value >= '0' && value <= '9') || value == '-' || value == '.' || value == '_'
-        || value == '~';
-}
-
-[[nodiscard]] bool isControlCharacter(const QChar character) noexcept
-{
-    return character.unicode() <= 0x1f || character.unicode() == 0x7f;
-}
-
-[[nodiscard]] bool decodeSegment(const QString &encoded, QString &decoded)
-{
-    QByteArray bytes;
-    bytes.reserve(encoded.size());
-
-    for (qsizetype index = 0; index < encoded.size(); ++index) {
-        const QChar character = encoded.at(index);
-        if (character == u'%') {
-            if (index + 2 >= encoded.size()) {
-                return false;
-            }
-            const QChar high = encoded.at(index + 1);
-            const QChar low = encoded.at(index + 2);
-            const int highValue = hexValue(high);
-            const int lowValue = hexValue(low);
-            if (highValue < 0 || lowValue < 0 || (high >= u'a' && high <= u'f')
-                || (low >= u'a' && low <= u'f')) {
-                return false;
-            }
-            const int byteValue = (highValue << 4) | lowValue;
-            if (isUnreservedAscii(byteValue)) {
-                return false;
-            }
-            bytes.append(static_cast<char>(byteValue));
-            index += 2;
-            continue;
-        }
-
-        if (character.unicode() > 0x7f || isControlCharacter(character) || character == u'\\'
-            || character == u' ') {
-            return false;
-        }
-        bytes.append(static_cast<char>(character.unicode()));
-    }
-
-    QStringDecoder decoder(QStringDecoder::Utf8);
-    decoded = decoder(bytes);
-    if (decoder.hasError() || decoded.contains(u'/') || decoded.contains(u'\\')
-        || decoded == QStringLiteral(".") || decoded == QStringLiteral("..")) {
-        return false;
-    }
-    for (const QChar character : decoded) {
-        if (isControlCharacter(character)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] bool parsePath(const QString &path, QStringList &segments)
-{
-    if (!path.startsWith(u'/') || path.contains(u'?') || path.contains(u'#')
-        || path.contains(QStringLiteral("//")) || (path.size() > 1 && path.endsWith(u'/'))) {
-        return false;
-    }
-    if (path == QStringLiteral("/")) {
-        return true;
-    }
-
-    const auto encodedSegments = path.sliced(1).split(u'/', Qt::KeepEmptyParts);
-    segments.reserve(encodedSegments.size());
-    for (const QString &encoded : encodedSegments) {
-        QString decoded;
-        if (!decodeSegment(encoded, decoded)) {
-            return false;
-        }
-        segments.append(std::move(decoded));
-    }
-    return true;
-}
-
 template<typename Segment>
 [[nodiscard]] bool hasHigherPrecedence(const QVector<Segment> &candidate,
                                        const QVector<Segment> &current) noexcept
@@ -169,13 +72,13 @@ RouteMatch::RouteMatch(RouteRecord routeRecord, QHash<QString, QString> routePar
 {
 }
 
-bool RouteRegistry::add(RouteRecord record)
+RouteAddResult RouteRegistry::add(RouteRecord record)
 {
     const QString &pattern = record.pattern;
     if (!pattern.startsWith(u'/') || pattern.contains(u'?') || pattern.contains(u'#')
         || pattern.contains(QStringLiteral("//"))
         || (pattern.size() > 1 && pattern.endsWith(u'/'))) {
-        return false;
+        return RouteAddResult::InvalidPattern;
     }
 
     QVector<Segment> segments;
@@ -190,14 +93,14 @@ bool RouteRegistry::add(RouteRecord record)
             if (rawSegment.startsWith(u':')) {
                 const QString name = rawSegment.sliced(1);
                 if (!isValidParameterName(name) || parameterNames.contains(name)) {
-                    return false;
+                    return RouteAddResult::InvalidPattern;
                 }
                 parameterNames.insert(name);
                 segments.append({true, name});
                 normalizedShape += QStringLiteral("/:");
             } else {
                 if (!isValidStaticSegment(rawSegment)) {
-                    return false;
+                    return RouteAddResult::InvalidPattern;
                 }
                 segments.append({false, rawSegment});
                 normalizedShape += u'/' + rawSegment;
@@ -207,20 +110,21 @@ bool RouteRegistry::add(RouteRecord record)
 
     for (const CompiledRoute &existing : m_routes) {
         if (existing.normalizedShape == normalizedShape) {
-            return false;
+            return RouteAddResult::DuplicateShape;
         }
     }
 
     m_routes.append({std::move(record), std::move(segments), std::move(normalizedShape)});
-    return true;
+    return RouteAddResult::Added;
 }
 
-RouteMatch RouteRegistry::match(const QString &path) const
+RouteMatch RouteRegistry::match(const QStringView pathText) const
 {
-    QStringList pathSegments;
-    if (!parsePath(path, pathSegments)) {
+    const NormalizedPath path = NormalizedPath::parse(pathText);
+    if (!path.isValid()) {
         return {};
     }
+    const QStringList pathSegments = path.decodedSegments();
 
     const CompiledRoute *best = nullptr;
     QHash<QString, QString> bestParameters;

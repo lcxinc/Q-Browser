@@ -1,6 +1,8 @@
 add_library(q_browser_router STATIC
   AppUrl.cpp
   AppUrl.h
+  NormalizedPath.cpp
+  NormalizedPath.h
   RouteRecord.h
   RouteRegistry.cpp
   RouteRegistry.h)
