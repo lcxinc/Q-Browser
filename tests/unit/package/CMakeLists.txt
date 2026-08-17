@@ -28,6 +28,10 @@ target_link_libraries(tst_archive
     q_browser_package
     Qt6::Test)
 
+target_compile_definitions(tst_archive
+  PRIVATE
+    Q_BROWSER_ARCHIVE_SOURCE_FILE="${PROJECT_SOURCE_DIR}/runtime/package/Archive.cpp")
+
 q_browser_enable_strict_warnings(tst_archive)
 
 q_browser_add_qt_test(

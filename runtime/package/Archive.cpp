@@ -4,6 +4,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QSaveFile>
 #include <QSet>
 #include <QStringDecoder>
@@ -23,7 +24,6 @@
 #endif
 
 #include <algorithm>
-#include <ctime>
 #include <cstring>
 #include <limits>
 
@@ -94,24 +94,24 @@ bool applyDeterministicCentralMetadata(QByteArray &bytes)
             return false;
         }
         writeLittle16(bytes, offset + 4, 0x0314U);
+        writeLittle16(bytes, offset + 12, 0U);
+        writeLittle16(bytes, offset + 14, 0x0021U);
         writeLittle16(bytes, offset + 36, 0U);
         writeLittle32(bytes, offset + 38, 0x81A40000U);
+        const qsizetype localOffset = static_cast<qsizetype>(
+            readLittle32(bytes, offset + 42));
+        if (localOffset < 0 || localOffset + 30 > bytes.size()
+            || readLittle32(bytes, localOffset) != 0x04034B50U) {
+            return false;
+        }
+        writeLittle16(bytes, localOffset + 10, 0U);
+        writeLittle16(bytes, localOffset + 12, 0x0021U);
         const quint16 nameLength = readLittle16(bytes, offset + 28);
         const quint16 extraLength = readLittle16(bytes, offset + 30);
         const quint16 commentLength = readLittle16(bytes, offset + 32);
         offset += 46 + nameLength + extraLength + commentLength;
     }
     return offset == endOffset;
-}
-
-MZ_TIME_T deterministicTimestamp()
-{
-    std::tm fixed{};
-    fixed.tm_year = 80;
-    fixed.tm_mon = 0;
-    fixed.tm_mday = 1;
-    fixed.tm_isdst = 0;
-    return static_cast<MZ_TIME_T>(std::mktime(&fixed));
 }
 
 struct ZipEnvelope final
@@ -269,7 +269,65 @@ bool isWindowsDeviceName(const QString &component)
 struct CheckedPath final
 {
     QString collisionKey;
+    bool isCanonical = true;
 };
+
+struct CollisionPath final
+{
+    QString key;
+    QByteArray path;
+    bool isCanonical = true;
+};
+
+std::optional<QByteArray> findPathCollision(
+    const QVector<CollisionPath> &paths)
+{
+    QHash<QString, QByteArray> firstPathByKey;
+    QSet<QString> keys;
+    QVector<QByteArray> candidates;
+    for (const CollisionPath &path : paths) {
+        const auto existing = firstPathByKey.constFind(path.key);
+        if (existing != firstPathByKey.cend()) {
+            candidates.push_back(
+                bytewiseLess(*existing, path.path) ? path.path : *existing);
+        } else {
+            firstPathByKey.insert(path.key, path.path);
+            keys.insert(path.key);
+        }
+    }
+    for (const CollisionPath &path : paths) {
+        qsizetype separator = path.key.indexOf(QLatin1Char('/'));
+        while (separator >= 0) {
+            if (keys.contains(path.key.left(separator))) {
+                candidates.push_back(path.path);
+                break;
+            }
+            separator = path.key.indexOf(QLatin1Char('/'), separator + 1);
+        }
+    }
+    if (candidates.isEmpty()) {
+        return std::nullopt;
+    }
+    return *std::min_element(
+        candidates.cbegin(),
+        candidates.cend(),
+        [](const QByteArray &left, const QByteArray &right) {
+            return bytewiseLess(left, right);
+        });
+}
+
+std::optional<QByteArray> firstNonCanonicalPath(
+    const QVector<CollisionPath> &paths)
+{
+    std::optional<QByteArray> result;
+    for (const CollisionPath &path : paths) {
+        if (!path.isCanonical
+            && (!result.has_value() || bytewiseLess(path.path, *result))) {
+            result = path.path;
+        }
+    }
+    return result;
+}
 
 std::optional<CheckedPath> validateEntryPath(
     const QByteArray &path,
@@ -283,10 +341,10 @@ std::optional<CheckedPath> validateEntryPath(
     QStringDecoder decoder(QStringDecoder::Utf8);
     const QString decoded = decoder.decode(path);
     if (decoder.hasError() || decoded.isEmpty()
-        || decoded.size() > limits.maximumPathUtf16Units
-        || decoded.normalized(QString::NormalizationForm_C) != decoded) {
+        || decoded.size() > limits.maximumPathUtf16Units) {
         return std::nullopt;
     }
+    const QString normalized = decoded.normalized(QString::NormalizationForm_C);
 
     const QList<QByteArray> rawComponents = path.split('/');
     const QStringList components = decoded.split(QLatin1Char('/'));
@@ -313,7 +371,7 @@ std::optional<CheckedPath> validateEntryPath(
             }
         }
     }
-    return CheckedPath{decoded.toCaseFolded()};
+    return CheckedPath{normalized.toCaseFolded(), normalized == decoded};
 }
 
 class ZipReader final
@@ -416,6 +474,12 @@ QVector<ArchiveEntry> ArchiveResult::contentDigestEntries() const
             result.push_back(entry);
         }
     }
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const ArchiveEntry &left, const ArchiveEntry &right) {
+            return bytewiseLess(left.path, right.path);
+        });
     return result;
 }
 
@@ -439,7 +503,7 @@ ArchiveResult Archive::create(
     }
 
     QVector<SourceEntry> sourceEntries;
-    QSet<QString> collisionKeys;
+    QVector<CollisionPath> collisionPaths;
     quint64 totalSize = 0;
     const QDir root(sourceRoot);
     QDirIterator iterator(
@@ -476,13 +540,8 @@ ArchiveResult Archive::create(
                 archiveName,
                 QStringLiteral("archive source path is invalid"));
         }
-        if (collisionKeys.contains(checkedPath->collisionKey)) {
-            return fail(
-                ArchiveErrorCode::DuplicateEntryPath,
-                archiveName,
-                QStringLiteral("archive source paths collide"));
-        }
-        collisionKeys.insert(checkedPath->collisionKey);
+        collisionPaths.push_back(
+            {checkedPath->collisionKey, archiveName, checkedPath->isCanonical});
 
         if (static_cast<quint64>(sourceEntries.size())
             >= limits.maximumEntries) {
@@ -508,6 +567,22 @@ ArchiveResult Archive::create(
         }
         totalSize += size;
         sourceEntries.push_back({info.absoluteFilePath(), archiveName, size});
+    }
+    if (const std::optional<QByteArray> collision =
+            findPathCollision(collisionPaths);
+        collision.has_value()) {
+        return fail(
+            ArchiveErrorCode::DuplicateEntryPath,
+            *collision,
+            QStringLiteral("archive source paths collide"));
+    }
+    if (const std::optional<QByteArray> nonCanonical =
+            firstNonCanonicalPath(collisionPaths);
+        nonCanonical.has_value()) {
+        return fail(
+            ArchiveErrorCode::InvalidEntryPath,
+            *nonCanonical,
+            QStringLiteral("archive source path is invalid"));
     }
     std::sort(
         sourceEntries.begin(),
@@ -541,7 +616,6 @@ ArchiveResult Archive::create(
             writeSucceeded = false;
             break;
         }
-        MZ_TIME_T fixedTimestamp = deterministicTimestamp();
         constexpr mz_uint writerFlags = static_cast<mz_uint>(6)
             | MZ_ZIP_FLAG_WRITE_HEADER_SET_SIZE;
         if (mz_zip_writer_add_read_buf_callback(
@@ -550,7 +624,7 @@ ArchiveResult Archive::create(
                 readMemory,
                 &bytes,
                 static_cast<mz_uint64>(bytes.size()),
-                &fixedTimestamp,
+                nullptr,
                 nullptr,
                 0,
                 writerFlags,
@@ -637,7 +711,7 @@ ArchiveResult inspectBytes(
     }
 
     QVector<ArchiveEntry> entries;
-    QSet<QString> collisionKeys;
+    QVector<CollisionPath> collisionPaths;
     const mz_uint count = mz_zip_reader_get_num_files(reader.get());
     if (count != static_cast<mz_uint>(envelope.entryCount)) {
         return fail(
@@ -676,13 +750,8 @@ ArchiveResult inspectBytes(
                 *name,
                 QStringLiteral("archive entry path is invalid"));
         }
-        if (collisionKeys.contains(checkedPath->collisionKey)) {
-            return fail(
-                ArchiveErrorCode::DuplicateEntryPath,
-                *name,
-                QStringLiteral("archive entry path collides"));
-        }
-        collisionKeys.insert(checkedPath->collisionKey);
+        collisionPaths.push_back(
+            {checkedPath->collisionKey, *name, checkedPath->isCanonical});
 
         constexpr quint16 allowedFlags = 0x0800U;
         const quint16 unsupportedFlags = static_cast<quint16>(
@@ -715,11 +784,15 @@ ArchiveResult inspectBytes(
                     *name,
                     QStringLiteral("archive entry type is unsupported"));
             }
-        } else if ((stat.m_external_attr & 0x10U) != 0U) {
-            return fail(
-                ArchiveErrorCode::UnsupportedEntry,
-                *name,
-                QStringLiteral("archive entry type is unsupported"));
+        } else {
+            constexpr quint32 allowedDosAttributes =
+                0x01U | 0x02U | 0x04U | 0x20U | 0x80U;
+            if ((stat.m_external_attr & ~allowedDosAttributes) != 0U) {
+                return fail(
+                    ArchiveErrorCode::UnsupportedEntry,
+                    *name,
+                    QStringLiteral("archive entry type is unsupported"));
+            }
         }
         if (stat.m_uncomp_size > limits.maximumEntryBytes) {
             return fail(
@@ -758,6 +831,22 @@ ArchiveResult inspectBytes(
                 QStringLiteral("archive entry metadata is invalid"));
         }
         entries.push_back({*name, stat.m_uncomp_size, stat.m_comp_size});
+    }
+    if (const std::optional<QByteArray> collision =
+            findPathCollision(collisionPaths);
+        collision.has_value()) {
+        return fail(
+            ArchiveErrorCode::DuplicateEntryPath,
+            *collision,
+            QStringLiteral("archive entry path collides"));
+    }
+    if (const std::optional<QByteArray> nonCanonical =
+            firstNonCanonicalPath(collisionPaths);
+        nonCanonical.has_value()) {
+        return fail(
+            ArchiveErrorCode::InvalidEntryPath,
+            *nonCanonical,
+            QStringLiteral("archive entry path is invalid"));
     }
     if (centralCursor != envelope.endOffset) {
         return fail(

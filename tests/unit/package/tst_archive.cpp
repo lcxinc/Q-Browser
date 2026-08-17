@@ -9,6 +9,8 @@
 #include <QTest>
 #include <QtEndian>
 
+#include <ctime>
+
 namespace
 {
 struct RawEntry final
@@ -162,6 +164,8 @@ struct CentralMetadata final
     quint16 versionMadeBy = 0;
     quint16 time = 0;
     quint16 date = 0;
+    quint16 localTime = 0;
+    quint16 localDate = 0;
     quint32 externalAttributes = 0;
 };
 
@@ -182,11 +186,19 @@ QVector<CentralMetadata> centralMetadata(const QByteArray &bytes)
         const quint16 nameLength = read16(bytes, offset + 28);
         const quint16 extraLength = read16(bytes, offset + 30);
         const quint16 commentLength = read16(bytes, offset + 32);
+        const qsizetype localOffset = static_cast<qsizetype>(
+            read32(bytes, offset + 42));
+        if (localOffset + 30 > bytes.size()
+            || read32(bytes, localOffset) != 0x04034B50U) {
+            return {};
+        }
         result.push_back({
             bytes.mid(offset + 46, nameLength),
             read16(bytes, offset + 4),
             read16(bytes, offset + 12),
             read16(bytes, offset + 14),
+            read16(bytes, localOffset + 10),
+            read16(bytes, localOffset + 12),
             read32(bytes, offset + 38)});
         offset += 46 + nameLength + extraLength + commentLength;
     }
@@ -198,6 +210,44 @@ bool writeFile(const QString &path, const QByteArray &bytes)
     QFile file(path);
     return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
 }
+
+class TimeZoneGuard final
+{
+public:
+    TimeZoneGuard()
+        : m_original(qgetenv("TZ")), m_hadOriginal(qEnvironmentVariableIsSet("TZ"))
+    {
+    }
+
+    ~TimeZoneGuard()
+    {
+        if (m_hadOriginal) {
+            (void)qputenv("TZ", m_original);
+        } else {
+            qunsetenv("TZ");
+        }
+        refresh();
+    }
+
+    void set(const QByteArray &value)
+    {
+        (void)qputenv("TZ", value);
+        refresh();
+    }
+
+private:
+    static void refresh()
+    {
+#ifdef Q_OS_WIN
+        _tzset();
+#else
+        tzset();
+#endif
+    }
+
+    QByteArray m_original;
+    bool m_hadOriginal = false;
+};
 }
 
 class ArchiveTest final : public QObject
@@ -208,8 +258,11 @@ private slots:
     void createsAndInspectsAnArchive();
     void rejectsUnsafeEntryPaths_data();
     void rejectsUnsafeEntryPaths();
+    void rejectsFileAncestorCollisions_data();
+    void rejectsFileAncestorCollisions();
     void rejectsUnsafeMetadata_data();
     void rejectsUnsafeMetadata();
+    void acceptsWhitelistedDosFileAttributes();
     void enforcesResourceLimits();
     void exposesCanonicalContentDigestView();
     void extractsOnlyAfterCompleteVerification();
@@ -296,6 +349,57 @@ void ArchiveTest::rejectsUnsafeEntryPaths()
     QVERIFY(!result.error().message.contains(QStringLiteral("x")));
 }
 
+void ArchiveTest::rejectsFileAncestorCollisions_data()
+{
+    QTest::addColumn<QVector<QByteArray>>("names");
+    QTest::addColumn<QByteArray>("expectedPath");
+
+    QTest::newRow("parent-first")
+        << QVector<QByteArray>{QByteArrayLiteral("a"), QByteArrayLiteral("a/b")}
+        << QByteArray("a/b");
+    QTest::newRow("child-first")
+        << QVector<QByteArray>{QByteArrayLiteral("a/b"), QByteArrayLiteral("a")}
+        << QByteArray("a/b");
+    QTest::newRow("case-equivalent-parent")
+        << QVector<QByteArray>{QByteArrayLiteral("A"), QByteArrayLiteral("a/b")}
+        << QByteArray("a/b");
+    const QByteArray composedParent = QStringLiteral("é").toUtf8();
+    const QByteArray decomposedChild = QStringLiteral("e\u0301/b").toUtf8();
+    QTest::newRow("nfc-equivalent-parent")
+        << QVector<QByteArray>{composedParent, decomposedChild}
+        << decomposedChild;
+    QTest::newRow("nfc-equivalent-child-first")
+        << QVector<QByteArray>{decomposedChild, composedParent}
+        << decomposedChild;
+}
+
+void ArchiveTest::rejectsFileAncestorCollisions()
+{
+    QFETCH(QVector<QByteArray>, names);
+    QFETCH(QByteArray, expectedPath);
+    QVector<RawEntry> entries;
+    for (const QByteArray &name : names) {
+        entries.push_back({name});
+    }
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(temporary, makeZip(entries));
+    QVERIFY(!package.isEmpty());
+
+    const ArchiveResult inspected = Archive::inspect(package);
+    QVERIFY(!inspected.hasValue());
+    QCOMPARE(inspected.error().code, ArchiveErrorCode::DuplicateEntryPath);
+    QCOMPARE(inspected.error().path, expectedPath);
+
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    const ArchiveResult extracted = Archive::extract(package, staging);
+    QVERIFY(!extracted.hasValue());
+    QCOMPARE(extracted.error().code, ArchiveErrorCode::DuplicateEntryPath);
+    QCOMPARE(extracted.error().path, expectedPath);
+    QVERIFY(QDir(staging).isEmpty());
+}
+
 void ArchiveTest::rejectsUnsafeMetadata_data()
 {
     QTest::addColumn<QByteArray>("archive");
@@ -335,6 +439,28 @@ void ArchiveTest::rejectsUnsafeMetadata_data()
     directory.externalAttributes = 0x41ED0010U;
     QTest::newRow("non-regular-directory-mode")
         << makeZip({directory}) << ArchiveErrorCode::UnsupportedEntry;
+
+    auto dosEntryWithAttributes = [](quint32 attributes) {
+        RawEntry entry{QByteArrayLiteral("safe.txt")};
+        entry.versionMadeBy = 0x0014U;
+        entry.externalAttributes = attributes;
+        return entry;
+    };
+    QTest::newRow("dos-volume-label")
+        << makeZip({dosEntryWithAttributes(0x08U)})
+        << ArchiveErrorCode::UnsupportedEntry;
+    QTest::newRow("dos-directory")
+        << makeZip({dosEntryWithAttributes(0x10U)})
+        << ArchiveErrorCode::UnsupportedEntry;
+    QTest::newRow("dos-device")
+        << makeZip({dosEntryWithAttributes(0x40U)})
+        << ArchiveErrorCode::UnsupportedEntry;
+    QTest::newRow("dos-reparse")
+        << makeZip({dosEntryWithAttributes(0x400U)})
+        << ArchiveErrorCode::UnsupportedEntry;
+    QTest::newRow("dos-unknown-attribute")
+        << makeZip({dosEntryWithAttributes(0x800U)})
+        << ArchiveErrorCode::UnsupportedEntry;
 
     RawEntry nameMismatch{QByteArrayLiteral("local.txt")};
     nameMismatch.centralName = QByteArrayLiteral("central.txt");
@@ -383,6 +509,26 @@ void ArchiveTest::rejectsUnsafeMetadata()
         QCOMPARE(result.error().path, QByteArray("safe.txt"));
     }
     QVERIFY(!result.error().message.contains(QStringLiteral("x")));
+}
+
+void ArchiveTest::acceptsWhitelistedDosFileAttributes()
+{
+    auto dosEntry = [](QByteArray name, quint32 attributes) {
+        RawEntry entry{std::move(name)};
+        entry.versionMadeBy = 0x0014U;
+        entry.externalAttributes = attributes;
+        return entry;
+    };
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary,
+        makeZip({dosEntry(QByteArrayLiteral("plain.txt"), 0U),
+                 dosEntry(QByteArrayLiteral("flags.txt"), 0x27U),
+                 dosEntry(QByteArrayLiteral("normal.txt"), 0x80U)}));
+    const ArchiveResult result = Archive::inspect(package);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    QCOMPARE(result.entries().size(), 3);
 }
 
 void ArchiveTest::enforcesResourceLimits()
@@ -504,17 +650,17 @@ void ArchiveTest::exposesCanonicalContentDigestView()
     QVERIFY(temporary.isValid());
     const QString path = writeArchive(
         temporary,
-        makeZip({RawEntry{QByteArrayLiteral("manifest.json")},
-                 RawEntry{QByteArrayLiteral("metadata/content.sha256")},
+        makeZip({RawEntry{QByteArrayLiteral("z.txt")},
                  RawEntry{QByteArrayLiteral("metadata/signature.ed25519")},
+                 RawEntry{QByteArrayLiteral("a.txt")},
                  RawEntry{QByteArrayLiteral("metadata/other.ed25519")}}));
     const ArchiveResult result = Archive::inspect(path);
     QVERIFY(result.hasValue());
     const QVector<ArchiveEntry> contentEntries = result.contentDigestEntries();
     QCOMPARE(contentEntries.size(), 3);
-    QCOMPARE(contentEntries.at(0).path, QByteArray("manifest.json"));
-    QCOMPARE(contentEntries.at(1).path, QByteArray("metadata/content.sha256"));
-    QCOMPARE(contentEntries.at(2).path, QByteArray("metadata/other.ed25519"));
+    QCOMPARE(contentEntries.at(0).path, QByteArray("a.txt"));
+    QCOMPARE(contentEntries.at(1).path, QByteArray("metadata/other.ed25519"));
+    QCOMPARE(contentEntries.at(2).path, QByteArray("z.txt"));
 }
 
 void ArchiveTest::extractsOnlyAfterCompleteVerification()
@@ -615,6 +761,8 @@ void ArchiveTest::requiresEmptyNonReparseStagingRoot()
 
 void ArchiveTest::writesByteForByteDeterministicArchives()
 {
+    TimeZoneGuard timeZone;
+    timeZone.set(QByteArrayLiteral("UTC0"));
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const QString source = temporary.filePath(QStringLiteral("source"));
@@ -641,6 +789,7 @@ void ArchiveTest::writesByteForByteDeterministicArchives()
     QVERIFY(QFile::remove(source + QLatin1Char('/') + bmpName));
     QVERIFY(writeFile(source + QLatin1Char('/') + bmpName, "bmp"));
     QVERIFY(writeFile(source + QLatin1Char('/') + supplementaryName, "supplementary"));
+    timeZone.set(QByteArrayLiteral("UTC+12"));
 
     const QString secondPath = temporary.filePath(QStringLiteral("second.qapkg"));
     const ArchiveResult second = Archive::create(source, secondPath);
@@ -662,8 +811,17 @@ void ArchiveTest::writesByteForByteDeterministicArchives()
         QCOMPARE(entry.versionMadeBy, static_cast<quint16>(0x0314U));
         QCOMPARE(entry.time, static_cast<quint16>(0U));
         QCOMPARE(entry.date, static_cast<quint16>(0x0021U));
+        QCOMPARE(entry.localTime, static_cast<quint16>(0U));
+        QCOMPARE(entry.localDate, static_cast<quint16>(0x0021U));
         QCOMPARE(entry.externalAttributes, 0x81A40000U);
     }
+
+    QFile sourceFile(QStringLiteral(Q_BROWSER_ARCHIVE_SOURCE_FILE));
+    QVERIFY(sourceFile.open(QIODevice::ReadOnly));
+    const QByteArray sourceCode = sourceFile.readAll();
+    QVERIFY(!sourceCode.contains("std::mktime"));
+    QVERIFY(!sourceCode.contains("MZ_TIME_T"));
+    QVERIFY(!sourceCode.contains("#include <ctime>"));
 }
 
 void ArchiveTest::rejectsUnsafeSourceTreesBeforeWriting()
@@ -706,7 +864,7 @@ void ArchiveTest::rejectsUnsafeSourceTreesBeforeWriting()
     output = temporary.filePath(QStringLiteral("collision.qapkg"));
     QCOMPARE(
         Archive::create(source, output).error().code,
-        ArchiveErrorCode::InvalidEntryPath);
+        ArchiveErrorCode::DuplicateEntryPath);
     QVERIFY(!QFileInfo::exists(output));
 
     QVERIFY(QDir(source).removeRecursively());
