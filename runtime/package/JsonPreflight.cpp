@@ -9,8 +9,6 @@
 
 namespace {
 
-constexpr qsizetype MaxJsonNestingDepth = 128;
-
 bool isAsciiIdentifierStart(const QChar character)
 {
     return (character >= u'A' && character <= u'Z')
@@ -119,21 +117,31 @@ public:
     }
 
 private:
-    bool parseValue(const QString &path, const qsizetype depth)
+    bool parseValue(const QString &path, const qsizetype containerNesting)
     {
-        if (depth > MaxJsonNestingDepth || m_position >= m_text.size()) {
+        if (m_position >= m_text.size()) {
             return false;
         }
         const QChar current = m_text.at(m_position);
         if (current == u'{') {
-            return parseObject(path, depth);
+            if (containerNesting >= ManifestResourceLimits::MaxJsonContainerNesting) {
+                setResourceError(QStringLiteral("$"));
+                return false;
+            }
+            return parseObject(path, containerNesting + 1);
         }
         if (current == u'[') {
-            return parseArray(path, depth);
+            if (containerNesting >= ManifestResourceLimits::MaxJsonContainerNesting) {
+                setResourceError(QStringLiteral("$"));
+                return false;
+            }
+            return parseArray(path, containerNesting + 1);
         }
         if (current == u'"') {
             QString value;
-            if (!parseString(value)) {
+            if (!parseString(value,
+                             ManifestResourceLimits::MaxJsonStringCharacters,
+                             path)) {
                 return false;
             }
             if (shouldRecordStringLength(path)) {
@@ -148,7 +156,7 @@ private:
             || consumeKeyword(QStringView(u"null"));
     }
 
-    bool parseObject(const QString &path, const qsizetype depth)
+    bool parseObject(const QString &path, const qsizetype containerNesting)
     {
         ++m_position;
         skipWhitespace();
@@ -159,7 +167,9 @@ private:
         QSet<QString> members;
         while (m_position < m_text.size()) {
             QString member;
-            if (!parseString(member)) {
+            if (!parseString(member,
+                             ManifestResourceLimits::MaxJsonMemberNameCharacters,
+                             path)) {
                 return false;
             }
             const QString memberPath = manifestJsonPathMember(path, member);
@@ -175,7 +185,7 @@ private:
                 return false;
             }
             skipWhitespace();
-            if (!parseValue(memberPath, depth + 1)) {
+            if (!parseValue(memberPath, containerNesting)) {
                 return false;
             }
             skipWhitespace();
@@ -190,7 +200,7 @@ private:
         return false;
     }
 
-    bool parseArray(const QString &path, const qsizetype depth)
+    bool parseArray(const QString &path, const qsizetype containerNesting)
     {
         ++m_position;
         skipWhitespace();
@@ -204,7 +214,7 @@ private:
 
         while (m_position < m_text.size()) {
             const QString itemPath = path + QStringLiteral("[%1]").arg(count);
-            if (!parseValue(itemPath, depth + 1)) {
+            if (!parseValue(itemPath, containerNesting)) {
                 return false;
             }
             ++count;
@@ -223,12 +233,26 @@ private:
         return false;
     }
 
-    bool parseString(QString &value)
+    bool parseString(QString &value, const qsizetype maximumScalars, const QString &resourcePath)
     {
         if (!consume(u'"')) {
             return false;
         }
+        const qsizetype rawStart = m_position;
+        qsizetype decodedScalars = 0;
+        const auto acceptScalar = [&] {
+            if (decodedScalars >= maximumScalars) {
+                setResourceError(resourcePath);
+                return false;
+            }
+            ++decodedScalars;
+            return true;
+        };
         while (m_position < m_text.size()) {
+            if (m_position - rawStart > ManifestResourceLimits::MaxJsonStringRawCharacters) {
+                setResourceError(resourcePath);
+                return false;
+            }
             const QChar character = m_text.at(m_position++);
             if (character == u'"') {
                 return true;
@@ -242,11 +266,17 @@ private:
                         || !m_text.at(m_position).isLowSurrogate()) {
                         return false;
                     }
+                    if (!acceptScalar()) {
+                        return false;
+                    }
                     value.append(character);
                     value.append(m_text.at(m_position++));
                 } else if (character.isLowSurrogate()) {
                     return false;
                 } else {
+                    if (!acceptScalar()) {
+                        return false;
+                    }
                     value.append(character);
                 }
                 continue;
@@ -259,21 +289,39 @@ private:
             case '"':
             case '\\':
             case '/':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(escape);
                 break;
             case 'b':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(u'\b');
                 break;
             case 'f':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(u'\f');
                 break;
             case 'n':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(u'\n');
                 break;
             case 'r':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(u'\r');
                 break;
             case 't':
+                if (!acceptScalar()) {
+                    return false;
+                }
                 value.append(u'\t');
                 break;
             case 'u': {
@@ -292,11 +340,17 @@ private:
                     if (!parseHexCodeUnit(lowCodeUnit) || !QChar(lowCodeUnit).isLowSurrogate()) {
                         return false;
                     }
+                    if (!acceptScalar()) {
+                        return false;
+                    }
                     value.append(decoded);
                     value.append(QChar(lowCodeUnit));
                 } else if (decoded.isLowSurrogate()) {
                     return false;
                 } else {
+                    if (!acceptScalar()) {
+                        return false;
+                    }
                     value.append(decoded);
                 }
                 break;
@@ -409,6 +463,15 @@ private:
             m_result.error = ManifestError{ManifestErrorCode::InvalidJson,
                                            QStringLiteral("$"),
                                            QStringLiteral("invalid JSON")};
+        }
+    }
+
+    void setResourceError(const QString &path)
+    {
+        if (!m_result.error.has_value()) {
+            m_result.error = ManifestError{ManifestErrorCode::ResourceLimitExceeded,
+                                           path,
+                                           QStringLiteral("manifest resource bound exceeded")};
         }
     }
 

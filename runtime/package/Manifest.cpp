@@ -306,7 +306,9 @@ bool isValidEntryPoint(const QString &path)
     }
     const QStringList segments = path.split(u'/', Qt::KeepEmptyParts);
     for (const QString &segment : segments) {
-        if (segment.isEmpty() || segment == QStringLiteral(".") || segment == QStringLiteral("..")
+        if (segment.size() > ManifestResourceLimits::MaxWindowsComponentUtf16Units
+            || segment.isEmpty() || segment == QStringLiteral(".")
+            || segment == QStringLiteral("..")
             || segment.endsWith(u'.') || segment.endsWith(u' ')
             || isWindowsDeviceSegment(segment)) {
             return false;
