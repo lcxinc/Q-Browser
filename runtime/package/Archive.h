@@ -42,18 +42,25 @@ struct ArchiveEntry final
     [[nodiscard]] bool isIncludedInContentDigest() const noexcept;
 };
 
+namespace qbrowser_archive_detail
+{
+class ArchiveResultFactory;
+}
+
 class ArchiveResult final
 {
 public:
-    [[nodiscard]] static ArchiveResult success(QVector<ArchiveEntry> entries);
-    [[nodiscard]] static ArchiveResult failure(ArchiveError error);
-
     [[nodiscard]] bool hasValue() const noexcept;
     [[nodiscard]] const QVector<ArchiveEntry> &entries() const noexcept;
     [[nodiscard]] QVector<ArchiveEntry> contentDigestEntries() const;
     [[nodiscard]] const ArchiveError &error() const noexcept;
 
 private:
+    friend class qbrowser_archive_detail::ArchiveResultFactory;
+
+    explicit ArchiveResult(QVector<ArchiveEntry> entries);
+    explicit ArchiveResult(ArchiveError error);
+
     std::optional<QVector<ArchiveEntry>> m_entries;
     ArchiveError m_error;
 };

@@ -1,4 +1,6 @@
 #include "Archive.h"
+#include "ArchiveTestHooks.h"
+#include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -8,6 +10,7 @@
 #include <QSaveFile>
 #include <QSet>
 #include <QStringDecoder>
+#include <QUuid>
 #include <QtEndian>
 
 #ifdef Q_OS_WIN
@@ -27,11 +30,34 @@
 #include <cstring>
 #include <limits>
 
+namespace qbrowser_archive_detail
+{
+class ArchiveResultFactory final
+{
+public:
+    [[nodiscard]] static ArchiveResult success(QVector<ArchiveEntry> entries)
+    {
+        return ArchiveResult(std::move(entries));
+    }
+
+    [[nodiscard]] static ArchiveResult failure(ArchiveError error)
+    {
+        if (error.code == ArchiveErrorCode::None) {
+            error.code = ArchiveErrorCode::InvalidArchive;
+            error.path.clear();
+            error.message = QStringLiteral("archive operation failed");
+        }
+        return ArchiveResult(std::move(error));
+    }
+};
+}
+
 namespace
 {
 ArchiveResult fail(ArchiveErrorCode code, QByteArray path, QString message)
 {
-    return ArchiveResult::failure({code, std::move(path), std::move(message)});
+    return qbrowser_archive_detail::ArchiveResultFactory::failure(
+        {code, std::move(path), std::move(message)});
 }
 
 ArchiveResult inspectBytes(
@@ -46,6 +72,72 @@ struct SourceEntry final
     QByteArray archiveName;
     quint64 size = 0;
 };
+
+enum class BoundedReadStatus
+{
+    Ok,
+    LimitExceeded,
+    ReadFailed,
+};
+
+struct BoundedReadResult final
+{
+    BoundedReadStatus status = BoundedReadStatus::ReadFailed;
+    QByteArray bytes;
+};
+
+bool byteArrayLimitIsRepresentable(quint64 maximum) noexcept
+{
+    const quint64 qint64Maximum = static_cast<quint64>(
+        std::numeric_limits<qint64>::max());
+    const quint64 byteArrayMaximum = static_cast<quint64>(
+        std::numeric_limits<qsizetype>::max());
+    return maximum < qint64Maximum && maximum < byteArrayMaximum;
+}
+
+BoundedReadResult readAtMost(QFile &file, quint64 maximum)
+{
+    if (!byteArrayLimitIsRepresentable(maximum)) {
+        return {BoundedReadStatus::LimitExceeded, {}};
+    }
+
+    constexpr qint64 chunkSize = 64 * 1024;
+    QByteArray bytes;
+    char buffer[chunkSize];
+    const quint64 sentinelSize = maximum + 1U;
+    while (static_cast<quint64>(bytes.size()) < sentinelSize) {
+        const quint64 remaining = sentinelSize
+            - static_cast<quint64>(bytes.size());
+        const qint64 request = static_cast<qint64>(
+            std::min<quint64>(remaining, static_cast<quint64>(chunkSize)));
+        const qint64 count = file.read(buffer, request);
+        if (count < 0) {
+            return {BoundedReadStatus::ReadFailed, {}};
+        }
+        if (count == 0) {
+            return file.atEnd()
+                ? BoundedReadResult{BoundedReadStatus::Ok, std::move(bytes)}
+                : BoundedReadResult{BoundedReadStatus::ReadFailed, {}};
+        }
+        bytes.append(buffer, count);
+    }
+    return {BoundedReadStatus::LimitExceeded, {}};
+}
+
+BoundedReadResult readExact(QFile &file, quint64 expected, quint64 maximum)
+{
+    if (expected > maximum || !byteArrayLimitIsRepresentable(expected)) {
+        return {BoundedReadStatus::LimitExceeded, {}};
+    }
+    BoundedReadResult result = readAtMost(file, expected);
+    if (result.status == BoundedReadStatus::LimitExceeded
+        || (result.status == BoundedReadStatus::Ok
+            && static_cast<quint64>(result.bytes.size()) != expected)) {
+        result.status = BoundedReadStatus::ReadFailed;
+        result.bytes.clear();
+    }
+    return result;
+}
 
 bool bytewiseLess(const QByteArray &left, const QByteArray &right)
 {
@@ -167,7 +259,8 @@ ZipEnvelopeResult preflightZipEnvelope(
 bool centralAndLocalMetadataMatch(
     const QByteArray &bytes,
     qsizetype &centralCursor,
-    const QByteArray &name)
+    const QByteArray &name,
+    QPair<qsizetype, qsizetype> &localRange)
 {
     constexpr qsizetype centralHeaderSize = 46;
     constexpr qsizetype localHeaderSize = 30;
@@ -196,8 +289,13 @@ bool centralAndLocalMetadataMatch(
     }
     const quint16 localNameLength = readLittle16(bytes, localOffset + 26);
     const quint16 localExtraLength = readLittle16(bytes, localOffset + 28);
+    const quint32 compressedSize = readLittle32(bytes, centralCursor + 20);
+    const quint64 localEnd = static_cast<quint64>(localOffset)
+        + static_cast<quint64>(localHeaderSize) + localNameLength
+        + localExtraLength + compressedSize;
     if (localExtraLength != 0U || localNameLength != nameLength
         || localOffset + localHeaderSize + localNameLength > bytes.size()
+        || localEnd > static_cast<quint64>(bytes.size())
         || bytes.mid(localOffset + localHeaderSize, localNameLength) != name) {
         return false;
     }
@@ -219,8 +317,54 @@ bool centralAndLocalMetadataMatch(
             == readLittle32(bytes, centralCursor + 20)
         && readLittle32(bytes, localOffset + 22)
             == readLittle32(bytes, centralCursor + 24);
+    localRange = {localOffset, static_cast<qsizetype>(localEnd)};
     centralCursor += centralRecordSize;
     return fixedFieldsMatch;
+}
+
+bool readEntryStream(
+    mz_zip_archive *reader,
+    mz_uint index,
+    quint64 expectedSize,
+    QIODevice *output)
+{
+    mz_zip_reader_extract_iter_state *state =
+        mz_zip_reader_extract_iter_new(reader, index, 0);
+    if (state == nullptr) {
+        return false;
+    }
+
+    QVector<char> buffer(64 * 1024);
+    quint64 written = 0;
+    bool succeeded = true;
+    while (written < expectedSize) {
+        const size_t request = static_cast<size_t>(std::min<quint64>(
+            expectedSize - written,
+            static_cast<quint64>(buffer.size())));
+        const size_t extracted = mz_zip_reader_extract_iter_read(
+            state, buffer.data(), request);
+        if (extracted == 0U
+            || (output != nullptr
+                && output->write(
+                       buffer.constData(), static_cast<qint64>(extracted))
+                    != static_cast<qint64>(extracted))) {
+            succeeded = false;
+            break;
+        }
+        written += static_cast<quint64>(extracted);
+    }
+
+    char extra = 0;
+    const size_t extraOutput = succeeded
+        ? mz_zip_reader_extract_iter_read(state, &extra, 1U)
+        : 0U;
+    const bool compressedInputConsumed =
+        state->file_stat.m_method == 0U
+        ? state->comp_remaining == 0U
+        : state->read_buf_avail == 0U && state->out_blk_remain == 0U;
+    const bool freed = mz_zip_reader_extract_iter_free(state) == MZ_TRUE;
+    return succeeded && written == expectedSize && extraOutput == 0U
+        && compressedInputConsumed && freed;
 }
 
 std::optional<QByteArray> readArchiveName(mz_zip_archive *zip, mz_uint index)
@@ -438,18 +582,14 @@ bool ArchiveEntry::isIncludedInContentDigest() const noexcept
     return path != QByteArrayLiteral("metadata/signature.ed25519");
 }
 
-ArchiveResult ArchiveResult::success(QVector<ArchiveEntry> entries)
+ArchiveResult::ArchiveResult(QVector<ArchiveEntry> entries)
+    : m_entries(std::move(entries))
 {
-    ArchiveResult result;
-    result.m_entries.emplace(std::move(entries));
-    return result;
 }
 
-ArchiveResult ArchiveResult::failure(ArchiveError error)
+ArchiveResult::ArchiveResult(ArchiveError error)
+    : m_error(std::move(error))
 {
-    ArchiveResult result;
-    result.m_error = std::move(error);
-    return result;
 }
 
 bool ArchiveResult::hasValue() const noexcept
@@ -501,6 +641,15 @@ ArchiveResult Archive::create(
             {},
             QStringLiteral("archive source is unavailable"));
     }
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree sourceTree;
+    if (!sourceTree.openRoot(sourceRoot) || !sourceTree.isStable()) {
+        return fail(
+            ArchiveErrorCode::SourceUnavailable,
+            {},
+            QStringLiteral("archive source is unavailable"));
+    }
+#endif
 
     QVector<SourceEntry> sourceEntries;
     QVector<CollisionPath> collisionPaths;
@@ -523,6 +672,14 @@ ArchiveResult Archive::create(
                 QStringLiteral("archive source entry is unsupported"));
         }
         if (info.isDir()) {
+#ifdef Q_OS_WIN
+            if (!sourceTree.addExistingDirectory(info.absoluteFilePath())) {
+                return fail(
+                    ArchiveErrorCode::UnsupportedEntry,
+                    archiveName,
+                    QStringLiteral("archive source entry is unsupported"));
+            }
+#endif
             continue;
         }
         if (!info.isFile()) {
@@ -531,6 +688,15 @@ ArchiveResult Archive::create(
                 archiveName,
                 QStringLiteral("archive source entry is unsupported"));
         }
+#ifdef Q_OS_WIN
+        if (!sourceTree.addExistingDirectory(
+                info.absoluteDir().absolutePath())) {
+            return fail(
+                ArchiveErrorCode::UnsupportedEntry,
+                archiveName,
+                QStringLiteral("archive source entry is unsupported"));
+        }
+#endif
 
         const std::optional<CheckedPath> checkedPath = validateEntryPath(
             archiveName, limits);
@@ -601,21 +767,63 @@ ArchiveResult Archive::create(
     }
 
     bool writeSucceeded = true;
+    ArchiveErrorCode writeError = ArchiveErrorCode::DestinationUnavailable;
+    QByteArray writeErrorPath;
     for (const SourceEntry &sourceEntry : sourceEntries) {
         if (isReparsePoint(sourceEntry.filesystemPath)) {
             writeSucceeded = false;
+            writeError = ArchiveErrorCode::SourceUnavailable;
+            writeErrorPath = sourceEntry.archiveName;
             break;
         }
+#ifdef Q_OS_WIN
+        qbrowser_archive_detail::WindowsStableFile input;
+        if (!input.openSource(sourceEntry.filesystemPath, sourceTree)) {
+            writeSucceeded = false;
+            writeError = ArchiveErrorCode::SourceUnavailable;
+            writeErrorPath = sourceEntry.archiveName;
+            break;
+        }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().beforeSourceRead) {
+            qbrowser_archive_testing::archiveTestHooks().beforeSourceRead(
+                sourceEntry.filesystemPath, sourceEntry.archiveName);
+        }
+#endif
+        QByteArray bytes;
+        if (!input.readExact(
+                sourceEntry.size, limits.maximumEntryBytes, bytes)) {
+            writeSucceeded = false;
+            writeError = ArchiveErrorCode::SourceUnavailable;
+            writeErrorPath = sourceEntry.archiveName;
+            break;
+        }
+#else
         QFile input(sourceEntry.filesystemPath);
         if (!input.open(QIODevice::ReadOnly)) {
             writeSucceeded = false;
+            writeError = ArchiveErrorCode::SourceUnavailable;
+            writeErrorPath = sourceEntry.archiveName;
             break;
         }
-        QByteArray bytes = input.readAll();
-        if (static_cast<quint64>(bytes.size()) != sourceEntry.size) {
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().beforeSourceRead) {
+            qbrowser_archive_testing::archiveTestHooks().beforeSourceRead(
+                sourceEntry.filesystemPath, sourceEntry.archiveName);
+        }
+#endif
+        BoundedReadResult sourceRead = readExact(
+            input, sourceEntry.size, limits.maximumEntryBytes);
+        if (sourceRead.status != BoundedReadStatus::Ok) {
             writeSucceeded = false;
+            writeError = sourceRead.status == BoundedReadStatus::LimitExceeded
+                ? ArchiveErrorCode::EntrySizeLimit
+                : ArchiveErrorCode::SourceUnavailable;
+            writeErrorPath = sourceEntry.archiveName;
             break;
         }
+        QByteArray &bytes = sourceRead.bytes;
+#endif
         constexpr mz_uint writerFlags = static_cast<mz_uint>(6)
             | MZ_ZIP_FLAG_WRITE_HEADER_SET_SIZE;
         if (mz_zip_writer_add_read_buf_callback(
@@ -646,9 +854,13 @@ ArchiveResult Archive::create(
             != MZ_TRUE) {
         (void)mz_zip_writer_end(&writer);
         return fail(
-            ArchiveErrorCode::DestinationUnavailable,
-            {},
-            QStringLiteral("archive could not be created"));
+            writeSucceeded
+                ? ArchiveErrorCode::DestinationUnavailable
+                : writeError,
+            writeSucceeded ? QByteArray{} : writeErrorPath,
+            writeSucceeded
+                ? QStringLiteral("archive could not be created")
+                : QStringLiteral("archive source could not be read"));
     }
     (void)mz_zip_writer_end(&writer);
 
@@ -699,7 +911,8 @@ ArchiveResult inspectBytes(
 {
     const ZipEnvelopeResult envelopeResult = preflightZipEnvelope(bytes, limits);
     if (!envelopeResult.envelope.has_value()) {
-        return ArchiveResult::failure(envelopeResult.error);
+        return qbrowser_archive_detail::ArchiveResultFactory::failure(
+            envelopeResult.error);
     }
     const ZipEnvelope &envelope = *envelopeResult.envelope;
     ZipReader reader;
@@ -720,6 +933,8 @@ ArchiveResult inspectBytes(
             QStringLiteral("archive structure is invalid"));
     }
     entries.reserve(static_cast<qsizetype>(count));
+    QVector<QPair<qsizetype, qsizetype>> localRanges;
+    localRanges.reserve(static_cast<qsizetype>(count));
     quint64 totalSize = 0;
     qsizetype centralCursor = envelope.centralOffset;
     for (mz_uint index = 0; index < count; ++index) {
@@ -737,12 +952,15 @@ ArchiveResult inspectBytes(
                 {},
                 QStringLiteral("archive entry metadata is invalid"));
         }
-        if (!centralAndLocalMetadataMatch(bytes, centralCursor, *name)) {
+        QPair<qsizetype, qsizetype> localRange;
+        if (!centralAndLocalMetadataMatch(
+                bytes, centralCursor, *name, localRange)) {
             return fail(
                 ArchiveErrorCode::InvalidArchive,
                 *name,
                 QStringLiteral("archive entry metadata is invalid"));
         }
+        localRanges.push_back(localRange);
         const std::optional<CheckedPath> checkedPath = validateEntryPath(*name, limits);
         if (!checkedPath.has_value()) {
             return fail(
@@ -800,6 +1018,18 @@ ArchiveResult inspectBytes(
                 *name,
                 QStringLiteral("archive entry is too large"));
         }
+        if ((stat.m_method == 0U && stat.m_comp_size != stat.m_uncomp_size)
+            || (stat.m_uncomp_size == 0U
+                && (stat.m_method != 0U || stat.m_comp_size != 0U
+                    || stat.m_crc32 != 0U))) {
+            return fail(
+                stat.m_uncomp_size == 0U
+                        && stat.m_method != 0U
+                    ? ArchiveErrorCode::UnsupportedEntry
+                    : ArchiveErrorCode::InvalidArchive,
+                *name,
+                QStringLiteral("archive entry data is invalid"));
+        }
         if (totalSize > limits.maximumTotalBytes
             || stat.m_uncomp_size > limits.maximumTotalBytes - totalSize) {
             return fail(
@@ -854,15 +1084,43 @@ ArchiveResult inspectBytes(
             {},
             QStringLiteral("archive structure is invalid"));
     }
+    std::sort(
+        localRanges.begin(),
+        localRanges.end(),
+        [](const auto &left, const auto &right) {
+            return left.first < right.first;
+        });
+    qsizetype expectedLocalOffset = 0;
+    for (const auto &range : localRanges) {
+        if (range.first != expectedLocalOffset || range.second < range.first
+            || range.second > envelope.centralOffset) {
+            return fail(
+                ArchiveErrorCode::InvalidArchive,
+                {},
+                QStringLiteral("archive structure is invalid"));
+        }
+        expectedLocalOffset = range.second;
+    }
+    if (expectedLocalOffset != envelope.centralOffset) {
+        return fail(
+            ArchiveErrorCode::InvalidArchive,
+            {},
+            QStringLiteral("archive structure is invalid"));
+    }
     for (mz_uint index = 0; index < count; ++index) {
-        if (mz_zip_validate_file(reader.get(), index, 0) != MZ_TRUE) {
+        if (!readEntryStream(
+                reader.get(),
+                index,
+                entries.at(static_cast<qsizetype>(index)).uncompressedSize,
+                nullptr)) {
             return fail(
                 ArchiveErrorCode::InvalidArchive,
                 entries.at(static_cast<qsizetype>(index)).path,
                 QStringLiteral("archive data is invalid"));
         }
     }
-    return ArchiveResult::success(std::move(entries));
+    return qbrowser_archive_detail::ArchiveResultFactory::success(
+        std::move(entries));
 }
 
 bool isReparsePoint(const QString &path)
@@ -903,23 +1161,7 @@ bool isEmptyDirectory(const QString &path)
                .isEmpty();
 }
 
-void clearStagingDirectory(const QString &stagingRoot)
-{
-    QDir root(stagingRoot);
-    const QFileInfoList children = root.entryInfoList(
-        QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
-    for (const QFileInfo &child : children) {
-        if (child.isDir() && !child.isSymLink()
-            && !isReparsePoint(child.absoluteFilePath())) {
-            (void)QDir(child.absoluteFilePath()).removeRecursively();
-        } else if (child.isDir()) {
-            (void)root.rmdir(child.fileName());
-        } else {
-            (void)QFile::remove(child.absoluteFilePath());
-        }
-    }
-}
-
+#ifndef Q_OS_WIN
 bool outputIsWithinRoot(const QString &root, const QString &output)
 {
     const QString normalizedRoot = QDir::fromNativeSeparators(
@@ -930,6 +1172,7 @@ bool outputIsWithinRoot(const QString &root, const QString &output)
         normalizedRoot + QLatin1Char('/'),
         Qt::CaseInsensitive);
 }
+#endif
 }
 
 ArchiveResult Archive::inspect(
@@ -943,21 +1186,27 @@ ArchiveResult Archive::inspect(
             {},
             QStringLiteral("archive source is unavailable"));
     }
-    if (input.size() < 0
-        || static_cast<quint64>(input.size()) > limits.maximumArchiveBytes) {
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterArchiveSizeChecked) {
+        qbrowser_archive_testing::archiveTestHooks().afterArchiveSizeChecked(
+            archivePath);
+    }
+#endif
+    BoundedReadResult archiveRead = readAtMost(
+        input, limits.maximumArchiveBytes);
+    if (archiveRead.status == BoundedReadStatus::LimitExceeded) {
         return fail(
             ArchiveErrorCode::ArchiveSizeLimit,
             {},
             QStringLiteral("archive size is too large"));
     }
-    const QByteArray bytes = input.readAll();
-    if (bytes.size() != input.size()) {
+    if (archiveRead.status != BoundedReadStatus::Ok) {
         return fail(
             ArchiveErrorCode::SourceUnavailable,
             {},
             QStringLiteral("archive source could not be read"));
     }
-    return inspectBytes(bytes, limits);
+    return inspectBytes(archiveRead.bytes, limits);
 }
 
 ArchiveResult Archive::extract(
@@ -972,6 +1221,27 @@ ArchiveResult Archive::extract(
             {},
             QStringLiteral("staging root is not an empty regular directory"));
     }
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree stagingTree;
+    if (!stagingTree.openRoot(stagingRoot) || !stagingTree.isStable()) {
+        return fail(
+            ArchiveErrorCode::UnsafeStagingRoot,
+            {},
+            QStringLiteral("staging root is not an empty regular directory"));
+    }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterStagingGuardOpened) {
+        qbrowser_archive_testing::archiveTestHooks().afterStagingGuardOpened(
+            stagingRoot);
+    }
+#endif
+    if (!stagingTree.isStable() || !isEmptyDirectory(stagingRoot)) {
+        return fail(
+            ArchiveErrorCode::UnsafeStagingRoot,
+            {},
+            QStringLiteral("staging root is not an empty regular directory"));
+    }
+#endif
 
     QFile input(archivePath);
     if (!input.open(QIODevice::ReadOnly)) {
@@ -980,20 +1250,27 @@ ArchiveResult Archive::extract(
             {},
             QStringLiteral("archive source is unavailable"));
     }
-    if (input.size() < 0
-        || static_cast<quint64>(input.size()) > limits.maximumArchiveBytes) {
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterArchiveSizeChecked) {
+        qbrowser_archive_testing::archiveTestHooks().afterArchiveSizeChecked(
+            archivePath);
+    }
+#endif
+    BoundedReadResult archiveRead = readAtMost(
+        input, limits.maximumArchiveBytes);
+    if (archiveRead.status == BoundedReadStatus::LimitExceeded) {
         return fail(
             ArchiveErrorCode::ArchiveSizeLimit,
             {},
             QStringLiteral("archive size is too large"));
     }
-    const QByteArray bytes = input.readAll();
-    if (bytes.size() != input.size()) {
+    if (archiveRead.status != BoundedReadStatus::Ok) {
         return fail(
             ArchiveErrorCode::SourceUnavailable,
             {},
             QStringLiteral("archive source could not be read"));
     }
+    const QByteArray &bytes = archiveRead.bytes;
     const ArchiveResult inspected = inspectBytes(bytes, limits);
     if (!inspected.hasValue()) {
         return inspected;
@@ -1007,8 +1284,150 @@ ArchiveResult Archive::extract(
             QStringLiteral("archive structure is invalid"));
     }
 
+#ifdef Q_OS_WIN
+    std::vector<qbrowser_archive_detail::WindowsStableFile> ownedFiles;
+    auto cleanup = [&] {
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().beforeFailureCleanup) {
+            qbrowser_archive_testing::archiveTestHooks().beforeFailureCleanup(
+                stagingRoot);
+        }
+#endif
+        if (!stagingTree.isStable()) {
+            return;
+        }
+        for (auto iterator = ownedFiles.rbegin();
+             iterator != ownedFiles.rend();
+             ++iterator) {
+            (void)iterator->deleteOwned();
+        }
+        stagingTree.cleanupCreatedDirectories();
+    };
+    auto extractionFailure = [&](ArchiveErrorCode code,
+                                 const QByteArray &path,
+                                 const QString &message) {
+        cleanup();
+        return fail(code, path, message);
+    };
+
+    const QString absoluteRoot = QFileInfo(stagingRoot).absoluteFilePath();
+    for (mz_uint index = 0;
+         index < static_cast<mz_uint>(inspected.entries().size());
+         ++index) {
+        const ArchiveEntry &entry = inspected.entries().at(
+            static_cast<qsizetype>(index));
+        const QString relativePath = QString::fromUtf8(entry.path);
+        const QStringList components = relativePath.split(QLatin1Char('/'));
+        QString parentPath = absoluteRoot;
+        for (qsizetype component = 0;
+             component + 1 < components.size();
+             ++component) {
+            parentPath = QDir(parentPath).absoluteFilePath(
+                components.at(component));
+            if (!stagingTree.contains(parentPath)) {
+                if (!stagingTree.createAndHoldDirectory(parentPath)
+                    || !stagingTree.isStable()) {
+                    return extractionFailure(
+                        ArchiveErrorCode::UnsafeStagingRoot,
+                        entry.path,
+                        QStringLiteral(
+                            "staging path is not a regular directory"));
+                }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+                if (qbrowser_archive_testing::archiveTestHooks()
+                        .afterParentGuardOpened) {
+                    qbrowser_archive_testing::archiveTestHooks()
+                        .afterParentGuardOpened(parentPath, entry.path);
+                }
+#endif
+                if (!stagingTree.isStable()) {
+                    return extractionFailure(
+                        ArchiveErrorCode::UnsafeStagingRoot,
+                        entry.path,
+                        QStringLiteral(
+                            "staging path is not a regular directory"));
+                }
+            }
+        }
+
+        const QString outputPath = QDir(parentPath).absoluteFilePath(
+            components.back());
+        QString temporaryPath;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            temporaryPath = QDir(parentPath).absoluteFilePath(
+                QStringLiteral(".qbrowser-")
+                + QUuid::createUuid().toString(QUuid::Id128)
+                + QStringLiteral(".tmp"));
+            if (!QFileInfo::exists(temporaryPath)) {
+                break;
+            }
+            temporaryPath.clear();
+        }
+        if (temporaryPath.isEmpty()) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                entry.path,
+                QStringLiteral("archive entry could not be written"));
+        }
+
+        QSaveFile output(temporaryPath);
+        if (!output.open(QIODevice::WriteOnly)
+            || !readEntryStream(
+                reader.get(), index, entry.uncompressedSize, &output)
+            || !output.commit()) {
+            output.cancelWriting();
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                entry.path,
+                QStringLiteral("archive entry extraction failed"));
+        }
+
+        qbrowser_archive_detail::WindowsStableFile owned;
+        if (!owned.openOwnedOutput(temporaryPath, stagingTree)) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                entry.path,
+                QStringLiteral("archive entry could not be secured"));
+        }
+        ownedFiles.push_back(std::move(owned));
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().beforePublish) {
+            qbrowser_archive_testing::archiveTestHooks().beforePublish(
+                outputPath, entry.path);
+        }
+#endif
+        if (!stagingTree.isStable()
+            || !ownedFiles.back().publishNoReplace(outputPath, stagingTree)) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                entry.path,
+                QStringLiteral("archive entry could not be published"));
+        }
+    }
+    return qbrowser_archive_detail::ArchiveResultFactory::success(
+        inspected.entries());
+#else
     const QDir root(stagingRoot);
-    QVector<char> buffer(64 * 1024);
+    QStringList createdFiles;
+    QStringList createdDirectories;
+    auto cleanup = [&] {
+        for (auto iterator = createdFiles.crbegin();
+             iterator != createdFiles.crend();
+             ++iterator) {
+            (void)QFile::remove(*iterator);
+        }
+        for (auto iterator = createdDirectories.crbegin();
+             iterator != createdDirectories.crend();
+             ++iterator) {
+            (void)QDir().rmdir(*iterator);
+        }
+    };
+    auto extractionFailure = [&](ArchiveErrorCode code,
+                                 const QByteArray &path,
+                                 const QString &message) {
+        cleanup();
+        return fail(code, path, message);
+    };
     for (mz_uint index = 0;
          index < static_cast<mz_uint>(inspected.entries().size());
          ++index) {
@@ -1017,73 +1436,75 @@ ArchiveResult Archive::extract(
         const QString relativePath = QString::fromUtf8(entry.path);
         const QString outputPath = root.absoluteFilePath(relativePath);
         if (!outputIsWithinRoot(stagingRoot, outputPath)) {
-            clearStagingDirectory(stagingRoot);
-            return fail(
+            return extractionFailure(
                 ArchiveErrorCode::InvalidEntryPath,
                 entry.path,
                 QStringLiteral("archive entry path is invalid"));
         }
 
         const QString parentPath = QFileInfo(outputPath).dir().absolutePath();
-        if (!root.mkpath(root.relativeFilePath(parentPath))
-            || pathChainContainsReparsePoint(parentPath)
-            || pathChainContainsReparsePoint(stagingRoot)) {
-            clearStagingDirectory(stagingRoot);
-            return fail(
+        QString currentParent = QFileInfo(stagingRoot).absoluteFilePath();
+        const QStringList parentComponents = QDir::fromNativeSeparators(
+            root.relativeFilePath(parentPath)).split(
+                QLatin1Char('/'), Qt::SkipEmptyParts);
+        bool parentSucceeded = true;
+        for (const QString &component : parentComponents) {
+            currentParent = QDir(currentParent).absoluteFilePath(component);
+            if (!QFileInfo::exists(currentParent)) {
+                if (!QDir().mkdir(currentParent)) {
+                    parentSucceeded = false;
+                    break;
+                }
+                createdDirectories.push_back(currentParent);
+            }
+            if (pathChainContainsReparsePoint(currentParent)) {
+                parentSucceeded = false;
+                break;
+            }
+        }
+        if (!parentSucceeded || pathChainContainsReparsePoint(stagingRoot)) {
+            return extractionFailure(
                 ArchiveErrorCode::UnsafeStagingRoot,
                 entry.path,
                 QStringLiteral("staging path is not a regular directory"));
         }
 
-        QSaveFile output(outputPath);
+        const QString temporaryPath = QDir(parentPath).absoluteFilePath(
+            QStringLiteral(".qbrowser-")
+            + QUuid::createUuid().toString(QUuid::Id128)
+            + QStringLiteral(".tmp"));
+        QSaveFile output(temporaryPath);
         if (!output.open(QIODevice::WriteOnly)) {
-            clearStagingDirectory(stagingRoot);
-            return fail(
+            return extractionFailure(
                 ArchiveErrorCode::ExtractionFailed,
                 entry.path,
                 QStringLiteral("archive entry could not be written"));
         }
 
-        mz_zip_reader_extract_iter_state *state =
-            mz_zip_reader_extract_iter_new(reader.get(), index, 0);
-        if (state == nullptr) {
-            output.cancelWriting();
-            clearStagingDirectory(stagingRoot);
-            return fail(
-                ArchiveErrorCode::ExtractionFailed,
-                entry.path,
-                QStringLiteral("archive entry could not be read"));
-        }
-
-        quint64 written = 0;
-        bool writeSucceeded = true;
-        while (written < entry.uncompressedSize) {
-            const size_t request = static_cast<size_t>(std::min<quint64>(
-                entry.uncompressedSize - written,
-                static_cast<quint64>(buffer.size())));
-            const size_t extracted = mz_zip_reader_extract_iter_read(
-                state, buffer.data(), request);
-            if (extracted == 0U
-                || output.write(
-                       buffer.constData(), static_cast<qint64>(extracted))
-                    != static_cast<qint64>(extracted)) {
-                writeSucceeded = false;
-                break;
-            }
-            written += static_cast<quint64>(extracted);
-        }
-        if (mz_zip_reader_extract_iter_free(state) != MZ_TRUE) {
-            writeSucceeded = false;
-        }
-        if (!writeSucceeded || written != entry.uncompressedSize
+        if (!readEntryStream(reader.get(), index, entry.uncompressedSize, &output)
             || !output.commit()) {
             output.cancelWriting();
-            clearStagingDirectory(stagingRoot);
-            return fail(
+            return extractionFailure(
                 ArchiveErrorCode::ExtractionFailed,
                 entry.path,
                 QStringLiteral("archive entry extraction failed"));
         }
+        createdFiles.push_back(temporaryPath);
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().beforePublish) {
+            qbrowser_archive_testing::archiveTestHooks().beforePublish(
+                outputPath, entry.path);
+        }
+#endif
+        if (!QFile::rename(temporaryPath, outputPath)) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                entry.path,
+                QStringLiteral("archive entry could not be published"));
+        }
+        createdFiles.back() = outputPath;
     }
-    return ArchiveResult::success(inspected.entries());
+    return qbrowser_archive_detail::ArchiveResultFactory::success(
+        inspected.entries());
+#endif
 }

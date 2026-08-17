@@ -1,4 +1,5 @@
 #include "Archive.h"
+#include "ArchiveTestHooks.h"
 
 #include <QDir>
 #include <QCryptographicHash>
@@ -9,10 +10,36 @@
 #include <QTest>
 #include <QtEndian>
 
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
+
 #include <ctime>
+#include <limits>
+#include <type_traits>
+
+static_assert(!std::is_default_constructible_v<ArchiveResult>);
+static_assert(!std::is_constructible_v<ArchiveResult, QVector<ArchiveEntry>>);
+static_assert(!std::is_constructible_v<ArchiveResult, ArchiveError>);
 
 namespace
 {
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+class ArchiveHookGuard final
+{
+public:
+    explicit ArchiveHookGuard(qbrowser_archive_testing::ArchiveTestHooks hooks)
+    {
+        qbrowser_archive_testing::setArchiveTestHooks(std::move(hooks));
+    }
+
+    ~ArchiveHookGuard()
+    {
+        qbrowser_archive_testing::resetArchiveTestHooks();
+    }
+};
+#endif
+
 struct RawEntry final
 {
     QByteArray name;
@@ -162,10 +189,14 @@ struct CentralMetadata final
 {
     QByteArray name;
     quint16 versionMadeBy = 0;
+    quint16 method = 0;
     quint16 time = 0;
     quint16 date = 0;
     quint16 localTime = 0;
     quint16 localDate = 0;
+    quint32 crc = 0;
+    quint32 compressedSize = 0;
+    quint32 uncompressedSize = 0;
     quint32 externalAttributes = 0;
 };
 
@@ -195,10 +226,14 @@ QVector<CentralMetadata> centralMetadata(const QByteArray &bytes)
         result.push_back({
             bytes.mid(offset + 46, nameLength),
             read16(bytes, offset + 4),
+            read16(bytes, offset + 10),
             read16(bytes, offset + 12),
             read16(bytes, offset + 14),
             read16(bytes, localOffset + 10),
             read16(bytes, localOffset + 12),
+            read32(bytes, offset + 16),
+            read32(bytes, offset + 20),
+            read32(bytes, offset + 24),
             read32(bytes, offset + 38)});
         offset += 46 + nameLength + extraLength + commentLength;
     }
@@ -210,6 +245,30 @@ bool writeFile(const QString &path, const QByteArray &bytes)
     QFile file(path);
     return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
 }
+
+#ifdef Q_OS_WIN
+bool movePathNoReplace(const QString &from, const QString &to)
+{
+    return MoveFileExW(
+               reinterpret_cast<LPCWSTR>(from.utf16()),
+               reinterpret_cast<LPCWSTR>(to.utf16()),
+               0U)
+        != FALSE;
+}
+
+bool createJunction(const QString &junction, const QString &target)
+{
+    return QProcess::execute(
+               QStringLiteral("cmd.exe"),
+               {QStringLiteral("/d"),
+                QStringLiteral("/c"),
+                QStringLiteral("mklink"),
+                QStringLiteral("/J"),
+                QDir::toNativeSeparators(junction),
+                QDir::toNativeSeparators(target)})
+        == 0;
+}
+#endif
 
 class TimeZoneGuard final
 {
@@ -255,6 +314,7 @@ class ArchiveTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void resultStateIsTotal();
     void createsAndInspectsAnArchive();
     void rejectsUnsafeEntryPaths_data();
     void rejectsUnsafeEntryPaths();
@@ -264,13 +324,41 @@ private slots:
     void rejectsUnsafeMetadata();
     void acceptsWhitelistedDosFileAttributes();
     void enforcesResourceLimits();
+    void boundsArchiveReadsAfterOpen();
+    void rejectsUnrepresentableArchiveLimit();
+    void rejectsSourceGrowthAfterPreflight();
+    void rejectsSourceShrinkAfterPreflight();
     void exposesCanonicalContentDigestView();
     void extractsOnlyAfterCompleteVerification();
     void leavesStagingEmptyWhenVerificationFails();
     void requiresEmptyNonReparseStagingRoot();
+    void stagingRootCannotBeReplacedAfterGuard();
+    void createdParentCannotBeReplacedAfterGuard();
+    void doesNotOverwriteConcurrentTargetOrDeleteUserFiles();
+    void cleansOnlyOwnedObjectsAfterFailure();
+    void sourceParentsRemainStableDuringRead();
     void writesByteForByteDeterministicArchives();
     void rejectsUnsafeSourceTreesBeforeWriting();
 };
+
+void ArchiveTest::resultStateIsTotal()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString missing = temporary.filePath(QStringLiteral("missing.qapkg"));
+    const ArchiveResult failed = Archive::inspect(missing);
+    QVERIFY(!failed.hasValue());
+    QVERIFY(failed.entries().isEmpty());
+    QVERIFY(failed.error().code != ArchiveErrorCode::None);
+
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(QDir().mkdir(source));
+    QVERIFY(writeFile(source + QStringLiteral("/empty"), {}));
+    const ArchiveResult succeeded = Archive::create(
+        source, temporary.filePath(QStringLiteral("valid.qapkg")));
+    QVERIFY(succeeded.hasValue());
+    QCOMPARE(succeeded.error().code, ArchiveErrorCode::None);
+}
 
 void ArchiveTest::createsAndInspectsAnArchive()
 {
@@ -283,6 +371,7 @@ void ArchiveTest::createsAndInspectsAnArchive()
     QVERIFY(input.open(QIODevice::WriteOnly));
     QCOMPARE(input.write("import QtQuick\n"), 15);
     input.close();
+    QVERIFY(writeFile(source + QStringLiteral("/empty.txt"), {}));
 
     const QString package = temporary.filePath(QStringLiteral("app.qapkg"));
     const ArchiveResult created = Archive::create(source, package);
@@ -290,8 +379,19 @@ void ArchiveTest::createsAndInspectsAnArchive()
 
     const ArchiveResult inspected = Archive::inspect(package);
     QVERIFY2(inspected.hasValue(), qPrintable(inspected.error().message));
-    QCOMPARE(inspected.entries().size(), 1);
-    QCOMPARE(inspected.entries().front().path, QByteArray("qml/Main.qml"));
+    QCOMPARE(inspected.entries().size(), 2);
+    QCOMPARE(inspected.entries().front().path, QByteArray("empty.txt"));
+    const QVector<CentralMetadata> metadata = centralMetadata(
+        [&package] {
+            QFile file(package);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+        }());
+    QCOMPARE(metadata.size(), 2);
+    QCOMPARE(metadata.front().name, QByteArray("empty.txt"));
+    QCOMPARE(metadata.front().method, static_cast<quint16>(0U));
+    QCOMPARE(metadata.front().crc, 0U);
+    QCOMPARE(metadata.front().compressedSize, 0U);
+    QCOMPARE(metadata.front().uncompressedSize, 0U);
 }
 
 void ArchiveTest::rejectsUnsafeEntryPaths_data()
@@ -430,6 +530,45 @@ void ArchiveTest::rejectsUnsafeMetadata_data()
     QTest::newRow("unsupported-method")
         << makeZip({unsupportedMethod}) << ArchiveErrorCode::UnsupportedEntry;
 
+    RawEntry zeroDeflate{QByteArrayLiteral("empty.txt")};
+    zeroDeflate.data.clear();
+    zeroDeflate.method = 8;
+    zeroDeflate.crc = 0;
+    zeroDeflate.compressedSize = 0;
+    zeroDeflate.uncompressedSize = 0;
+    QTest::newRow("zero-length-deflate")
+        << makeZip({zeroDeflate}) << ArchiveErrorCode::UnsupportedEntry;
+
+    RawEntry hiddenEmptyBytes{QByteArrayLiteral("empty.txt")};
+    hiddenEmptyBytes.data = QByteArrayLiteral("hidden");
+    hiddenEmptyBytes.crc = 0;
+    hiddenEmptyBytes.compressedSize = 0;
+    hiddenEmptyBytes.uncompressedSize = 0;
+    QTest::newRow("zero-length-hidden-bytes")
+        << makeZip({hiddenEmptyBytes}) << ArchiveErrorCode::InvalidArchive;
+
+    RawEntry storedSizeMismatch{QByteArrayLiteral("stored.txt")};
+    storedSizeMismatch.data = QByteArrayLiteral("x");
+    storedSizeMismatch.uncompressedSize = 2;
+    QTest::newRow("stored-size-mismatch")
+        << makeZip({storedSizeMismatch}) << ArchiveErrorCode::InvalidArchive;
+
+    RawEntry overOutput{QByteArrayLiteral("deflate.txt")};
+    overOutput.data = QByteArray::fromHex("4b4c4c0400");
+    overOutput.method = 8;
+    overOutput.crc = crc32(QByteArrayLiteral("aa"));
+    overOutput.uncompressedSize = 2;
+    QTest::newRow("deflate-over-output")
+        << makeZip({overOutput}) << ArchiveErrorCode::InvalidArchive;
+
+    RawEntry trailingDeflate{QByteArrayLiteral("deflate.txt")};
+    trailingDeflate.data = QByteArray::fromHex("4b4c4c0400deadbeef");
+    trailingDeflate.method = 8;
+    trailingDeflate.crc = crc32(QByteArrayLiteral("aaa"));
+    trailingDeflate.uncompressedSize = 3;
+    QTest::newRow("deflate-trailing-stream")
+        << makeZip({trailingDeflate}) << ArchiveErrorCode::InvalidArchive;
+
     RawEntry symlink{QByteArrayLiteral("safe.txt")};
     symlink.externalAttributes = 0xA1FF0000U;
     QTest::newRow("symlink")
@@ -509,6 +648,13 @@ void ArchiveTest::rejectsUnsafeMetadata()
         QCOMPARE(result.error().path, QByteArray("safe.txt"));
     }
     QVERIFY(!result.error().message.contains(QStringLiteral("x")));
+
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    const ArchiveResult extracted = Archive::extract(path, staging);
+    QVERIFY(!extracted.hasValue());
+    QCOMPARE(extracted.error().code, expectedCode);
+    QVERIFY(QDir(staging).isEmpty());
 }
 
 void ArchiveTest::acceptsWhitelistedDosFileAttributes()
@@ -644,6 +790,108 @@ void ArchiveTest::enforcesResourceLimits()
         ArchiveErrorCode::InvalidEntryPath);
 }
 
+void ArchiveTest::boundsArchiveReadsAfterOpen()
+{
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QByteArray bytes = makeZip({RawEntry{QByteArrayLiteral("safe.txt")}});
+    ArchiveLimits limits;
+    limits.maximumArchiveBytes = static_cast<quint64>(bytes.size());
+
+    auto appendAfterSizeCheck = [](const QString &path) {
+        QFile file(path);
+        if (file.open(QIODevice::Append)) {
+            (void)file.write("!", 1);
+        }
+    };
+    {
+        const QString path = writeArchive(temporary, bytes);
+        ArchiveHookGuard guard({appendAfterSizeCheck});
+        QCOMPARE(
+            Archive::inspect(path, limits).error().code,
+            ArchiveErrorCode::ArchiveSizeLimit);
+    }
+    {
+        const QString path = writeArchive(temporary, bytes);
+        const QString staging = temporary.filePath(QStringLiteral("staging"));
+        QVERIFY(QDir().mkdir(staging));
+        ArchiveHookGuard guard({appendAfterSizeCheck});
+        QCOMPARE(
+            Archive::extract(path, staging, limits).error().code,
+            ArchiveErrorCode::ArchiveSizeLimit);
+        QVERIFY(QDir(staging).isEmpty());
+    }
+#else
+    QSKIP("archive test hooks are unavailable");
+#endif
+}
+
+void ArchiveTest::rejectsUnrepresentableArchiveLimit()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString path = writeArchive(
+        temporary, makeZip({RawEntry{QByteArrayLiteral("safe.txt")}}));
+    ArchiveLimits limits;
+    limits.maximumArchiveBytes = std::numeric_limits<quint64>::max();
+    QCOMPARE(
+        Archive::inspect(path, limits).error().code,
+        ArchiveErrorCode::ArchiveSizeLimit);
+}
+
+void ArchiveTest::rejectsSourceGrowthAfterPreflight()
+{
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(QDir().mkdir(source));
+    QVERIFY(writeFile(source + QStringLiteral("/data.txt"), "safe"));
+    const QString output = temporary.filePath(QStringLiteral("output.qapkg"));
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforeSourceRead = [](const QString &path, const QByteArray &) {
+        QFile file(path);
+        if (file.open(QIODevice::Append)) {
+            (void)file.write("!", 1);
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::create(source, output);
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.error().code, ArchiveErrorCode::SourceUnavailable);
+    QVERIFY(!QFileInfo::exists(output));
+#else
+    QSKIP("archive test hooks are unavailable");
+#endif
+}
+
+void ArchiveTest::rejectsSourceShrinkAfterPreflight()
+{
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(QDir().mkdir(source));
+    QVERIFY(writeFile(source + QStringLiteral("/data.txt"), "safe"));
+    const QString output = temporary.filePath(QStringLiteral("output.qapkg"));
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforeSourceRead = [](const QString &path, const QByteArray &) {
+        QFile file(path);
+        if (file.open(QIODevice::ReadWrite)) {
+            (void)file.resize(2);
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::create(source, output);
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.error().code, ArchiveErrorCode::SourceUnavailable);
+    QVERIFY(!QFileInfo::exists(output));
+#else
+    QSKIP("archive test hooks are unavailable");
+#endif
+}
+
 void ArchiveTest::exposesCanonicalContentDigestView()
 {
     QTemporaryDir temporary;
@@ -757,6 +1005,219 @@ void ArchiveTest::requiresEmptyNonReparseStagingRoot()
         Archive::extract(package, junction).error().code,
         ArchiveErrorCode::UnsafeStagingRoot);
     QVERIFY(QDir(target).isEmpty());
+}
+
+void ArchiveTest::stagingRootCannotBeReplacedAfterGuard()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary, makeZip({RawEntry{QByteArrayLiteral("safe.txt")}}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    const QString moved = temporary.filePath(QStringLiteral("moved-staging"));
+    const QString outside = temporary.filePath(QStringLiteral("outside"));
+    QVERIFY(QDir().mkdir(staging));
+    QVERIFY(QDir().mkdir(outside));
+    const QString marker = outside + QStringLiteral("/marker.txt");
+    QVERIFY(writeFile(marker, "outside"));
+
+    bool hookRan = false;
+    bool renameSucceeded = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.afterStagingGuardOpened = [&](const QString &) {
+        hookRan = true;
+        renameSucceeded = movePathNoReplace(staging, moved);
+        if (renameSucceeded) {
+            (void)createJunction(staging, outside);
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(hookRan);
+    QVERIFY(!renameSucceeded);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    QVERIFY(QFileInfo::exists(staging + QStringLiteral("/safe.txt")));
+    QVERIFY(QFileInfo::exists(marker));
+    QVERIFY(!QFileInfo::exists(outside + QStringLiteral("/safe.txt")));
+    QVERIFY(movePathNoReplace(staging, moved));
+    QVERIFY(movePathNoReplace(moved, staging));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::createdParentCannotBeReplacedAfterGuard()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary, makeZip({RawEntry{QByteArrayLiteral("parent/safe.txt")}}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    const QString moved = staging + QStringLiteral("/moved-parent");
+    const QString outside = temporary.filePath(QStringLiteral("outside"));
+    QVERIFY(QDir().mkdir(staging));
+    QVERIFY(QDir().mkdir(outside));
+    const QString marker = outside + QStringLiteral("/marker.txt");
+    QVERIFY(writeFile(marker, "outside"));
+
+    bool hookRan = false;
+    bool renameSucceeded = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.afterParentGuardOpened =
+        [&](const QString &parent, const QByteArray &) {
+            hookRan = true;
+            renameSucceeded = movePathNoReplace(parent, moved);
+            if (renameSucceeded) {
+                (void)createJunction(parent, outside);
+            }
+        };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(hookRan);
+    QVERIFY(!renameSucceeded);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    QVERIFY(QFileInfo::exists(staging + QStringLiteral("/parent/safe.txt")));
+    QVERIFY(QFileInfo::exists(marker));
+    QVERIFY(!QFileInfo::exists(outside + QStringLiteral("/safe.txt")));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::doesNotOverwriteConcurrentTargetOrDeleteUserFiles()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary, makeZip({RawEntry{QByteArrayLiteral("safe.txt")}}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    const QString target = staging + QStringLiteral("/safe.txt");
+    const QString marker = staging + QStringLiteral("/user.marker");
+
+    bool hookRan = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforePublish = [&](const QString &path, const QByteArray &) {
+        hookRan = true;
+        QCOMPARE(path, target);
+        QVERIFY(writeFile(target, "user"));
+        QVERIFY(writeFile(marker, "marker"));
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(hookRan);
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.error().code, ArchiveErrorCode::ExtractionFailed);
+    QFile targetFile(target);
+    QVERIFY(targetFile.open(QIODevice::ReadOnly));
+    QCOMPARE(targetFile.readAll(), QByteArray("user"));
+    QVERIFY(QFileInfo::exists(marker));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::cleansOnlyOwnedObjectsAfterFailure()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary,
+        makeZip({RawEntry{QByteArrayLiteral("owned/a.txt")},
+                 RawEntry{QByteArrayLiteral("owned/b.txt")}}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    const QString parent = staging + QStringLiteral("/owned");
+    const QString moved = staging + QStringLiteral("/moved-owned");
+    const QString outside = temporary.filePath(QStringLiteral("outside"));
+    QVERIFY(QDir().mkdir(staging));
+    QVERIFY(QDir().mkdir(outside));
+    const QString outsideMarker = outside + QStringLiteral("/outside.marker");
+    QVERIFY(writeFile(outsideMarker, "outside"));
+    const QString marker = staging + QStringLiteral("/user.marker");
+    const QString target = parent + QStringLiteral("/b.txt");
+
+    bool cleanupHookRan = false;
+    bool cleanupRenameSucceeded = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforePublish = [&](const QString &path, const QByteArray &entry) {
+        if (entry == QByteArrayLiteral("owned/b.txt")) {
+            QCOMPARE(path, target);
+            QVERIFY(writeFile(target, "user"));
+            QVERIFY(writeFile(marker, "marker"));
+        }
+    };
+    hooks.beforeFailureCleanup = [&](const QString &) {
+        cleanupHookRan = true;
+        cleanupRenameSucceeded = movePathNoReplace(parent, moved);
+        if (cleanupRenameSucceeded) {
+            (void)createJunction(parent, outside);
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(!result.hasValue());
+    QVERIFY(cleanupHookRan);
+    QVERIFY(!cleanupRenameSucceeded);
+    QVERIFY(!QFileInfo::exists(parent + QStringLiteral("/a.txt")));
+    QFile targetFile(target);
+    QVERIFY(targetFile.open(QIODevice::ReadOnly));
+    QCOMPARE(targetFile.readAll(), QByteArray("user"));
+    QVERIFY(QFileInfo::exists(marker));
+    QVERIFY(QFileInfo::exists(outsideMarker));
+    QVERIFY(!QFileInfo::exists(outside + QStringLiteral("/a.txt")));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::sourceParentsRemainStableDuringRead()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    const QString parent = source + QStringLiteral("/parent");
+    const QString moved = source + QStringLiteral("/moved-parent");
+    const QString outside = temporary.filePath(QStringLiteral("outside"));
+    QVERIFY(QDir().mkpath(parent));
+    QVERIFY(QDir().mkdir(outside));
+    QVERIFY(writeFile(parent + QStringLiteral("/safe.txt"), "safe"));
+    QVERIFY(writeFile(outside + QStringLiteral("/safe.txt"), "secret"));
+
+    bool hookRan = false;
+    bool renameSucceeded = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforeSourceRead = [&](const QString &, const QByteArray &) {
+        hookRan = true;
+        renameSucceeded = movePathNoReplace(parent, moved);
+        if (renameSucceeded) {
+            (void)createJunction(parent, outside);
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const QString package = temporary.filePath(QStringLiteral("output.qapkg"));
+    const ArchiveResult result = Archive::create(source, package);
+    QVERIFY(hookRan);
+    QVERIFY(!renameSucceeded);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+
+    QVERIFY(movePathNoReplace(parent, moved));
+    QVERIFY(movePathNoReplace(moved, parent));
+
+    qbrowser_archive_testing::resetArchiveTestHooks();
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    QVERIFY(Archive::extract(package, staging).hasValue());
+    QFile extracted(staging + QStringLiteral("/parent/safe.txt"));
+    QVERIFY(extracted.open(QIODevice::ReadOnly));
+    QCOMPARE(extracted.readAll(), QByteArray("safe"));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
 }
 
 void ArchiveTest::writesByteForByteDeterministicArchives()

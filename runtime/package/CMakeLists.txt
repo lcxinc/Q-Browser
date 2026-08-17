@@ -2,12 +2,16 @@ add_library(q_browser_package STATIC
   Archive.cpp
   Archive.h
   ArchiveLimits.h
+  ArchiveTestHooks.cpp
+  ArchiveTestHooks.h
   JsonPreflight.cpp
   JsonPreflight.h
   Manifest.cpp
   Manifest.h
   ManifestError.h
-  ManifestResourceLimits.h)
+  ManifestResourceLimits.h
+  WindowsStableIo.cpp
+  WindowsStableIo.h)
 
 target_include_directories(q_browser_package
   PUBLIC
@@ -21,3 +25,7 @@ target_link_libraries(q_browser_package
     miniz)
 
 q_browser_enable_strict_warnings(q_browser_package)
+
+if(BUILD_TESTING)
+  target_compile_definitions(q_browser_package PRIVATE Q_BROWSER_ARCHIVE_TESTING)
+endif()
