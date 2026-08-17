@@ -1,7 +1,10 @@
 add_library(q_browser_package STATIC
+  JsonPreflight.cpp
+  JsonPreflight.h
   Manifest.cpp
   Manifest.h
-  ManifestError.h)
+  ManifestError.h
+  ManifestResourceLimits.h)
 
 target_include_directories(q_browser_package
   PUBLIC

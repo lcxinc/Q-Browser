@@ -1,6 +1,8 @@
 add_executable(tst_manifest
   tst_manifest.cpp)
 
+find_program(Q_BROWSER_NODE_EXECUTABLE NAMES node REQUIRED)
+
 target_link_libraries(tst_manifest
   PRIVATE
     q_browser_package
@@ -9,7 +11,8 @@ target_link_libraries(tst_manifest
 target_compile_definitions(tst_manifest
   PRIVATE
     Q_BROWSER_MANIFEST_FIXTURE_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures/manifests"
-    Q_BROWSER_MANIFEST_SCHEMA_FILE="${PROJECT_SOURCE_DIR}/schemas/qapkg-manifest-v1.schema.json")
+    Q_BROWSER_MANIFEST_SCHEMA_FILE="${PROJECT_SOURCE_DIR}/schemas/qapkg-manifest-v1.schema.json"
+    Q_BROWSER_NODE_EXECUTABLE="${Q_BROWSER_NODE_EXECUTABLE}")
 
 q_browser_enable_strict_warnings(tst_manifest)
 

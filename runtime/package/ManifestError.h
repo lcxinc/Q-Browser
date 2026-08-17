@@ -28,6 +28,7 @@ enum class ManifestErrorCode
     InvalidLimit,
     InvalidRoute,
     DuplicateRoute,
+    ResourceLimitExceeded,
 };
 
 Q_DECLARE_METATYPE(ManifestErrorCode)

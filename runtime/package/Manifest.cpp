@@ -1,12 +1,13 @@
 #include "Manifest.h"
 
+#include "JsonPreflight.h"
+#include "ManifestResourceLimits.h"
 #include "RouteRegistry.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
-#include <QCborValue>
 #include <QRegularExpression>
 #include <QSet>
 
@@ -106,7 +107,7 @@ void appendUnknownFields(QVector<ManifestError> &errors,
     for (const QString &key : keys) {
         if (!allowed.contains(key)) {
             errors.append({ManifestErrorCode::UnknownField,
-                           path + u'.' + key,
+                           manifestJsonPathMember(path, key),
                            QStringLiteral("field is not allowed")});
         }
     }
@@ -254,12 +255,53 @@ bool isWindowsDeviceSegment(QStringView segment)
     return numberedDevices.match(upper).hasMatch();
 }
 
+bool isUnicodeNoncharacter(const char32_t codePoint)
+{
+    return (codePoint >= 0xfdd0 && codePoint <= 0xfdef)
+        || (codePoint <= 0x10ffff && (codePoint & 0xffff) >= 0xfffe);
+}
+
+bool containsInvalidWindowsPathCharacter(QStringView segment)
+{
+    for (qsizetype index = 0; index < segment.size(); ++index) {
+        const QChar character = segment.at(index);
+        char32_t codePoint = character.unicode();
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= segment.size() || !segment.at(index + 1).isLowSurrogate()) {
+                return true;
+            }
+            codePoint = QChar::surrogateToUcs4(character, segment.at(++index));
+        } else if (character.isLowSurrogate()) {
+            return true;
+        }
+        if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+            || isUnicodeNoncharacter(codePoint)) {
+            return true;
+        }
+        switch (codePoint) {
+        case u'<':
+        case u'>':
+        case u':':
+        case u'"':
+        case u'/':
+        case u'\\':
+        case u'|':
+        case u'?':
+        case u'*':
+        case u'%':
+        case u'#':
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
 bool isValidEntryPoint(const QString &path)
 {
     if (path.isEmpty() || path.startsWith(u'/') || path.startsWith(u'\\')
-        || path.contains(u':') || path.contains(u'\\')
-        || path.contains(QStringLiteral("//")) || path.contains(u'%') || path.contains(u'?')
-        || path.contains(u'#') || !path.endsWith(QStringLiteral(".qml"))) {
+        || path.contains(QStringLiteral("//")) || !path.endsWith(QStringLiteral(".qml"))) {
         return false;
     }
     const QStringList segments = path.split(u'/', Qt::KeepEmptyParts);
@@ -269,12 +311,8 @@ bool isValidEntryPoint(const QString &path)
             || isWindowsDeviceSegment(segment)) {
             return false;
         }
-        for (const QChar character : segment) {
-            if (character.unicode() < 0x20 || character.unicode() == 0x7f
-                || character == u'<' || character == u'>' || character == u'"'
-                || character == u'|' || character == u'*') {
-                return false;
-            }
+        if (containsInvalidWindowsPathCharacter(segment)) {
+            return false;
         }
     }
     return true;
@@ -448,13 +486,25 @@ bool isCanonicalHostname(const QString &host)
                                [](const QString &label) { return label.size() <= 63; });
 }
 
+bool isLegacyIpv4Alias(const QString &host)
+{
+    const QStringList parts = host.split(u'.', Qt::KeepEmptyParts);
+    if (parts.isEmpty() || parts.size() > 4) {
+        return false;
+    }
+    static const QRegularExpression numericComponent(
+        QStringLiteral(R"(^(?:[0-9]+|0[xX][0-9A-Fa-f]+)$)"));
+    return std::ranges::all_of(parts, [](const QString &part) {
+        return numericComponent.match(part).hasMatch();
+    });
+}
+
 bool isCanonicalNetworkHost(const QString &host)
 {
-    const bool looksLikeIpv4 = host.contains(u'.')
-        && std::ranges::all_of(host, [](const QChar character) {
-               return character.isDigit() || character == u'.';
-           });
-    return looksLikeIpv4 ? isCanonicalIpv4(host) : isCanonicalHostname(host);
+    if (isCanonicalIpv4(host)) {
+        return true;
+    }
+    return !isLegacyIpv4Alias(host) && isCanonicalHostname(host);
 }
 
 QVector<ManifestError> validateNetworkHosts(const QJsonObject &permissions)
@@ -541,21 +591,106 @@ QVector<ManifestError> validateNetworkMethods(const QJsonObject &permissions)
     return errors;
 }
 
-QVector<ManifestError> validateLimits(const QJsonObject &limits)
+struct LimitDefinition
 {
-    struct LimitDefinition
-    {
-        QString key;
-        qint64 maximum;
-    };
-    const QVector<LimitDefinition> definitions = {
+    QString key;
+    qint64 maximum;
+};
+
+const QVector<LimitDefinition> &limitDefinitions()
+{
+    static const QVector<LimitDefinition> definitions = {
         {QStringLiteral("packageBytes"), 50LL * 1024LL * 1024LL},
         {QStringLiteral("memoryMiB"), 384},
         {QStringLiteral("processes"), 1},
     };
+    return definitions;
+}
+
+std::optional<ManifestError> exactNumberError(const JsonPreflightResult &preflight)
+{
+    const QString schemaVersionPath = QStringLiteral("$.schemaVersion");
+    const auto schemaVersion = preflight.numberLexemes.constFind(schemaVersionPath);
+    if (schemaVersion != preflight.numberLexemes.cend()
+        && !manifestExactPositiveJsonInteger(*schemaVersion, 1)) {
+        return ManifestError{ManifestErrorCode::UnsupportedSchemaVersion,
+                             schemaVersionPath,
+                             QStringLiteral("only schema version 1 is supported")};
+    }
+    for (const LimitDefinition &definition : limitDefinitions()) {
+        const QString path = QStringLiteral("$.limits.") + definition.key;
+        const auto lexeme = preflight.numberLexemes.constFind(path);
+        if (lexeme != preflight.numberLexemes.cend()
+            && !manifestExactPositiveJsonInteger(*lexeme, definition.maximum)) {
+            return ManifestError{ManifestErrorCode::InvalidLimit,
+                                 path,
+                                 QStringLiteral("limit must be a positive integer within the host maximum")};
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ManifestError> resourceBoundError(const JsonPreflightResult &preflight)
+{
+    struct Bound
+    {
+        QString path;
+        qsizetype maximum;
+    };
+    const QVector<Bound> stringBounds = {
+        {QStringLiteral("$.version"), ManifestResourceLimits::MaxVersionCharacters},
+        {QStringLiteral("$.runtime.minVersion"),
+         ManifestResourceLimits::MaxVersionCharacters},
+        {QStringLiteral("$.runtime.maxVersion"),
+         ManifestResourceLimits::MaxVersionCharacters},
+        {QStringLiteral("$.entryPoint"), ManifestResourceLimits::MaxEntryPointCharacters},
+    };
+    const QVector<Bound> arrayBounds = {
+        {QStringLiteral("$.imports"), ManifestResourceLimits::MaxImports},
+        {QStringLiteral("$.permissions.network.hosts"),
+         ManifestResourceLimits::MaxNetworkHosts},
+        {QStringLiteral("$.permissions.network.methods"),
+         ManifestResourceLimits::MaxNetworkMethods},
+        {QStringLiteral("$.routes"), ManifestResourceLimits::MaxRoutes},
+    };
+
+    const auto makeError = [](const QString &path) {
+        return ManifestError{ManifestErrorCode::ResourceLimitExceeded,
+                             path,
+                             QStringLiteral("manifest resource bound exceeded")};
+    };
+    for (const Bound &bound : stringBounds) {
+        const auto size = preflight.stringLengths.constFind(bound.path);
+        if (size != preflight.stringLengths.cend() && *size > bound.maximum) {
+            return makeError(bound.path);
+        }
+    }
+    for (const Bound &bound : arrayBounds) {
+        const auto size = preflight.arraySizes.constFind(bound.path);
+        if (size != preflight.arraySizes.cend() && *size > bound.maximum) {
+            return makeError(bound.path);
+        }
+    }
+    const qsizetype routeCount = std::min(
+        preflight.arraySizes.value(QStringLiteral("$.routes")),
+        ManifestResourceLimits::MaxRoutes);
+    for (qsizetype index = 0; index < routeCount; ++index) {
+        const QString path = QStringLiteral("$.routes[%1]").arg(index);
+        const auto size = preflight.stringLengths.constFind(path);
+        if (size != preflight.stringLengths.cend()
+            && *size > ManifestResourceLimits::MaxRouteCharacters) {
+            return makeError(path);
+        }
+    }
+    return std::nullopt;
+}
+
+QVector<ManifestError> validateLimits(const QJsonObject &limits,
+                                      const JsonPreflightResult &preflight)
+{
 
     QVector<ManifestError> errors;
-    for (const LimitDefinition &definition : definitions) {
+    for (const LimitDefinition &definition : limitDefinitions()) {
         const QString path = QStringLiteral("$.limits.") + definition.key;
         if (!limits.contains(definition.key)) {
             errors.append({ManifestErrorCode::MissingRequiredField,
@@ -570,18 +705,12 @@ QVector<ManifestError> validateLimits(const QJsonObject &limits)
                            QStringLiteral("limit must be a JSON integer")});
             continue;
         }
-        const QCborValue cborValue = QCborValue::fromJsonValue(value);
-        if (!cborValue.isInteger()) {
+        const auto lexeme = preflight.numberLexemes.constFind(path);
+        if (lexeme == preflight.numberLexemes.cend()
+            || !manifestExactPositiveJsonInteger(*lexeme, definition.maximum)) {
             errors.append({ManifestErrorCode::InvalidLimit,
                            path,
-                           QStringLiteral("limit must be an integer within the host maximum")});
-            continue;
-        }
-        const qint64 integer = cborValue.toInteger();
-        if (integer <= 0 || integer > definition.maximum) {
-            errors.append({ManifestErrorCode::InvalidLimit,
-                           path,
-                           QStringLiteral("limit must be positive and within the host maximum")});
+                           QStringLiteral("limit must be a positive integer within the host maximum")});
         }
     }
     return errors;
@@ -666,6 +795,8 @@ QString manifestErrorCodeName(const ManifestErrorCode code)
         return QStringLiteral("unsupported_network_method");
     case ManifestErrorCode::DuplicateNetworkMethod:
         return QStringLiteral("duplicate_network_method");
+    case ManifestErrorCode::ResourceLimitExceeded:
+        return QStringLiteral("resource_limit_exceeded");
     case ManifestErrorCode::InvalidStoragePermission:
         return QStringLiteral("invalid_storage_permission");
     case ManifestErrorCode::InvalidClipboardReadPermission:
@@ -686,9 +817,28 @@ QString manifestErrorCodeName(const ManifestErrorCode code)
 
 ManifestParseResult Manifest::parse(const QByteArray &bytes)
 {
+    if (bytes.size() > ManifestResourceLimits::MaxManifestBytes) {
+        return ManifestParseResult(QVector<ManifestError>{
+            {ManifestErrorCode::ResourceLimitExceeded,
+             QStringLiteral("$"),
+             QStringLiteral("manifest resource bound exceeded")}});
+    }
+    const JsonPreflightResult preflight = preflightManifestJson(bytes);
+    if (preflight.error.has_value()) {
+        return ManifestParseResult(QVector<ManifestError>{*preflight.error});
+    }
+    if (const std::optional<ManifestError> error = resourceBoundError(preflight);
+        error.has_value()) {
+        return ManifestParseResult(QVector<ManifestError>{*error});
+    }
+
     QJsonParseError parseError;
     const QJsonDocument document = QJsonDocument::fromJson(bytes, &parseError);
     if (parseError.error != QJsonParseError::NoError) {
+        if (const std::optional<ManifestError> error = exactNumberError(preflight);
+            error.has_value()) {
+            return ManifestParseResult(QVector<ManifestError>{*error});
+        }
         return ManifestParseResult(QVector<ManifestError>{
             {ManifestErrorCode::InvalidJson, QStringLiteral("$"), QStringLiteral("invalid JSON")}});
     }
@@ -711,8 +861,11 @@ ManifestParseResult Manifest::parse(const QByteArray &bytes)
     if (!errors.isEmpty()) {
         return ManifestParseResult(std::move(errors));
     }
+    const auto schemaVersionLexeme =
+        preflight.numberLexemes.constFind(QStringLiteral("$.schemaVersion"));
     if (object.value(QStringLiteral("schemaVersion")).isDouble()
-        && object.value(QStringLiteral("schemaVersion")).toInt() != 1) {
+        && (schemaVersionLexeme == preflight.numberLexemes.cend()
+            || !manifestExactPositiveJsonInteger(*schemaVersionLexeme, 1))) {
         return ManifestParseResult(QVector<ManifestError>{
             {ManifestErrorCode::UnsupportedSchemaVersion,
              QStringLiteral("$.schemaVersion"),
@@ -760,7 +913,7 @@ ManifestParseResult Manifest::parse(const QByteArray &bytes)
     if (!errors.isEmpty()) {
         return ManifestParseResult(std::move(errors));
     }
-    errors = validateLimits(object.value(QStringLiteral("limits")).toObject());
+    errors = validateLimits(object.value(QStringLiteral("limits")).toObject(), preflight);
     if (!errors.isEmpty()) {
         return ManifestParseResult(std::move(errors));
     }
@@ -772,7 +925,7 @@ ManifestParseResult Manifest::parse(const QByteArray &bytes)
     }
 
     Manifest manifest;
-    manifest.m_schemaVersion = object.value(QStringLiteral("schemaVersion")).toInt();
+    manifest.m_schemaVersion = 1;
     manifest.m_appId = object.value(QStringLiteral("appId")).toString();
     manifest.m_version = object.value(QStringLiteral("version")).toString();
     manifest.m_entryPoint = object.value(QStringLiteral("entryPoint")).toString();
@@ -800,11 +953,29 @@ ManifestParseResult Manifest::parse(const QByteArray &bytes)
         manifest.m_permissions.fileOpen = FileOpenPermission::UserBrokered;
     }
 
-    const QJsonObject limits = object.value(QStringLiteral("limits")).toObject();
-    manifest.m_limits.packageBytes =
-        static_cast<qint64>(limits.value(QStringLiteral("packageBytes")).toDouble());
-    manifest.m_limits.memoryMiB = limits.value(QStringLiteral("memoryMiB")).toInt();
-    manifest.m_limits.processes = limits.value(QStringLiteral("processes")).toInt();
+    qint64 packageBytes = 0;
+    qint64 memoryMiB = 0;
+    qint64 processes = 0;
+    const bool packageBytesValid = manifestExactPositiveJsonInteger(
+        preflight.numberLexemes.value(QStringLiteral("$.limits.packageBytes")),
+        50LL * 1024LL * 1024LL,
+        &packageBytes);
+    const bool memoryMiBValid = manifestExactPositiveJsonInteger(
+        preflight.numberLexemes.value(QStringLiteral("$.limits.memoryMiB")), 384, &memoryMiB);
+    const bool processesValid = manifestExactPositiveJsonInteger(
+        preflight.numberLexemes.value(QStringLiteral("$.limits.processes")), 1, &processes);
+    if (!packageBytesValid || !memoryMiBValid || !processesValid) {
+        const QString invalidKey = !packageBytesValid
+            ? QStringLiteral("packageBytes")
+            : (!memoryMiBValid ? QStringLiteral("memoryMiB") : QStringLiteral("processes"));
+        return ManifestParseResult(QVector<ManifestError>{
+            {ManifestErrorCode::InvalidLimit,
+             QStringLiteral("$.limits.") + invalidKey,
+             QStringLiteral("limit must be a positive integer within the host maximum")}});
+    }
+    manifest.m_limits.packageBytes = packageBytes;
+    manifest.m_limits.memoryMiB = static_cast<int>(memoryMiB);
+    manifest.m_limits.processes = static_cast<int>(processes);
     manifest.m_routes = stringList(object.value(QStringLiteral("routes")).toArray());
 
     return ManifestParseResult(std::move(manifest));
