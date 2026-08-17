@@ -439,10 +439,29 @@ void ManifestTest::windowsEntryPointCorpusHasSchemaRuntimeParity_data()
 
     QTest::newRow("normal-dotted-file") << QStringLiteral("qml/pages/Main.view.qml") << true;
     QTest::newRow("normal-dotted-directory") << QStringLiteral("qml/v1.2/Main.qml") << true;
+    QTest::newRow("normal-unicode") << QStringLiteral("qml/页面/报告.qml") << true;
     QTest::newRow("device-prefix-is-normal") << QStringLiteral("qml/concept/Main.qml") << true;
     QTest::newRow("com-zero-is-normal") << QStringLiteral("qml/COM0.qml") << true;
     QTest::newRow("com-ten-is-normal") << QStringLiteral("qml/COM10.qml") << true;
+    QTest::newRow("lpt-zero-is-normal") << QStringLiteral("qml/LPT0.qml") << true;
     QTest::newRow("lpt-ten-is-normal") << QStringLiteral("qml/LPT10.qml") << true;
+    QTest::newRow("less-than") << QStringLiteral("qml/less<than/Main.qml") << false;
+    QTest::newRow("greater-than") << QStringLiteral("qml/greater>than/Main.qml") << false;
+    QTest::newRow("double-quote") << QStringLiteral("qml/quote\"name/Main.qml") << false;
+    QTest::newRow("pipe") << QStringLiteral("qml/pipe|name/Main.qml") << false;
+    QTest::newRow("asterisk") << QStringLiteral("qml/star*name/Main.qml") << false;
+    QTest::newRow("colon-regression") << QStringLiteral("qml/name:stream/Main.qml") << false;
+    QTest::newRow("question-regression") << QStringLiteral("qml/Main?.qml") << false;
+    QTest::newRow("duplicate-slash-regression") << QStringLiteral("qml//Main.qml") << false;
+    QTest::newRow("backslash-regression") << QStringLiteral("qml\\Main.qml") << false;
+    QString controlOne = QStringLiteral("qml/control");
+    controlOne.append(QChar(0x0001));
+    controlOne.append(QStringLiteral("/Main.qml"));
+    QTest::newRow("control-u0001-regression") << controlOne << false;
+    QString controlUnitSeparator = QStringLiteral("qml/control");
+    controlUnitSeparator.append(QChar(0x001f));
+    controlUnitSeparator.append(QStringLiteral("/Main.qml"));
+    QTest::newRow("control-u001f-regression") << controlUnitSeparator << false;
     QTest::newRow("directory-trailing-dot") << QStringLiteral("qml./Main.qml") << false;
     QTest::newRow("directory-trailing-space") << QStringLiteral("qml /Main.qml") << false;
     QTest::newRow("file-trailing-space") << QStringLiteral("qml/Main.qml ") << false;
@@ -454,8 +473,14 @@ void ManifestTest::windowsEntryPointCorpusHasSchemaRuntimeParity_data()
     QTest::newRow("clock-dollar") << QStringLiteral("qml/CLOCK$.qml") << false;
     QTest::newRow("com-one") << QStringLiteral("qml/com1.qml") << false;
     QTest::newRow("com-nine-directory") << QStringLiteral("qml/COM9/Main.qml") << false;
+    QTest::newRow("com-superscript-one") << QStringLiteral("qml/COM¹.qml") << false;
+    QTest::newRow("com-superscript-two-lowercase") << QStringLiteral("qml/com².txt.qml") << false;
+    QTest::newRow("com-superscript-three-padded") << QStringLiteral("qml/Com³ .qml") << false;
     QTest::newRow("lpt-one") << QStringLiteral("qml/lpt1.qml") << false;
     QTest::newRow("lpt-nine") << QStringLiteral("qml/LPT9.qml") << false;
+    QTest::newRow("lpt-superscript-one") << QStringLiteral("qml/LPT¹.qml") << false;
+    QTest::newRow("lpt-superscript-two-lowercase") << QStringLiteral("qml/lpt².txt.qml") << false;
+    QTest::newRow("lpt-superscript-three-padded") << QStringLiteral("qml/LpT³ .qml") << false;
     QTest::newRow("device-base-padded-before-extension")
         << QStringLiteral("qml/CON .qml") << false;
 }

@@ -250,7 +250,7 @@ bool isWindowsDeviceSegment(QStringView segment)
         return true;
     }
     static const QRegularExpression numberedDevices(
-        QStringLiteral(R"(^(?:COM|LPT)[1-9]$)"));
+        QStringLiteral(R"(^(?:COM|LPT)(?:[1-9]|\x{00B9}|\x{00B2}|\x{00B3})$)"));
     return numberedDevices.match(upper).hasMatch();
 }
 
@@ -270,7 +270,9 @@ bool isValidEntryPoint(const QString &path)
             return false;
         }
         for (const QChar character : segment) {
-            if (character.unicode() < 0x20 || character.unicode() == 0x7f) {
+            if (character.unicode() < 0x20 || character.unicode() == 0x7f
+                || character == u'<' || character == u'>' || character == u'"'
+                || character == u'|' || character == u'*') {
                 return false;
             }
         }
