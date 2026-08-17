@@ -1,0 +1,5 @@
+foreach(q_browser_app IN ITEMS worker host)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${q_browser_app}/CMakeLists.txt")
+    add_subdirectory("${q_browser_app}")
+  endif()
+endforeach()

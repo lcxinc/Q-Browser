@@ -1,0 +1,5 @@
+foreach(q_browser_qml_module IN ITEMS Company/Design Company/Pilot)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${q_browser_qml_module}/CMakeLists.txt")
+    add_subdirectory("${q_browser_qml_module}")
+  endif()
+endforeach()

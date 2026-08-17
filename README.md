@@ -52,6 +52,12 @@ npm run build --prefix tools
 npm run lint --prefix tools
 ```
 
+`tools/package.json` reserves the `mock-api` and `migrator` npm workspaces.
+Each workspace is registered automatically when its directory and
+`package.json` are created. Add its TypeScript project to the root
+`tools/tsconfig.json` `references` array in that same change; references must
+never point at a workspace that does not exist yet.
+
 `npm test --prefix tools` becomes applicable when the first TypeScript source project adds its Vitest suite.
 
 ## Generated directories

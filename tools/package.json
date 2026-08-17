@@ -2,6 +2,10 @@
   "name": "@q-browser/tools",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "mock-api",
+    "migrator"
+  ],
   "engines": {
     "node": ">=24"
   },

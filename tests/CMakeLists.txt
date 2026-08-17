@@ -9,5 +9,7 @@ if(BUILD_TESTING)
 
   q_browser_enable_strict_warnings(q_browser_build_smoke)
 
-  add_test(NAME build_smoke COMMAND q_browser_build_smoke)
+  q_browser_add_qt_test(
+    NAME build_smoke
+    TARGET q_browser_build_smoke)
 endif()

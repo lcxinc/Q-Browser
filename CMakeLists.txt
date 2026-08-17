@@ -16,9 +16,12 @@ option(Q_BROWSER_BUILD_WEBENGINE "Build the WebEngine fallback surface" ON)
 
 include(cmake/Warnings.cmake)
 include(cmake/Dependencies.cmake)
+include(cmake/Testing.cmake)
 
-foreach(q_browser_subdirectory IN ITEMS apps runtime qml tests)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${q_browser_subdirectory}/CMakeLists.txt")
-    add_subdirectory("${q_browser_subdirectory}")
-  endif()
-endforeach()
+add_subdirectory(runtime)
+add_subdirectory(apps)
+add_subdirectory(qml)
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()

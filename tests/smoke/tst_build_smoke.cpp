@@ -5,7 +5,7 @@ class BuildSmokeTest final : public QObject {
 
 private slots:
   void qtRuntimeIsUsable() {
-    QVERIFY(QVersionNumber::fromString(qVersion()) >= QVersionNumber(6, 11));
+    QCOMPARE(QString::fromLatin1(qVersion()), QStringLiteral(QT_VERSION_STR));
   }
 };
 
