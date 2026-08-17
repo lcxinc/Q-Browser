@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "appId": "com.qbrowser.pilot",
+  "version": "1.0.0",
+  "entryPoint": "qml/Main.qml",
+  "runtime": {"minVersion": "1.0.0", "maxVersion": "1.x"},
+  "imports": ["QtQuick"],
+  "permissions": {"process": false},
+  "limits": {"packageBytes": 52428801, "memoryMiB": 384.5, "processes": 2},
+  "routes": ["/login"]
+}

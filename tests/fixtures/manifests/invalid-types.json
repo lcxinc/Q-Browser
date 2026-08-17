@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "1",
+  "appId": 7,
+  "version": true,
+  "entryPoint": [],
+  "runtime": "1.x",
+  "imports": {},
+  "permissions": [],
+  "limits": false,
+  "routes": null
+}

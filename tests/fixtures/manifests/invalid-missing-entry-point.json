@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "appId": "com.qbrowser.pilot",
+  "version": "1.0.0",
+  "runtime": {"minVersion": "1.0.0", "maxVersion": "1.x"},
+  "imports": ["QtQuick"],
+  "permissions": {"process": false},
+  "limits": {"packageBytes": 1024, "memoryMiB": 64, "processes": 1},
+  "routes": ["/login"]
+}
