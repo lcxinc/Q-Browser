@@ -8,6 +8,7 @@
 struct HostRequestContext {
     QString appIdentity;
     QString requestId;
+    QString sessionNonce;
 };
 
 [[nodiscard]] constexpr qint64 maximumIpcBinaryResultBytes() noexcept

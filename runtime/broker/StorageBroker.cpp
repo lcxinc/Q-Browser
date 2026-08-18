@@ -1,4 +1,5 @@
 #include "StorageBroker.h"
+#include "StorageTestHooks.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -119,6 +120,158 @@ bool applyHostOnlyAcl(const QString &path)
     return result == ERROR_SUCCESS;
 }
 
+bool hasHostOnlyAcl(const QString &path)
+{
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == FALSE) {
+        return false;
+    }
+    DWORD required = 0;
+    (void)GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+    std::vector<BYTE> tokenBytes(required);
+    const bool tokenValid = required > 0
+        && GetTokenInformation(token,
+                               TokenUser,
+                               tokenBytes.data(),
+                               required,
+                               &required)
+            != FALSE;
+    CloseHandle(token);
+    if (!tokenValid) {
+        return false;
+    }
+    const auto *user = reinterpret_cast<const TOKEN_USER *>(tokenBytes.data());
+    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD systemSize = sizeof(systemBuffer);
+    if (CreateWellKnownSid(WinLocalSystemSid, nullptr, systemBuffer, &systemSize) == FALSE) {
+        return false;
+    }
+    QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL dacl = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &dacl,
+        nullptr,
+        &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr || dacl == nullptr) {
+        if (descriptor != nullptr) {
+            LocalFree(descriptor);
+        }
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    ACL_SIZE_INFORMATION information{};
+    bool valid = GetSecurityDescriptorControl(descriptor, &control, &revision) != FALSE
+        && (control & SE_DACL_PROTECTED) != 0U
+        && GetAclInformation(dacl,
+                             &information,
+                             static_cast<DWORD>(sizeof(information)),
+                             AclSizeInformation)
+            != FALSE
+        && information.AceCount >= 2U
+        && information.AceCount <= 4U;
+    bool foundUser = false;
+    bool foundSystem = false;
+    for (DWORD index = 0; valid && index < information.AceCount; ++index) {
+        void *ace = nullptr;
+        if (GetAce(dacl, index, &ace) == FALSE
+            || static_cast<ACE_HEADER *>(ace)->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            valid = false;
+            break;
+        }
+        const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+        if (EqualSid(sid, user->User.Sid) != FALSE) {
+            foundUser = true;
+        } else if (EqualSid(sid, systemBuffer) != FALSE) {
+            foundSystem = true;
+        } else {
+            valid = false;
+        }
+    }
+    LocalFree(descriptor);
+    return valid && foundUser && foundSystem;
+}
+
+struct ValidatedStorageObject final
+{
+    QString path;
+    std::unique_ptr<qbrowser_archive_detail::WindowsStableFile> file;
+};
+
+struct DaclSnapshot final
+{
+    QString path;
+    QByteArray acl;
+    bool protectedAcl = false;
+};
+
+bool captureDacl(const QString &path, DaclSnapshot &snapshot)
+{
+    QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL dacl = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &dacl,
+        nullptr,
+        &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr || dacl == nullptr) {
+        if (descriptor != nullptr) {
+            LocalFree(descriptor);
+        }
+        return false;
+    }
+    ACL_SIZE_INFORMATION information{};
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    const bool valid = GetAclInformation(dacl,
+                                         &information,
+                                         static_cast<DWORD>(sizeof(information)),
+                                         AclSizeInformation)
+            != FALSE
+        && information.AclBytesInUse >= sizeof(ACL)
+        && GetSecurityDescriptorControl(descriptor, &control, &revision) != FALSE;
+    if (valid) {
+        snapshot.path = path;
+        snapshot.acl = QByteArray(reinterpret_cast<const char *>(dacl),
+                                  static_cast<qsizetype>(information.AclBytesInUse));
+        snapshot.protectedAcl = (control & SE_DACL_PROTECTED) != 0U;
+    }
+    LocalFree(descriptor);
+    return valid;
+}
+
+bool restoreDacl(const DaclSnapshot &snapshot)
+{
+    if (snapshot.acl.size() < static_cast<qsizetype>(sizeof(ACL))) {
+        return false;
+    }
+    QString native = QDir::toNativeSeparators(QFileInfo(snapshot.path).absoluteFilePath());
+    const SECURITY_INFORMATION protection = snapshot.protectedAcl
+        ? PROTECTED_DACL_SECURITY_INFORMATION
+        : UNPROTECTED_DACL_SECURITY_INFORMATION;
+    return SetNamedSecurityInfoW(
+               reinterpret_cast<LPWSTR>(native.data()),
+               SE_FILE_OBJECT,
+               DACL_SECURITY_INFORMATION | protection,
+               nullptr,
+               nullptr,
+               reinterpret_cast<PACL>(const_cast<char *>(snapshot.acl.constData())),
+               nullptr)
+        == ERROR_SUCCESS;
+}
+
 BrokerResult loadValues(const QString &path,
                         const qint64 quotaBytes,
                         QJsonObject &values,
@@ -155,13 +308,16 @@ BrokerResult loadValues(const QString &path,
 bool validateExistingLayout(
     const QString &rootDirectory,
     const qint64 quotaBytes,
-    const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot)
+    const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot,
+    std::vector<ValidatedStorageObject> &objects)
 {
     QDirIterator iterator(rootDirectory,
                           QDir::AllEntries | QDir::Hidden | QDir::System
                               | QDir::NoDotAndDotDot,
                           QDirIterator::NoIteratorFlags);
     qsizetype count = 0;
+    qint64 aggregateDataBytes = 0;
+    qint64 aggregateLockBytes = 0;
     while (iterator.hasNext()) {
         iterator.next();
         if (++count > maximumExistingStorageObjects) {
@@ -178,20 +334,68 @@ bool validateExistingLayout(
         if (expected < 0 || expected > maximumBytes) {
             return false;
         }
-        qbrowser_archive_detail::WindowsStableFile file;
+        qint64 &aggregate = lockFile ? aggregateLockBytes : aggregateDataBytes;
+        if (expected > maximumBytes - aggregate) {
+            return false;
+        }
+        aggregate += expected;
+        auto file = std::make_unique<qbrowser_archive_detail::WindowsStableFile>();
         QByteArray content;
-        if (!applyHostOnlyAcl(information.absoluteFilePath())
-            || !file.openReadLocked(information.absoluteFilePath(), stableRoot)
-            || !file.readExact(static_cast<quint64>(expected),
-                               static_cast<quint64>(maximumBytes),
-                               content)
-            || !applyHostOnlyAcl(information.absoluteFilePath())
-            || !file.isSameIdentityAt(information.absoluteFilePath())
+        if (!file->openReadLocked(information.absoluteFilePath(), stableRoot)
+            || !file->readExact(static_cast<quint64>(expected),
+                                static_cast<quint64>(maximumBytes),
+                                content)
+            || !file->isSameIdentityAt(information.absoluteFilePath())
             || !stableRoot.isStable()) {
             return false;
         }
+        objects.push_back({information.absoluteFilePath(), std::move(file)});
     }
     return stableRoot.isStable();
+}
+
+bool applyAclsTransactionally(
+    const QString &rootDirectory,
+    const std::vector<ValidatedStorageObject> &objects,
+    const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot)
+{
+    std::vector<DaclSnapshot> snapshots;
+    snapshots.reserve(objects.size() + 1U);
+    for (const ValidatedStorageObject &object : objects) {
+        DaclSnapshot snapshot;
+        if (!captureDacl(object.path, snapshot)) {
+            return false;
+        }
+        snapshots.push_back(std::move(snapshot));
+    }
+    DaclSnapshot rootSnapshot;
+    if (!captureDacl(rootDirectory, rootSnapshot)) {
+        return false;
+    }
+    snapshots.push_back(std::move(rootSnapshot));
+
+    qsizetype applied = 0;
+    for (; applied < static_cast<qsizetype>(snapshots.size()); ++applied) {
+#ifdef Q_BROWSER_BROKER_TESTING
+        const auto &hooks = qbrowser_broker_testing::storageTestHooks();
+        if (hooks.allowAclApply && !hooks.allowAclApply(snapshots[applied].path, applied)) {
+            break;
+        }
+#endif
+        if (!applyHostOnlyAcl(snapshots[applied].path)
+            || !hasHostOnlyAcl(snapshots[applied].path)) {
+            break;
+        }
+    }
+    if (applied == static_cast<qsizetype>(snapshots.size()) && stableRoot.isStable()) {
+        return true;
+    }
+    bool restored = true;
+    for (qsizetype index = applied; index > 0; --index) {
+        restored = restoreDacl(snapshots[static_cast<size_t>(index - 1)]) && restored;
+    }
+    (void)restored;
+    return false;
 }
 #else
 bool containsSymlinkAncestor(const QString &path)
@@ -244,6 +448,8 @@ bool validateExistingLayout(const QString &rootDirectory, const qint64 quotaByte
                               | QDir::NoDotAndDotDot,
                           QDirIterator::NoIteratorFlags);
     qsizetype count = 0;
+    qint64 aggregateDataBytes = 0;
+    qint64 aggregateLockBytes = 0;
     while (iterator.hasNext()) {
         iterator.next();
         if (++count > maximumExistingStorageObjects) {
@@ -256,11 +462,12 @@ bool validateExistingLayout(const QString &rootDirectory, const qint64 quotaByte
             return false;
         }
         const qint64 maximumBytes = lockFile ? maximumLockBytes : quotaBytes;
-        if (information.size() < 0 || information.size() > maximumBytes
-            || !QFile::setPermissions(information.absoluteFilePath(),
-                                      QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        const qint64 expected = information.size();
+        qint64 &aggregate = lockFile ? aggregateLockBytes : aggregateDataBytes;
+        if (expected < 0 || expected > maximumBytes || expected > maximumBytes - aggregate) {
             return false;
         }
+        aggregate += expected;
         QFile file(information.absoluteFilePath());
         if (!file.open(QIODevice::ReadOnly)
             || file.read(static_cast<qsizetype>(maximumBytes) + 1).size()
@@ -301,17 +508,34 @@ std::unique_ptr<StorageBroker> StorageBroker::create(EffectiveStoragePolicy poli
 #ifdef Q_OS_WIN
     broker->stableRoot_ =
         std::make_unique<qbrowser_archive_detail::WindowsStableDirectoryTree>();
-    if (!broker->stableRoot_->openRoot(absoluteRoot) || !applyHostOnlyAcl(absoluteRoot)
+    std::vector<ValidatedStorageObject> objects;
+    if (!broker->stableRoot_->openRoot(absoluteRoot)
         || !broker->stableRoot_->isStable()
-        || !validateExistingLayout(absoluteRoot, policy.quotaBytes, *broker->stableRoot_)) {
+        || !validateExistingLayout(absoluteRoot,
+                                   policy.quotaBytes,
+                                   *broker->stableRoot_,
+                                   objects)
+        || !applyAclsTransactionally(absoluteRoot, objects, *broker->stableRoot_)) {
         return fail(QStringLiteral("storage.invalid_root"));
     }
 #else
     if (containsSymlinkAncestor(absoluteRoot)
-        || !QFile::setPermissions(absoluteRoot,
-                                  QFileDevice::ReadOwner | QFileDevice::WriteOwner
-                                      | QFileDevice::ExeOwner)
         || !validateExistingLayout(absoluteRoot, policy.quotaBytes)) {
+        return fail(QStringLiteral("storage.invalid_root"));
+    }
+    QDirIterator permissionIterator(absoluteRoot,
+                                    QDir::Files | QDir::Hidden | QDir::System,
+                                    QDirIterator::NoIteratorFlags);
+    while (permissionIterator.hasNext()) {
+        permissionIterator.next();
+        if (!QFile::setPermissions(permissionIterator.filePath(),
+                                   QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+            return fail(QStringLiteral("storage.invalid_root"));
+        }
+    }
+    if (!QFile::setPermissions(absoluteRoot,
+                               QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                   | QFileDevice::ExeOwner)) {
         return fail(QStringLiteral("storage.invalid_root"));
     }
 #endif

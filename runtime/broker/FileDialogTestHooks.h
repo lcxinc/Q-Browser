@@ -11,7 +11,7 @@ namespace qbrowser_broker_testing
 struct FileDialogTestHooks final
 {
     std::function<QString()> selectedPath;
-    std::function<void(const QString &)> afterStreamBound;
+    std::function<void(const QString &)> afterNativeHandleOpened;
 };
 
 void setFileDialogTestHooks(FileDialogTestHooks hooks);

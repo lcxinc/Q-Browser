@@ -11,6 +11,8 @@ add_library(q_browser_broker STATIC
   NetworkBroker.h
   StorageBroker.cpp
   StorageBroker.h
+  StorageTestHooks.cpp
+  StorageTestHooks.h
   UserGestureGrantStore.cpp
   UserGestureGrantStore.h)
 

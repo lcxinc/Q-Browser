@@ -4,6 +4,8 @@
 
 namespace {
 constexpr qsizetype maximumRememberedGrants = 4096;
+constexpr qsizetype maximumRememberedPerSession = 8192;
+constexpr qsizetype maximumSessions = 128;
 constexpr qint64 replayWindowMs = 60000;
 }
 
@@ -12,42 +14,66 @@ UserGestureGrantStore::UserGestureGrantStore()
     clock_.start();
 }
 
-bool UserGestureGrantStore::issue(const QString &appIdentity,
+bool UserGestureGrantStore::issue(const QString &sessionNonce,
+                                  const QString &appIdentity,
                                   const QString &requestId,
                                   const int lifetimeMs)
 {
-    if (!validToken(appIdentity) || !validToken(requestId) || lifetimeMs <= 0
+    if (!validToken(sessionNonce) || !validToken(appIdentity) || !validToken(requestId)
+        || lifetimeMs <= 0
         || lifetimeMs > 60000) {
         return false;
     }
     QMutexLocker lock(&mutex_);
     const qint64 now = clock_.elapsed();
-    purgeExpired(now);
+    auto sessionIterator = sessions_.find(sessionNonce);
+    if (sessionIterator == sessions_.end()) {
+        if (sessions_.size() >= maximumSessions) {
+            return false;
+        }
+        sessionIterator = sessions_.insert(sessionNonce, SessionState{});
+    }
+    SessionState &session = sessionIterator.value();
+    purgeExpired(session, now);
     const QString grantKey = key(appIdentity, requestId);
-    if (grants_.contains(grantKey) || used_.contains(grantKey)
-        || grants_.size() >= maximumRememberedGrants) {
+    if (session.grants.contains(grantKey) || session.used.contains(grantKey)
+        || session.grants.size() >= maximumRememberedGrants
+        || session.grants.size() + session.used.size() >= maximumRememberedPerSession) {
         return false;
     }
-    grants_.insert(grantKey, now + lifetimeMs);
+    session.grants.insert(grantKey, now + lifetimeMs);
     return true;
 }
 
-bool UserGestureGrantStore::consume(const QString &appIdentity, const QString &requestId)
+bool UserGestureGrantStore::consume(const QString &sessionNonce,
+                                    const QString &appIdentity,
+                                    const QString &requestId)
 {
-    if (!validToken(appIdentity) || !validToken(requestId)) {
+    if (!validToken(sessionNonce) || !validToken(appIdentity) || !validToken(requestId)) {
         return false;
     }
     QMutexLocker lock(&mutex_);
-    const qint64 now = clock_.elapsed();
-    purgeExpired(now);
-    const QString grantKey = key(appIdentity, requestId);
-    const auto grant = grants_.constFind(grantKey);
-    if (grant == grants_.cend() || *grant <= now) {
+    auto sessionIterator = sessions_.find(sessionNonce);
+    if (sessionIterator == sessions_.end()) {
         return false;
     }
-    grants_.remove(grantKey);
-    used_.insert(grantKey, now + replayWindowMs);
+    const qint64 now = clock_.elapsed();
+    SessionState &session = sessionIterator.value();
+    purgeExpired(session, now);
+    const QString grantKey = key(appIdentity, requestId);
+    const auto grant = session.grants.constFind(grantKey);
+    if (grant == session.grants.cend() || *grant <= now) {
+        return false;
+    }
+    session.grants.remove(grantKey);
+    session.used.insert(grantKey, now + replayWindowMs);
     return true;
+}
+
+void UserGestureGrantStore::invalidateSession(const QString &sessionNonce)
+{
+    QMutexLocker lock(&mutex_);
+    sessions_.remove(sessionNonce);
 }
 
 QString UserGestureGrantStore::key(const QString &appIdentity, const QString &requestId)
@@ -68,19 +94,19 @@ bool UserGestureGrantStore::validToken(const QString &token)
     return true;
 }
 
-void UserGestureGrantStore::purgeExpired(const qint64 now)
+void UserGestureGrantStore::purgeExpired(SessionState &session, const qint64 now)
 {
-    for (auto iterator = grants_.begin(); iterator != grants_.end();) {
+    for (auto iterator = session.grants.begin(); iterator != session.grants.end();) {
         if (iterator.value() <= now) {
-            used_.insert(iterator.key(), now + replayWindowMs);
-            iterator = grants_.erase(iterator);
+            session.used.insert(iterator.key(), now + replayWindowMs);
+            iterator = session.grants.erase(iterator);
         } else {
             ++iterator;
         }
     }
-    for (auto iterator = used_.begin(); iterator != used_.end();) {
+    for (auto iterator = session.used.begin(); iterator != session.used.end();) {
         if (iterator.value() <= now) {
-            iterator = used_.erase(iterator);
+            iterator = session.used.erase(iterator);
         } else {
             ++iterator;
         }

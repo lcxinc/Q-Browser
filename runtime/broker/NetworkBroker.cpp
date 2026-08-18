@@ -296,11 +296,12 @@ std::optional<NetworkAddressClass> classifyNetworkAddress(const QHostAddress &in
     if (inSubnet(address, "fc00::", 7)) {
         return NetworkAddressClass::Private;
     }
-    if (!inSubnet(address, "2000::", 3)
-        || inSubnet(address, "2001::", 23)
-        || inSubnet(address, "2001:db8::", 32)
-        || inSubnet(address, "2002::", 16)
-        || inSubnet(address, "3fff::", 20)) {
+    const bool allocatedRirBlock = inSubnet(address, "2400::", 12)
+        || inSubnet(address, "2600::", 12)
+        || inSubnet(address, "2800::", 12)
+        || inSubnet(address, "2a00::", 12)
+        || inSubnet(address, "2c00::", 12);
+    if (!allocatedRirBlock) {
         return std::nullopt;
     }
     return NetworkAddressClass::Public;

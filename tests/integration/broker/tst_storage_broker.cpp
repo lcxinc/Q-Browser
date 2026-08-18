@@ -1,4 +1,5 @@
 #include "StorageBroker.h"
+#include "StorageTestHooks.h"
 
 #include <QDir>
 #include <QCryptographicHash>
@@ -11,6 +12,7 @@
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #include <Aclapi.h>
+#include <sddl.h>
 #endif
 
 namespace {
@@ -120,6 +122,39 @@ bool hasProtectedHostOnlyDacl(const QString &path)
     LocalFree(descriptor);
     return valid;
 }
+
+QByteArray aclSnapshot(const QString &path)
+{
+    QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr) {
+        return {};
+    }
+    LPWSTR sddl = nullptr;
+    const BOOL converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor,
+        SDDL_REVISION_1,
+        DACL_SECURITY_INFORMATION,
+        &sddl,
+        nullptr);
+    const QByteArray snapshot = converted != FALSE && sddl != nullptr
+        ? QString::fromWCharArray(sddl).toUtf8()
+        : QByteArray{};
+    if (sddl != nullptr) {
+        LocalFree(sddl);
+    }
+    LocalFree(descriptor);
+    return snapshot;
+}
 #endif
 
 } // namespace
@@ -135,6 +170,9 @@ private slots:
     void rejectsExistingNamespaceOverQuota();
     void validatesAndTightensExistingNamespaceLayout();
     void rejectsUnexpectedExistingStorageObjects();
+    void invalidLayoutDoesNotMutateAcls();
+    void rejectsAggregateExistingDataOverQuota();
+    void aclMigrationFailureRollsBackEveryObject();
     void serializesConcurrentQuotaUpdates();
     void rejectsReparseRoot();
     void rejectsReparseNamespaceFile();
@@ -277,6 +315,91 @@ void StorageBrokerTest::rejectsUnexpectedExistingStorageObjects()
     QString error;
     QVERIFY(StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error) == nullptr);
     QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+}
+
+void StorageBrokerTest::invalidLayoutDoesNotMutateAcls()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows ACL transaction coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString unexpected = QDir(root.path()).filePath(QStringLiteral("unexpected"));
+    QVERIFY(QDir().mkdir(unexpected));
+    QVERIFY(grantWorldAccess(root.path()));
+    QVERIFY(grantWorldAccess(unexpected));
+    const QByteArray rootAcl = aclSnapshot(root.path());
+    const QByteArray childAcl = aclSnapshot(unexpected);
+    QVERIFY(!rootAcl.isEmpty());
+    QVERIFY(!childAcl.isEmpty());
+
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error) == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    QCOMPARE(aclSnapshot(root.path()), rootAcl);
+    QCOMPARE(aclSnapshot(unexpected), childAcl);
+#endif
+}
+
+void StorageBrokerTest::rejectsAggregateExistingDataOverQuota()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    for (const QString &identity : {QStringLiteral("host.one"), QStringLiteral("host.two")}) {
+        const QString name = QString::fromLatin1(
+                                 QCryptographicHash::hash(identity.toUtf8(),
+                                                          QCryptographicHash::Sha256)
+                                     .toHex())
+            + QStringLiteral(".json");
+        QFile file(QDir(root.path()).filePath(name));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(QByteArray(30, ' ')), 30);
+    }
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{40}, root.path(), &error) == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+}
+
+void StorageBrokerTest::aclMigrationFailureRollsBackEveryObject()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows ACL transaction coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QStringList paths{root.path()};
+    for (const QString &identity : {QStringLiteral("host.one"), QStringLiteral("host.two")}) {
+        const QString name = QString::fromLatin1(
+                                 QCryptographicHash::hash(identity.toUtf8(),
+                                                          QCryptographicHash::Sha256)
+                                     .toHex())
+            + QStringLiteral(".json");
+        const QString path = QDir(root.path()).filePath(name);
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("{}"), 2);
+        file.close();
+        QVERIFY(grantWorldAccess(path));
+        paths.append(path);
+    }
+    QVERIFY(grantWorldAccess(root.path()));
+    QHash<QString, QByteArray> before;
+    for (const QString &path : paths) {
+        before.insert(path, aclSnapshot(path));
+        QVERIFY(!before.value(path).isEmpty());
+    }
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.allowAclApply = [](const QString &, const qsizetype index) {
+             return index != 1;
+         }});
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error) == nullptr);
+    qbrowser_broker_testing::resetStorageTestHooks();
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    for (const QString &path : paths) {
+        QCOMPARE(aclSnapshot(path), before.value(path));
+    }
+#endif
 }
 
 void StorageBrokerTest::serializesConcurrentQuotaUpdates()

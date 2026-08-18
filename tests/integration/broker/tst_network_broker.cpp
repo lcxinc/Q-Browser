@@ -250,6 +250,13 @@ void NetworkBrokerTest::classifiesOnlyGloballyRoutableAddressesAsPublic_data()
                                      << static_cast<int>(NetworkAddressClass::Loopback);
     QTest::newRow("public-v6") << QStringLiteral("2606:4700:4700::1111")
                                << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-apnic-v6") << QStringLiteral("2404:6800:4001::1")
+                                         << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-ripe-v6") << QStringLiteral("2a02:6b8::1")
+                                        << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("unallocated-3000-v6") << QStringLiteral("3000::1") << denied;
+    QTest::newRow("former-6bone-v6") << QStringLiteral("3ffe::1") << denied;
+    QTest::newRow("unallocated-2d00-v6") << QStringLiteral("2d00::1") << denied;
     QTest::newRow("unspecified-v6") << QStringLiteral("::") << denied;
     QTest::newRow("documentation-v6") << QStringLiteral("2001:db8::1") << denied;
     QTest::newRow("private-v6") << QStringLiteral("fd00::1")

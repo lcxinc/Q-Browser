@@ -21,6 +21,8 @@ target_link_libraries(tst_storage_broker
     q_browser_broker
     Qt6::Test)
 
+target_compile_definitions(tst_storage_broker PRIVATE Q_BROWSER_BROKER_TESTING)
+
 q_browser_enable_strict_warnings(tst_storage_broker)
 
 q_browser_add_qt_test(
