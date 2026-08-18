@@ -115,6 +115,7 @@ class UnifiedNavigationTest final : public QObject
 
 private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
+    void navigationTransactionsRejectReentrantCommands();
 };
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()
@@ -234,6 +235,122 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    const QString webAppUrl = QStringLiteral("app://pilot/worker-shaped-web");
+    const QString unavailableWorkerAppUrl =
+        QStringLiteral("app://pilot/web-shaped-worker/42");
+
+    QVERIFY(window.navigate(webAppUrl));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
+    QCOMPARE(window.historyCount(), 1);
+
+    bool navigateReceiverRan = false;
+    bool navigateReceiverSawCommittedState = false;
+    bool reentrantNavigateResult = true;
+    const QMetaObject::Connection navigateConnection = connect(
+        &window, &MainWindow::currentUrlChanged, &window,
+        [&](const QString &url) {
+            if (navigateReceiverRan || url != unavailableWorkerAppUrl) {
+                return;
+            }
+            navigateReceiverRan = true;
+            navigateReceiverSawCommittedState =
+                window.currentAppUrl() == unavailableWorkerAppUrl
+                && window.historyCount() == 2
+                && window.historyIndex() == 1
+                && window.activeSurface() == HostSurfaceKind::TrustedError;
+            reentrantNavigateResult = window.navigate(unavailableWorkerAppUrl);
+        },
+        Qt::DirectConnection);
+
+    QVERIFY(!window.navigate(unavailableWorkerAppUrl));
+    QVERIFY(navigateReceiverRan);
+    QVERIFY(navigateReceiverSawCommittedState);
+    QVERIFY(!reentrantNavigateResult);
+    QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
+    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    disconnect(navigateConnection);
+
+    const int historyBeforeDuplicate = window.historyCount();
+    QVERIFY(!window.navigate(unavailableWorkerAppUrl));
+    QCOMPARE(window.historyCount(), historyBeforeDuplicate);
+    QCOMPARE(window.historyIndex(), historyBeforeDuplicate - 1);
+
+    QVERIFY(window.navigate(webAppUrl));
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 2);
+
+    bool backReceiverRan = false;
+    bool backReceiverSawCommittedState = false;
+    bool reentrantBackResult = true;
+    const QMetaObject::Connection backConnection = connect(
+        &window, &MainWindow::currentUrlChanged, &window,
+        [&](const QString &url) {
+            if (backReceiverRan || url != unavailableWorkerAppUrl) {
+                return;
+            }
+            backReceiverRan = true;
+            backReceiverSawCommittedState =
+                window.currentAppUrl() == unavailableWorkerAppUrl
+                && window.historyCount() == 3
+                && window.historyIndex() == 1
+                && window.activeSurface() == HostSurfaceKind::TrustedError;
+            reentrantBackResult = window.goBack();
+        },
+        Qt::DirectConnection);
+
+    QVERIFY(window.goBack());
+    QVERIFY(backReceiverRan);
+    QVERIFY(backReceiverSawCommittedState);
+    QVERIFY(!reentrantBackResult);
+    QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    disconnect(backConnection);
+
+    QVERIFY(window.goBack());
+    QCOMPARE(window.currentAppUrl(), webAppUrl);
+    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
+
+    bool forwardReceiverRan = false;
+    bool forwardReceiverSawCommittedState = false;
+    bool reentrantForwardResult = true;
+    const QMetaObject::Connection forwardConnection = connect(
+        &window, &MainWindow::currentUrlChanged, &window,
+        [&](const QString &url) {
+            if (forwardReceiverRan || url != unavailableWorkerAppUrl) {
+                return;
+            }
+            forwardReceiverRan = true;
+            forwardReceiverSawCommittedState =
+                window.currentAppUrl() == unavailableWorkerAppUrl
+                && window.historyCount() == 3
+                && window.historyIndex() == 1
+                && window.activeSurface() == HostSurfaceKind::TrustedError;
+            reentrantForwardResult = window.goForward();
+        },
+        Qt::DirectConnection);
+
+    QVERIFY(window.goForward());
+    QVERIFY(forwardReceiverRan);
+    QVERIFY(forwardReceiverSawCommittedState);
+    QVERIFY(!reentrantForwardResult);
+    QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    disconnect(forwardConnection);
 }
 
 int main(int argc, char **argv)

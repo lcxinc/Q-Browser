@@ -6,6 +6,7 @@
 #include "WorkerSurface.h"
 
 #include <QLabel>
+#include <QScopedValueRollback>
 #include <QStackedWidget>
 #include <QVBoxLayout>
 #include <QVariantMap>
@@ -89,50 +90,71 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
 
 bool MainWindow::navigate(const QStringView input)
 {
+    if (navigationInProgress_) {
+        return false;
+    }
+    QScopedValueRollback transaction(navigationInProgress_, true);
+
     const AppUrl parsed = AppUrl::parse(input, QStringLiteral("pilot"));
     if (!parsed.isValid()) {
-        showTrustedError(QStringLiteral("The address is not a valid Q-Browser route."));
         navigationBar_->setAddressText(currentAppUrl_);
         return false;
     }
     const QString canonical = canonicalAppUrl(parsed);
-    if (historyIndex_ + 1 < history_.size()) {
-        history_.erase(history_.begin() + historyIndex_ + 1, history_.end());
+    const bool isCurrentEntry = historyIndex_ >= 0
+        && historyIndex_ < history_.size()
+        && history_.at(historyIndex_) == canonical;
+    if (!isCurrentEntry) {
+        if (historyIndex_ + 1 < history_.size()) {
+            history_.erase(history_.begin() + historyIndex_ + 1, history_.end());
+        }
+        history_.append(canonical);
+        if (history_.size() > maximumHistoryEntries) {
+            history_.removeFirst();
+        }
+        historyIndex_ = history_.size() - 1;
     }
-    history_.append(canonical);
-    if (history_.size() > maximumHistoryEntries) {
-        history_.removeFirst();
-    }
-    historyIndex_ = history_.size() - 1;
+    const bool urlChanged = currentAppUrl_ != canonical;
     setCurrentAppUrl(canonical);
-    const bool activated = activate(canonical);
     updateNavigationState();
+    const bool activated = activate(canonical);
+    if (urlChanged) {
+        emit currentUrlChanged(canonical);
+    }
     return activated;
 }
 
 bool MainWindow::goBack()
 {
-    if (historyIndex_ <= 0) {
+    if (navigationInProgress_ || historyIndex_ <= 0) {
         return false;
     }
+    QScopedValueRollback transaction(navigationInProgress_, true);
+
     --historyIndex_;
     const QString url = history_.at(historyIndex_);
     setCurrentAppUrl(url);
-    (void)activate(url);
     updateNavigationState();
+    (void)activate(url);
+    emit currentUrlChanged(url);
     return true;
 }
 
 bool MainWindow::goForward()
 {
-    if (historyIndex_ < 0 || historyIndex_ + 1 >= history_.size()) {
+    if (navigationInProgress_
+        || historyIndex_ < 0
+        || historyIndex_ + 1 >= history_.size()) {
         return false;
     }
+    QScopedValueRollback transaction(navigationInProgress_, true);
+
     ++historyIndex_;
     const QString url = history_.at(historyIndex_);
     setCurrentAppUrl(url);
-    (void)activate(url);
     updateNavigationState();
+    (void)activate(url);
+    emit currentUrlChanged(url);
     return true;
 }
 
@@ -194,7 +216,11 @@ bool MainWindow::activate(const QString &canonicalUrl)
             webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Active);
         }
         const QUrl target(match.record.entryPoint, QUrl::StrictMode);
-        return webSurface_->navigate(target);
+        if (!webSurface_->navigate(target)) {
+            showTrustedError(QStringLiteral("The web content is unavailable."));
+            return false;
+        }
+        return true;
     }
     case Engine::TrustedQml:
         showTrustedError(QStringLiteral("The trusted page is unavailable."));
@@ -220,7 +246,6 @@ void MainWindow::setCurrentAppUrl(const QString &url)
 {
     currentAppUrl_ = url;
     navigationBar_->setAddressText(url);
-    emit currentUrlChanged(url);
 }
 
 void MainWindow::updateNavigationState()

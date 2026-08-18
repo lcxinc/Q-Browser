@@ -70,4 +70,5 @@ private:
     int historyIndex_ = -1;
     QString currentAppUrl_;
     HostSurfaceKind activeSurface_ = HostSurfaceKind::TrustedError;
+    bool navigationInProgress_ = false;
 };
