@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Q-Browser Pilot Help</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 52rem; margin: 0 auto; padding: 2rem; line-height: 1.55; }
+      nav ul { display: flex; gap: 1rem; padding: 0; list-style: none; }
+      section { margin-block: 2rem; }
+      code { padding: 0.1rem 0.3rem; border-radius: 0.25rem; background: CanvasText; color: Canvas; }
+      :focus-visible { outline: 0.2rem solid Highlight; outline-offset: 0.2rem; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Q-Browser Pilot Help</h1>
+      <p>This local document verifies the isolated WebEngine fallback route.</p>
+    </header>
+    <nav aria-label="Help topics">
+      <ul>
+        <li><a href="#navigation">Navigation</a></li>
+        <li><a href="#orders">Orders</a></li>
+        <li><a href="#recovery">Recovery</a></li>
+      </ul>
+    </nav>
+    <main>
+      <section id="navigation">
+        <h2>Navigation</h2>
+        <p>Use the application navigation to open dashboard, order, customer, file, and settings pages.</p>
+      </section>
+      <section id="orders">
+        <h2>Working with orders</h2>
+        <p>Search and filter the order list, open an order, then use the edit page to update supported fields.</p>
+      </section>
+      <section id="recovery">
+        <h2>Errors and recovery</h2>
+        <p>Retry transient server errors. A trusted error page is shown when a route or worker cannot be loaded safely.</p>
+      </section>
+    </main>
+  </body>
+</html>

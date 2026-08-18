@@ -14,5 +14,7 @@
     "skipLibCheck": true
   },
   "files": ["package.json"],
-  "references": []
+  "references": [
+    { "path": "./mock-api" }
+  ]
 }

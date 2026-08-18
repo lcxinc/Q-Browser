@@ -15,6 +15,7 @@
     "lint": "tsc -b --pretty false"
   },
   "devDependencies": {
+    "@types/node": "24.10.1",
     "css-tree": "3.2.1",
     "parse5": "8.0.1",
     "typescript": "7.0.2",

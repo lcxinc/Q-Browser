@@ -1,0 +1,13 @@
+{
+  "name": "@q-browser/mock-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "dist/src/server.d.ts",
+  "scripts": {
+    "start": "node src/server.ts",
+    "build": "tsc -b",
+    "test": "vitest run",
+    "lint": "tsc -b --pretty false"
+  }
+}
