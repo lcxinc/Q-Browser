@@ -64,7 +64,7 @@ std::unique_ptr<QLockFile> acquireActivationTransactionLock(
 {
     auto lock = std::make_unique<QLockFile>(
         applicationRoot + QStringLiteral("/.activation.lock"));
-    lock->setStaleLockTime(0);
+    lock->setStaleLockTime(30000);
 #ifdef Q_BROWSER_PACKAGE_STORE_TESTING
     if (qbrowser_package_store_testing::packageStoreTestHooks()
             .beforeActivationLockAttempt) {

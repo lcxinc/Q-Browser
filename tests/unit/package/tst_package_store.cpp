@@ -4,6 +4,7 @@
 #include "PackageStoreTestHooks.h"
 
 #include <QDir>
+#include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -91,6 +92,7 @@ private slots:
     void activationTransactionsSerializeWithoutLostUpdates();
     void canonicalCandidateKeysRejectCaseFoldedDuplicates();
     void activationLockIsNonStaleAndPreservesStateOnTimeout();
+    void recoversExpiredMalformedActivationLocks();
 };
 
 void PackageStoreTest::storesVersionDirectoriesWithoutReplacingExistingContent()
@@ -472,6 +474,9 @@ void PackageStoreTest::canonicalCandidateKeysRejectCaseFoldedDuplicates()
 
 void PackageStoreTest::activationLockIsNonStaleAndPreservesStateOnTimeout()
 {
+#ifndef Q_OS_WIN
+    QSKIP("Windows lock-file sharing semantics are unavailable");
+#else
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
@@ -490,9 +495,9 @@ void PackageStoreTest::activationLockIsNonStaleAndPreservesStateOnTimeout()
 
     const QString lockPath = store.appRoot(appId())
         + QStringLiteral("/.activation.lock");
-    QLockFile blocker(lockPath);
-    blocker.setStaleLockTime(0);
-    QVERIFY(blocker.tryLock());
+    QLockFile lockTemplate(lockPath);
+    lockTemplate.setStaleLockTime(30000);
+    QVERIFY(lockTemplate.tryLock());
     QFile liveLock(lockPath);
     QVERIFY(liveLock.open(QIODevice::ReadOnly));
     QByteArray abandonedLock = liveLock.readAll();
@@ -500,6 +505,27 @@ void PackageStoreTest::activationLockIsNonStaleAndPreservesStateOnTimeout()
     const qsizetype firstLineEnd = abandonedLock.indexOf('\n');
     QVERIFY(firstLineEnd > 0);
     abandonedLock.replace(0, firstLineEnd, QByteArrayLiteral("2147483647"));
+    lockTemplate.unlock();
+    QByteArray liveOwnerLock = abandonedLock;
+    liveOwnerLock.replace(0, liveOwnerLock.indexOf('\n'),
+                          QByteArray::number(GetCurrentProcessId()));
+    QVERIFY(writeFile(lockPath, liveOwnerLock));
+    QFile oldLiveLock(lockPath);
+    QVERIFY(oldLiveLock.open(QIODevice::ReadWrite));
+    QVERIFY(oldLiveLock.setFileTime(
+        QDateTime::currentDateTimeUtc().addSecs(-60),
+        QFileDevice::FileModificationTime));
+    oldLiveLock.close();
+    const QString nativeLockPath = QDir::toNativeSeparators(lockPath);
+    const HANDLE blocker = CreateFileW(
+        reinterpret_cast<LPCWSTR>(nativeLockPath.utf16()),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    QVERIFY(blocker != INVALID_HANDLE_VALUE);
 
     qint64 configuredStaleTime = -1;
     int configuredTimeout = -1;
@@ -512,16 +538,52 @@ void PackageStoreTest::activationLockIsNonStaleAndPreservesStateOnTimeout()
     qbrowser_package_store_testing::setPackageStoreTestHooks(std::move(hooks));
     const PackageStoreResult blocked =
         competingStore.activateForTesting(appId(), two);
+    CloseHandle(blocker);
     qbrowser_package_store_testing::resetPackageStoreTestHooks();
 
-    QCOMPARE(configuredStaleTime, qint64(0));
+    QCOMPARE(configuredStaleTime, qint64(30000));
     QCOMPARE(configuredTimeout, 5000);
     QCOMPARE(blocked.error, PackageStoreError::StateUnavailable);
     QCOMPARE(store.activationState(appId()).state.current, one);
-    blocker.unlock();
     QVERIFY(writeFile(lockPath, abandonedLock));
     QVERIFY(competingStore.activateForTesting(appId(), two).succeeded());
     QCOMPARE(store.activationState(appId()).state.current, two);
+#endif
+}
+
+void PackageStoreTest::recoversExpiredMalformedActivationLocks()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    const QString candidate = createCandidate(
+        temporary, QStringLiteral("malformed-lock"), "one");
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionOne(), digest('a'), candidate)
+                .succeeded());
+    const QString one = targetName(versionOne(), digest('a'));
+    QVERIFY(store.activateForTesting(appId(), one).succeeded());
+    const QString lockPath = store.appRoot(appId())
+        + QStringLiteral("/.activation.lock");
+
+    const QList<QByteArray> malformedLocks{
+        QByteArray{},
+        QByteArrayLiteral("2147483647\n"),
+        QByteArrayLiteral("not-a-lock\ngarbage\ngarbage\n")};
+    for (const QByteArray &contents : malformedLocks) {
+        QVERIFY(writeFile(lockPath, contents));
+        QFile oldLock(lockPath);
+        QVERIFY(oldLock.open(QIODevice::ReadWrite));
+        QVERIFY(oldLock.setFileTime(
+            QDateTime::currentDateTimeUtc().addSecs(-60),
+            QFileDevice::FileModificationTime));
+        oldLock.close();
+        const PackageStoreResult recovered =
+            store.markCurrentLastKnownGood(appId());
+        QVERIFY2(recovered.succeeded(), qPrintable(recovered.message));
+        QVERIFY(!QFileInfo::exists(lockPath));
+    }
+    QCOMPARE(store.activationState(appId()).state.current, one);
 }
 
 QTEST_APPLESS_MAIN(PackageStoreTest)
