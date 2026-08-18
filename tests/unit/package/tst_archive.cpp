@@ -1328,6 +1328,8 @@ void ArchiveTest::cleansOnlyOwnedObjectsAfterFailure()
 
     bool cleanupHookRan = false;
     bool cleanupRenameSucceeded = false;
+    bool directoryDeleteHookRan = false;
+    bool directoryDeleteRenameSucceeded = false;
     qbrowser_archive_testing::ArchiveTestHooks hooks;
     hooks.beforePublish = [&](const QString &path, const QByteArray &entry) {
         if (entry == QByteArrayLiteral("owned/b.txt")) {
@@ -1343,11 +1345,21 @@ void ArchiveTest::cleansOnlyOwnedObjectsAfterFailure()
             (void)createJunction(parent, outside);
         }
     };
+    hooks.beforeOwnedDirectoryDelete = [&](const QString &path) {
+        if (QDir::cleanPath(path).compare(
+                QDir::cleanPath(parent), Qt::CaseInsensitive)
+            == 0) {
+            directoryDeleteHookRan = true;
+            directoryDeleteRenameSucceeded = movePathNoReplace(parent, moved);
+        }
+    };
     ArchiveHookGuard guard(std::move(hooks));
     const ArchiveResult result = Archive::extract(package, staging);
     QVERIFY(!result.hasValue());
     QVERIFY(cleanupHookRan);
     QVERIFY(!cleanupRenameSucceeded);
+    QVERIFY(directoryDeleteHookRan);
+    QVERIFY(!directoryDeleteRenameSucceeded);
     QVERIFY(!QFileInfo::exists(parent + QStringLiteral("/a.txt")));
     QFile targetFile(target);
     QVERIFY(targetFile.open(QIODevice::ReadOnly));

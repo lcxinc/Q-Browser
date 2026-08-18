@@ -19,6 +19,7 @@ struct ArchiveTestHooks final
     std::function<void(const QString &, const QByteArray &)> afterTemporaryReady;
     std::function<void(const QString &, const QByteArray &)> beforePublish;
     std::function<void(const QString &)> beforeFailureCleanup;
+    std::function<void(const QString &)> beforeOwnedDirectoryDelete;
     std::function<void(const QString &, quint32, bool)> afterWindowsHandleOpened;
     std::function<quint32(quint32)> limitWindowsWriteRequest;
     std::function<bool()> allowWindowsFlush;

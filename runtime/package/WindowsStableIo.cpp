@@ -223,8 +223,6 @@ bool WindowsStableDirectoryTree::createAndHoldDirectory(const QString &path)
         return false;
     }
     if (!addDirectory(path, true)) {
-        (void)RemoveDirectoryW(
-            reinterpret_cast<LPCWSTR>(absolutePath(path).utf16()));
         return false;
     }
     return true;
@@ -269,9 +267,15 @@ void WindowsStableDirectoryTree::cleanupCreatedDirectories() noexcept
         if (!iterator->created || !iterator->handle.isValid()) {
             continue;
         }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks()
+                .beforeOwnedDirectoryDelete) {
+            qbrowser_archive_testing::archiveTestHooks()
+                .beforeOwnedDirectoryDelete(iterator->path);
+        }
+#endif
+        deleteOnClose(iterator->handle.get());
         iterator->handle.reset();
-        (void)RemoveDirectoryW(
-            reinterpret_cast<LPCWSTR>(iterator->path.utf16()));
     }
 }
 
