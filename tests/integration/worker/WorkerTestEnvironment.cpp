@@ -13,8 +13,6 @@
 #include <sddl.h>
 #include <userenv.h>
 
-#include <algorithm>
-
 namespace {
 
 class UniqueHandle final
@@ -92,15 +90,34 @@ SessionReceiveResult receiveUntil(IpcSession &session,
                                   const ProtocolType expectedType,
                                   const int timeoutMs)
 {
+    constexpr qsizetype heartbeatBurstAllowance = 32;
+    constexpr int minimumHeartbeatIntervalMs = 20;
+    const auto timeout = [](const QString &errorCode) {
+        return SessionReceiveResult{SessionStatus::TimedOut, std::nullopt, errorCode};
+    };
+    if (timeoutMs <= 0) {
+        return timeout(QStringLiteral("worker.test.receive_timeout"));
+    }
+    const qsizetype maximumSkippedHeartbeats = heartbeatBurstAllowance
+        + static_cast<qsizetype>(timeoutMs / minimumHeartbeatIntervalMs);
+    qsizetype skippedHeartbeats = 0;
     QElapsedTimer elapsed;
     elapsed.start();
     for (;;) {
-        const int remaining = std::max(0, timeoutMs - static_cast<int>(elapsed.elapsed()));
+        const qint64 elapsedMs = elapsed.elapsed();
+        if (elapsedMs >= timeoutMs) {
+            return timeout(QStringLiteral("worker.test.receive_timeout"));
+        }
+        const int remaining = timeoutMs - static_cast<int>(elapsedMs);
         SessionReceiveResult result = session.receive(remaining);
         if (result.status != SessionStatus::MessageReady || !result.message.has_value()
             || result.message->type() == expectedType
             || result.message->type() != ProtocolType::Heartbeat) {
             return result;
+        }
+        ++skippedHeartbeats;
+        if (skippedHeartbeats >= maximumSkippedHeartbeats) {
+            return timeout(QStringLiteral("worker.test.heartbeat_limit"));
         }
     }
 }
