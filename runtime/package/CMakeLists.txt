@@ -8,6 +8,7 @@ add_library(q_browser_package STATIC
   ArchiveTestHooks.h
   CanonicalArchivePath.cpp
   CanonicalArchivePath.h
+  CandidateMemberKeys.h
   ContentDigest.cpp
   ContentDigest.h
   JsonPreflight.cpp

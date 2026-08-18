@@ -10,6 +10,8 @@ namespace qbrowser_package_store_testing
 {
 struct PackageStoreTestHooks final
 {
+    std::function<void(const QString &, qint64, int)>
+        beforeActivationLockAttempt;
     std::function<void(const QString &, const QString &)>
         afterActivationLockAcquired;
 };

@@ -25,6 +25,33 @@
 
 namespace
 {
+#ifdef Q_OS_WIN
+bool enableCaseSensitiveDirectory(const QString &path)
+{
+    const QString native = QDir::toNativeSeparators(path);
+    const HANDLE directory = CreateFileW(
+        reinterpret_cast<LPCWSTR>(native.utf16()),
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (directory == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    FILE_CASE_SENSITIVE_INFO info{FILE_CS_FLAG_CASE_SENSITIVE_DIR};
+    const bool enabled = SetFileInformationByHandle(
+                             directory,
+                             FileCaseSensitiveInfo,
+                             &info,
+                             sizeof(info))
+        != FALSE;
+    CloseHandle(directory);
+    return enabled;
+}
+#endif
+
 class PackageTemporaryDir final : public QTemporaryDir
 {
 public:
@@ -152,6 +179,7 @@ private slots:
     void changedSignatureFailsBeforeActivation();
     void archiveEntryLimitAcceptsMaximumAndRejectsMaximumPlusOne();
     void injectedCandidateMembersKeepCleanupHandleCountBounded();
+    void caseFoldedRaceMembersFailBeforePublication();
     void activationFailureDoesNotChangeCurrent();
     void postVerificationNewMemberCannotPublishUnderOldDigest();
     void postVerificationReplacementCannotPublishUnderOldDigest();
@@ -565,6 +593,65 @@ void PackageInstallerTest::injectedCandidateMembersKeepCleanupHandleCountBounded
     QVERIFY2(handlesAfterInjection <= 20,
              qPrintable(QStringLiteral("held %1 post-injection handles")
                             .arg(handlesAfterInjection)));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+#endif
+}
+
+void PackageInstallerTest::caseFoldedRaceMembersFailBeforePublication()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows case-sensitive directory mode is unavailable");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("case-fold-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool caseSensitiveReady = false;
+    bool raceHookRan = false;
+    bool fileInserted = false;
+    bool directoryInserted = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidateCommit = [&](const QString &candidateRoot) {
+        caseSensitiveReady = enableCaseSensitiveDirectory(candidateRoot)
+            && enableCaseSensitiveDirectory(
+                candidateRoot + QStringLiteral("/qml"));
+    };
+    hooks.afterCandidateScanBeforeSeal = [&](const QString &candidateRoot) {
+        raceHookRan = true;
+        if (!caseSensitiveReady) {
+            return;
+        }
+        directoryInserted = QDir().mkdir(
+            candidateRoot + QStringLiteral("/QML"));
+        QFile collision(candidateRoot + QStringLiteral("/qml/main.qml"));
+        fileInserted = collision.open(QIODevice::WriteOnly)
+            && collision.write("unauthenticated case collision") == qint64(30);
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("case-fold-race"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    if (!caseSensitiveReady) {
+        QSKIP("The test volume cannot enable per-directory case sensitivity");
+    }
+    QVERIFY(raceHookRan);
+    QVERIFY(fileInserted);
+    QVERIFY(directoryInserted);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
 #endif
 }

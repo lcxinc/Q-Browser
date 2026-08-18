@@ -1,5 +1,6 @@
 #include "PackageStore.h"
 #include "Archive.h"
+#include "CandidateMemberKeys.h"
 #include "CanonicalArchivePath.h"
 #include "ContentDigest.h"
 #include "PackageInstallerTestHooks.h"
@@ -10,6 +11,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QLockFile>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -62,7 +64,17 @@ std::unique_ptr<QLockFile> acquireActivationTransactionLock(
 {
     auto lock = std::make_unique<QLockFile>(
         applicationRoot + QStringLiteral("/.activation.lock"));
-    lock->setStaleLockTime(30000);
+    lock->setStaleLockTime(0);
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+    if (qbrowser_package_store_testing::packageStoreTestHooks()
+            .beforeActivationLockAttempt) {
+        qbrowser_package_store_testing::packageStoreTestHooks()
+            .beforeActivationLockAttempt(
+                applicationRoot,
+                lock->staleLockTime(),
+                5000);
+    }
+#endif
     if (!lock->tryLock(5000)) {
         return {};
     }
@@ -114,9 +126,7 @@ QString candidateMemberKey(
 {
     QString relative = QDir::fromNativeSeparators(
         QDir(root).relativeFilePath(path));
-#ifdef Q_OS_WIN
-    relative = relative.toCaseFolded();
-#endif
+    relative = qbrowser_package_detail::canonicalCandidatePath(relative);
     return (directory ? QStringLiteral("d:") : QStringLiteral("f:")) + relative;
 }
 
@@ -132,6 +142,7 @@ std::optional<QSet<QString>> candidateMemberSet(
     const ArchiveLimits &limits)
 {
     QSet<QString> result;
+    QSet<QString> canonicalPaths;
     QDirIterator iterator(
         root,
         QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
@@ -146,6 +157,9 @@ std::optional<QSet<QString>> candidateMemberSet(
             QDir(root).relativeFilePath(path));
         const QString key = candidateMemberKey(root, path, info.isDir());
         if (result.size() >= expectedMembers.size()
+            || result.contains(key)
+            || !qbrowser_package_detail::insertCanonicalCandidatePath(
+                canonicalPaths, relative)
             || !expectedMembers.contains(key)
             || candidateDepth(relative) > maximumDepth
             || !qbrowser_archive_detail::validateArchivePath(
@@ -164,11 +178,8 @@ void addExpectedParentDirectories(
 {
     QString parent = QFileInfo(relativeFile).path();
     while (!parent.isEmpty() && parent != QLatin1String(".")) {
-#ifdef Q_OS_WIN
-        expectedDirectories.insert(parent.toCaseFolded());
-#else
-        expectedDirectories.insert(parent);
-#endif
+        expectedDirectories.insert(
+            qbrowser_package_detail::canonicalCandidatePath(parent));
         parent = QFileInfo(parent).path();
     }
 }
@@ -343,6 +354,9 @@ PackageStoreResult PackageStore::commitCandidateImpl(
                            QStringLiteral("authenticated candidate is invalid"));
         }
         bool authenticatedSignatureMatched = false;
+        QSet<QString> verifiedCanonicalFiles;
+        QSet<QString> verifiedCanonicalDirectories;
+        QHash<QString, QString> verifiedDirectorySpellings;
         for (const ArchiveFile &file : *authenticatedFiles) {
             const auto checked = qbrowser_archive_detail::validateArchivePath(
                 file.path, limits);
@@ -351,18 +365,38 @@ PackageStoreResult PackageStore::commitCandidateImpl(
                                QStringLiteral("authenticated candidate is invalid"));
             }
             const QString relative = QString::fromUtf8(file.path);
-            verifiedMembers.insert(
-                QStringLiteral("f:")
-#ifdef Q_OS_WIN
-                + relative.toCaseFolded()
-#else
-                + relative
-#endif
-            );
-            QSet<QString> parentDirectories;
-            addExpectedParentDirectories(relative, parentDirectories);
-            for (const QString &parentDirectory : std::as_const(parentDirectories)) {
-                verifiedMembers.insert(QStringLiteral("d:") + parentDirectory);
+            const QString canonical =
+                qbrowser_package_detail::canonicalCandidatePath(relative);
+            if (verifiedCanonicalDirectories.contains(canonical)
+                || !qbrowser_package_detail::insertCanonicalCandidatePath(
+                    verifiedCanonicalFiles, relative)) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("authenticated members collide"));
+            }
+            verifiedMembers.insert(QStringLiteral("f:") + canonical);
+            QString parentDirectory = QFileInfo(relative).path();
+            while (!parentDirectory.isEmpty()
+                   && parentDirectory != QLatin1String(".")) {
+                const QString normalizedParent =
+                    QDir::fromNativeSeparators(parentDirectory)
+                        .normalized(QString::NormalizationForm_C);
+                const QString canonicalParent =
+                    qbrowser_package_detail::canonicalCandidatePath(
+                        normalizedParent);
+                const auto spelling = verifiedDirectorySpellings.constFind(
+                    canonicalParent);
+                if (verifiedCanonicalFiles.contains(canonicalParent)
+                    || (spelling != verifiedDirectorySpellings.cend()
+                        && *spelling != normalizedParent)) {
+                    return failure(
+                        PackageStoreError::CandidateCommitFailed,
+                        QStringLiteral("authenticated members collide"));
+                }
+                verifiedCanonicalDirectories.insert(canonicalParent);
+                verifiedDirectorySpellings.insert(
+                    canonicalParent, normalizedParent);
+                verifiedMembers.insert(QStringLiteral("d:") + canonicalParent);
+                parentDirectory = QFileInfo(parentDirectory).path();
             }
             maximumCandidateDepth = std::max(
                 maximumCandidateDepth, candidateDepth(relative));
@@ -378,6 +412,7 @@ PackageStoreResult PackageStore::commitCandidateImpl(
         QSet<QString> actualDirectories;
         QSet<QString> expectedDirectories;
         QSet<QString> actualMembers;
+        QSet<QString> actualCanonicalPaths;
         bool actualSignatureMatched = false;
         quint64 totalBytes = 0;
         QDirIterator iterator(
@@ -396,6 +431,9 @@ PackageStoreResult PackageStore::commitCandidateImpl(
             const QString memberKey = candidateMemberKey(
                 candidateRoot, path, info.isDir());
             if (actualMembers.size() >= verifiedMembers.size()
+                || actualMembers.contains(memberKey)
+                || !qbrowser_package_detail::insertCanonicalCandidatePath(
+                    actualCanonicalPaths, relative)
                 || !verifiedMembers.contains(memberKey)
                 || candidateDepth(relative) > maximumCandidateDepth
                 || !qbrowser_archive_detail::validateArchivePath(
@@ -412,10 +450,12 @@ PackageStoreResult PackageStore::commitCandidateImpl(
                                    QStringLiteral("candidate identity changed"));
                 }
 #endif
-                QString relativeDirectory = relative;
-#ifdef Q_OS_WIN
-                relativeDirectory = relativeDirectory.toCaseFolded();
-#endif
+                const QString relativeDirectory =
+                    qbrowser_package_detail::canonicalCandidatePath(relative);
+                if (actualDirectories.contains(relativeDirectory)) {
+                    return failure(PackageStoreError::CandidateCommitFailed,
+                                   QStringLiteral("candidate members collide"));
+                }
                 actualDirectories.insert(relativeDirectory);
                 continue;
             }
@@ -508,6 +548,13 @@ PackageStoreResult PackageStore::commitCandidateImpl(
             return failure(PackageStoreError::CandidateCommitFailed,
                            QStringLiteral("candidate identity changed"));
         }
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+        if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+                .afterCandidateScanBeforeSeal) {
+            qbrowser_package_installer_testing::packageInstallerTestHooks()
+                .afterCandidateScanBeforeSeal(candidateRoot);
+        }
+#endif
         const bool filesSealed = std::ranges::all_of(
             candidateLockedFiles,
             [](auto &file) { return file.sealMutationsForMove(); });

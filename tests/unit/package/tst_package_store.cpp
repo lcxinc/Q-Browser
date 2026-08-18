@@ -1,5 +1,6 @@
 #include "PackageStore.h"
 #include "ArchiveTestHooks.h"
+#include "CandidateMemberKeys.h"
 #include "PackageStoreTestHooks.h"
 
 #include <QDir>
@@ -7,6 +8,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLockFile>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -87,6 +89,8 @@ private slots:
     void rejectsInvalidOrEscapingPointerTargets();
     void pinsStoreDirectoriesDuringStateCommit();
     void activationTransactionsSerializeWithoutLostUpdates();
+    void canonicalCandidateKeysRejectCaseFoldedDuplicates();
+    void activationLockIsNonStaleAndPreservesStateOnTimeout();
 };
 
 void PackageStoreTest::storesVersionDirectoriesWithoutReplacingExistingContent()
@@ -453,6 +457,71 @@ void PackageStoreTest::activationTransactionsSerializeWithoutLostUpdates()
     QCOMPARE(rolledBack.current, one);
     QCOMPARE(rolledBack.previous, two);
     QCOMPARE(rolledBack.lastKnownGood, one);
+}
+
+void PackageStoreTest::canonicalCandidateKeysRejectCaseFoldedDuplicates()
+{
+    QSet<QString> paths;
+    QVERIFY(qbrowser_package_detail::insertCanonicalCandidatePath(
+        paths, QStringLiteral("qml/Main.qml")));
+    QVERIFY(!qbrowser_package_detail::insertCanonicalCandidatePath(
+        paths, QStringLiteral("QML/main.qml")));
+    QVERIFY(!qbrowser_package_detail::insertCanonicalCandidatePath(
+        paths, QStringLiteral("qml/MAIN.QML")));
+}
+
+void PackageStoreTest::activationLockIsNonStaleAndPreservesStateOnTimeout()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageStore competingStore(store.root());
+    const QString first = createCandidate(temporary, QStringLiteral("lock-one"), "one");
+    const QString second = createCandidate(temporary, QStringLiteral("lock-two"), "two");
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionOne(), digest('a'), first)
+                .succeeded());
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionTwo(), digest('b'), second)
+                .succeeded());
+    const QString one = targetName(versionOne(), digest('a'));
+    const QString two = targetName(versionTwo(), digest('b'));
+    QVERIFY(store.activateForTesting(appId(), one).succeeded());
+
+    const QString lockPath = store.appRoot(appId())
+        + QStringLiteral("/.activation.lock");
+    QLockFile blocker(lockPath);
+    blocker.setStaleLockTime(0);
+    QVERIFY(blocker.tryLock());
+    QFile liveLock(lockPath);
+    QVERIFY(liveLock.open(QIODevice::ReadOnly));
+    QByteArray abandonedLock = liveLock.readAll();
+    liveLock.close();
+    const qsizetype firstLineEnd = abandonedLock.indexOf('\n');
+    QVERIFY(firstLineEnd > 0);
+    abandonedLock.replace(0, firstLineEnd, QByteArrayLiteral("2147483647"));
+
+    qint64 configuredStaleTime = -1;
+    int configuredTimeout = -1;
+    qbrowser_package_store_testing::PackageStoreTestHooks hooks;
+    hooks.beforeActivationLockAttempt =
+        [&](const QString &, const qint64 staleTime, const int timeout) {
+            configuredStaleTime = staleTime;
+            configuredTimeout = timeout;
+        };
+    qbrowser_package_store_testing::setPackageStoreTestHooks(std::move(hooks));
+    const PackageStoreResult blocked =
+        competingStore.activateForTesting(appId(), two);
+    qbrowser_package_store_testing::resetPackageStoreTestHooks();
+
+    QCOMPARE(configuredStaleTime, qint64(0));
+    QCOMPARE(configuredTimeout, 5000);
+    QCOMPARE(blocked.error, PackageStoreError::StateUnavailable);
+    QCOMPARE(store.activationState(appId()).state.current, one);
+    blocker.unlock();
+    QVERIFY(writeFile(lockPath, abandonedLock));
+    QVERIFY(competingStore.activateForTesting(appId(), two).succeeded());
+    QCOMPARE(store.activationState(appId()).state.current, two);
 }
 
 QTEST_APPLESS_MAIN(PackageStoreTest)
