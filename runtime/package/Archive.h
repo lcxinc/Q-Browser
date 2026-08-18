@@ -14,6 +14,7 @@ enum class ArchiveErrorCode
     SourceUnavailable,
     DestinationUnavailable,
     InvalidArchive,
+    NonCanonicalArchive,
     ArchiveSizeLimit,
     InvalidEntryPath,
     DuplicateEntryPath,
@@ -42,6 +43,14 @@ struct ArchiveEntry final
     [[nodiscard]] bool isIncludedInContentDigest() const noexcept;
 };
 
+struct ArchiveFile final
+{
+    QByteArray path;
+    QByteArray contents;
+
+    friend bool operator==(const ArchiveFile &, const ArchiveFile &) = default;
+};
+
 namespace qbrowser_archive_detail
 {
 class ArchiveResultFactory;
@@ -65,6 +74,23 @@ private:
     ArchiveError m_error;
 };
 
+class ArchiveSnapshotResult final
+{
+public:
+    [[nodiscard]] bool hasValue() const noexcept;
+    [[nodiscard]] const QVector<ArchiveFile> &files() const noexcept;
+    [[nodiscard]] const ArchiveError &error() const noexcept;
+
+private:
+    friend class Archive;
+
+    explicit ArchiveSnapshotResult(QVector<ArchiveFile> files);
+    explicit ArchiveSnapshotResult(ArchiveError error);
+
+    std::optional<QVector<ArchiveFile>> m_files;
+    ArchiveError m_error;
+};
+
 class Archive final
 {
 public:
@@ -73,7 +99,16 @@ public:
         const QString &sourceRoot,
         const QString &archivePath,
         const ArchiveLimits &limits = {});
+    [[nodiscard]] static ArchiveResult createFromFiles(
+        const QVector<ArchiveFile> &files,
+        const QString &archivePath,
+        const ArchiveLimits &limits = {});
     [[nodiscard]] static ArchiveResult inspect(
+        const QString &archivePath,
+        const ArchiveLimits &limits = {});
+    // Reads, validates, and materializes entries from one immutable in-memory
+    // image so callers cannot observe different package versions.
+    [[nodiscard]] static ArchiveSnapshotResult snapshot(
         const QString &archivePath,
         const ArchiveLimits &limits = {});
     // stagingRoot must already exist as an empty, non-reparse directory.

@@ -67,3 +67,20 @@ never point at a workspace that does not exist yet.
 - `tools/node_modules/`, `dist/`, `coverage/`, TypeScript build metadata, Visual Studio user files, and logs are generated and ignored.
 
 Do not commit generated output or runtime state.
+
+## Package signing CLI
+
+`qbrowser-package` provides a stable four-command development workflow:
+
+```powershell
+qbrowser-package keygen --private-key keys/dev/private.pem --public-key keys/dev/public.pem
+qbrowser-package pack --source path/to/package-tree --output unsigned.qapkg
+qbrowser-package sign --package unsigned.qapkg --private-key keys/dev/private.pem --output signed.qapkg
+qbrowser-package inspect --package signed.qapkg --public-key keys/dev/public.pem
+```
+
+`pack` writes a deterministic archive and canonical lowercase payload digest.
+`sign` validates that digest, signs a separate domain-separated digest that
+includes `metadata/content.sha256`, and writes a new archive. `inspect` emits
+one compact JSON object on standard output and returns zero only when the
+archive, manifest, digest, public key, and Ed25519 signature all verify.

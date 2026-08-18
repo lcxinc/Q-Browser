@@ -10,6 +10,7 @@
 #include <QSaveFile>
 #include <QSet>
 #include <QStringDecoder>
+#include <QTemporaryDir>
 #include <QUuid>
 #include <QtEndian>
 
@@ -63,6 +64,10 @@ ArchiveResult fail(ArchiveErrorCode code, QByteArray path, QString message)
 
 ArchiveResult inspectBytes(
     const QByteArray &bytes,
+    const ArchiveLimits &limits);
+ArchiveResult createFromBuffers(
+    const QVector<ArchiveFile> &files,
+    const QString &archivePath,
     const ArchiveLimits &limits);
 bool isReparsePoint(const QString &path);
 bool pathChainContainsReparsePoint(const QString &path);
@@ -627,6 +632,32 @@ const ArchiveError &ArchiveResult::error() const noexcept
     return m_error;
 }
 
+ArchiveSnapshotResult::ArchiveSnapshotResult(QVector<ArchiveFile> files)
+    : m_files(std::move(files))
+{
+}
+
+ArchiveSnapshotResult::ArchiveSnapshotResult(ArchiveError error)
+    : m_error(std::move(error))
+{
+}
+
+bool ArchiveSnapshotResult::hasValue() const noexcept
+{
+    return m_files.has_value();
+}
+
+const QVector<ArchiveFile> &ArchiveSnapshotResult::files() const noexcept
+{
+    static const QVector<ArchiveFile> empty;
+    return m_files.has_value() ? *m_files : empty;
+}
+
+const ArchiveError &ArchiveSnapshotResult::error() const noexcept
+{
+    return m_error;
+}
+
 ArchiveResult Archive::create(
     const QString &sourceRoot,
     const QString &archivePath,
@@ -902,6 +933,14 @@ ArchiveResult Archive::create(
     return verified;
 }
 
+ArchiveResult Archive::createFromFiles(
+    const QVector<ArchiveFile> &files,
+    const QString &archivePath,
+    const ArchiveLimits &limits)
+{
+    return createFromBuffers(files, archivePath, limits);
+}
+
 namespace
 {
 ArchiveResult inspectBytes(
@@ -1122,6 +1161,148 @@ ArchiveResult inspectBytes(
         std::move(entries));
 }
 
+ArchiveResult createFromBuffers(
+    const QVector<ArchiveFile> &files,
+    const QString &archivePath,
+    const ArchiveLimits &limits)
+{
+    if (static_cast<quint64>(files.size()) > limits.maximumEntries) {
+        return fail(
+            ArchiveErrorCode::EntryCountLimit,
+            {},
+            QStringLiteral("archive entry count is too large"));
+    }
+    QVector<ArchiveFile> sorted = files;
+    QVector<CollisionPath> collisionPaths;
+    collisionPaths.reserve(sorted.size());
+    quint64 totalSize = 0;
+    for (const ArchiveFile &entry : sorted) {
+        const std::optional<CheckedPath> checkedPath = validateEntryPath(
+            entry.path, limits);
+        if (!checkedPath.has_value()) {
+            return fail(
+                ArchiveErrorCode::InvalidEntryPath,
+                entry.path,
+                QStringLiteral("archive source path is invalid"));
+        }
+        collisionPaths.push_back(
+            {checkedPath->collisionKey, entry.path, checkedPath->isCanonical});
+        const quint64 size = static_cast<quint64>(entry.contents.size());
+        if (size > limits.maximumEntryBytes) {
+            return fail(
+                ArchiveErrorCode::EntrySizeLimit,
+                entry.path,
+                QStringLiteral("archive entry is too large"));
+        }
+        if (totalSize > limits.maximumTotalBytes
+            || size > limits.maximumTotalBytes - totalSize) {
+            return fail(
+                ArchiveErrorCode::TotalSizeLimit,
+                entry.path,
+                QStringLiteral("archive contents are too large"));
+        }
+        totalSize += size;
+    }
+    if (const std::optional<QByteArray> collision = findPathCollision(collisionPaths);
+        collision.has_value()) {
+        return fail(
+            ArchiveErrorCode::DuplicateEntryPath,
+            *collision,
+            QStringLiteral("archive source paths collide"));
+    }
+    if (const std::optional<QByteArray> nonCanonical = firstNonCanonicalPath(collisionPaths);
+        nonCanonical.has_value()) {
+        return fail(
+            ArchiveErrorCode::InvalidEntryPath,
+            *nonCanonical,
+            QStringLiteral("archive source path is invalid"));
+    }
+    std::sort(
+        sorted.begin(), sorted.end(), [](const ArchiveFile &left, const ArchiveFile &right) {
+            return bytewiseLess(left.path, right.path);
+        });
+
+    mz_zip_archive writer{};
+    mz_zip_zero_struct(&writer);
+    if (mz_zip_writer_init_heap(&writer, 0, 0) != MZ_TRUE) {
+        return fail(
+            ArchiveErrorCode::DestinationUnavailable,
+            {},
+            QStringLiteral("archive writer could not be initialized"));
+    }
+    constexpr mz_uint writerFlags = static_cast<mz_uint>(6)
+        | MZ_ZIP_FLAG_WRITE_HEADER_SET_SIZE;
+    for (const ArchiveFile &entry : sorted) {
+        if (mz_zip_writer_add_read_buf_callback(
+                &writer,
+                entry.path.constData(),
+                readMemory,
+                const_cast<QByteArray *>(&entry.contents),
+                static_cast<mz_uint64>(entry.contents.size()),
+                nullptr,
+                nullptr,
+                0,
+                writerFlags,
+                nullptr,
+                0,
+                nullptr,
+                0)
+            != MZ_TRUE) {
+            (void)mz_zip_writer_end(&writer);
+            return fail(
+                ArchiveErrorCode::DestinationUnavailable,
+                entry.path,
+                QStringLiteral("archive could not be created"));
+        }
+    }
+
+    void *archiveBytes = nullptr;
+    size_t archiveSize = 0;
+    if (mz_zip_writer_finalize_heap_archive(&writer, &archiveBytes, &archiveSize)
+        != MZ_TRUE) {
+        (void)mz_zip_writer_end(&writer);
+        return fail(
+            ArchiveErrorCode::DestinationUnavailable,
+            {},
+            QStringLiteral("archive could not be created"));
+    }
+    (void)mz_zip_writer_end(&writer);
+    if (archiveSize > static_cast<size_t>(std::numeric_limits<qint64>::max())
+        || static_cast<quint64>(archiveSize) > limits.maximumArchiveBytes) {
+        mz_free(archiveBytes);
+        return fail(
+            ArchiveErrorCode::ArchiveSizeLimit,
+            {},
+            QStringLiteral("archive size is too large"));
+    }
+    QByteArray deterministicBytes(
+        static_cast<const char *>(archiveBytes),
+        static_cast<qsizetype>(archiveSize));
+    mz_free(archiveBytes);
+    if (!applyDeterministicCentralMetadata(deterministicBytes)) {
+        return fail(
+            ArchiveErrorCode::DestinationUnavailable,
+            {},
+            QStringLiteral("archive metadata could not be finalized"));
+    }
+    const ArchiveResult verified = inspectBytes(deterministicBytes, limits);
+    if (!verified.hasValue()) {
+        return verified;
+    }
+    QSaveFile output(archivePath);
+    const bool opened = output.open(QIODevice::WriteOnly);
+    const bool wrote = opened
+        && output.write(deterministicBytes) == deterministicBytes.size();
+    if (!wrote || !output.commit()) {
+        output.cancelWriting();
+        return fail(
+            ArchiveErrorCode::DestinationUnavailable,
+            {},
+            QStringLiteral("archive destination is unavailable"));
+    }
+    return verified;
+}
+
 bool isReparsePoint(const QString &path)
 {
 #ifdef Q_OS_WIN
@@ -1206,6 +1387,89 @@ ArchiveResult Archive::inspect(
             QStringLiteral("archive source could not be read"));
     }
     return inspectBytes(archiveRead.bytes, limits);
+}
+
+ArchiveSnapshotResult Archive::snapshot(
+    const QString &archivePath,
+    const ArchiveLimits &limits)
+{
+    QFile input(archivePath);
+    if (!input.open(QIODevice::ReadOnly)) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::SourceUnavailable,
+                                      {},
+                                      QStringLiteral("archive source is unavailable")});
+    }
+    const BoundedReadResult archiveRead = readAtMost(
+        input, limits.maximumArchiveBytes);
+    if (archiveRead.status == BoundedReadStatus::LimitExceeded) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::ArchiveSizeLimit,
+                                      {},
+                                      QStringLiteral("archive size is too large")});
+    }
+    if (archiveRead.status != BoundedReadStatus::Ok) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::SourceUnavailable,
+                                      {},
+                                      QStringLiteral("archive source could not be read")});
+    }
+    const ArchiveResult inspected = inspectBytes(archiveRead.bytes, limits);
+    if (!inspected.hasValue()) {
+        return ArchiveSnapshotResult(inspected.error());
+    }
+    ZipReader reader;
+    if (!reader.initialize(archiveRead.bytes)) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::InvalidArchive,
+                                      {},
+                                      QStringLiteral("archive structure is invalid")});
+    }
+    QVector<ArchiveFile> files;
+    files.reserve(inspected.entries().size());
+    for (mz_uint index = 0;
+         index < static_cast<mz_uint>(inspected.entries().size());
+         ++index) {
+        const ArchiveEntry &entry = inspected.entries().at(
+            static_cast<qsizetype>(index));
+        QByteArray contents;
+        contents.reserve(static_cast<qsizetype>(entry.uncompressedSize));
+        if (!readEntryStream(
+                reader.get(),
+                index,
+                entry.uncompressedSize,
+                [&contents](const char *data, size_t size) {
+                    contents.append(data, static_cast<qsizetype>(size));
+                    return true;
+                })) {
+            return ArchiveSnapshotResult({ArchiveErrorCode::ExtractionFailed,
+                                          entry.path,
+                                          QStringLiteral("archive entry snapshot failed")});
+        }
+        files.push_back({entry.path, std::move(contents)});
+    }
+    std::sort(
+        files.begin(), files.end(), [](const ArchiveFile &left, const ArchiveFile &right) {
+            return bytewiseLess(left.path, right.path);
+        });
+    QTemporaryDir canonicalDirectory;
+    if (!canonicalDirectory.isValid()) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::DestinationUnavailable,
+                                      {},
+                                      QStringLiteral("canonical snapshot could not be created")});
+    }
+    const QString canonicalPath = canonicalDirectory.filePath(
+        QStringLiteral("canonical.qapkg"));
+    const ArchiveResult canonical = createFromBuffers(files, canonicalPath, limits);
+    QFile canonicalFile(canonicalPath);
+    if (!canonical.hasValue() || !canonicalFile.open(QIODevice::ReadOnly)) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::DestinationUnavailable,
+                                      {},
+                                      QStringLiteral("canonical snapshot could not be created")});
+    }
+    const QByteArray canonicalBytes = canonicalFile.readAll();
+    if (canonicalBytes != archiveRead.bytes) {
+        return ArchiveSnapshotResult({ArchiveErrorCode::NonCanonicalArchive,
+                                      {},
+                                      QStringLiteral("archive encoding is not canonical")});
+    }
+    return ArchiveSnapshotResult(std::move(files));
 }
 
 ArchiveResult Archive::extract(

@@ -4,12 +4,16 @@ add_library(q_browser_package STATIC
   ArchiveLimits.h
   ArchiveTestHooks.cpp
   ArchiveTestHooks.h
+  ContentDigest.cpp
+  ContentDigest.h
   JsonPreflight.cpp
   JsonPreflight.h
   Manifest.cpp
   Manifest.h
   ManifestError.h
   ManifestResourceLimits.h
+  SignatureVerifier.cpp
+  SignatureVerifier.h
   WindowsStableIo.cpp
   WindowsStableIo.h)
 
@@ -22,7 +26,8 @@ target_link_libraries(q_browser_package
     Qt6::Core
   PRIVATE
     q_browser_router
-    miniz)
+    miniz
+    OpenSSL::Crypto)
 
 q_browser_enable_strict_warnings(q_browser_package)
 

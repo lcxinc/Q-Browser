@@ -38,3 +38,18 @@ q_browser_enable_strict_warnings(tst_archive)
 q_browser_add_qt_test(
   NAME archive
   TARGET tst_archive)
+
+add_executable(tst_signature
+  tst_signature.cpp)
+
+target_link_libraries(tst_signature
+  PRIVATE
+    q_browser_package
+    OpenSSL::Crypto
+    Qt6::Test)
+
+q_browser_enable_strict_warnings(tst_signature)
+
+q_browser_add_qt_test(
+  NAME signature
+  TARGET tst_signature)

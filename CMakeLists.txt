@@ -21,6 +21,7 @@ include(cmake/Testing.cmake)
 add_subdirectory(runtime)
 add_subdirectory(apps)
 add_subdirectory(qml)
+add_subdirectory(tools/package-cli)
 
 if(BUILD_TESTING)
   add_subdirectory(tests)
