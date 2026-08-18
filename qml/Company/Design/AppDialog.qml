@@ -21,7 +21,7 @@ Dialog {
     palette.text: Theme.textPrimary
     palette.button: Theme.primary
     palette.buttonText: Theme.textOnPrimary
-    palette.highlight: Theme.primary
+    palette.highlight: Theme.focusOnPrimary
     palette.highlightedText: Theme.textOnPrimary
 
     Overlay.modal: Rectangle {

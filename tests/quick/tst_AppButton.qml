@@ -79,6 +79,10 @@ TestCase {
         button.forceActiveFocus(Qt.TabFocusReason)
 
         verify(button.focusVisible)
+        compare(button.background.border.color.toString(),
+                Theme.focusOnPrimary.toString())
+        verify(contrast(button.background.border.color,
+                        button.background.color) >= 3.0)
         compare(button.Accessible.name, "Save order")
         compare(button.Accessible.role, Accessible.Button)
     }

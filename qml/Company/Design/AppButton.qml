@@ -51,6 +51,6 @@ Button {
         color: !root.enabled ? Theme.disabled
                              : root.down ? Theme.primaryPressed : Theme.primary
         border.width: root.focusVisible ? Spacing.focusRing : 0
-        border.color: Theme.focus
+        border.color: Theme.focusOnPrimary
     }
 }
