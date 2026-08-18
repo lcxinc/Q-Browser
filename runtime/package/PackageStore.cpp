@@ -1,6 +1,7 @@
 #include "PackageStore.h"
 #include "Archive.h"
 #include "ContentDigest.h"
+#include "PackageInstallerTestHooks.h"
 #include "WindowsStableIo.h"
 
 #include <QDir>
@@ -9,6 +10,9 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
+
+#include <optional>
 
 namespace
 {
@@ -87,6 +91,52 @@ bool pathIsWithin(const QString &root, const QString &candidate)
 #endif
 }
 
+QString candidateMemberKey(
+    const QString &root,
+    const QString &path,
+    const bool directory)
+{
+    QString relative = QDir::fromNativeSeparators(
+        QDir(root).relativeFilePath(path));
+#ifdef Q_OS_WIN
+    relative = relative.toCaseFolded();
+#endif
+    return (directory ? QStringLiteral("d:") : QStringLiteral("f:")) + relative;
+}
+
+std::optional<QSet<QString>> candidateMemberSet(const QString &root)
+{
+    QSet<QString> result;
+    QDirIterator iterator(
+        root,
+        QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString path = iterator.next();
+        const QFileInfo info = iterator.fileInfo();
+        if (info.isSymLink() || (!info.isDir() && !info.isFile())) {
+            return std::nullopt;
+        }
+        result.insert(candidateMemberKey(root, path, info.isDir()));
+    }
+    return result;
+}
+
+void addExpectedParentDirectories(
+    const QString &relativeFile,
+    QSet<QString> &expectedDirectories)
+{
+    QString parent = QFileInfo(relativeFile).path();
+    while (!parent.isEmpty() && parent != QLatin1String(".")) {
+#ifdef Q_OS_WIN
+        expectedDirectories.insert(parent.toCaseFolded());
+#else
+        expectedDirectories.insert(parent);
+#endif
+        parent = QFileInfo(parent).path();
+    }
+}
+
 #ifdef Q_OS_WIN
 bool openStableAppTree(
     const QString &storeRoot,
@@ -109,7 +159,7 @@ bool pinStateTargets(
         state.current, state.previous, state.lastKnownGood};
     for (const QString &target : targets) {
         if (!target.isEmpty()
-            && !tree.addExistingDirectory(
+            && !tree.addImmutableDirectory(
                 applicationRoot + QStringLiteral("/versions/") + target)) {
             return false;
         }
@@ -222,8 +272,12 @@ PackageStoreResult PackageStore::commitCandidate(
         return failure(PackageStoreError::UnsafeStore,
                        QStringLiteral("version store escapes application root"));
     }
+    QSet<QString> verifiedMembers;
+    QStringList verifiedRelativeFiles;
     if (!expectedSignedDigest.isEmpty()) {
         QVector<ArchiveFile> actualFiles;
+        QSet<QString> actualDirectories;
+        QSet<QString> expectedDirectories;
         quint64 totalBytes = 0;
         QDirIterator iterator(
             candidateRoot,
@@ -237,6 +291,19 @@ PackageStoreResult PackageStore::commitCandidate(
                                QStringLiteral("candidate identity changed"));
             }
             if (info.isDir()) {
+#ifdef Q_OS_WIN
+                if (!candidateTree.addExistingDirectory(path)) {
+                    return failure(PackageStoreError::CandidateCommitFailed,
+                                   QStringLiteral("candidate identity changed"));
+                }
+#endif
+                QString relative = QDir::fromNativeSeparators(
+                    QDir(candidateRoot).relativeFilePath(path));
+#ifdef Q_OS_WIN
+                relative = relative.toCaseFolded();
+#endif
+                actualDirectories.insert(relative);
+                verifiedMembers.insert(candidateMemberKey(candidateRoot, path, true));
                 continue;
             }
             if (!info.isFile() || info.size() < 0
@@ -272,9 +339,13 @@ PackageStoreResult PackageStore::commitCandidate(
             }
 #endif
             totalBytes += static_cast<quint64>(bytes.size());
+            const QString relativeFile = QDir::fromNativeSeparators(
+                QDir(candidateRoot).relativeFilePath(path));
+            addExpectedParentDirectories(relativeFile, expectedDirectories);
+            verifiedRelativeFiles.push_back(relativeFile);
+            verifiedMembers.insert(candidateMemberKey(candidateRoot, path, false));
             actualFiles.push_back(
-                {QDir::fromNativeSeparators(
-                     QDir(candidateRoot).relativeFilePath(path)).toUtf8(),
+                {relativeFile.toUtf8(),
                  std::move(bytes)});
         }
         const ContentDigestResult actualSigned = ContentDigest::signedPackage(actualFiles);
@@ -282,6 +353,7 @@ PackageStoreResult PackageStore::commitCandidate(
         if (!actualSigned.hasValue() || actualSigned.bytes() != expectedSignedDigest
             || !actualPayload.isValid()
             || actualPayload.digest().toHex() != digestHex
+            || actualDirectories != expectedDirectories
 #ifdef Q_OS_WIN
             || !candidateTree.isStable()
             || !std::ranges::all_of(
@@ -294,21 +366,120 @@ PackageStoreResult PackageStore::commitCandidate(
             return failure(PackageStoreError::CandidateCommitFailed,
                            QStringLiteral("candidate digest changed"));
         }
-        if (!makeVersionFilesReadOnly(candidateRoot)) {
+    }
+#if defined(Q_BROWSER_PACKAGE_INSTALLER_TESTING) && !defined(Q_OS_WIN)
+    if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .beforeCandidatePublish) {
+        qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .beforeCandidatePublish(candidateRoot, destination);
+    }
+#endif
+#ifdef Q_OS_WIN
+    if (!expectedSignedDigest.isEmpty()) {
+        const std::optional<QSet<QString>> currentMembers = candidateMemberSet(
+            candidateRoot);
+        if (!currentMembers.has_value()
+            || *currentMembers != verifiedMembers
+            || !candidateTree.isStable()
+            || !std::ranges::all_of(
+                candidateLockedFiles,
+                [&candidateTree](const auto &file) {
+                    return file.isStableWithin(candidateTree);
+                })) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("candidate identity changed"));
+        }
+        const bool filesSealed = std::ranges::all_of(
+            candidateLockedFiles,
+            [](auto &file) { return file.sealMutationsForMove(); });
+        const bool directoriesSealed = filesSealed
+            && candidateTree.sealMutationsForMove();
+        const bool filesReadOnly = directoriesSealed
+            && std::ranges::all_of(
+                candidateLockedFiles,
+                [](auto &file) { return file.setReadOnly(true); });
+        if (!filesSealed || !directoriesSealed || !filesReadOnly) {
+            for (auto &file : candidateLockedFiles) {
+                (void)file.setReadOnly(false);
+                (void)file.restoreMutationSeal(file.path());
+            }
+            (void)candidateTree.restoreMutationSeals();
             return failure(PackageStoreError::CandidateCommitFailed,
                            QStringLiteral("version could not be made immutable"));
         }
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+        if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+                .beforeCandidatePublish) {
+            qbrowser_package_installer_testing::packageInstallerTestHooks()
+                .beforeCandidatePublish(candidateRoot, destination);
+        }
+#endif
+        const std::optional<QSet<QString>> sealedMembers = candidateMemberSet(
+            candidateRoot);
+        if (!sealedMembers.has_value()
+            || *sealedMembers != verifiedMembers
+            || !candidateTree.isStable()
+            || !std::ranges::all_of(
+                candidateLockedFiles,
+                [&candidateTree](const auto &file) {
+                    return file.isStableWithin(candidateTree);
+                })) {
+            for (auto &file : candidateLockedFiles) {
+                (void)file.setReadOnly(false);
+                (void)file.restoreMutationSeal(file.path());
+            }
+            (void)candidateTree.restoreMutationSeals();
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("candidate identity changed"));
+        }
+        for (auto &file : candidateLockedFiles) {
+            file.releaseSealedForMove();
+        }
+        candidateTree.releaseDescendantsForMove();
     }
-#ifdef Q_OS_WIN
-    candidateLockedFiles.clear();
     if (!candidateTree.publishRootNoReplace(destination, storeTree)) {
+        for (size_t index = 0;
+             index < candidateLockedFiles.size(); ++index) {
+            const QString path = candidateRoot + QLatin1Char('/')
+                + verifiedRelativeFiles.at(static_cast<qsizetype>(index));
+            if (candidateLockedFiles.at(index).restoreMutationSeal(path)) {
+                (void)QFile::setPermissions(
+                    path,
+                    QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+            }
+        }
+        (void)candidateTree.restoreMutationSeals();
 #else
     if (!QDir().rename(QDir::cleanPath(candidateRoot), destination)) {
 #endif
         return failure(PackageStoreError::CandidateCommitFailed,
                        QStringLiteral("candidate could not be committed"));
     }
-    if (expectedSignedDigest.isEmpty() && !makeVersionFilesReadOnly(destination)) {
+#ifdef Q_OS_WIN
+    if (!expectedSignedDigest.isEmpty()) {
+        const std::optional<QSet<QString>> publishedMembers = candidateMemberSet(
+            destination);
+        bool identitiesMatch = publishedMembers.has_value()
+            && *publishedMembers == verifiedMembers
+            && candidateTree.verifyMovedTree(destination);
+        for (size_t index = 0;
+             identitiesMatch && index < candidateLockedFiles.size(); ++index) {
+            identitiesMatch = candidateLockedFiles.at(index).isSameIdentityAt(
+                destination + QLatin1Char('/')
+                + verifiedRelativeFiles.at(static_cast<qsizetype>(index)));
+        }
+        if (!identitiesMatch) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("candidate identity changed"));
+        }
+    }
+#endif
+#ifdef Q_OS_WIN
+    if (expectedSignedDigest.isEmpty()
+        && !makeVersionFilesReadOnly(destination)) {
+#else
+    if (!makeVersionFilesReadOnly(destination)) {
+#endif
         return failure(PackageStoreError::CandidateCommitFailed,
                        QStringLiteral("version could not be made immutable"));
     }

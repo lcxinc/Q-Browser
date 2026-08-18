@@ -49,12 +49,17 @@ public:
     [[nodiscard]] bool openRoot(const QString &rootPath);
     [[nodiscard]] bool openMovableRoot(const QString &rootPath);
     [[nodiscard]] bool addExistingDirectory(const QString &path);
+    [[nodiscard]] bool addImmutableDirectory(const QString &path);
     [[nodiscard]] bool createAndHoldDirectory(const QString &path);
     [[nodiscard]] bool contains(const QString &path) const;
     [[nodiscard]] bool isStable() const;
     [[nodiscard]] bool publishRootNoReplace(
         const QString &destination,
         const WindowsStableDirectoryTree &destinationTree);
+    [[nodiscard]] bool sealMutationsForMove();
+    void releaseDescendantsForMove() noexcept;
+    [[nodiscard]] bool restoreMutationSeals() noexcept;
+    [[nodiscard]] bool verifyMovedTree(const QString &destination) const;
     [[nodiscard]] bool deleteHeldTree() noexcept;
     void cleanupCreatedDirectories() noexcept;
 
@@ -69,10 +74,15 @@ private:
         QString finalPath;
         WindowsFileIdentity identity;
         UniqueWindowsHandle handle;
+        QByteArray originalSecurity;
+        bool mutationSealed = false;
         bool created = false;
     };
 
-    [[nodiscard]] bool addDirectory(const QString &path, bool created);
+    [[nodiscard]] bool addDirectory(
+        const QString &path,
+        bool created,
+        bool immutable = false);
     [[nodiscard]] bool openRootImpl(const QString &rootPath, bool movable);
     [[nodiscard]] bool pathIsWithinRoot(const QString &path) const;
 
@@ -113,6 +123,11 @@ public:
         const QString &destination,
         const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool deleteOwned() noexcept;
+    [[nodiscard]] bool setReadOnly(bool readOnly) noexcept;
+    [[nodiscard]] bool sealMutationsForMove();
+    void releaseSealedForMove() noexcept;
+    [[nodiscard]] bool restoreMutationSeal(const QString &path) noexcept;
+    [[nodiscard]] bool isSameIdentityAt(const QString &path) const;
     [[nodiscard]] bool isStableWithin(
         const WindowsStableDirectoryTree &tree) const;
 
@@ -128,8 +143,10 @@ private:
 
     UniqueWindowsHandle m_handle;
     WindowsFileIdentity m_identity;
+    QByteArray m_originalSecurity;
     QString m_finalPath;
     QString m_path;
+    bool m_mutationSealed = false;
 };
 }
 

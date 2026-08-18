@@ -284,7 +284,7 @@ void PackageStoreTest::pinsStoreDirectoriesDuringStateCommit()
         if (QDir::cleanPath(path).compare(QDir::cleanPath(targetPath),
                                           Qt::CaseInsensitive)
                 == 0
-            && (access & DELETE) != 0U) {
+            && (access & FILE_LIST_DIRECTORY) != 0U) {
             const QString renamed = targetPath + QStringLiteral("-renamed");
             targetRenameBlocked = MoveFileExW(
                                       reinterpret_cast<LPCWSTR>(targetPath.utf16()),

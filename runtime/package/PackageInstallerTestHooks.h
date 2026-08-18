@@ -11,6 +11,7 @@ namespace qbrowser_package_installer_testing
 struct PackageInstallerTestHooks final
 {
     std::function<void(const QString &)> beforeCandidateCommit;
+    std::function<void(const QString &, const QString &)> beforeCandidatePublish;
     std::function<void(const QString &, const QString &)> beforeActivate;
 };
 

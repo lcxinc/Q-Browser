@@ -7,6 +7,7 @@
 #include "SignatureVerifier.h"
 
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -18,11 +19,55 @@
 #include <utility>
 
 #ifdef Q_OS_WIN
+#include <Aclapi.h>
 #include <qt_windows.h>
 #endif
 
 namespace
 {
+class PackageTemporaryDir final : public QTemporaryDir
+{
+public:
+    ~PackageTemporaryDir()
+    {
+#ifdef Q_OS_WIN
+        if (!isValid()) {
+            return;
+        }
+        QStringList paths{path()};
+        QDirIterator iterator(
+            path(),
+            QDir::AllEntries | QDir::Hidden | QDir::System
+                | QDir::NoDotAndDotDot,
+            QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            paths.push_back(iterator.next());
+        }
+        for (const QString &entry : paths) {
+            QString native = QDir::toNativeSeparators(entry);
+            (void)SetNamedSecurityInfoW(
+                reinterpret_cast<LPWSTR>(native.data()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION
+                    | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr);
+            const auto *nativePath = reinterpret_cast<LPCWSTR>(native.utf16());
+            const DWORD attributes = GetFileAttributesW(nativePath);
+            if (attributes != INVALID_FILE_ATTRIBUTES
+                && (attributes & FILE_ATTRIBUTE_READONLY) != 0U) {
+                (void)SetFileAttributesW(
+                    nativePath, attributes & ~FILE_ATTRIBUTE_READONLY);
+            }
+        }
+        (void)QDir(path()).removeRecursively();
+        setAutoRemove(false);
+#endif
+    }
+};
+
 QByteArray manifest(const QString &version,
                     const QString &minimumRuntime = QStringLiteral("1.0.0"),
                     const QString &maximumRuntime = QStringLiteral("1.x"),
@@ -105,11 +150,15 @@ private slots:
     void preflightMutationCannotEnterCommittedVersion();
     void changedCandidateFailsBeforeActivation();
     void activationFailureDoesNotChangeCurrent();
+    void postVerificationNewMemberCannotPublishUnderOldDigest();
+    void postVerificationReplacementCannotPublishUnderOldDigest();
+    void unexpectedEmptyDirectoryFailsCandidate();
+    void publicationRaceRestoresOwnedStagingCleanup();
 };
 
 void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -141,7 +190,7 @@ void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
 
 void PackageInstallerTest::rejectsInvalidSignatureWithoutChangingCurrent()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -216,7 +265,7 @@ void PackageInstallerTest::rejectsInvalidSignatureWithoutChangingCurrent()
 
 void PackageInstallerTest::rejectsIncompatibleRuntimeWithoutChangingCurrent()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -241,7 +290,7 @@ void PackageInstallerTest::rejectsIncompatibleRuntimeWithoutChangingCurrent()
 
 void PackageInstallerTest::rejectsDeniedImportWithoutChangingCurrent()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -267,7 +316,7 @@ void PackageInstallerTest::rejectsDeniedImportWithoutChangingCurrent()
 
 void PackageInstallerTest::rejectsFailedPreflightWithoutChangingCurrent()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -295,7 +344,7 @@ void PackageInstallerTest::rejectsFailedPreflightWithoutChangingCurrent()
 
 void PackageInstallerTest::preflightMutationCannotEnterCommittedVersion()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -321,7 +370,7 @@ void PackageInstallerTest::preflightMutationCannotEnterCommittedVersion()
 
 void PackageInstallerTest::changedCandidateFailsBeforeActivation()
 {
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -332,7 +381,6 @@ void PackageInstallerTest::changedCandidateFailsBeforeActivation()
         manifest(QStringLiteral("1.0.0"))));
     QVERIFY(first.succeeded());
     const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
-
     bool hookRan = false;
     qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
     hooks.beforeCandidateCommit = [&hookRan](const QString &candidateRoot) {
@@ -361,7 +409,7 @@ void PackageInstallerTest::activationFailureDoesNotChangeCurrent()
 #ifndef Q_OS_WIN
     QSKIP("The deterministic activation sharing violation is Windows-specific");
 #else
-    QTemporaryDir temporary;
+    PackageTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
@@ -372,7 +420,6 @@ void PackageInstallerTest::activationFailureDoesNotChangeCurrent()
         keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
     QVERIFY(first.succeeded());
     const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
-
     bool hookRan = false;
     HANDLE blocker = INVALID_HANDLE_VALUE;
     qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
@@ -406,6 +453,193 @@ void PackageInstallerTest::activationFailureDoesNotChangeCurrent()
     QCOMPARE(rejected.error, InstallError::ActivationFailed);
     QCOMPARE(rejected.stableError, QStringLiteral("activation_failed"));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+#endif
+}
+
+void PackageInstallerTest::postVerificationNewMemberCannotPublishUnderOldDigest()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows candidate tree mutation seals are unavailable");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("member-first"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+
+    bool hookRan = false;
+    bool mutationSucceeded = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidatePublish = [&](const QString &candidateRoot,
+                                        const QString &) {
+        hookRan = true;
+        const QString injected = candidateRoot
+            + QStringLiteral("/injected/member.txt");
+        mutationSucceeded = QDir().mkpath(QFileInfo(injected).dir().absolutePath());
+        QFile file(injected);
+        mutationSucceeded = mutationSucceeded
+            && file.open(QIODevice::WriteOnly)
+            && file.write("unauthenticated") == qint64(15);
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult result = installer.install(signedPackage(
+        temporary, QStringLiteral("member-injected"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(!mutationSucceeded);
+    QVERIFY2(result.succeeded(), qPrintable(result.stableError));
+    QVERIFY(!QFileInfo::exists(result.path + QStringLiteral("/injected")));
+    QFile added(result.path + QStringLiteral("/postpublish.txt"));
+    QVERIFY(!added.open(QIODevice::WriteOnly));
+#endif
+}
+
+void PackageInstallerTest::postVerificationReplacementCannotPublishUnderOldDigest()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows candidate tree mutation seals are unavailable");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("replacement-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+
+    bool hookRan = false;
+    bool mutationSucceeded = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidatePublish = [&](const QString &candidateRoot,
+                                        const QString &) {
+        hookRan = true;
+        const QString entryPath = candidateRoot + QStringLiteral("/qml/Main.qml");
+        (void)QFile::setPermissions(
+            entryPath,
+            QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        QFile entry(entryPath);
+        mutationSucceeded = entry.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            && entry.write("unauthenticated replacement") == qint64(27);
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult result = installer.install(signedPackage(
+        temporary, QStringLiteral("replacement-injected"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(!mutationSucceeded);
+    QVERIFY2(result.succeeded(), qPrintable(result.stableError));
+    const QString entryPath = result.path + QStringLiteral("/qml/Main.qml");
+    QFile entry(entryPath);
+    QVERIFY(entry.open(QIODevice::ReadOnly));
+    QCOMPARE(entry.readAll(), QByteArray("import QtQuick\nItem {}"));
+    entry.close();
+    QVERIFY(!entry.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QVERIFY(!QFile::remove(entryPath));
+#endif
+}
+
+void PackageInstallerTest::unexpectedEmptyDirectoryFailsCandidate()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("empty-directory-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool hookRan = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidateCommit = [&hookRan](const QString &candidateRoot) {
+        hookRan = true;
+        QVERIFY(QDir().mkdir(
+            candidateRoot + QStringLiteral("/unauthenticated-empty")));
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("empty-directory-injected"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::publicationRaceRestoresOwnedStagingCleanup()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows handle-based publication is unavailable");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("publication-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+    const QString marker = store.root()
+        + QStringLiteral("/.staging/do-not-remove/marker");
+    QVERIFY(QDir().mkpath(QFileInfo(marker).dir().absolutePath()));
+    QFile markerFile(marker);
+    QVERIFY(markerFile.open(QIODevice::WriteOnly));
+    QCOMPARE(markerFile.write("preserve"), qint64(8));
+    markerFile.close();
+
+    bool hookRan = false;
+    bool destinationWonRace = false;
+    QString racedDestination;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidatePublish = [&](const QString &, const QString &destination) {
+        hookRan = true;
+        racedDestination = destination;
+        destinationWonRace = QDir().mkdir(destination);
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("publication-race"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(destinationWonRace);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+    QVERIFY(QFileInfo::exists(racedDestination));
+    QVERIFY(QFileInfo::exists(marker));
+    const QStringList stagingEntries = QDir(store.root() + QStringLiteral("/.staging"))
+                                           .entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    QCOMPARE(stagingEntries, QStringList{QStringLiteral("do-not-remove")});
 #endif
 }
 

@@ -43,6 +43,10 @@ target_link_libraries(q_browser_package
     miniz
     OpenSSL::Crypto)
 
+if(WIN32)
+  target_link_libraries(q_browser_package PRIVATE Advapi32)
+endif()
+
 q_browser_enable_strict_warnings(q_browser_package)
 
 if(BUILD_TESTING)

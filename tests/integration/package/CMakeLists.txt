@@ -31,6 +31,10 @@ target_link_libraries(tst_package_installer
     q_browser_package
     Qt6::Test)
 
+if(WIN32)
+  target_link_libraries(tst_package_installer PRIVATE Advapi32)
+endif()
+
 target_compile_definitions(tst_package_installer PRIVATE
   Q_BROWSER_ARCHIVE_TESTING
   Q_BROWSER_PACKAGE_INSTALLER_TESTING)
