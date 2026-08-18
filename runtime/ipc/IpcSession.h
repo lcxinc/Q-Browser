@@ -52,6 +52,7 @@ public:
                      int timeoutMs);
     bool sendRouteLoad(const QString &requestId, const QString &route, int timeoutMs);
     SessionReceiveResult receive(int timeoutMs);
+    SessionReceiveResult poll(int timeoutMs = 0);
 
     bool isAuthenticated() const noexcept;
     QString appIdentity() const;
@@ -63,6 +64,7 @@ public:
 
 private:
     SessionReceiveResult processFrame(const QJsonObject &object);
+    SessionReceiveResult receiveImpl(int timeoutMs, bool closeOnCallerTimeout);
     SessionReceiveResult fail(SessionStatus status, const QString &code);
     bool pendingRequestExpired() const;
     std::optional<qint64> nearestPendingDeadline() const;

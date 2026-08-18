@@ -39,7 +39,7 @@ public:
     static std::optional<ProtocolMessage> handshake(const QString &nonce);
     static std::optional<ProtocolMessage> handshakeAck(const QString &nonce,
                                                        const QString &appIdentity);
-    static ProtocolMessage surfaceReady();
+    static std::optional<ProtocolMessage> surfaceReady(const QString &windowHandle);
     static std::optional<ProtocolMessage> routeLoad(const QString &requestId,
                                                     const QString &route);
     static ProtocolMessage ready();

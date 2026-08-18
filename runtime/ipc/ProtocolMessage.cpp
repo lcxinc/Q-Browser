@@ -108,7 +108,15 @@ bool validPayload(const ProtocolType type, const QJsonObject &payload)
                             {QStringLiteral("nonce"), QStringLiteral("appIdentity")})
                && validToken(payload.value(QStringLiteral("nonce")))
                && validToken(payload.value(QStringLiteral("appIdentity")));
-    case ProtocolType::SurfaceReady:
+    case ProtocolType::SurfaceReady: {
+        if (!hasExactKeys(payload, {QStringLiteral("windowHandle")})) {
+            return false;
+        }
+        const QString handle = payload.value(QStringLiteral("windowHandle")).toString();
+        bool converted = false;
+        const qulonglong value = handle.toULongLong(&converted, 10);
+        return converted && value != 0 && QString::number(value) == handle;
+    }
     case ProtocolType::Ready:
     case ProtocolType::Heartbeat:
         return payload.isEmpty();
@@ -262,9 +270,11 @@ std::optional<ProtocolMessage> ProtocolMessage::handshakeAck(const QString &nonc
                                  {QStringLiteral("appIdentity"), appIdentity}});
 }
 
-ProtocolMessage ProtocolMessage::surfaceReady()
+std::optional<ProtocolMessage> ProtocolMessage::surfaceReady(const QString &windowHandle)
 {
-    return {ProtocolType::SurfaceReady, {}, {}};
+    return validated(ProtocolType::SurfaceReady,
+                     {},
+                     QJsonObject{{QStringLiteral("windowHandle"), windowHandle}});
 }
 
 std::optional<ProtocolMessage> ProtocolMessage::routeLoad(const QString &requestId,

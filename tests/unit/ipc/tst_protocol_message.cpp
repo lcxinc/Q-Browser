@@ -54,7 +54,9 @@ void ProtocolMessageTest::parsesValidMessages_data()
     QTest::newRow("surface-ready")
         << QJsonObject{{QStringLiteral("protocolVersion"), 1},
                        {QStringLiteral("type"), QStringLiteral("surfaceReady")},
-                       {QStringLiteral("payload"), QJsonObject{}}}
+                       {QStringLiteral("payload"),
+                        QJsonObject{{QStringLiteral("windowHandle"),
+                                     QStringLiteral("123456")}}}}
         << ProtocolType::SurfaceReady;
     QTest::newRow("route-load")
         << QJsonObject{{QStringLiteral("protocolVersion"), 1},
@@ -202,7 +204,7 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
     const ProtocolMessage response = *ProtocolMessage::successResponse(
         QStringLiteral("req-1"), QJsonObject{{QStringLiteral("status"), 200}});
     const ProtocolMessage heartbeat = ProtocolMessage::heartbeat();
-    const ProtocolMessage surfaceReady = ProtocolMessage::surfaceReady();
+    const ProtocolMessage surfaceReady = *ProtocolMessage::surfaceReady(QStringLiteral("123456"));
     const ProtocolMessage routeLoad = *ProtocolMessage::routeLoad(QStringLiteral("route-1"),
                                                                   QStringLiteral("/orders"));
     const ProtocolMessage structuredLog = *ProtocolMessage::structuredLog(
@@ -221,6 +223,7 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
         QVERIFY(reparsed.message.has_value());
         QCOMPARE(reparsed.message->toJson(), message.toJson());
     }
+    QVERIFY(!ProtocolMessage::surfaceReady(QStringLiteral("0")).has_value());
 }
 
 void ProtocolMessageTest::factoriesRejectInvalidArguments()

@@ -114,6 +114,17 @@ bool IpcSession::sendRouteLoad(const QString &requestId,
 
 SessionReceiveResult IpcSession::receive(const int timeoutMs)
 {
+    return receiveImpl(timeoutMs, true);
+}
+
+SessionReceiveResult IpcSession::poll(const int timeoutMs)
+{
+    return receiveImpl(timeoutMs, false);
+}
+
+SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
+                                             const bool closeOnCallerTimeout)
+{
     if (closed_) {
         return {SessionStatus::Failed, std::nullopt, lastErrorCode_};
     }
@@ -151,7 +162,11 @@ SessionReceiveResult IpcSession::receive(const int timeoutMs)
                 return fail(SessionStatus::TimedOut,
                             QStringLiteral("ipc.session.request_timeout"));
             }
-            return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
+            if (closeOnCallerTimeout) {
+                return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
+            }
+            return {SessionStatus::TimedOut, std::nullopt,
+                    QStringLiteral("ipc.session.timeout")};
         }
         if (read.status == PipeIoStatus::PeerClosed) {
             return fail(SessionStatus::PeerClosed, QStringLiteral("ipc.session.peer_closed"));
@@ -175,7 +190,11 @@ SessionReceiveResult IpcSession::receive(const int timeoutMs)
             return {SessionStatus::MessageReady, receivedMessages_.dequeue(), {}};
         }
         if (receiveTimer.elapsed() >= timeoutMs) {
-            return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
+            if (closeOnCallerTimeout) {
+                return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
+            }
+            return {SessionStatus::TimedOut, std::nullopt,
+                    QStringLiteral("ipc.session.timeout")};
         }
     }
 }
