@@ -481,11 +481,11 @@ Use CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName, explic
 
 **Step 3: Write failing launch-negative tests**
 
-sandbox_probe attempts allowed package-read/temp-write and denied C:\Windows\win.ini read, loopback network, cmd.exe process, and self-spawn.
+`sandbox_probe` attempts allowed package-read/temp-write and denied Host-created protected private-sentinel read, loopback network, `cmd.exe` process, and self-spawn. It also reports `C:\Windows\win.ini` access as a diagnostic only: that file can legitimately grant read access to `S-1-15-2-1` (`ALL APPLICATION PACKAGES`) and `S-1-15-2-2` (`ALL RESTRICTED APPLICATION PACKAGES`) on current Windows, so it is not a portable default-deny assertion. The sentinel uses a protected Host/SYSTEM-only DACL and requires no system ACL change or elevation.
 
 **Step 4: Implement SandboxLauncher**
 
-Use STARTUPINFOEX, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited IPC handles only, CREATE_SUSPENDED, job assignment before ResumeThread, no broad capabilities, and no Internet capability.
+Use `STARTUPINFOEX`, `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY` with `PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT`; inherit IPC handles only, use `CREATE_SUSPENDED`, assign the Job before `ResumeThread`, and declare neither broad nor Internet capabilities. Assert an LPAC token and zero capabilities; if the OS returns `ERROR_INVALID_PARAMETER` for `TokenIsLessPrivilegedAppContainer`, assert the documented equivalent that the token has no enabled `ALL APPLICATION PACKAGES` membership. See Microsoft [Launch an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer) and the official [`appcontainer_runner.rs`](https://github.com/microsoft/mxc/blob/main/src/backends/appcontainer/common/src/appcontainer_runner.rs) opt-out implementation.
 
 **Step 5: Verify negative security behavior and commit**
 
