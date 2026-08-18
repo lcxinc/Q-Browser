@@ -1,0 +1,12 @@
+module Company.Design
+singleton Theme 1.0 Theme.qml
+singleton Spacing 1.0 Spacing.qml
+singleton Typography 1.0 Typography.qml
+AppButton 1.0 AppButton.qml
+AppCard 1.0 AppCard.qml
+AppDialog 1.0 AppDialog.qml
+AppNavigation 1.0 AppNavigation.qml
+AppTable 1.0 AppTable.qml
+AppTextField 1.0 AppTextField.qml
+AppToast 1.0 AppToast.qml
+StateView 1.0 StateView.qml

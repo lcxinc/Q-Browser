@@ -21,7 +21,9 @@ target_link_libraries(q_browser_worker_app
     Qt6::Gui
     Qt6::Network
     Qt6::Qml
-    Qt6::Quick)
+    Qt6::Quick
+  PRIVATE
+    q_browser_design)
 
 q_browser_enable_strict_warnings(q_browser_worker_app)
 
