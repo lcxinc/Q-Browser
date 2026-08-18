@@ -348,7 +348,7 @@ bool WindowsStableFile::createOwnedOutput(
     m_handle.reset(CreateFileW(
         reinterpret_cast<LPCWSTR>(path.utf16()),
         desiredAccess,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        0U,
         securityAttributes,
         CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT

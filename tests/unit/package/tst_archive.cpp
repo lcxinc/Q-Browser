@@ -337,6 +337,8 @@ private slots:
     void createdParentCannotBeReplacedAfterGuard();
     void doesNotOverwriteConcurrentTargetOrDeleteUserFiles();
     void publishesTheOriginallyCreatedTemporaryFile();
+    void keepsArchiveOutputExclusiveUntilPublish();
+    void rejectsSymlinkedArchiveOutputParents();
     void handlesShortWindowsWrites();
     void cleansOwnedTemporaryWhenFlushFails();
     void cleansOnlyOwnedObjectsAfterFailure();
@@ -1167,6 +1169,76 @@ void ArchiveTest::publishesTheOriginallyCreatedTemporaryFile()
     QVERIFY(!QFileInfo::exists(captured));
 #else
     QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::keepsArchiveOutputExclusiveUntilPublish()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QVector<ArchiveFile> expected{
+        {QByteArrayLiteral("a.txt"), QByteArrayLiteral("safe-bytes")}};
+    const QString package = temporary.filePath(QStringLiteral("output.qapkg"));
+    bool hookRan = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforeArchivePublish = [&](const QString &staged,
+                                     const QString &destination) {
+        if (destination != QFileInfo(package).absoluteFilePath()) {
+            return;
+        }
+        hookRan = true;
+        const auto openSecond = [&](DWORD access) {
+            return CreateFileW(
+                reinterpret_cast<LPCWSTR>(staged.utf16()),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+        };
+        HANDLE reader = openSecond(GENERIC_READ);
+        if (reader != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(reader);
+        }
+        QCOMPARE(reader, INVALID_HANDLE_VALUE);
+        HANDLE writer = openSecond(GENERIC_WRITE);
+        if (writer != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(writer);
+        }
+        QCOMPARE(writer, INVALID_HANDLE_VALUE);
+        QVERIFY(!DeleteFileW(reinterpret_cast<LPCWSTR>(staged.utf16())));
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::createFromFiles(expected, package);
+    QVERIFY(hookRan);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    const ArchiveSnapshotResult snapshot = Archive::snapshot(package);
+    QVERIFY(snapshot.hasValue());
+    QCOMPARE(snapshot.files(), expected);
+#else
+    QSKIP("Windows archive locking tests are unavailable");
+#endif
+}
+
+void ArchiveTest::rejectsSymlinkedArchiveOutputParents()
+{
+#ifndef Q_OS_WIN
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString realParent = temporary.filePath(QStringLiteral("real"));
+    const QString linkedParent = temporary.filePath(QStringLiteral("linked"));
+    QVERIFY(QDir().mkdir(realParent));
+    QVERIFY(QFile::link(realParent, linkedParent));
+    const QString output = linkedParent + QStringLiteral("/output.qapkg");
+    const ArchiveResult result = Archive::createFromFiles(
+        {{QByteArrayLiteral("a.txt"), QByteArrayLiteral("safe")}}, output);
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.error().code, ArchiveErrorCode::DestinationUnavailable);
+    QVERIFY(!QFileInfo::exists(realParent + QStringLiteral("/output.qapkg")));
+#else
+    QSKIP("POSIX archive parent tests are unavailable");
 #endif
 }
 

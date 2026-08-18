@@ -1,6 +1,7 @@
 #include "Archive.h"
 #include "ArchiveTestHooks.h"
 #include "CanonicalArchivePath.h"
+#include "PosixStableIo.h"
 #include "WindowsStableIo.h"
 
 #include <QDir>
@@ -20,9 +21,16 @@
 #pragma warning(push)
 #pragma warning(disable : 4505)
 #endif
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include <miniz.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
+#endif
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 #include <algorithm>
@@ -31,10 +39,7 @@
 #include <limits>
 
 #ifndef Q_OS_WIN
-#include <cerrno>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #endif
 
 namespace qbrowser_archive_detail
@@ -1234,97 +1239,32 @@ bool publishArchiveBytes(
     }
     return true;
 #else
-    const QByteArray parentBytes = QFile::encodeName(parent);
     const QByteArray destinationName = QFile::encodeName(
         QFileInfo(destination).fileName());
     if (destinationName.isEmpty() || destinationName.contains('/')) {
         return false;
     }
-    const int directoryFd = ::open(
-        parentBytes.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (directoryFd < 0) {
+    qbrowser_archive_detail::PosixStableDirectory directory;
+    if (!directory.openAbsolute(parent)) {
         return false;
     }
-    QByteArray temporaryName;
-    int fileFd = -1;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        temporaryName = QByteArrayLiteral(".qbrowser-")
-            + QUuid::createUuid().toString(QUuid::Id128).toLatin1()
-            + QByteArrayLiteral(".tmp");
-        fileFd = ::openat(
-            directoryFd,
-            temporaryName.constData(),
-            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        if (fileFd >= 0) {
-            break;
-        }
-    }
-    if (fileFd < 0) {
-        (void)::close(directoryFd);
-        return false;
-    }
-    auto unlinkOwned = [&](const QByteArray &name) {
-        struct stat owned{};
-        struct stat candidate{};
-        return !name.isEmpty()
-            && ::fstat(fileFd, &owned) == 0
-            && ::fstatat(
-                   directoryFd,
-                   name.constData(),
-                   &candidate,
-                   AT_SYMLINK_NOFOLLOW) == 0
-            && owned.st_dev == candidate.st_dev
-            && owned.st_ino == candidate.st_ino
-            && ::unlinkat(directoryFd, name.constData(), 0) == 0;
-    };
-    bool published = false;
-    auto cleanup = [&] {
-        if (published) {
-            (void)unlinkOwned(destinationName);
-        }
-        (void)unlinkOwned(temporaryName);
-        (void)::fsync(directoryFd);
-        (void)::close(fileFd);
-        (void)::close(directoryFd);
-    };
-    qsizetype offset = 0;
-    while (offset < bytes.size()) {
-        const ssize_t written = ::write(
-            fileFd,
-            bytes.constData() + offset,
-            static_cast<size_t>(bytes.size() - offset));
-        if (written <= 0) {
-            cleanup();
-            return false;
-        }
-        offset += static_cast<qsizetype>(written);
-    }
-    if (::fsync(fileFd) != 0) {
-        cleanup();
+    qbrowser_archive_detail::PosixOwnedOutput owned;
+    if (!owned.create(
+            directory,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        || !owned.writeAll(
+            bytes.constData(), static_cast<size_t>(bytes.size()))
+        || !owned.flush()) {
         return false;
     }
 #ifdef Q_BROWSER_ARCHIVE_TESTING
     if (qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish) {
         qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish(
-            QDir(parent).absoluteFilePath(QString::fromUtf8(temporaryName)),
+            QString(),
             destination);
     }
 #endif
-    published = ::linkat(
-        directoryFd,
-        temporaryName.constData(),
-        directoryFd,
-        destinationName.constData(),
-        0) == 0;
-    if (!published || !unlinkOwned(temporaryName)
-        || ::fsync(directoryFd) != 0) {
-        cleanup();
-        return false;
-    }
-    (void)::close(fileFd);
-    (void)::close(directoryFd);
-    return true;
+    return owned.publishNoReplace(destinationName, directory);
 #endif
 }
 

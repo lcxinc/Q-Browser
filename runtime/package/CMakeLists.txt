@@ -14,6 +14,8 @@ add_library(q_browser_package STATIC
   Manifest.h
   ManifestError.h
   ManifestResourceLimits.h
+  PosixStableIo.cpp
+  PosixStableIo.h
   SignatureVerifier.cpp
   SignatureVerifier.h
   SignatureTestHooks.cpp

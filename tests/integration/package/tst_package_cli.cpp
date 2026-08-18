@@ -16,6 +16,8 @@
 #ifdef Q_OS_WIN
 #include <Aclapi.h>
 #include <qt_windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 #include <algorithm>
@@ -42,6 +44,16 @@ QByteArray readFile(const QString &path)
     QFile file(path);
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
 }
+
+#ifndef Q_OS_WIN
+mode_t fileMode(const QString &path)
+{
+    struct stat metadata{};
+    return ::stat(QFile::encodeName(path).constData(), &metadata) == 0
+        ? metadata.st_mode & static_cast<mode_t>(0777)
+        : static_cast<mode_t>(0);
+}
+#endif
 
 ProcessResult runCli(
     const QStringList &arguments,
@@ -194,6 +206,8 @@ private slots:
     void keygenPackSignInspectRoundTrip();
     void rejectsOverwriteAndProtectsPrivateKey();
     void keygenNeverDeletesRacingTargets();
+    void keygenKeepsStagedKeysExclusive();
+    void keygenEnforcesPrivateModeAfterOpen();
     void packAndSignAreReproducible();
     void packAndSignNeverReplaceRacingOutputs();
     void inspectFailsClosedForTamperingAndWrongKey();
@@ -276,10 +290,7 @@ void PackageCliTest::rejectsOverwriteAndProtectsPrivateKey()
 #ifdef Q_OS_WIN
     QVERIFY(hasProtectedSinglePrincipalDacl(privateKey));
 #else
-    const QFileDevice::Permissions permissions = QFileInfo(privateKey).permissions();
-    QCOMPARE(
-        permissions,
-        QFileDevice::Permissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    QCOMPARE(fileMode(privateKey), static_cast<mode_t>(0600));
 #endif
 }
 
@@ -313,11 +324,60 @@ void PackageCliTest::keygenNeverDeletesRacingTargets()
         publicEnvironment);
     QVERIFY(publicResult.exitCode != 0);
     QCOMPARE(readFile(publicRace), sentinel);
+#ifdef Q_OS_WIN
     QVERIFY(!QFileInfo::exists(ownedPrivate));
+#else
+    QVERIFY(QFileInfo::exists(ownedPrivate));
+#endif
 
     const QStringList temporaryOutputs = QDir(temporary.path()).entryList(
         {QStringLiteral(".qbrowser-key-*.tmp")}, QDir::Files | QDir::Hidden);
     QVERIFY(temporaryOutputs.isEmpty());
+}
+
+void PackageCliTest::keygenEnforcesPrivateModeAfterOpen()
+{
+#ifndef Q_OS_WIN
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString privateKey = temporary.filePath(QStringLiteral("private.pem"));
+    const QString publicKey = temporary.filePath(QStringLiteral("public.pem"));
+    const ProcessResult result = runCli(
+        {"keygen", "--private-key", privateKey, "--public-key", publicKey},
+        {{QStringLiteral("Q_BROWSER_TEST_KEYGEN_RELAX_PRIVATE_MODE"),
+          QStringLiteral("1")}});
+    QCOMPARE(result.exitCode, 0);
+    QCOMPARE(fileMode(privateKey), static_cast<mode_t>(0600));
+#else
+    QSKIP("POSIX key permission tests are unavailable");
+#endif
+}
+
+void PackageCliTest::keygenKeepsStagedKeysExclusive()
+{
+#ifdef Q_OS_WIN
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString privateKey = temporary.filePath(QStringLiteral("private.pem"));
+    const QString publicKey = temporary.filePath(QStringLiteral("public.pem"));
+    const QString marker = temporary.filePath(QStringLiteral("lock-probe.marker"));
+    const QHash<QString, QString> environment{
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_LOCK_TARGET"), privateKey},
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_LOCK_MARKER"), marker}};
+    const ProcessResult result = runCli(
+        {"keygen", "--private-key", privateKey, "--public-key", publicKey},
+        environment);
+    QCOMPARE(result.exitCode, 0);
+    QCOMPARE(readFile(marker), QByteArray("exclusive"));
+    const QByteArray message("generated-key-pair");
+    const SignatureOperationResult signature = SignatureVerifier::signPem(
+        message, readFile(privateKey));
+    QVERIFY(signature.hasValue());
+    QVERIFY(SignatureVerifier::verifyPem(
+        message, readFile(publicKey), signature.value()).isVerified());
+#else
+    QSKIP("Windows key locking tests are unavailable");
+#endif
 }
 
 void PackageCliTest::packAndSignAreReproducible()

@@ -25,6 +25,7 @@
 #include <Aclapi.h>
 #include <qt_windows.h>
 #else
+#include "PosixStableIo.h"
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -232,6 +233,9 @@ public:
 
     [[nodiscard]] bool publish()
     {
+        if (!probeExclusiveLock(m_destination, m_temporary)) {
+            return false;
+        }
         injectKeyRace(m_destination);
         return m_directory != nullptr && m_directory->isStable()
             && m_file.publishNoReplace(m_destination, *m_directory);
@@ -240,6 +244,49 @@ public:
     void commit() noexcept { m_committed = true; }
 
 private:
+    static bool probeExclusiveLock(
+        const QString &destination,
+        const QString &temporary)
+    {
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+        const QString target = qEnvironmentVariable(
+            "Q_BROWSER_TEST_KEYGEN_LOCK_TARGET");
+        if (target.isEmpty()
+            || QFileInfo(target).absoluteFilePath()
+                != QFileInfo(destination).absoluteFilePath()) {
+            return true;
+        }
+        const auto cannotOpen = [&](DWORD access) {
+            const HANDLE second = CreateFileW(
+                reinterpret_cast<LPCWSTR>(temporary.utf16()),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (second == INVALID_HANDLE_VALUE) {
+                return true;
+            }
+            (void)CloseHandle(second);
+            return false;
+        };
+        const bool exclusive = cannotOpen(GENERIC_READ)
+            && cannotOpen(GENERIC_WRITE)
+            && DeleteFileW(reinterpret_cast<LPCWSTR>(temporary.utf16())) == FALSE;
+        const QString markerPath = qEnvironmentVariable(
+            "Q_BROWSER_TEST_KEYGEN_LOCK_MARKER");
+        QFile marker(markerPath);
+        return exclusive && !markerPath.isEmpty()
+            && marker.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+            && marker.write("exclusive") == 9 && marker.flush();
+#else
+        Q_UNUSED(destination);
+        Q_UNUSED(temporary);
+        return true;
+#endif
+    }
+
     static void injectKeyRace(const QString &destination)
     {
 #ifdef Q_BROWSER_PACKAGE_CLI_TESTING
@@ -277,45 +324,9 @@ enum class OwnedKeyStageStatus
     FlushFailed,
 };
 
-int openStableDirectory(const QString &absoluteDirectory)
-{
-    int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (current < 0) {
-        return -1;
-    }
-    const QStringList components = QDir::fromNativeSeparators(
-        absoluteDirectory).split(QLatin1Char('/'), Qt::SkipEmptyParts);
-    for (const QString &component : components) {
-        const QByteArray encoded = QFile::encodeName(component);
-        const int next = ::openat(
-            current,
-            encoded.constData(),
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        (void)::close(current);
-        if (next < 0) {
-            return -1;
-        }
-        current = next;
-    }
-    return current;
-}
-
 class OwnedKeyOutput final
 {
 public:
-    ~OwnedKeyOutput()
-    {
-        if (!m_committed) {
-            removeOwned();
-        }
-        if (m_fileFd >= 0) {
-            (void)::close(m_fileFd);
-        }
-        if (m_directoryFd >= 0) {
-            (void)::close(m_directoryFd);
-        }
-    }
-
     [[nodiscard]] OwnedKeyStageStatus stage(
         const QString &destination,
         const QByteArray &contents,
@@ -323,60 +334,41 @@ public:
     {
         m_absoluteDestination = QFileInfo(destination).absoluteFilePath();
         m_destination = QFile::encodeName(QFileInfo(destination).fileName());
-        m_directoryFd = openStableDirectory(
-            QFileInfo(destination).dir().absolutePath());
-        if (m_directoryFd < 0 || m_destination.isEmpty()) {
+        if (!m_directory.openAbsolute(
+                QFileInfo(destination).dir().absolutePath())
+            || m_destination.isEmpty()
+            || m_destination.contains('/')) {
             return OwnedKeyStageStatus::ParentUnavailable;
         }
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            m_temporary = QByteArrayLiteral(".qbrowser-key-")
-                + QUuid::createUuid().toString(QUuid::Id128).toLatin1()
-                + QByteArrayLiteral(".tmp");
-            m_fileFd = ::openat(
-                m_directoryFd,
-                m_temporary.constData(),
-                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                mode);
-            if (m_fileFd >= 0) {
-                break;
-            }
-        }
-        qsizetype offset = 0;
-        while (m_fileFd >= 0 && offset < contents.size()) {
-            const ssize_t written = ::write(
-                m_fileFd,
-                contents.constData() + offset,
-                static_cast<size_t>(contents.size() - offset));
-            if (written <= 0) {
-                return OwnedKeyStageStatus::WriteFailed;
-            }
-            offset += static_cast<qsizetype>(written);
-        }
-        if (m_fileFd < 0) {
+        if (!m_file.create(m_directory, mode)) {
             return OwnedKeyStageStatus::TemporaryCreateFailed;
         }
-        return ::fsync(m_fileFd) == 0
-            ? OwnedKeyStageStatus::Ready
-            : OwnedKeyStageStatus::FlushFailed;
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+        if (mode == (S_IRUSR | S_IWUSR)
+            && qEnvironmentVariableIsSet(
+                "Q_BROWSER_TEST_KEYGEN_RELAX_PRIVATE_MODE")) {
+            (void)m_file.setModeExact(
+                S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP
+                    | S_IROTH | S_IWOTH);
+        }
+#endif
+        if (!m_file.writeAll(
+                contents.constData(), static_cast<size_t>(contents.size()))) {
+            return OwnedKeyStageStatus::WriteFailed;
+        }
+        if (!m_file.setModeExact(mode) || !m_file.flush()) {
+            return OwnedKeyStageStatus::FlushFailed;
+        }
+        return OwnedKeyStageStatus::Ready;
     }
 
     [[nodiscard]] bool publish()
     {
         injectKeyRace();
-        if (::linkat(
-                m_directoryFd,
-                m_temporary.constData(),
-                m_directoryFd,
-                m_destination.constData(),
-                0) != 0) {
-            return false;
-        }
-        m_published = true;
-        return ::unlinkat(m_directoryFd, m_temporary.constData(), 0) == 0
-            && ::fsync(m_directoryFd) == 0;
+        return m_file.publishNoReplace(m_destination, m_directory);
     }
 
-    void commit() noexcept { m_committed = true; }
+    void commit() noexcept {}
 
 private:
     void injectKeyRace() const
@@ -389,7 +381,7 @@ private:
             const QByteArray content = qEnvironmentVariable(
                 "Q_BROWSER_TEST_KEYGEN_RACE_CONTENT").toUtf8();
             const int marker = ::openat(
-                m_directoryFd,
+                m_directory.fd(),
                 m_destination.constData(),
                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                 S_IRUSR | S_IWUSR);
@@ -402,42 +394,10 @@ private:
 #endif
     }
 
-    void removeOwned() noexcept
-    {
-        if (m_directoryFd < 0 || m_fileFd < 0) {
-            return;
-        }
-        struct stat owned{};
-        if (::fstat(m_fileFd, &owned) != 0) {
-            return;
-        }
-        auto removeIfOwned = [&](const QByteArray &name) {
-            struct stat candidate{};
-            if (!name.isEmpty()
-                && ::fstatat(
-                    m_directoryFd,
-                    name.constData(),
-                    &candidate,
-                    AT_SYMLINK_NOFOLLOW) == 0
-                && owned.st_dev == candidate.st_dev
-                && owned.st_ino == candidate.st_ino) {
-                (void)::unlinkat(m_directoryFd, name.constData(), 0);
-            }
-        };
-        if (m_published) {
-            removeIfOwned(m_destination);
-        }
-        removeIfOwned(m_temporary);
-        (void)::fsync(m_directoryFd);
-    }
-
-    int m_directoryFd = -1;
-    int m_fileFd = -1;
-    QByteArray m_temporary;
+    qbrowser_archive_detail::PosixStableDirectory m_directory;
+    qbrowser_archive_detail::PosixOwnedOutput m_file;
     QByteArray m_destination;
     QString m_absoluteDestination;
-    bool m_published = false;
-    bool m_committed = false;
 };
 #endif
 
