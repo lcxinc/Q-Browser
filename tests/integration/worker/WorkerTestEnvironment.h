@@ -6,7 +6,17 @@
 
 #include <QTemporaryDir>
 
+#include <functional>
 #include <optional>
+
+using SessionReceiveFunction = std::function<SessionReceiveResult(int)>;
+using ElapsedMillisecondsFunction = std::function<qint64()>;
+
+SessionReceiveResult receiveUntilWithClock(
+    const SessionReceiveFunction &receive,
+    const ElapsedMillisecondsFunction &elapsedMilliseconds,
+    ProtocolType expectedType,
+    int timeoutMs);
 
 SessionReceiveResult receiveUntil(IpcSession &session,
                                   ProtocolType expectedType,

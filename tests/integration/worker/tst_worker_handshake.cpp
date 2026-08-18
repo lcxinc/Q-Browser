@@ -3,10 +3,6 @@
 
 #include <QProcess>
 #include <QTest>
-#include <QThread>
-
-#include <atomic>
-#include <future>
 
 namespace {
 
@@ -37,8 +33,8 @@ private slots:
     void directLaunchWithoutInheritedHandlesFailsClosed();
     void sandboxedWorkerCompletesLifecycle();
     void heartbeatInterleavingIsDispatched();
-    void receiveUntilStopsAtDeadlineWithPrequeuedHeartbeatFlood();
-    void receiveUntilBoundsContinuousHeartbeatFlood();
+    void receiveUntilMissingTargetHonorsAbsoluteDeadline();
+    void receiveUntilBoundsOverBudgetHeartbeatFlood();
     void wrongNonceFailsClosed();
 };
 
@@ -125,8 +121,10 @@ void WorkerHandshakeTest::heartbeatInterleavingIsDispatched()
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }
 
-void WorkerHandshakeTest::receiveUntilStopsAtDeadlineWithPrequeuedHeartbeatFlood()
+void WorkerHandshakeTest::receiveUntilMissingTargetHonorsAbsoluteDeadline()
 {
+    constexpr int timeoutMs = 100;
+    constexpr int prequeuedHeartbeats = 5;
     WinPipePair pair = WinPipeTransport::createHostPair();
     QVERIFY(pair.isValid());
     WinPipeTransport peer = WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
@@ -134,23 +132,34 @@ void WorkerHandshakeTest::receiveUntilStopsAtDeadlineWithPrequeuedHeartbeatFlood
                     HostLaunchContext{QStringLiteral("flood-nonce"),
                                       QStringLiteral("com.qbrowser.flood")});
     QVERIFY(authenticateRawPeer(host, peer));
-    const QByteArray flood = heartbeatFrames(240);
-    QVERIFY(flood.size() < 64 * 1024);
-    QVERIFY(peer.writeAll(flood, 1000));
+    QVERIFY(peer.writeAll(heartbeatFrames(prequeuedHeartbeats), 1000));
 
-    QElapsedTimer elapsed;
-    elapsed.start();
-    const SessionReceiveResult missing = receiveUntil(host, ProtocolType::Ready, 1);
+    qint64 elapsedMs = 0;
+    int receiveCalls = 0;
+
+    QElapsedTimer wall;
+    wall.start();
+    const SessionReceiveResult missing = receiveUntilWithClock(
+        [&](const int remainingMs) {
+            ++receiveCalls;
+            const SessionReceiveResult result = host.receive(remainingMs);
+            if (receiveCalls == prequeuedHeartbeats) elapsedMs = timeoutMs;
+            return result;
+        },
+        [&] { return elapsedMs; }, ProtocolType::Ready, timeoutMs);
+
     QCOMPARE(missing.status, SessionStatus::TimedOut);
     QCOMPARE(missing.errorCode, QStringLiteral("worker.test.receive_timeout"));
-    QVERIFY2(elapsed.elapsed() < 100,
-             qPrintable(QStringLiteral("receiveUntil took %1ms").arg(elapsed.elapsed())));
+    QCOMPARE(receiveCalls, prequeuedHeartbeats);
     QVERIFY(!host.isClosed());
-    QCOMPARE(host.receive(0).status, SessionStatus::MessageReady);
+    QVERIFY2(wall.elapsed() < 50,
+             qPrintable(QStringLiteral("receiveUntil took %1ms").arg(wall.elapsed())));
 }
 
-void WorkerHandshakeTest::receiveUntilBoundsContinuousHeartbeatFlood()
+void WorkerHandshakeTest::receiveUntilBoundsOverBudgetHeartbeatFlood()
 {
+    constexpr int timeoutMs = 100;
+    constexpr int expectedHeartbeatBudget = 37;
     WinPipePair pair = WinPipeTransport::createHostPair();
     QVERIFY(pair.isValid());
     WinPipeTransport peer = WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
@@ -158,33 +167,25 @@ void WorkerHandshakeTest::receiveUntilBoundsContinuousHeartbeatFlood()
                     HostLaunchContext{QStringLiteral("flood-nonce"),
                                       QStringLiteral("com.qbrowser.flood")});
     QVERIFY(authenticateRawPeer(host, peer));
-    const QByteArray initialFlood = heartbeatFrames(32);
-    const QByteArray continuingFlood = heartbeatFrames(16);
-    QVERIFY(initialFlood.size() < 64 * 1024);
-    QVERIFY(peer.writeAll(initialFlood, 1000));
+    QVERIFY(peer.writeAll(heartbeatFrames(expectedHeartbeatBudget), 1000));
 
-    std::atomic_bool keepFlooding = true;
-    auto writer = std::async(std::launch::async, [&] {
-        QElapsedTimer duration;
-        duration.start();
-        while (keepFlooding.load(std::memory_order_acquire)
-               && duration.elapsed() < 300) {
-            if (!peer.writeAll(continuingFlood, 100)) break;
-            QThread::msleep(1);
-        }
-    });
-    QElapsedTimer elapsed;
-    elapsed.start();
-    const SessionReceiveResult missing = receiveUntil(host, ProtocolType::Ready, 50);
-    const qint64 receiveMs = elapsed.elapsed();
-    keepFlooding.store(false, std::memory_order_release);
-    writer.get();
+    int receiveCalls = 0;
+
+    QElapsedTimer wall;
+    wall.start();
+    const SessionReceiveResult missing = receiveUntilWithClock(
+        [&](const int remainingMs) {
+            ++receiveCalls;
+            return host.receive(remainingMs);
+        },
+        [] { return qint64(0); }, ProtocolType::Ready, timeoutMs);
 
     QCOMPARE(missing.status, SessionStatus::TimedOut);
     QCOMPARE(missing.errorCode, QStringLiteral("worker.test.heartbeat_limit"));
-    QVERIFY2(receiveMs < 150,
-             qPrintable(QStringLiteral("receiveUntil took %1ms").arg(receiveMs)));
+    QCOMPARE(receiveCalls, expectedHeartbeatBudget);
     QVERIFY(!host.isClosed());
+    QVERIFY2(wall.elapsed() < 50,
+             qPrintable(QStringLiteral("receiveUntil took %1ms").arg(wall.elapsed())));
 }
 
 void WorkerHandshakeTest::wrongNonceFailsClosed()

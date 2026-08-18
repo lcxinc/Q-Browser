@@ -86,9 +86,11 @@ bool writeNewFile(const QString &path, const QByteArray &contents)
 
 } // namespace
 
-SessionReceiveResult receiveUntil(IpcSession &session,
-                                  const ProtocolType expectedType,
-                                  const int timeoutMs)
+SessionReceiveResult receiveUntilWithClock(
+    const SessionReceiveFunction &receive,
+    const ElapsedMillisecondsFunction &elapsedMilliseconds,
+    const ProtocolType expectedType,
+    const int timeoutMs)
 {
     constexpr qsizetype heartbeatBurstAllowance = 32;
     constexpr int minimumHeartbeatIntervalMs = 20;
@@ -101,15 +103,13 @@ SessionReceiveResult receiveUntil(IpcSession &session,
     const qsizetype maximumSkippedHeartbeats = heartbeatBurstAllowance
         + static_cast<qsizetype>(timeoutMs / minimumHeartbeatIntervalMs);
     qsizetype skippedHeartbeats = 0;
-    QElapsedTimer elapsed;
-    elapsed.start();
     for (;;) {
-        const qint64 elapsedMs = elapsed.elapsed();
+        const qint64 elapsedMs = elapsedMilliseconds();
         if (elapsedMs >= timeoutMs) {
             return timeout(QStringLiteral("worker.test.receive_timeout"));
         }
         const int remaining = timeoutMs - static_cast<int>(elapsedMs);
-        SessionReceiveResult result = session.receive(remaining);
+        SessionReceiveResult result = receive(remaining);
         if (result.status != SessionStatus::MessageReady || !result.message.has_value()
             || result.message->type() == expectedType
             || result.message->type() != ProtocolType::Heartbeat) {
@@ -120,6 +120,17 @@ SessionReceiveResult receiveUntil(IpcSession &session,
             return timeout(QStringLiteral("worker.test.heartbeat_limit"));
         }
     }
+}
+
+SessionReceiveResult receiveUntil(IpcSession &session,
+                                  const ProtocolType expectedType,
+                                  const int timeoutMs)
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    return receiveUntilWithClock(
+        [&](const int remainingMs) { return session.receive(remainingMs); },
+        [&] { return elapsed.elapsed(); }, expectedType, timeoutMs);
 }
 
 WorkerTestEnvironment::Launch::Launch(IpcSession host, SandboxProcess child)
