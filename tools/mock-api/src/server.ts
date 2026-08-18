@@ -10,13 +10,13 @@ import { createPilotFixtures } from "./fixtures.ts";
 import {
   createRouteHandler,
   MAX_REQUEST_BODY_BYTES,
+  MAX_REQUEST_HEADER_FIELDS,
 } from "./routes.ts";
 
 export { MAX_REQUEST_BODY_BYTES } from "./routes.ts";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_HEADER_BYTES = 8 * 1024;
-const MAX_HEADERS = 64;
 const HEADERS_TIMEOUT_MS = 2_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const MIN_REQUEST_TIMEOUT_MS = 25;
@@ -47,31 +47,74 @@ function requestTimeoutFor(options: StartMockApiOptions): number {
   return timeout;
 }
 
-function stableClientError(error: Error & { code?: string }, response: Duplex): void {
+interface HttpClientError extends Error {
+  code?: string;
+  rawPacket?: Buffer;
+}
+
+interface RawHeaderProbe {
+  bytes: Buffer;
+  fieldCount?: number;
+}
+
+function headerFieldCount(packet: Buffer): number | undefined {
+  const headerEnd = packet.indexOf("\r\n\r\n");
+  if (headerEnd < 0) return undefined;
+  const lines = packet.subarray(0, headerEnd).toString("latin1").split("\r\n");
+  if (lines.length === 0) return undefined;
+  return lines.slice(1).filter((line) => line.includes(":")).length;
+}
+
+function captureRawHeader(probe: RawHeaderProbe, chunk: Buffer): void {
+  if (probe.fieldCount !== undefined) return;
+  const remaining = MAX_HEADER_BYTES + 4 - probe.bytes.byteLength;
+  if (remaining <= 0) return;
+  probe.bytes = Buffer.concat([
+    probe.bytes,
+    chunk.subarray(0, remaining),
+  ]);
+  probe.fieldCount = headerFieldCount(probe.bytes);
+}
+
+function stableClientError(
+  error: HttpClientError,
+  response: Duplex,
+  probedHeaderCount?: number,
+): void {
   if (!response.writable) {
     response.destroy();
     return;
   }
   const timedOut = error.code === "ERR_HTTP_REQUEST_TIMEOUT";
   const headerOverflow = error.code === "HPE_HEADER_OVERFLOW";
+  const packetHeaderCount =
+    error.rawPacket === undefined
+      ? undefined
+      : headerFieldCount(error.rawPacket);
+  const observedHeaderCount = probedHeaderCount ?? packetHeaderCount ?? 0;
+  const tooManyHeaders = observedHeaderCount > MAX_REQUEST_HEADER_FIELDS;
   const invalidFraming =
     error.code === "HPE_UNEXPECTED_CONTENT_LENGTH" ||
     error.code === "HPE_INVALID_CONTENT_LENGTH" ||
     error.code === "HPE_INVALID_TRANSFER_ENCODING";
-  const status = timedOut ? 408 : headerOverflow ? 431 : 400;
+  const status = timedOut ? 408 : headerOverflow || tooManyHeaders ? 431 : 400;
   const reason = timedOut
     ? "Request Timeout"
-    : headerOverflow
+    : headerOverflow || tooManyHeaders
       ? "Request Header Fields Too Large"
       : "Bad Request";
   const code = timedOut
     ? "request_timeout"
-    : invalidFraming
-      ? "invalid_http_framing"
-      : "invalid_http_request";
+    : tooManyHeaders
+      ? "too_many_headers"
+      : invalidFraming
+        ? "invalid_http_framing"
+        : "invalid_http_request";
   const message = timedOut
     ? "The HTTP request did not complete before the deadline."
-    : "The HTTP request is malformed or exceeds the header limit.";
+    : tooManyHeaders
+      ? "The request contains too many header fields."
+      : "The HTTP request is malformed or exceeds the header limit.";
   const body = Buffer.from(
     JSON.stringify({
       error: {
@@ -140,6 +183,7 @@ export async function startMockApi(
   const helpHtml = await loadHelpDocument();
   let handler: ReturnType<typeof createRouteHandler> | undefined;
   const protocolRejections = new WeakSet<Duplex>();
+  const rawHeaderProbes = new WeakMap<Duplex, RawHeaderProbe>();
   const server = createServer(
     {
       connectionsCheckingInterval: Math.min(requestTimeoutMs, 100),
@@ -148,6 +192,11 @@ export async function startMockApi(
       requireHostHeader: false,
     },
     (request, response) => {
+      const probe = rawHeaderProbes.get(request.socket);
+      if (probe !== undefined) {
+        probe.bytes = Buffer.alloc(0);
+        probe.fieldCount = undefined;
+      }
       request.setTimeout(requestTimeoutMs, () => stableRequestTimeout(response));
       if (handler === undefined) {
         response.writeHead(503, { connection: "close", "content-length": "0" });
@@ -159,13 +208,18 @@ export async function startMockApi(
   );
   server.headersTimeout = Math.min(HEADERS_TIMEOUT_MS, requestTimeoutMs);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
-  server.maxHeadersCount = MAX_HEADERS;
+  server.maxHeadersCount = 0;
   server.maxRequestsPerSocket = 100;
+  server.on("connection", (socket: Duplex) => {
+    const probe: RawHeaderProbe = { bytes: Buffer.alloc(0) };
+    rawHeaderProbes.set(socket, probe);
+    socket.prependListener("data", (chunk: Buffer) => captureRawHeader(probe, chunk));
+  });
   server.on("clientError", (error, socket) => {
     if (protocolRejections.has(socket)) {
       return;
     }
-    stableClientError(error, socket);
+    stableClientError(error, socket, rawHeaderProbes.get(socket)?.fieldCount);
   });
 
   await new Promise<void>((resolveListen, rejectListen) => {

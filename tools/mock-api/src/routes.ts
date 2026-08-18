@@ -9,6 +9,7 @@ import {
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+export const MAX_REQUEST_HEADER_FIELDS = 64;
 const MAX_PAGE_SIZE = 100;
 const VALID_ORDER_STATUSES = new Set<OrderStatus>([
   "pending",
@@ -388,6 +389,17 @@ function validateRequestIdentity(
   }
 }
 
+function validateRequestHeaderCount(request: IncomingMessage): void {
+  const fieldCount = request.rawHeaders.length / 2;
+  if (!Number.isInteger(fieldCount) || fieldCount > MAX_REQUEST_HEADER_FIELDS) {
+    throw new RouteError(
+      431,
+      "too_many_headers",
+      "The request contains too many header fields.",
+    );
+  }
+}
+
 function validateRequestBodyPolicy(request: IncomingMessage, path: string): void {
   const contentLengths = rawHeaderValues(request, "content-length");
   const transferEncodings = rawHeaderValues(request, "transfer-encoding");
@@ -481,6 +493,7 @@ export function createRouteHandler({
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const connection = request.socket;
     try {
+      validateRequestHeaderCount(request);
       if (request.url === undefined || request.method === undefined) {
         throw new RouteError(400, "invalid_request", "The HTTP request is incomplete.");
       }
@@ -549,13 +562,14 @@ export function createRouteHandler({
 
       const orderMatch = /^\/api\/orders\/(ORD-[0-9]{4})$/.exec(path);
       if (orderMatch !== null) {
-        const order = findOrder(fixtures, orderMatch[1]!);
         if (request.method === "GET") {
+          const order = findOrder(fixtures, orderMatch[1]!);
           sendJson(response, 200, orderWithCustomer(fixtures, order));
           return;
         }
         if (request.method === "PATCH") {
           const update = validateOrderUpdate(requireRecord(await readJsonRequest(request)));
+          const order = findOrder(fixtures, orderMatch[1]!);
           Object.assign(order, update, { updatedAt: "2026-08-18T12:00:00.000Z" });
           sendJson(response, 200, orderWithCustomer(fixtures, order));
           return;

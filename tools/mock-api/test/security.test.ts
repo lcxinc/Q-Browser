@@ -20,6 +20,7 @@ function requestBytes(
     target?: string;
     headers?: ReadonlyArray<readonly [string, string]>;
     body?: Buffer | string;
+    includeConnection?: boolean;
     includeHost?: boolean;
   } = {},
 ): Buffer {
@@ -30,7 +31,10 @@ function requestBytes(
   if (options.includeHost !== false) {
     headers.push(["Host", `${api.host}:${api.port}`]);
   }
-  headers.push(...(options.headers ?? []), ["Connection", "close"]);
+  headers.push(...(options.headers ?? []));
+  if (options.includeConnection !== false) {
+    headers.push(["Connection", "close"]);
+  }
   const head =
     `${options.method ?? "GET"} ${options.target ?? "/api/dashboard"} HTTP/1.1\r\n` +
     headers.map(([name, value]) => `${name}: ${value}\r\n`).join("") +
@@ -48,6 +52,43 @@ async function exchange(api: RunningMockApi, bytes: Buffer): Promise<RawResponse
     }, 2_000);
     deadline.unref();
     socket.once("connect", () => socket.end(bytes));
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.once("error", (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+    socket.once("end", () => {
+      clearTimeout(deadline);
+      resolve(Buffer.concat(chunks));
+    });
+  });
+
+  return parseRawResponse(raw);
+}
+
+async function exchangeParts(
+  api: RunningMockApi,
+  parts: readonly Buffer[],
+): Promise<RawResponse> {
+  const raw = await new Promise<Buffer>((resolve, reject) => {
+    const socket = connect(api.port, api.host);
+    const chunks: Buffer[] = [];
+    let partIndex = 0;
+    const deadline = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("fragmented raw HTTP exchange exceeded its deadline"));
+    }, 2_000);
+    deadline.unref();
+    const sendNext = () => {
+      const part = parts[partIndex++];
+      if (part === undefined) {
+        socket.end();
+        return;
+      }
+      socket.write(part);
+      setTimeout(sendNext, 5).unref();
+    };
+    socket.once("connect", sendNext);
     socket.on("data", (chunk: Buffer) => chunks.push(chunk));
     socket.once("error", (error) => {
       clearTimeout(deadline);
@@ -141,6 +182,13 @@ function jsonHeaders(body: Buffer | string): ReadonlyArray<readonly [string, str
     ["Content-Type", "application/json"],
     ["Content-Length", String(size)],
   ];
+}
+
+function fillerHeaders(count: number): ReadonlyArray<readonly [string, string]> {
+  return Array.from(
+    { length: count },
+    (_, index) => [`X-Filler-${index}`, "fixture"] as const,
+  );
 }
 
 describe("mock-api security boundary", () => {
@@ -247,6 +295,82 @@ describe("mock-api security boundary", () => {
 
     expect(response.status).toBe(400);
     expect(errorCode(response)).toBe("invalid_origin");
+  });
+
+  test("accepts exactly 64 complete header fields", async () => {
+    const response = await exchange(
+      api,
+      requestBytes(api, {
+        headers: fillerHeaders(63),
+        includeConnection: false,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  test.each(["Host", "Origin", "Content-Length", "Transfer-Encoding"] as const)(
+    "rejects a late duplicate %s field after the 64-field limit without reusing the body",
+    async (field) => {
+      const firstValues = {
+        Host: `${api.host}:${api.port}`,
+        Origin: api.origin,
+        "Content-Length": "0",
+        "Transfer-Encoding": "chunked",
+      } as const;
+      const lateValues = {
+        Host: `attacker.example:${api.port}`,
+        Origin: `http://attacker.example:${api.port}`,
+        "Content-Length": "0",
+        "Transfer-Encoding": "chunked",
+      } as const;
+      const leadingHeaders: Array<readonly [string, string]> = [];
+      const includeHost = field !== "Host";
+      if (field === "Host") {
+        leadingHeaders.push(["Host", firstValues.Host]);
+      } else {
+        leadingHeaders.push([field, firstValues[field]]);
+      }
+      leadingHeaders.push(...fillerHeaders(63 - (includeHost ? 1 : 0)));
+      leadingHeaders.push([field, lateValues[field]]);
+      const first = requestBytes(api, {
+        headers: leadingHeaders,
+        includeConnection: false,
+        includeHost,
+      });
+      const second = requestBytes(api);
+
+      const response = await exchange(api, Buffer.concat([first, second]));
+
+      expect(response.status).toBe(431);
+      expect(errorCode(response)).toBe("too_many_headers");
+      expect(response.headers.get("connection")).toBe("close");
+      expect(response.body.toString("utf8")).not.toContain("HTTP/1.1");
+    },
+  );
+
+  test("counts late duplicate framing fields across TCP fragments", async () => {
+    const first = requestBytes(api, {
+      headers: [
+        ["Content-Length", "0"],
+        ...fillerHeaders(62),
+        ["Content-Length", "0"],
+      ],
+      includeConnection: false,
+    });
+    const lateHeader = Buffer.from("Content-Length: 0\r\n\r\n", "ascii");
+    const split = first.lastIndexOf(lateHeader);
+    expect(split).toBeGreaterThan(0);
+
+    const response = await exchangeParts(api, [
+      first.subarray(0, split),
+      Buffer.concat([first.subarray(split), requestBytes(api)]),
+    ]);
+
+    expect(response.status).toBe(431);
+    expect(errorCode(response)).toBe("too_many_headers");
+    expect(response.headers.get("connection")).toBe("close");
+    expect(response.body.toString("utf8")).not.toContain("HTTP/1.1");
   });
 
   test.each([
@@ -356,6 +480,79 @@ describe("mock-api security boundary", () => {
     );
 
     expect(response.status).toBe(200);
+  });
+
+  test("caps a chunked PATCH body before looking up a nonexistent order", async () => {
+    const payload = Buffer.alloc(MAX_REQUEST_BODY_BYTES + 1, 0x20);
+    const body = Buffer.concat([
+      Buffer.from(`${payload.byteLength.toString(16)}\r\n`, "ascii"),
+      payload,
+      Buffer.from("\r\n0\r\n\r\n", "ascii"),
+    ]);
+    const response = await exchange(
+      api,
+      requestBytes(api, {
+        method: "PATCH",
+        target: "/api/orders/ORD-9999",
+        headers: [
+          ["Content-Type", "application/json"],
+          ["Transfer-Encoding", "chunked"],
+        ],
+        body,
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(errorCode(response)).toBe("request_body_too_large");
+  });
+
+  test("rejects invalid PATCH JSON before looking up a nonexistent order", async () => {
+    const body = "{";
+    const response = await exchange(
+      api,
+      requestBytes(api, {
+        method: "PATCH",
+        target: "/api/orders/ORD-9999",
+        headers: jsonHeaders(body),
+        body,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(errorCode(response)).toBe("invalid_json");
+  });
+
+  test("validates the PATCH schema before looking up a nonexistent order", async () => {
+    const body = '{"unsupported":true}';
+    const response = await exchange(
+      api,
+      requestBytes(api, {
+        method: "PATCH",
+        target: "/api/orders/ORD-9999",
+        headers: jsonHeaders(body),
+        body,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(errorCode(response)).toBe("invalid_order_update");
+  });
+
+  test("rejects a declared oversized PATCH before looking up a nonexistent order", async () => {
+    const response = await exchange(
+      api,
+      requestBytes(api, {
+        method: "PATCH",
+        target: "/api/orders/ORD-9999",
+        headers: [
+          ["Content-Type", "application/json"],
+          ["Content-Length", String(MAX_REQUEST_BODY_BYTES + 1)],
+        ],
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(errorCode(response)).toBe("request_body_too_large");
   });
 
   test.each([
