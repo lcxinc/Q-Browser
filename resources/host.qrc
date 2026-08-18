@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/web">
+    <file alias="error.html">web/error.html</file>
+  </qresource>
+</RCC>

@@ -9,11 +9,18 @@ if(BUILD_TESTING)
   add_subdirectory(integration/ipc)
   add_subdirectory(integration/package)
   add_subdirectory(integration/worker)
+  if(Q_BROWSER_BUILD_WEBENGINE)
+    add_subdirectory(integration/host)
+  endif()
   add_subdirectory(unit/broker)
   add_subdirectory(unit/ipc)
   add_subdirectory(unit/package)
   add_subdirectory(unit/policy)
   add_subdirectory(unit/router)
+
+  if(Q_BROWSER_BUILD_WEBENGINE)
+    add_subdirectory(unit/webengine)
+  endif()
 
   add_executable(q_browser_build_smoke
     smoke/tst_build_smoke.cpp)
