@@ -13,10 +13,7 @@ Control {
     property string emptyText: "No items"
     property int rowHeight: Spacing.touchTarget
     property int cacheBuffer: rowHeight * 2
-    readonly property int count: model === null || model === undefined
-                                     ? 0
-                                     : typeof model.count === "number" ? model.count
-                                                                       : model.length || 0
+    readonly property int count: listView.count
     readonly property bool empty: count === 0
     readonly property bool emptyVisible: empty
     readonly property int currentIndex: listView.currentIndex
@@ -107,9 +104,25 @@ Control {
             font.family: Typography.family
             font.pixelSize: Typography.body
             Accessible.name: text
-            Accessible.description: highlighted ? "Selected" : ""
             Accessible.role: Accessible.Row
+            Accessible.selectable: true
+            Accessible.selected: highlighted
             onClicked: root.select(index)
+
+
+            contentItem: Text {
+                text: row.text
+                color: row.enabled ? Theme.textPrimary : Theme.disabled
+                font: row.font
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+
+            background: Rectangle {
+                color: row.highlighted ? Theme.surfaceRaised : Theme.surface
+                border.width: row.visualFocus ? Spacing.focusRing : 0
+                border.color: Theme.focus
+            }
         }
     }
 }

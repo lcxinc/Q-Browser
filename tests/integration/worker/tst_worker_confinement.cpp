@@ -54,6 +54,7 @@ private slots:
     void pendingCapabilityQueueIsTypedBoundedAndFifo();
     void rejectsEntryOutsideVerifiedPackage();
     void rejectsPollutedImportAndNativePlugin();
+    void loadsApprovedBuiltInDesignModuleFromWorkerClosure();
     void inProcessQmlNetworkIsDeniedBeforeSocketConnect();
     void loadingFacadeCallsAndRawNetworkAreBrokeredOrDenied();
     void loadingQueueOverflowFailsClosedBeforeReady();
@@ -134,6 +135,56 @@ void WorkerConfinementTest::rejectsPollutedImportAndNativePlugin()
     QVERIFY(!pluginWindow.load(package, QStringLiteral("qml/Main.qml"), &facade));
     QCOMPARE(pluginWindow.errorString(),
              QStringLiteral("worker.qml.native_plugin_forbidden"));
+}
+
+void WorkerConfinementTest::loadsApprovedBuiltInDesignModuleFromWorkerClosure()
+{
+    const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
+import Company.Design
+Rectangle {
+    width: 320
+    height: 200
+    color: Theme.background
+    AppButton {
+        text: "Design closure loaded"
+    }
+    Component.onCompleted: Runtime.invoke(
+        "test", "observe", { kind: "designLoaded", darkSurface: Theme.surface.toString() })
+}
+)QML");
+    WorkerTestEnvironment environment(qml);
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    EnvironmentGuard pollutedImports("QML2_IMPORT_PATH",
+                                       QByteArrayLiteral("Z:/untrusted/qml"));
+    EnvironmentGuard pollutedImportsModern("QML_IMPORT_PATH",
+                                             QByteArrayLiteral("Z:/untrusted/qml"));
+    auto launch = environment.launch(QStringLiteral("design-nonce"),
+                                     QStringLiteral("design-nonce"));
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::SurfaceReady).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    const auto request = receiveUntil(launch->hostSession, ProtocolType::Request);
+    QCOMPARE(request.status, SessionStatus::MessageReady);
+    QCOMPARE(request.message->payload().value(QStringLiteral("capability")).toString(),
+             QStringLiteral("test"));
+    const QJsonObject body = request.message->payload()
+                                 .value(QStringLiteral("payload")).toObject();
+    QCOMPARE(body.value(QStringLiteral("kind")).toString(),
+             QStringLiteral("designLoaded"));
+    QVERIFY(!body.value(QStringLiteral("darkSurface")).toString().isEmpty());
+    QVERIFY(launch->hostSession.send(
+        *ProtocolMessage::successResponse(request.message->requestId(), QJsonObject{}), 5000));
+    QVERIFY(launch->hostSession.send(*ProtocolMessage::shutdown(QStringLiteral("test.done")),
+                                    5000));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(launch->process.waitForFinished(5000));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }
 
 void WorkerConfinementTest::inProcessQmlNetworkIsDeniedBeforeSocketConnect()

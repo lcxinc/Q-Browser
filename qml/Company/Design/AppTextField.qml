@@ -13,6 +13,7 @@ Control {
     property alias inputMethodHints: editor.inputMethodHints
     property alias maximumLength: editor.maximumLength
     property alias readOnly: editor.readOnly
+    readonly property alias inputControl: editor
     property bool required: false
     property string requiredMessage: label.length > 0 ? label + " is required"
                                                        : "This field is required"
@@ -39,10 +40,7 @@ Control {
     topPadding: 0
     bottomPadding: 0
 
-    Accessible.name: accessibleName
-    Accessible.description: accessibleDescription
-    Accessible.role: Accessible.EditableText
-    Accessible.focusable: true
+    Accessible.ignored: true
 
     contentItem: Column {
         id: contentColumn
@@ -67,7 +65,10 @@ Control {
             selectByMouse: true
             font.family: Typography.family
             font.pixelSize: Typography.body
-            Accessible.ignored: true
+            Accessible.name: root.accessibleName
+            Accessible.description: root.accessibleDescription
+            Accessible.role: Accessible.EditableText
+            Accessible.focusable: true
             onAccepted: root.accepted()
             onTextEdited: root.clientError = ""
 

@@ -218,7 +218,10 @@ bool WorkerTestEnvironment::prepare()
     QProcess deploy;
     deploy.start(QString::fromUtf8(Q_BROWSER_WINDEPLOYQT_PATH),
                  {QStringLiteral("--no-translations"),
-                  QStringLiteral("--qmldir"), qmlDirectory,
+                  QStringLiteral("--add-plugin-types"),
+                  QStringLiteral("quickcontrols2,quickcontrols2basic,quickcontrols2basicstyleimpl"),
+                  QStringLiteral("--qmldir"),
+                  QString::fromUtf8(Q_BROWSER_DESIGN_QML_SOURCE_DIR),
                   QStringLiteral("--dir"), runtimeRoot_,
                   workerExecutable_});
     if (!deploy.waitForStarted(5000) || !deploy.waitForFinished(120000)

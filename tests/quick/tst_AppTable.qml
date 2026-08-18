@@ -51,4 +51,31 @@ TestCase {
         verify(table.instantiatedItemCount < rows.length)
         verify(table.itemAtIndex(1999) === null)
     }
+
+    function test_integerModelUsesListViewCount() {
+        const table = createTemporaryObject(tableComponent, this, { "model": 3 })
+        verify(table)
+
+        tryCompare(table, "count", 3)
+        verify(!table.empty)
+        verify(table.select(2))
+        compare(table.currentIndex, 2)
+    }
+
+    function test_darkThemeStylesActualRowAndSelectionSemantics() {
+        const originalDark = Theme.dark
+        Theme.dark = true
+        const table = createTemporaryObject(tableComponent, this,
+                                             { "model": ["One", "Two"] })
+        verify(table)
+        tryVerify(function() { return table.itemAtIndex(0) !== null })
+        verify(table.select(0))
+        const row = table.itemAtIndex(0)
+
+        compare(row.contentItem.color.toString(), Theme.textPrimary.toString())
+        compare(row.background.color.toString(), Theme.surfaceRaised.toString())
+        verify(row.Accessible.selectable)
+        verify(row.Accessible.selected)
+        Theme.dark = originalDark
+    }
 }

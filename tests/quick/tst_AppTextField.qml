@@ -48,7 +48,12 @@ TestCase {
         const field = createTemporaryObject(fieldComponent, this)
         verify(field)
 
-        compare(field.Accessible.name, "Email")
-        compare(field.Accessible.role, Accessible.EditableText)
+        verify(field.Accessible.ignored)
+        compare(field.inputControl.Accessible.name, "Email")
+        compare(field.inputControl.Accessible.role, Accessible.EditableText)
+        verify(field.inputControl.Accessible.focusable)
+
+        verify(!field.validate())
+        compare(field.inputControl.Accessible.description, "Email is required")
     }
 }

@@ -12,18 +12,29 @@ Control {
     property string accessibleName: "Navigation"
     property string accessibleDescription: count + " destinations"
     readonly property bool focusVisible: visualFocus
-    readonly property int count: model === null || model === undefined
-                                     ? 0
-                                     : typeof model.count === "number" ? model.count
-                                                                       : model.length || 0
+    readonly property int count: navigationList.count
 
     signal activated(int index, var value)
+
+    function itemAtIndex(index) {
+        return navigationList.itemAtIndex(index)
+    }
+
+    function valueAt(index) {
+        if (Array.isArray(model))
+            return model[index]
+        if (typeof model === "number")
+            return index
+        if (model !== null && model !== undefined && typeof model.get === "function")
+            return model.get(index)
+        return index
+    }
 
     function navigate(index) {
         if (!enabled || !Number.isInteger(index) || index < 0 || index >= count)
             return false
         currentIndex = index
-        activated(index, Array.isArray(model) ? model[index] : null)
+        activated(index, valueAt(index))
         return true
     }
 
@@ -62,6 +73,7 @@ Control {
         boundsBehavior: Flickable.StopAtBounds
 
         delegate: ItemDelegate {
+            id: destination
             required property int index
             required property var modelData
             width: root.orientation === Qt.Vertical ? navigationList.width : implicitWidth
@@ -74,7 +86,23 @@ Control {
             font.pixelSize: Typography.body
             Accessible.name: text
             Accessible.role: Accessible.PageTab
+            Accessible.selectable: true
+            Accessible.selected: highlighted
             onClicked: root.navigate(index)
+
+            contentItem: Text {
+                text: destination.text
+                color: destination.enabled ? Theme.textPrimary : Theme.disabled
+                font: destination.font
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+
+            background: Rectangle {
+                color: destination.highlighted ? Theme.surfaceRaised : Theme.surface
+                border.width: destination.visualFocus ? Spacing.focusRing : 0
+                border.color: Theme.focus
+            }
         }
     }
 

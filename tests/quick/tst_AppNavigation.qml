@@ -22,6 +22,12 @@ TestCase {
         signalName: "activated"
     }
 
+    ListModel {
+        id: destinationModel
+        ListElement { label: "Dashboard"; route: "/dashboard" }
+        ListElement { label: "Orders"; route: "/orders" }
+    }
+
     function init() {
         activatedSpy.clear()
     }
@@ -53,5 +59,38 @@ TestCase {
         verify(!navigation.navigate(0))
         compare(navigation.currentIndex, -1)
         compare(activatedSpy.count, 0)
+    }
+
+    function test_integerAndListModelsFollowListViewContract() {
+        const integerNavigation = createTemporaryObject(navigationComponent, this,
+                                                        { "model": 3 })
+        verify(integerNavigation)
+        tryCompare(integerNavigation, "count", 3)
+        verify(integerNavigation.navigate(2))
+        compare(integerNavigation.currentIndex, 2)
+
+        const objectNavigation = createTemporaryObject(navigationComponent, this,
+                                                       { "model": destinationModel })
+        verify(objectNavigation)
+        activatedSpy.target = objectNavigation
+        tryCompare(objectNavigation, "count", 2)
+        verify(objectNavigation.navigate(1))
+        compare(activatedSpy.signalArguments[0][1].route, "/orders")
+    }
+
+    function test_darkThemeStylesActualDelegateAndSelectionSemantics() {
+        const originalDark = Theme.dark
+        Theme.dark = true
+        const navigation = createTemporaryObject(navigationComponent, this)
+        verify(navigation)
+        tryVerify(function() { return navigation.itemAtIndex(0) !== null })
+        verify(navigation.navigate(0))
+        const destination = navigation.itemAtIndex(0)
+
+        compare(destination.contentItem.color.toString(), Theme.textPrimary.toString())
+        compare(destination.background.color.toString(), Theme.surfaceRaised.toString())
+        verify(destination.Accessible.selectable)
+        verify(destination.Accessible.selected)
+        Theme.dark = originalDark
     }
 }

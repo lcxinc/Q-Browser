@@ -20,7 +20,8 @@ foreach(q_browser_worker_test IN ITEMS handshake surface crash confinement)
   target_compile_definitions(tst_worker_${q_browser_worker_test}
     PRIVATE
       Q_BROWSER_WORKER_PATH="$<TARGET_FILE:qbrowser-worker>"
-      Q_BROWSER_WINDEPLOYQT_PATH="${WINDEPLOYQT_EXECUTABLE}")
+      Q_BROWSER_WINDEPLOYQT_PATH="${WINDEPLOYQT_EXECUTABLE}"
+      Q_BROWSER_DESIGN_QML_SOURCE_DIR="${PROJECT_SOURCE_DIR}/qml")
   add_dependencies(tst_worker_${q_browser_worker_test} qbrowser-worker)
   q_browser_enable_strict_warnings(tst_worker_${q_browser_worker_test})
   q_browser_add_qt_test(
