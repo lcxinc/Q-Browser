@@ -1,8 +1,11 @@
 if(BUILD_TESTING)
+  add_subdirectory(integration/broker)
   add_subdirectory(integration/ipc)
   add_subdirectory(integration/package)
+  add_subdirectory(unit/broker)
   add_subdirectory(unit/ipc)
   add_subdirectory(unit/package)
+  add_subdirectory(unit/policy)
   add_subdirectory(unit/router)
 
   add_executable(q_browser_build_smoke
