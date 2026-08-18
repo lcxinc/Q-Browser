@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "test": "vitest run",
+    "test": "vitest run --pool=threads --maxWorkers=1",
     "lint": "tsc -b --pretty false"
   },
   "devDependencies": {

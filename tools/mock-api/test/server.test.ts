@@ -317,7 +317,7 @@ describe("mock-api", () => {
       socket.once("connect", () => {
         socket.write(
           "POST /api/login HTTP/1.1\r\n" +
-            "Host: 127.0.0.1\r\n" +
+            `Host: ${api.host}:${api.port}\r\n` +
             "Content-Type: application/json\r\n" +
             "Content-Length: 100\r\n\r\n" +
             "{",

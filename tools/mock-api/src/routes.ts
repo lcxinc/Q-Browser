@@ -6,6 +6,7 @@ import {
   type OrderStatus,
   type PilotFixtures,
 } from "./fixtures.ts";
+import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_PAGE_SIZE = 100;
@@ -197,13 +198,17 @@ async function readJsonRequest(request: IncomingMessage): Promise<unknown> {
   }
 
   try {
-    return JSON.parse(Buffer.concat(chunks, received).toString("utf8")) as unknown;
-  } catch {
-    throw new RouteError(
-      400,
-      "invalid_json",
-      "The request body is not valid JSON.",
-    );
+    return parseStrictJson(Buffer.concat(chunks, received));
+  } catch (error) {
+    if (!(error instanceof StrictJsonError)) throw error;
+    const messages = {
+      duplicate_json_member: "The JSON body contains a duplicate member.",
+      invalid_json: "The request body is not valid JSON.",
+      invalid_utf8: "The request body is not valid UTF-8.",
+      json_too_complex: "The JSON body contains too many members.",
+      json_too_deep: "The JSON body is nested too deeply.",
+    } as const;
+    throw new RouteError(400, error.code, messages[error.code]);
   }
 }
 
@@ -324,18 +329,165 @@ async function waitForDelay(
 }
 
 export interface RouteHandlerOptions {
+  expectedAuthority: string;
+  expectedOrigin: string;
   fixtures: PilotFixtures;
   helpHtml: string;
+  onProtocolRejection: (connection: IncomingMessage["socket"]) => void;
 }
 
-export function createRouteHandler({ fixtures, helpHtml }: RouteHandlerOptions) {
+function rawHeaderValues(request: IncomingMessage, expectedName: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    if (request.rawHeaders[index]?.toLowerCase() === expectedName) {
+      values.push(request.rawHeaders[index + 1] ?? "");
+    }
+  }
+  return values;
+}
+
+function validateRequestIdentity(
+  request: IncomingMessage,
+  expectedAuthority: string,
+  expectedOrigin: string,
+): void {
+  const target = request.url;
+  if (
+    target === undefined ||
+    !target.startsWith("/") ||
+    target.startsWith("//") ||
+    target.includes("\\") ||
+    target.includes("#")
+  ) {
+    throw new RouteError(
+      400,
+      "invalid_request_target",
+      "The request target must use canonical origin-form.",
+    );
+  }
+
+  const hostValues = rawHeaderValues(request, "host");
+  if (hostValues.length !== 1 || hostValues[0] !== expectedAuthority) {
+    throw new RouteError(
+      400,
+      "invalid_authority",
+      "The Host authority does not match the local mock API.",
+    );
+  }
+
+  const originValues = rawHeaderValues(request, "origin");
+  if (
+    originValues.length > 1 ||
+    (originValues.length === 1 && originValues[0] !== expectedOrigin)
+  ) {
+    throw new RouteError(
+      400,
+      "invalid_origin",
+      "The Origin does not match the local mock API.",
+    );
+  }
+}
+
+function validateRequestBodyPolicy(request: IncomingMessage, path: string): void {
+  const contentLengths = rawHeaderValues(request, "content-length");
+  const transferEncodings = rawHeaderValues(request, "transfer-encoding");
+  if (
+    contentLengths.length > 1 ||
+    transferEncodings.length > 1 ||
+    (contentLengths.length !== 0 && transferEncodings.length !== 0)
+  ) {
+    throw new RouteError(
+      400,
+      "invalid_http_framing",
+      "The request uses ambiguous HTTP message framing.",
+    );
+  }
+
+  let declaredLength = 0;
+  if (contentLengths.length === 1) {
+    const rawLength = contentLengths[0]!;
+    if (!/^(0|[1-9][0-9]*)$/.test(rawLength)) {
+      throw new RouteError(
+        400,
+        "invalid_http_framing",
+        "The Content-Length header is invalid.",
+      );
+    }
+    declaredLength = Number(rawLength);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength > MAX_REQUEST_BODY_BYTES) {
+      throw new RouteError(
+        413,
+        "request_body_too_large",
+        "The request body exceeds the allowed size.",
+      );
+    }
+  }
+
+  if (
+    transferEncodings.length === 1 &&
+    transferEncodings[0]!.toLowerCase() !== "chunked"
+  ) {
+    throw new RouteError(
+      400,
+      "invalid_http_framing",
+      "The Transfer-Encoding header is not supported.",
+    );
+  }
+
+  const contentEncodings = rawHeaderValues(request, "content-encoding");
+  if (
+    contentEncodings.length > 1 ||
+    (contentEncodings.length === 1 && contentEncodings[0]!.toLowerCase() !== "identity")
+  ) {
+    throw new RouteError(
+      415,
+      "unsupported_content_encoding",
+      "Encoded request bodies are not supported.",
+    );
+  }
+
+  const acceptsBody =
+    (request.method === "POST" && path === "/api/login") ||
+    (request.method === "PATCH" && /^\/api\/orders\/ORD-[0-9]{4}$/.test(path));
+  const bodyIsFramed = declaredLength > 0 || transferEncodings.length === 1;
+  if (!acceptsBody && bodyIsFramed) {
+    throw new RouteError(
+      400,
+      "request_body_not_allowed",
+      "This resource does not accept a request body.",
+    );
+  }
+
+  if (acceptsBody) {
+    const contentTypes = rawHeaderValues(request, "content-type");
+    const mediaType = contentTypes[0]?.split(";", 1)[0]?.trim().toLowerCase();
+    if (contentTypes.length !== 1 || mediaType !== "application/json") {
+      throw new RouteError(
+        415,
+        "unsupported_media_type",
+        "The request body must use application/json.",
+      );
+    }
+  }
+}
+
+export function createRouteHandler({
+  expectedAuthority,
+  expectedOrigin,
+  fixtures,
+  helpHtml,
+  onProtocolRejection,
+}: RouteHandlerOptions) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    const connection = request.socket;
     try {
       if (request.url === undefined || request.method === undefined) {
         throw new RouteError(400, "invalid_request", "The HTTP request is incomplete.");
       }
-      const url = new URL(request.url, "http://127.0.0.1");
+      validateRequestIdentity(request, expectedAuthority, expectedOrigin);
+      const url = new URL(request.url, expectedOrigin);
       const path = url.pathname;
+      validateRequestBodyPolicy(request, path);
 
       if (path === "/api/login") {
         if (!assertMethod(request, response, "POST")) return;
@@ -479,11 +631,11 @@ export function createRouteHandler({ fixtures, helpHtml }: RouteHandlerOptions) 
       sendError(response, 404, "not_found", "The requested resource was not found.");
     } catch (error) {
       if (error instanceof RouteError) {
-        const closeConnection = error.status === 413;
-        sendError(response, error.status, error.code, error.message, closeConnection ? { connection: "close" } : {});
-        if (closeConnection) {
-          request.resume();
-        }
+        onProtocolRejection(connection);
+        sendError(response, error.status, error.code, error.message, {
+          connection: "close",
+        });
+        request.resume();
         return;
       }
       sendError(

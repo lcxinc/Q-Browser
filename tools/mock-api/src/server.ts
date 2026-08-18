@@ -54,13 +54,21 @@ function stableClientError(error: Error & { code?: string }, response: Duplex): 
   }
   const timedOut = error.code === "ERR_HTTP_REQUEST_TIMEOUT";
   const headerOverflow = error.code === "HPE_HEADER_OVERFLOW";
+  const invalidFraming =
+    error.code === "HPE_UNEXPECTED_CONTENT_LENGTH" ||
+    error.code === "HPE_INVALID_CONTENT_LENGTH" ||
+    error.code === "HPE_INVALID_TRANSFER_ENCODING";
   const status = timedOut ? 408 : headerOverflow ? 431 : 400;
   const reason = timedOut
     ? "Request Timeout"
     : headerOverflow
       ? "Request Header Fields Too Large"
       : "Bad Request";
-  const code = timedOut ? "request_timeout" : "invalid_http_request";
+  const code = timedOut
+    ? "request_timeout"
+    : invalidFraming
+      ? "invalid_http_framing"
+      : "invalid_http_request";
   const message = timedOut
     ? "The HTTP request did not complete before the deadline."
     : "The HTTP request is malformed or exceeds the header limit.";
@@ -130,18 +138,22 @@ export async function startMockApi(
 ): Promise<RunningMockApi> {
   const requestTimeoutMs = requestTimeoutFor(options);
   const helpHtml = await loadHelpDocument();
-  const handler = createRouteHandler({
-    fixtures: createPilotFixtures(),
-    helpHtml,
-  });
+  let handler: ReturnType<typeof createRouteHandler> | undefined;
+  const protocolRejections = new WeakSet<Duplex>();
   const server = createServer(
     {
       connectionsCheckingInterval: Math.min(requestTimeoutMs, 100),
       maxHeaderSize: MAX_HEADER_BYTES,
       requestTimeout: requestTimeoutMs,
+      requireHostHeader: false,
     },
     (request, response) => {
       request.setTimeout(requestTimeoutMs, () => stableRequestTimeout(response));
+      if (handler === undefined) {
+        response.writeHead(503, { connection: "close", "content-length": "0" });
+        response.end();
+        return;
+      }
       void handler(request, response);
     },
   );
@@ -149,7 +161,12 @@ export async function startMockApi(
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
   server.maxHeadersCount = MAX_HEADERS;
   server.maxRequestsPerSocket = 100;
-  server.on("clientError", (error, socket) => stableClientError(error, socket));
+  server.on("clientError", (error, socket) => {
+    if (protocolRejections.has(socket)) {
+      return;
+    }
+    stableClientError(error, socket);
+  });
 
   await new Promise<void>((resolveListen, rejectListen) => {
     const failed = (error: Error) => {
@@ -170,6 +187,15 @@ export async function startMockApi(
     await closeServer(server);
     throw new Error("mock-api did not bind the required IPv4 loopback address");
   }
+
+  const expectedAuthority = `${LOOPBACK_HOST}:${address.port}`;
+  handler = createRouteHandler({
+    expectedAuthority,
+    expectedOrigin: `http://${expectedAuthority}`,
+    fixtures: createPilotFixtures(),
+    helpHtml,
+    onProtocolRejection: (connection) => protocolRejections.add(connection),
+  });
 
   let closePromise: Promise<void> | undefined;
   return Object.freeze({
