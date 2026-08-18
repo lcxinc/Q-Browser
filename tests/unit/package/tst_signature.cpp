@@ -1,6 +1,7 @@
 #include "Archive.h"
 #include "ContentDigest.h"
 #include "SignatureVerifier.h"
+#include "SignatureTestHooks.h"
 
 #include <QDir>
 #include <QFile>
@@ -17,6 +18,25 @@
 
 namespace
 {
+#ifdef Q_BROWSER_SIGNATURE_TESTING
+class SignatureHookGuard final
+{
+public:
+    explicit SignatureHookGuard(qbrowser_signature_testing::SignatureTestHooks hooks)
+    {
+        qbrowser_signature_testing::setSignatureTestHooks(std::move(hooks));
+    }
+
+    ~SignatureHookGuard()
+    {
+        qbrowser_signature_testing::resetSignatureTestHooks();
+    }
+
+    SignatureHookGuard(const SignatureHookGuard &) = delete;
+    SignatureHookGuard &operator=(const SignatureHookGuard &) = delete;
+};
+#endif
+
 QByteArray hex(const char *value)
 {
     return QByteArray::fromHex(QByteArray(value));
@@ -76,10 +96,12 @@ private slots:
     void excludesOnlyExactMetadataNames();
     void validatesCanonicalPayloadMetadata();
     void rejectsAmbiguousDigestInputs();
+    void rejectsNonCanonicalUnicodeDigestPaths();
     void signsAndVerifiesRfc8032Vector();
     void rejectsChangedMessageWrongKeyAndMalformedSizes();
     void generatesStrictPemKeyPairs();
     void rejectsNonEd25519PemAndClearsErrorQueue();
+    void cleansesPrivateBioBeforeReleaseOnSuccessAndFailure();
 };
 
 void SignatureTest::snapshotsOneValidatedArchiveImage()
@@ -233,6 +255,16 @@ void SignatureTest::rejectsAmbiguousDigestInputs()
         ContentDigestErrorCode::InvalidPath);
 }
 
+void SignatureTest::rejectsNonCanonicalUnicodeDigestPaths()
+{
+    const QByteArray nfdPath = QStringLiteral("e\u0301.txt").toUtf8();
+    const QByteArray nfcPath = QStringLiteral("\u00e9.txt").toUtf8();
+    QCOMPARE(
+        ContentDigest::payload({{nfdPath, QByteArrayLiteral("data")}}).error().code,
+        ContentDigestErrorCode::InvalidPath);
+    QVERIFY(ContentDigest::payload({{nfcPath, QByteArrayLiteral("data")}}).hasValue());
+}
+
 void SignatureTest::signsAndVerifiesRfc8032Vector()
 {
     const QByteArray privateSeed = hex(
@@ -333,6 +365,35 @@ void SignatureTest::rejectsNonEd25519PemAndClearsErrorQueue()
                 "message", pair.value().publicKeyPem, signature.value())
                 .isVerified());
     QCOMPARE(ERR_peek_error(), static_cast<unsigned long>(0));
+}
+
+void SignatureTest::cleansesPrivateBioBeforeReleaseOnSuccessAndFailure()
+{
+#ifdef Q_BROWSER_SIGNATURE_TESTING
+    auto runCase = [](bool forceFailure) {
+        bool observed = false;
+        bool allZero = false;
+        qbrowser_signature_testing::SignatureTestHooks hooks;
+        hooks.failAfterPrivatePemWrite = forceFailure;
+        hooks.afterPrivateBioCleanseBeforeFree =
+            [&observed, &allZero](QByteArrayView bytes) {
+                observed = true;
+                allZero = !bytes.isEmpty()
+                    && std::all_of(bytes.cbegin(), bytes.cend(), [](char value) {
+                           return value == '\0';
+                       });
+            };
+        SignatureHookGuard guard(std::move(hooks));
+        const SignatureKeyPairResult result = SignatureVerifier::generateKeyPair();
+        QCOMPARE(result.hasValue(), !forceFailure);
+        QVERIFY(observed);
+        QVERIFY(allZero);
+    };
+    runCase(false);
+    runCase(true);
+#else
+    QSKIP("signature test hooks are unavailable");
+#endif
 }
 
 QTEST_APPLESS_MAIN(SignatureTest)

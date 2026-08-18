@@ -14,6 +14,8 @@ add_library(q_browser_package STATIC
   ManifestResourceLimits.h
   SignatureVerifier.cpp
   SignatureVerifier.h
+  SignatureTestHooks.cpp
+  SignatureTestHooks.h
   WindowsStableIo.cpp
   WindowsStableIo.h)
 
@@ -32,5 +34,8 @@ target_link_libraries(q_browser_package
 q_browser_enable_strict_warnings(q_browser_package)
 
 if(BUILD_TESTING)
-  target_compile_definitions(q_browser_package PRIVATE Q_BROWSER_ARCHIVE_TESTING)
+  target_compile_definitions(q_browser_package
+    PRIVATE
+      Q_BROWSER_ARCHIVE_TESTING
+      Q_BROWSER_SIGNATURE_TESTING)
 endif()

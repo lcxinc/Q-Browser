@@ -32,7 +32,8 @@ bool isCanonicalPath(const QByteArray &path)
     }
     QStringDecoder decoder(QStringDecoder::Utf8);
     const QString decoded = decoder.decode(path);
-    if (decoder.hasError() || decoded.toUtf8() != path) {
+    if (decoder.hasError() || decoded.toUtf8() != path
+        || decoded.normalized(QString::NormalizationForm_C) != decoded) {
         return false;
     }
     const QList<QByteArray> components = path.split('/');

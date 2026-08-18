@@ -1,4 +1,5 @@
 #include "SignatureVerifier.h"
+#include "SignatureTestHooks.h"
 
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
@@ -37,6 +38,45 @@ QByteArray bioContents(BIO *bio)
         ? QByteArray(buffer->data, static_cast<qsizetype>(buffer->length))
         : QByteArray{};
 }
+
+class PrivateMemoryBio final
+{
+public:
+    explicit PrivateMemoryBio(BIO *bio) noexcept : m_bio(bio) {}
+
+    ~PrivateMemoryBio()
+    {
+        if (m_bio == nullptr) {
+            return;
+        }
+        BUF_MEM *buffer = nullptr;
+        (void)BIO_get_mem_ptr(m_bio, &buffer);
+        if (buffer != nullptr && buffer->data != nullptr && buffer->length > 0U) {
+            OPENSSL_cleanse(buffer->data, buffer->length);
+        }
+#ifdef Q_BROWSER_SIGNATURE_TESTING
+        if (qbrowser_signature_testing::signatureTestHooks()
+                .afterPrivateBioCleanseBeforeFree) {
+            const QByteArrayView view = buffer != nullptr && buffer->data != nullptr
+                ? QByteArrayView(
+                      buffer->data, static_cast<qsizetype>(buffer->length))
+                : QByteArrayView{};
+            qbrowser_signature_testing::signatureTestHooks()
+                .afterPrivateBioCleanseBeforeFree(view);
+        }
+#endif
+        BIO_free(m_bio);
+    }
+
+    PrivateMemoryBio(const PrivateMemoryBio &) = delete;
+    PrivateMemoryBio &operator=(const PrivateMemoryBio &) = delete;
+
+    [[nodiscard]] BIO *get() const noexcept { return m_bio; }
+    [[nodiscard]] explicit operator bool() const noexcept { return m_bio != nullptr; }
+
+private:
+    BIO *m_bio = nullptr;
+};
 
 PKeyPtr readPrivatePem(const QByteArray &pem)
 {
@@ -201,13 +241,27 @@ SignatureKeyPairResult SignatureVerifier::generateKeyPair()
             SignatureErrorCode::CryptoFailure, "key generation failed"));
     }
     PKeyPtr key(generated, EVP_PKEY_free);
-    BioPtr privateBio(BIO_new(BIO_s_mem()), BIO_free);
+    PrivateMemoryBio privateBio(BIO_new(BIO_s_mem()));
     BioPtr publicBio(BIO_new(BIO_s_mem()), BIO_free);
     QByteArray raw(32, Qt::Uninitialized);
     size_t rawLength = static_cast<size_t>(raw.size());
     if (!privateBio || !publicBio
-        || PEM_write_bio_PrivateKey(privateBio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) != 1
-        || PEM_write_bio_PUBKEY(publicBio.get(), key.get()) != 1
+        || PEM_write_bio_PrivateKey(
+               privateBio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr)
+            != 1) {
+        OPENSSL_cleanse(raw.data(), static_cast<size_t>(raw.size()));
+        return SignatureKeyPairResult(error(
+            SignatureErrorCode::CryptoFailure, "key generation failed"));
+    }
+#ifdef Q_BROWSER_SIGNATURE_TESTING
+    if (qbrowser_signature_testing::signatureTestHooks()
+            .failAfterPrivatePemWrite) {
+        OPENSSL_cleanse(raw.data(), static_cast<size_t>(raw.size()));
+        return SignatureKeyPairResult(error(
+            SignatureErrorCode::CryptoFailure, "key generation failed"));
+    }
+#endif
+    if (PEM_write_bio_PUBKEY(publicBio.get(), key.get()) != 1
         || EVP_PKEY_get_raw_public_key(
                key.get(), reinterpret_cast<unsigned char *>(raw.data()), &rawLength) != 1
         || rawLength != 32U) {

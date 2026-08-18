@@ -48,6 +48,8 @@ target_link_libraries(tst_signature
     OpenSSL::Crypto
     Qt6::Test)
 
+target_compile_definitions(tst_signature PRIVATE Q_BROWSER_SIGNATURE_TESTING)
+
 q_browser_enable_strict_warnings(tst_signature)
 
 q_browser_add_qt_test(
