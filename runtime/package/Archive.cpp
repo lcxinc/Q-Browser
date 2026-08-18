@@ -1746,3 +1746,222 @@ ArchiveResult Archive::extract(
         inspected.entries());
 #endif
 }
+
+ArchiveResult Archive::extractFiles(
+    const QVector<ArchiveFile> &files,
+    const QString &stagingRoot,
+    const ArchiveLimits &limits)
+{
+    if (!isEmptyDirectory(stagingRoot)
+        || pathChainContainsReparsePoint(stagingRoot)) {
+        return fail(
+            ArchiveErrorCode::UnsafeStagingRoot,
+            {},
+            QStringLiteral("staging root is not an empty regular directory"));
+    }
+    if (static_cast<quint64>(files.size()) > limits.maximumEntries) {
+        return fail(
+            ArchiveErrorCode::EntryCountLimit,
+            {},
+            QStringLiteral("archive entry count is too large"));
+    }
+    QVector<ArchiveFile> sorted = files;
+    QVector<CollisionPath> collisionPaths;
+    collisionPaths.reserve(sorted.size());
+    QVector<ArchiveEntry> entries;
+    entries.reserve(sorted.size());
+    quint64 totalSize = 0;
+    for (const ArchiveFile &file : sorted) {
+        const std::optional<CheckedPath> checkedPath = validateEntryPath(
+            file.path, limits);
+        if (!checkedPath.has_value()) {
+            return fail(ArchiveErrorCode::InvalidEntryPath,
+                        file.path,
+                        QStringLiteral("archive source path is invalid"));
+        }
+        collisionPaths.push_back(
+            {checkedPath->collisionKey, file.path, checkedPath->isCanonical});
+        const quint64 size = static_cast<quint64>(file.contents.size());
+        if (size > limits.maximumEntryBytes) {
+            return fail(ArchiveErrorCode::EntrySizeLimit,
+                        file.path,
+                        QStringLiteral("archive entry is too large"));
+        }
+        if (totalSize > limits.maximumTotalBytes
+            || size > limits.maximumTotalBytes - totalSize) {
+            return fail(ArchiveErrorCode::TotalSizeLimit,
+                        file.path,
+                        QStringLiteral("archive contents are too large"));
+        }
+        totalSize += size;
+        entries.push_back({file.path, size, size});
+    }
+    if (const std::optional<QByteArray> collision = findPathCollision(collisionPaths);
+        collision.has_value()) {
+        return fail(ArchiveErrorCode::DuplicateEntryPath,
+                    *collision,
+                    QStringLiteral("archive source paths collide"));
+    }
+    if (const std::optional<QByteArray> nonCanonical = firstNonCanonicalPath(collisionPaths);
+        nonCanonical.has_value()) {
+        return fail(ArchiveErrorCode::InvalidEntryPath,
+                    *nonCanonical,
+                    QStringLiteral("archive source path is invalid"));
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const ArchiveFile &left,
+                                               const ArchiveFile &right) {
+        return bytewiseLess(left.path, right.path);
+    });
+    std::sort(entries.begin(), entries.end(), [](const ArchiveEntry &left,
+                                                 const ArchiveEntry &right) {
+        return bytewiseLess(left.path, right.path);
+    });
+
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree stagingTree;
+    if (!stagingTree.openRoot(stagingRoot) || !stagingTree.isStable()
+        || !isEmptyDirectory(stagingRoot)) {
+        return fail(ArchiveErrorCode::UnsafeStagingRoot,
+                    {},
+                    QStringLiteral("staging root is not an empty regular directory"));
+    }
+    std::vector<qbrowser_archive_detail::WindowsStableFile> ownedFiles;
+    auto cleanup = [&] {
+        if (!stagingTree.isStable()) {
+            return;
+        }
+        for (auto iterator = ownedFiles.rbegin(); iterator != ownedFiles.rend();
+             ++iterator) {
+            (void)iterator->deleteOwned();
+        }
+        stagingTree.cleanupCreatedDirectories();
+    };
+    auto extractionFailure = [&](const ArchiveErrorCode code,
+                                 const QByteArray &path,
+                                 const QString &message) {
+        cleanup();
+        return fail(code, path, message);
+    };
+    const QString absoluteRoot = QFileInfo(stagingRoot).absoluteFilePath();
+    for (const ArchiveFile &file : sorted) {
+        const QString relativePath = QString::fromUtf8(file.path);
+        const QStringList components = relativePath.split(QLatin1Char('/'));
+        QString parentPath = absoluteRoot;
+        for (qsizetype component = 0; component + 1 < components.size();
+             ++component) {
+            parentPath = QDir(parentPath).absoluteFilePath(components.at(component));
+            if (!stagingTree.contains(parentPath)
+                && (!stagingTree.createAndHoldDirectory(parentPath)
+                    || !stagingTree.isStable())) {
+                return extractionFailure(
+                    ArchiveErrorCode::UnsafeStagingRoot,
+                    file.path,
+                    QStringLiteral("staging path is not a regular directory"));
+            }
+        }
+        const QString outputPath = QDir(parentPath).absoluteFilePath(components.back());
+        QString temporaryPath;
+        qbrowser_archive_detail::WindowsStableFile owned;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            temporaryPath = QDir(parentPath).absoluteFilePath(
+                QStringLiteral(".qbrowser-")
+                + QUuid::createUuid().toString(QUuid::Id128)
+                + QStringLiteral(".tmp"));
+            if (owned.createOwnedOutput(temporaryPath, stagingTree)) {
+                break;
+            }
+            temporaryPath.clear();
+        }
+        if (temporaryPath.isEmpty()) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                file.path,
+                QStringLiteral("archive entry could not be written"));
+        }
+        ownedFiles.push_back(std::move(owned));
+        qbrowser_archive_detail::WindowsStableFile &output = ownedFiles.back();
+        if (!output.writeAll(file.contents.constData(),
+                             static_cast<size_t>(file.contents.size()))
+            || !output.flush() || !stagingTree.isStable()
+            || !output.publishNoReplace(outputPath, stagingTree)) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                file.path,
+                QStringLiteral("archive entry could not be published"));
+        }
+    }
+#else
+    const QDir root(stagingRoot);
+    QStringList createdFiles;
+    QStringList createdDirectories;
+    auto cleanup = [&] {
+        for (auto iterator = createdFiles.crbegin(); iterator != createdFiles.crend();
+             ++iterator) {
+            (void)QFile::remove(*iterator);
+        }
+        for (auto iterator = createdDirectories.crbegin();
+             iterator != createdDirectories.crend(); ++iterator) {
+            (void)QDir().rmdir(*iterator);
+        }
+    };
+    auto extractionFailure = [&](const ArchiveErrorCode code,
+                                 const QByteArray &path,
+                                 const QString &message) {
+        cleanup();
+        return fail(code, path, message);
+    };
+    for (const ArchiveFile &file : sorted) {
+        const QString outputPath = root.absoluteFilePath(QString::fromUtf8(file.path));
+        if (!outputIsWithinRoot(stagingRoot, outputPath)) {
+            return extractionFailure(ArchiveErrorCode::InvalidEntryPath,
+                                     file.path,
+                                     QStringLiteral("archive entry path is invalid"));
+        }
+        const QString parentPath = QFileInfo(outputPath).dir().absolutePath();
+        QString currentParent = QFileInfo(stagingRoot).absoluteFilePath();
+        const QStringList components = QDir::fromNativeSeparators(
+            root.relativeFilePath(parentPath)).split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        for (const QString &component : components) {
+            currentParent = QDir(currentParent).absoluteFilePath(component);
+            if (!QFileInfo::exists(currentParent)) {
+                if (!QDir().mkdir(currentParent)) {
+                    return extractionFailure(
+                        ArchiveErrorCode::ExtractionFailed,
+                        file.path,
+                        QStringLiteral("archive parent could not be created"));
+                }
+                createdDirectories.push_back(currentParent);
+            }
+            if (pathChainContainsReparsePoint(currentParent)) {
+                return extractionFailure(
+                    ArchiveErrorCode::UnsafeStagingRoot,
+                    file.path,
+                    QStringLiteral("staging path is not a regular directory"));
+            }
+        }
+        const QString temporaryPath = parentPath + QStringLiteral("/.qbrowser-")
+            + QUuid::createUuid().toString(QUuid::Id128) + QStringLiteral(".tmp");
+        QSaveFile output(temporaryPath);
+        output.setDirectWriteFallback(false);
+        if (!output.open(QIODevice::WriteOnly)
+            || output.write(file.contents) != file.contents.size()
+            || !output.commit()) {
+            output.cancelWriting();
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                file.path,
+                QStringLiteral("archive entry could not be written"));
+        }
+        createdFiles.push_back(temporaryPath);
+        if (!QFile::rename(temporaryPath, outputPath)) {
+            return extractionFailure(
+                ArchiveErrorCode::ExtractionFailed,
+                file.path,
+                QStringLiteral("archive entry could not be published"));
+        }
+        createdFiles.back() = outputPath;
+    }
+#endif
+    return qbrowser_archive_detail::ArchiveResultFactory::success(
+        std::move(entries));
+}

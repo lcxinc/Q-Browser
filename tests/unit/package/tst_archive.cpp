@@ -315,6 +315,7 @@ class ArchiveTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void extractsOnlyTheAuthenticatedSnapshot();
     void resultStateIsTotal();
     void createsAndInspectsAnArchive();
     void rejectsUnsafeEntryPaths_data();
@@ -347,6 +348,32 @@ private slots:
     void writesByteForByteDeterministicArchives();
     void rejectsUnsafeSourceTreesBeforeWriting();
 };
+
+void ArchiveTest::extractsOnlyTheAuthenticatedSnapshot()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = temporary.filePath(QStringLiteral("candidate.qapkg"));
+    QVERIFY(Archive::createFromFiles(
+                {{QByteArrayLiteral("qml/Main.qml"), QByteArrayLiteral("safe")}},
+                package)
+                .hasValue());
+    const ArchiveSnapshotResult snapshot = Archive::snapshot(package);
+    QVERIFY(snapshot.hasValue());
+
+    QVERIFY(QFile::remove(package));
+    QVERIFY(Archive::createFromFiles(
+                {{QByteArrayLiteral("qml/Main.qml"), QByteArrayLiteral("changed")}},
+                package)
+                .hasValue());
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    const ArchiveResult extracted = Archive::extractFiles(snapshot.files(), staging);
+    QVERIFY2(extracted.hasValue(), qPrintable(extracted.error().message));
+    QFile output(staging + QStringLiteral("/qml/Main.qml"));
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), QByteArray("safe"));
+}
 
 void ArchiveTest::resultStateIsTotal()
 {

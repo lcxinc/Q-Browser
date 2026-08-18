@@ -55,3 +55,19 @@ q_browser_enable_strict_warnings(tst_signature)
 q_browser_add_qt_test(
   NAME signature
   TARGET tst_signature)
+
+add_executable(tst_package_store
+  tst_package_store.cpp)
+
+target_link_libraries(tst_package_store
+  PRIVATE
+    q_browser_package
+    Qt6::Test)
+
+target_compile_definitions(tst_package_store PRIVATE Q_BROWSER_ARCHIVE_TESTING)
+
+q_browser_enable_strict_warnings(tst_package_store)
+
+q_browser_add_qt_test(
+  NAME package_store
+  TARGET tst_package_store)

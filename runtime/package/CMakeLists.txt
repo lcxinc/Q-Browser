@@ -1,4 +1,6 @@
 add_library(q_browser_package STATIC
+  ActivationState.cpp
+  ActivationState.h
   Archive.cpp
   Archive.h
   ArchiveLimits.h
@@ -14,6 +16,10 @@ add_library(q_browser_package STATIC
   Manifest.h
   ManifestError.h
   ManifestResourceLimits.h
+  PackageStore.cpp
+  PackageStore.h
+  PackageInstaller.cpp
+  PackageInstaller.h
   PosixStableIo.cpp
   PosixStableIo.h
   SignatureVerifier.cpp

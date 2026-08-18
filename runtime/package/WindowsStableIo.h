@@ -83,6 +83,9 @@ public:
     [[nodiscard]] bool openSource(
         const QString &path,
         const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] bool openReadLocked(
+        const QString &path,
+        const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool createOwnedOutput(
         const QString &path,
         const WindowsStableDirectoryTree &tree,
@@ -105,6 +108,7 @@ private:
     [[nodiscard]] bool openAndVerify(
         const QString &path,
         DWORD access,
+        DWORD shareMode,
         const WindowsStableDirectoryTree &tree);
 
     UniqueWindowsHandle m_handle;

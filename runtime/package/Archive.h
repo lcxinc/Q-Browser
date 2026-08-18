@@ -117,4 +117,10 @@ public:
         const QString &archivePath,
         const QString &stagingRoot,
         const ArchiveLimits &limits = {});
+    // Materializes the already authenticated, immutable snapshot without
+    // reopening the archive path between verification and extraction.
+    [[nodiscard]] static ArchiveResult extractFiles(
+        const QVector<ArchiveFile> &files,
+        const QString &stagingRoot,
+        const ArchiveLimits &limits = {});
 };

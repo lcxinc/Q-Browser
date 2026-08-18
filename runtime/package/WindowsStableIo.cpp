@@ -335,7 +335,21 @@ bool WindowsStableFile::openSource(
     const WindowsStableDirectoryTree &tree)
 {
     return openAndVerify(
-        path, GENERIC_READ | FILE_READ_ATTRIBUTES, tree);
+        path,
+        GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        tree);
+}
+
+bool WindowsStableFile::openReadLocked(
+    const QString &path,
+    const WindowsStableDirectoryTree &tree)
+{
+    return openAndVerify(
+        path,
+        GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        tree);
 }
 
 bool WindowsStableFile::createOwnedOutput(
@@ -527,12 +541,13 @@ const QString &WindowsStableFile::path() const noexcept
 bool WindowsStableFile::openAndVerify(
     const QString &path,
     DWORD access,
+    DWORD shareMode,
     const WindowsStableDirectoryTree &tree)
 {
     m_handle.reset(CreateFileW(
         reinterpret_cast<LPCWSTR>(path.utf16()),
         access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        shareMode,
         nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,

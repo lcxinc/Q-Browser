@@ -22,3 +22,19 @@ q_browser_enable_strict_warnings(tst_package_cli)
 q_browser_add_qt_test(
   NAME package_cli
   TARGET tst_package_cli)
+
+add_executable(tst_package_installer
+  tst_package_installer.cpp)
+
+target_link_libraries(tst_package_installer
+  PRIVATE
+    q_browser_package
+    Qt6::Test)
+
+target_compile_definitions(tst_package_installer PRIVATE Q_BROWSER_ARCHIVE_TESTING)
+
+q_browser_enable_strict_warnings(tst_package_installer)
+
+q_browser_add_qt_test(
+  NAME package_installer
+  TARGET tst_package_installer)
