@@ -59,7 +59,8 @@ public:
         const QString &appId,
         const QString &version,
         const QByteArray &digestHex,
-        const QString &candidateRoot) const;
+        const QString &candidateRoot,
+        const QByteArray &expectedSignedDigest = {}) const;
     [[nodiscard]] ActivationStateResult activationState(
         const QString &appId) const;
     [[nodiscard]] PackageStoreResult activate(

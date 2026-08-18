@@ -2,6 +2,7 @@
 #include "ArchiveTestHooks.h"
 #include "ContentDigest.h"
 #include "PackageInstaller.h"
+#include "PackageInstallerTestHooks.h"
 #include "PackageStore.h"
 #include "SignatureVerifier.h"
 
@@ -101,6 +102,9 @@ private slots:
     void rejectsIncompatibleRuntimeWithoutChangingCurrent();
     void rejectsDeniedImportWithoutChangingCurrent();
     void rejectsFailedPreflightWithoutChangingCurrent();
+    void preflightMutationCannotEnterCommittedVersion();
+    void changedCandidateFailsBeforeActivation();
+    void activationFailureDoesNotChangeCurrent();
 };
 
 void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
@@ -160,6 +164,8 @@ void PackageInstallerTest::rejectsInvalidSignatureWithoutChangingCurrent()
         manifest(QStringLiteral("1.1.0")), true);
 #ifdef Q_OS_WIN
     bool sawExactStagingLock = false;
+    bool cleanupRaceRan = false;
+    bool stagingRenameBlocked = false;
     qbrowser_archive_testing::ArchiveTestHooks hooks;
     hooks.afterWindowsHandleOpened = [&](const QString &path,
                                          const quint32 access,
@@ -169,12 +175,33 @@ void PackageInstallerTest::rejectsInvalidSignatureWithoutChangingCurrent()
             sawExactStagingLock = true;
         }
     };
+    hooks.beforeFailureCleanup = [&](const QString &stagingRoot) {
+        if (!QFileInfo(stagingRoot).fileName().startsWith(
+                QStringLiteral("install-"))) {
+            return;
+        }
+        cleanupRaceRan = true;
+        const QString renamed = stagingRoot + QStringLiteral("-replaced");
+        stagingRenameBlocked = MoveFileExW(
+                                   reinterpret_cast<LPCWSTR>(stagingRoot.utf16()),
+                                   reinterpret_cast<LPCWSTR>(renamed.utf16()),
+                                   0U)
+            == FALSE;
+        if (QFileInfo::exists(renamed)) {
+            QVERIFY(QDir().mkpath(stagingRoot));
+            QFile replacement(stagingRoot + QStringLiteral("/replacement-marker"));
+            QVERIFY(replacement.open(QIODevice::WriteOnly));
+            QCOMPARE(replacement.write("preserve"), qint64(8));
+        }
+    };
     qbrowser_archive_testing::setArchiveTestHooks(std::move(hooks));
 #endif
     const InstallResult rejected = installer.install(rejectedPackage);
 #ifdef Q_OS_WIN
     qbrowser_archive_testing::resetArchiveTestHooks();
     QVERIFY(sawExactStagingLock);
+    QVERIFY(cleanupRaceRan);
+    QVERIFY(stagingRenameBlocked);
 #endif
     QVERIFY(!rejected.succeeded());
     QCOMPARE(rejected.phase, InstallPhase::Verify);
@@ -264,6 +291,122 @@ void PackageInstallerTest::rejectsFailedPreflightWithoutChangingCurrent()
     QCOMPARE(rejected.error, InstallError::PreflightRejected);
     QCOMPARE(rejected.stableError, QStringLiteral("preflight_rejected"));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::preflightMutationCannotEnterCommittedVersion()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    InstallPolicy mutatingPolicy = policy();
+    mutatingPolicy.preflight = [](const Manifest &, const QString &root) {
+        QFile entry(root + QStringLiteral("/qml/Main.qml"));
+        return entry.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            && entry.write("mutated by preflight") == qint64(20);
+    };
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               std::move(mutatingPolicy));
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("mutating-preflight"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    QFile entry(installed.path + QStringLiteral("/qml/Main.qml"));
+    QVERIFY(entry.open(QIODevice::ReadOnly));
+    QCOMPARE(entry.readAll(), QByteArray("import QtQuick\nItem {}"));
+    entry.close();
+    QVERIFY(!entry.open(QIODevice::WriteOnly | QIODevice::Truncate));
+}
+
+void PackageInstallerTest::changedCandidateFailsBeforeActivation()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("candidate-first"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool hookRan = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidateCommit = [&hookRan](const QString &candidateRoot) {
+        hookRan = true;
+        QFile entry(candidateRoot + QStringLiteral("/qml/Main.qml"));
+        QVERIFY(entry.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(entry.write("changed after authentication"), qint64(28));
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("candidate-changed"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::activationFailureDoesNotChangeCurrent()
+{
+#ifndef Q_OS_WIN
+    QSKIP("The deterministic activation sharing violation is Windows-specific");
+#else
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("activation-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool hookRan = false;
+    HANDLE blocker = INVALID_HANDLE_VALUE;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeActivate = [&](const QString &appId, const QString &) {
+        hookRan = true;
+        const QString statePath = store.root() + QStringLiteral("/apps/") + appId
+            + QStringLiteral("/activation.json");
+        blocker = CreateFileW(
+            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(statePath).utf16()),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("activation-blocked"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+    if (blocker != INVALID_HANDLE_VALUE) {
+        CloseHandle(blocker);
+    }
+
+    QVERIFY(hookRan);
+    QVERIFY(blocker != INVALID_HANDLE_VALUE);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Activate);
+    QCOMPARE(rejected.error, InstallError::ActivationFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("activation_failed"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+#endif
 }
 
 QTEST_APPLESS_MAIN(PackageInstallerTest)

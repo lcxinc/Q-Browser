@@ -20,6 +20,8 @@ add_library(q_browser_package STATIC
   PackageStore.h
   PackageInstaller.cpp
   PackageInstaller.h
+  PackageInstallerTestHooks.cpp
+  PackageInstallerTestHooks.h
   PosixStableIo.cpp
   PosixStableIo.h
   SignatureVerifier.cpp
@@ -47,5 +49,6 @@ if(BUILD_TESTING)
   target_compile_definitions(q_browser_package
     PRIVATE
       Q_BROWSER_ARCHIVE_TESTING
+      Q_BROWSER_PACKAGE_INSTALLER_TESTING
       Q_BROWSER_SIGNATURE_TESTING)
 endif()

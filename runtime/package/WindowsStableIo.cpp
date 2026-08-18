@@ -85,12 +85,15 @@ bool finalPathIsWithin(const QString &root, const QString &candidate)
         || foldedCandidate.startsWith(foldedRoot + QLatin1Char('\\'));
 }
 
-UniqueWindowsHandle openDirectory(const QString &path, DWORD desiredAccess)
+UniqueWindowsHandle openDirectory(
+    const QString &path,
+    DWORD desiredAccess,
+    DWORD shareMode)
 {
     return UniqueWindowsHandle(CreateFileW(
         reinterpret_cast<LPCWSTR>(path.utf16()),
         desiredAccess,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        shareMode,
         nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
@@ -152,7 +155,20 @@ void UniqueWindowsHandle::reset(HANDLE handle) noexcept
 
 bool WindowsStableDirectoryTree::openRoot(const QString &rootPath)
 {
+    return openRootImpl(rootPath, false);
+}
+
+bool WindowsStableDirectoryTree::openMovableRoot(const QString &rootPath)
+{
+    return openRootImpl(rootPath, true);
+}
+
+bool WindowsStableDirectoryTree::openRootImpl(
+    const QString &rootPath,
+    const bool movable)
+{
     m_directories.clear();
+    m_movableRoot = movable;
     m_rootPath = absolutePath(rootPath);
     m_rootKey = pathKey(m_rootPath);
 
@@ -256,6 +272,66 @@ bool WindowsStableDirectoryTree::isStable() const
     return true;
 }
 
+bool WindowsStableDirectoryTree::publishRootNoReplace(
+    const QString &destination,
+    const WindowsStableDirectoryTree &destinationTree)
+{
+    if (m_directories.empty() || !isStable()
+        || !destinationTree.isStable()
+        || !destinationTree.contains(QFileInfo(destination).dir().absolutePath())) {
+        return false;
+    }
+    DirectoryRecord &root = m_directories.back();
+    if (root.key != m_rootKey || !root.handle.isValid()) {
+        return false;
+    }
+    const QString normalizedDestination = absolutePath(destination);
+    const size_t nameBytes = static_cast<size_t>(normalizedDestination.size())
+        * sizeof(wchar_t);
+    constexpr size_t renameHeaderSize = sizeof(FILE_RENAME_INFO);
+    if (nameBytes > static_cast<size_t>(std::numeric_limits<DWORD>::max())
+            - renameHeaderSize
+        || nameBytes > std::numeric_limits<size_t>::max() - renameHeaderSize) {
+        return false;
+    }
+    std::vector<unsigned char> renameBuffer(renameHeaderSize + nameBytes);
+    auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(renameBuffer.data());
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(nameBytes);
+    std::memcpy(rename->FileName, normalizedDestination.utf16(), nameBytes);
+    return SetFileInformationByHandle(
+               root.handle.get(),
+               FileRenameInfo,
+               rename,
+               static_cast<DWORD>(renameBuffer.size()))
+        != FALSE;
+}
+
+bool WindowsStableDirectoryTree::deleteHeldTree() noexcept
+{
+    if (!isStable()) {
+        return false;
+    }
+    bool deleted = true;
+    for (auto iterator = m_directories.rbegin();
+         iterator != m_directories.rend(); ++iterator) {
+        if (!pathIsWithinRoot(iterator->path) || !iterator->handle.isValid()) {
+            continue;
+        }
+        FILE_DISPOSITION_INFO disposition{TRUE};
+        deleted = SetFileInformationByHandle(
+                      iterator->handle.get(),
+                      FileDispositionInfo,
+                      &disposition,
+                      static_cast<DWORD>(sizeof(disposition)))
+                != FALSE
+            && deleted;
+        iterator->handle.reset();
+    }
+    return deleted;
+}
+
 void WindowsStableDirectoryTree::cleanupCreatedDirectories() noexcept
 {
     if (!isStable()) {
@@ -297,7 +373,10 @@ bool WindowsStableDirectoryTree::addDirectory(const QString &path, bool created)
         || key.startsWith(m_rootKey + QLatin1Char('\\'));
     const DWORD desiredAccess = FILE_READ_ATTRIBUTES
         | ((created || lockRename) ? DELETE : 0U);
-    UniqueWindowsHandle handle = openDirectory(normalized, desiredAccess);
+    const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE
+        | ((m_movableRoot && key == m_rootKey) ? FILE_SHARE_DELETE : 0U);
+    UniqueWindowsHandle handle = openDirectory(
+        normalized, desiredAccess, shareMode);
     WindowsFileIdentity identity;
     QString finalPath;
     if (!handle.isValid()
@@ -349,6 +428,28 @@ bool WindowsStableFile::openReadLocked(
         path,
         GENERIC_READ | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
+        tree);
+}
+
+bool WindowsStableFile::openReadMoveLocked(
+    const QString &path,
+    const WindowsStableDirectoryTree &tree)
+{
+    return openAndVerify(
+        path,
+        GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        tree);
+}
+
+bool WindowsStableFile::openForDelete(
+    const QString &path,
+    const WindowsStableDirectoryTree &tree)
+{
+    return openAndVerify(
+        path,
+        DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         tree);
 }
 
@@ -528,6 +629,19 @@ bool WindowsStableFile::deleteOwned() noexcept
     return deleted;
 }
 
+bool WindowsStableFile::isStableWithin(
+    const WindowsStableDirectoryTree &tree) const
+{
+    WindowsFileIdentity identity;
+    QString finalPath;
+    return m_handle.isValid()
+        && queryHandle(m_handle.get(), false, identity, finalPath)
+        && identity == m_identity
+        && identity.volumeSerial == tree.rootVolumeSerial()
+        && finalPathIsWithin(tree.rootFinalPath(), finalPath)
+        && finalPath.toCaseFolded() == m_finalPath.toCaseFolded();
+}
+
 bool WindowsStableFile::isOpen() const noexcept
 {
     return m_handle.isValid();
@@ -562,6 +676,7 @@ bool WindowsStableFile::openAndVerify(
         return false;
     }
     m_identity = identity;
+    m_finalPath = finalPath;
     m_path = absolutePath(path);
 #ifdef Q_BROWSER_ARCHIVE_TESTING
     if (qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened) {

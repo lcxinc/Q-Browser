@@ -47,10 +47,15 @@ class WindowsStableDirectoryTree final
 {
 public:
     [[nodiscard]] bool openRoot(const QString &rootPath);
+    [[nodiscard]] bool openMovableRoot(const QString &rootPath);
     [[nodiscard]] bool addExistingDirectory(const QString &path);
     [[nodiscard]] bool createAndHoldDirectory(const QString &path);
     [[nodiscard]] bool contains(const QString &path) const;
     [[nodiscard]] bool isStable() const;
+    [[nodiscard]] bool publishRootNoReplace(
+        const QString &destination,
+        const WindowsStableDirectoryTree &destinationTree);
+    [[nodiscard]] bool deleteHeldTree() noexcept;
     void cleanupCreatedDirectories() noexcept;
 
     [[nodiscard]] const QString &rootFinalPath() const noexcept;
@@ -68,6 +73,7 @@ private:
     };
 
     [[nodiscard]] bool addDirectory(const QString &path, bool created);
+    [[nodiscard]] bool openRootImpl(const QString &rootPath, bool movable);
     [[nodiscard]] bool pathIsWithinRoot(const QString &path) const;
 
     std::vector<DirectoryRecord> m_directories;
@@ -75,6 +81,7 @@ private:
     QString m_rootKey;
     QString m_rootFinalPath;
     DWORD m_rootVolumeSerial = 0;
+    bool m_movableRoot = false;
 };
 
 class WindowsStableFile final
@@ -84,6 +91,12 @@ public:
         const QString &path,
         const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool openReadLocked(
+        const QString &path,
+        const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] bool openReadMoveLocked(
+        const QString &path,
+        const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] bool openForDelete(
         const QString &path,
         const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool createOwnedOutput(
@@ -100,6 +113,8 @@ public:
         const QString &destination,
         const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool deleteOwned() noexcept;
+    [[nodiscard]] bool isStableWithin(
+        const WindowsStableDirectoryTree &tree) const;
 
     [[nodiscard]] bool isOpen() const noexcept;
     [[nodiscard]] const QString &path() const noexcept;
@@ -113,6 +128,7 @@ private:
 
     UniqueWindowsHandle m_handle;
     WindowsFileIdentity m_identity;
+    QString m_finalPath;
     QString m_path;
 };
 }

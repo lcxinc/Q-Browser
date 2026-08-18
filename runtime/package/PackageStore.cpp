@@ -1,7 +1,10 @@
 #include "PackageStore.h"
+#include "Archive.h"
+#include "ContentDigest.h"
 #include "WindowsStableIo.h"
 
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -50,6 +53,24 @@ bool existingPlainDirectory(const QString &path)
 {
     const QFileInfo info(path);
     return info.exists() && info.isDir() && !info.isSymLink();
+}
+
+bool makeVersionFilesReadOnly(const QString &root)
+{
+    QDirIterator iterator(
+        root,
+        QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString path = iterator.next();
+        if (!QFile::setPermissions(
+                path,
+                QFileDevice::ReadOwner | QFileDevice::ReadGroup
+                    | QFileDevice::ReadOther)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool pathIsWithin(const QString &root, const QString &candidate)
@@ -154,7 +175,8 @@ PackageStoreResult PackageStore::commitCandidate(
     const QString &appId,
     const QString &version,
     const QByteArray &digestHex,
-    const QString &candidateRoot) const
+    const QString &candidateRoot,
+    const QByteArray &expectedSignedDigest) const
 {
     if (!validAppId(appId) || version.size() > 128
         || !VersionPattern.match(version).hasMatch()
@@ -177,6 +199,13 @@ PackageStoreResult PackageStore::commitCandidate(
         return failure(PackageStoreError::UnsafeStore,
                        QStringLiteral("package store is unavailable"));
     }
+    qbrowser_archive_detail::WindowsStableDirectoryTree candidateTree;
+    std::vector<qbrowser_archive_detail::WindowsStableFile> candidateLockedFiles;
+    if (!candidateTree.openMovableRoot(QDir::cleanPath(candidateRoot))
+        || !candidateTree.isStable()) {
+        return failure(PackageStoreError::SourceUnavailable,
+                       QStringLiteral("candidate directory is unavailable"));
+    }
 #endif
     const QString directory = version + QLatin1Char('-')
         + QString::fromLatin1(digestHex);
@@ -193,9 +222,95 @@ PackageStoreResult PackageStore::commitCandidate(
         return failure(PackageStoreError::UnsafeStore,
                        QStringLiteral("version store escapes application root"));
     }
+    if (!expectedSignedDigest.isEmpty()) {
+        QVector<ArchiveFile> actualFiles;
+        quint64 totalBytes = 0;
+        QDirIterator iterator(
+            candidateRoot,
+            QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+            QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString path = iterator.next();
+            const QFileInfo info = iterator.fileInfo();
+            if (info.isSymLink()) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate identity changed"));
+            }
+            if (info.isDir()) {
+                continue;
+            }
+            if (!info.isFile() || info.size() < 0
+                || static_cast<quint64>(info.size())
+                    > ArchiveLimits::DefaultMaximumEntryBytes
+                || totalBytes > ArchiveLimits::DefaultMaximumTotalBytes
+                || static_cast<quint64>(info.size())
+                    > ArchiveLimits::DefaultMaximumTotalBytes - totalBytes) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate contents are invalid"));
+            }
+            QByteArray bytes;
+#ifdef Q_OS_WIN
+            qbrowser_archive_detail::WindowsStableFile locked;
+            if (!locked.openReadMoveLocked(path, candidateTree)
+                || !locked.readExact(static_cast<quint64>(info.size()),
+                                     ArchiveLimits::DefaultMaximumEntryBytes,
+                                     bytes)) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate identity changed"));
+            }
+            candidateLockedFiles.push_back(std::move(locked));
+#else
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate identity changed"));
+            }
+            bytes = file.readAll();
+            if (bytes.size() != info.size()) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate identity changed"));
+            }
+#endif
+            totalBytes += static_cast<quint64>(bytes.size());
+            actualFiles.push_back(
+                {QDir::fromNativeSeparators(
+                     QDir(candidateRoot).relativeFilePath(path)).toUtf8(),
+                 std::move(bytes)});
+        }
+        const ContentDigestResult actualSigned = ContentDigest::signedPackage(actualFiles);
+        const ContentDigestValidation actualPayload = ContentDigest::validatePayload(actualFiles);
+        if (!actualSigned.hasValue() || actualSigned.bytes() != expectedSignedDigest
+            || !actualPayload.isValid()
+            || actualPayload.digest().toHex() != digestHex
+#ifdef Q_OS_WIN
+            || !candidateTree.isStable()
+            || !std::ranges::all_of(
+                candidateLockedFiles,
+                [&candidateTree](const auto &file) {
+                    return file.isStableWithin(candidateTree);
+                })
+#endif
+        ) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("candidate digest changed"));
+        }
+        if (!makeVersionFilesReadOnly(candidateRoot)) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("version could not be made immutable"));
+        }
+    }
+#ifdef Q_OS_WIN
+    candidateLockedFiles.clear();
+    if (!candidateTree.publishRootNoReplace(destination, storeTree)) {
+#else
     if (!QDir().rename(QDir::cleanPath(candidateRoot), destination)) {
+#endif
         return failure(PackageStoreError::CandidateCommitFailed,
                        QStringLiteral("candidate could not be committed"));
+    }
+    if (expectedSignedDigest.isEmpty() && !makeVersionFilesReadOnly(destination)) {
+        return failure(PackageStoreError::CandidateCommitFailed,
+                       QStringLiteral("version could not be made immutable"));
     }
     return {PackageStoreError::None, destination, {}};
 }
