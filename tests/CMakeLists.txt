@@ -1,5 +1,7 @@
 if(BUILD_TESTING)
+  add_subdirectory(integration/ipc)
   add_subdirectory(integration/package)
+  add_subdirectory(unit/ipc)
   add_subdirectory(unit/package)
   add_subdirectory(unit/router)
 
