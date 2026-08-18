@@ -33,14 +33,17 @@ void WorkerSurfaceTest::embedsOnlyTheLaunchedWorkersWindow()
     host.show();
     WorkerSurface *surface = WorkerSurface::create(
         surfaceMessage.message->payload().value(QStringLiteral("windowHandle")).toString(),
-        launch->process.processId(), &host);
+        launch->process.nativeProcessHandle(), WorkerAttemptId{42}, &host);
     QVERIFY(surface != nullptr);
     surface->setGeometry(host.rect());
     surface->show();
     QTest::qWait(100);
     QVERIFY(surface->isValid());
-    QVERIFY(WorkerSurface::create(QStringLiteral("1"), launch->process.processId(), &host)
+    QVERIFY(WorkerSurface::create(QStringLiteral("1"),
+                                  launch->process.nativeProcessHandle(),
+                                  WorkerAttemptId{42}, &host)
             == nullptr);
+    QCOMPARE(surface->attemptId(), WorkerAttemptId{42});
 
     host.resize(800, 600);
     surface->setGeometry(host.rect());
@@ -50,14 +53,30 @@ void WorkerSurfaceTest::embedsOnlyTheLaunchedWorkersWindow()
     QCOMPARE(nativeRect.right - nativeRect.left, 800L);
     QCOMPARE(nativeRect.bottom - nativeRect.top, 600L);
     surface->setFocus(Qt::OtherFocusReason);
-    QVERIFY(surface->hasFocus() || surface->containerHasFocus());
+    const HWND workerWindow = reinterpret_cast<HWND>(surface->nativeWindowId());
+    DWORD workerPid = 0;
+    const DWORD workerThread = GetWindowThreadProcessId(workerWindow, &workerPid);
+    QCOMPARE(workerPid, launch->process.processId());
+    QVERIFY(workerThread != 0);
+    GUITHREADINFO guiInfo{sizeof(GUITHREADINFO)};
+    QTRY_VERIFY_WITH_TIMEOUT(GetGUIThreadInfo(workerThread, &guiInfo)
+                                 && guiInfo.hwndFocus == workerWindow,
+                             2000);
 
     delete surface;
     QVERIFY(!launch->process.waitForFinished(0));
-    QVERIFY(launch->hostSession.send(*ProtocolMessage::shutdown(QStringLiteral("test.done")),
-                                    5000));
-    QCOMPARE(launch->hostSession.receive(5000).message->type(), ProtocolType::Shutdown);
+    WorkerSurface *lifetimeBound = WorkerSurface::create(
+        surfaceMessage.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        launch->process.nativeProcessHandle(), WorkerAttemptId{43}, &host);
+    QVERIFY(lifetimeBound != nullptr);
+    launch->hostSession.close();
+    launch->process.terminate(ERROR_PROCESS_ABORTED);
     QVERIFY(launch->process.waitForFinished(5000));
+    QVERIFY(!lifetimeBound->isValid());
+    lifetimeBound->resize(320, 240);
+    lifetimeBound->setFocus(Qt::OtherFocusReason);
+    QVERIFY(!lifetimeBound->isValid());
+    delete lifetimeBound;
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }

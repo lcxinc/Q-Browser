@@ -4,10 +4,13 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QDirIterator>
+#include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QQmlContext>
 #include <QQmlEngine>
 
@@ -73,6 +76,33 @@ bool isStrictLocalEntry(const QString &packageDirectory,
         && resolved.startsWith(root + u'/') && entryInfo.suffix() == QStringLiteral("qml");
 }
 
+bool packageDeclaresNativeQmlPlugin(const QString &packageDirectory)
+{
+    const QString qmlRoot = QDir(packageDirectory).filePath(QStringLiteral("qml"));
+    QDirIterator files(qmlRoot, {QStringLiteral("qmldir")},
+                       QDir::Files | QDir::NoSymLinks,
+                       QDirIterator::Subdirectories);
+    while (files.hasNext()) {
+        QFile descriptor(files.next());
+        if (!descriptor.open(QIODevice::ReadOnly) || descriptor.size() > 1024 * 1024) {
+            return true;
+        }
+        while (!descriptor.atEnd()) {
+            const QString line = QString::fromUtf8(descriptor.readLine())
+                                     .section(u'#', 0, 0).trimmed();
+            const QStringList tokens = line.split(
+                QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+            if ((!tokens.isEmpty() && tokens.first() == QStringLiteral("plugin"))
+                || (tokens.size() >= 2
+                    && tokens.at(0) == QStringLiteral("optional")
+                    && tokens.at(1) == QStringLiteral("plugin"))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 WorkerWindow::WorkerWindow()
@@ -95,6 +125,10 @@ bool WorkerWindow::load(const QString &packageDirectory,
     QString entry;
     if (!isStrictLocalEntry(packageDirectory, entryPoint, entry)) {
         errorString_ = QStringLiteral("worker.qml.invalid_entry");
+        return false;
+    }
+    if (packageDeclaresNativeQmlPlugin(packageDirectory)) {
+        errorString_ = QStringLiteral("worker.qml.native_plugin_forbidden");
         return false;
     }
     QQmlEngine *engine = view_.engine();

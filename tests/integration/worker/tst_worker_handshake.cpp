@@ -1,4 +1,5 @@
 #include "WorkerTestEnvironment.h"
+#include "WorkerApplication.h"
 
 #include <QProcess>
 #include <QTest>
@@ -19,7 +20,7 @@ void WorkerHandshakeTest::directLaunchWithoutInheritedHandlesFailsClosed()
     QVERIFY(worker.waitForStarted(5000));
     QVERIFY(worker.waitForFinished(5000));
     QCOMPARE(worker.exitStatus(), QProcess::NormalExit);
-    QVERIFY(worker.exitCode() != 0);
+    QCOMPARE(worker.exitCode(), WorkerApplication::invalidLaunchExitCode());
 }
 
 void WorkerHandshakeTest::sandboxedWorkerCompletesLifecycle()

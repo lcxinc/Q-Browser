@@ -103,7 +103,7 @@ std::optional<WorkerApplication::LaunchArguments> WorkerApplication::parseArgume
 
 void WorkerApplication::pollIpc()
 {
-    if (session_ == nullptr || exiting_) return;
+    if (session_ == nullptr || state_ == State::Exiting) return;
     const SessionReceiveResult received = session_->poll(0);
     if (received.status == SessionStatus::TimedOut) return;
     if (received.status != SessionStatus::MessageReady || !received.message.has_value()) {
@@ -117,6 +117,7 @@ bool WorkerApplication::finishAuthentication()
 {
     runtimeFacade_.assignAppIdentity(session_->appIdentity());
     window_ = std::make_unique<WorkerWindow>();
+    state_ = State::Loading;
     if (!window_->load(launch_.packageDirectory, launch_.entryPoint, &runtimeFacade_)) {
         return false;
     }
@@ -126,14 +127,32 @@ bool WorkerApplication::finishAuthentication()
         || !session_->send(ProtocolMessage::ready(), 5000)) {
         return false;
     }
-    ready_ = true;
+    state_ = State::Ready;
+    if (!flushPendingCapabilities()) {
+        return false;
+    }
     heartbeatTimer_.start();
+    return true;
+}
+
+bool WorkerApplication::flushPendingCapabilities()
+{
+    while (auto request = pendingCapabilities_.takeNext()) {
+        if (!session_->sendRequest(request->requestId,
+                                   request->capability,
+                                   request->operation,
+                                   request->payload,
+                                   5000)) {
+            pendingCapabilities_.clear();
+            return false;
+        }
+    }
     return true;
 }
 
 void WorkerApplication::handleMessage(const ProtocolMessage &message)
 {
-    if (!ready_) {
+    if (state_ == State::Authenticating) {
         if (message.type() != ProtocolType::HandshakeAck || !session_->isAuthenticated()
             || !finishAuthentication()) {
             failClosed();
@@ -155,7 +174,7 @@ void WorkerApplication::handleMessage(const ProtocolMessage &message)
     case ProtocolType::Heartbeat:
         break;
     case ProtocolType::Shutdown: {
-        exiting_ = true;
+        state_ = State::Exiting;
         pollTimer_.stop();
         heartbeatTimer_.stop();
         const auto acknowledgement = ProtocolMessage::shutdown(QStringLiteral("worker.ack"));
@@ -171,7 +190,7 @@ void WorkerApplication::handleMessage(const ProtocolMessage &message)
 
 void WorkerApplication::sendHeartbeat()
 {
-    if (session_ != nullptr && ready_
+    if (session_ != nullptr && state_ == State::Ready
         && !session_->send(ProtocolMessage::heartbeat(), 5000)) {
         failClosed();
     }
@@ -182,7 +201,18 @@ void WorkerApplication::sendCapabilityRequest(const QString &requestId,
                                               const QString &operation,
                                               const QJsonObject &payload)
 {
-    if (session_ == nullptr || !ready_
+    if (session_ == nullptr) {
+        failClosed();
+        return;
+    }
+    if (state_ == State::Loading) {
+        if (pendingCapabilities_.enqueue({requestId, capability, operation, payload})
+            != PendingCapabilityPushResult::Accepted) {
+            failClosed();
+        }
+        return;
+    }
+    if (state_ != State::Ready
         || !session_->sendRequest(requestId, capability, operation, payload, 5000)) {
         failClosed();
     }
@@ -190,8 +220,9 @@ void WorkerApplication::sendCapabilityRequest(const QString &requestId,
 
 void WorkerApplication::failClosed(const int exitCode)
 {
-    if (exiting_) return;
-    exiting_ = true;
+    if (state_ == State::Exiting) return;
+    state_ = State::Exiting;
+    pendingCapabilities_.clear();
     pollTimer_.stop();
     heartbeatTimer_.stop();
     if (session_ != nullptr) session_->close();

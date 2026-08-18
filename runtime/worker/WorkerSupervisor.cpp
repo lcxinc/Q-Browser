@@ -3,6 +3,15 @@
 #include <limits>
 #include <utility>
 
+namespace {
+
+quint64 nextId(const quint64 current) noexcept
+{
+    return current == std::numeric_limits<quint64>::max() ? 1 : current + 1;
+}
+
+} // namespace
+
 WorkerSupervisor::WorkerSupervisor(WorkerSupervisionPolicy policy,
                                    Callback restart,
                                    Callback rollback)
@@ -13,83 +22,123 @@ WorkerSupervisor::WorkerSupervisor(WorkerSupervisionPolicy policy,
     }
 }
 
-quint64 WorkerSupervisor::beginActivation(const qint64 nowMs)
+WorkerActivationId WorkerSupervisor::beginActivation(const qint64 nowMs)
 {
-    if (generation_ == std::numeric_limits<quint64>::max()) {
-        generation_ = 1;
-    } else {
-        ++generation_;
-    }
-    launchTimeMs_ = nowMs;
+    activation_.value = nextId(activation_.value);
+    state_ = WorkerSupervisorState::Stopped;
+    activationStartMs_ = nowMs;
     lastHeartbeatMs_ = nowMs;
-    restartCount_ = 0;
+    restartUsed_ = false;
+    rollbackCalled_ = false;
+    hasAttempt_ = false;
+    hasLastFailedAttempt_ = false;
     crashLoop_ = false;
-    return generation_;
+    return activation_;
 }
 
-void WorkerSupervisor::heartbeat(const quint64 generation, const qint64 nowMs)
+std::optional<WorkerAttemptId> WorkerSupervisor::beginAttempt(
+    const WorkerActivationId activation,
+    const qint64 nowMs)
 {
-    if (generation == generation_ && nowMs >= lastHeartbeatMs_) {
+    if (activation != activation_ || state_ != WorkerSupervisorState::Stopped
+        || crashLoop_) {
+        return std::nullopt;
+    }
+    attempt_.value = nextId(attempt_.value);
+    hasAttempt_ = true;
+    state_ = WorkerSupervisorState::Running;
+    lastHeartbeatMs_ = nowMs;
+    return attempt_;
+}
+
+void WorkerSupervisor::heartbeat(const WorkerAttemptKey key, const qint64 nowMs)
+{
+    if (state_ == WorkerSupervisorState::Running && isCurrent(key)
+        && nowMs >= lastHeartbeatMs_) {
         lastHeartbeatMs_ = nowMs;
     }
 }
 
-WorkerSupervisionAction WorkerSupervisor::checkHealth(const quint64 generation,
+WorkerSupervisionAction WorkerSupervisor::checkHealth(const WorkerAttemptKey key,
                                                       const qint64 nowMs)
 {
-    if (generation != generation_) {
-        return WorkerSupervisionAction::IgnoredStaleGeneration;
+    if (isDuplicateFailure(key)) {
+        return WorkerSupervisionAction::IgnoredDuplicateFailure;
     }
-    if (crashLoop_ || nowMs <= lastHeartbeatMs_ + policy_.heartbeatTimeoutMs) {
+    if (!isCurrent(key)) {
+        return WorkerSupervisionAction::IgnoredStaleAttempt;
+    }
+    if (state_ != WorkerSupervisorState::Running
+        || nowMs <= lastHeartbeatMs_ + policy_.heartbeatTimeoutMs) {
         return WorkerSupervisionAction::None;
     }
-    return unexpectedFailure(nowMs);
+    return unexpectedFailure(key, nowMs);
 }
 
-WorkerSupervisionAction WorkerSupervisor::workerExited(const quint64 generation,
+WorkerSupervisionAction WorkerSupervisor::workerExited(const WorkerAttemptKey key,
                                                        const WorkerExitReason reason,
                                                        const qint64 nowMs)
 {
-    if (generation != generation_) {
-        return WorkerSupervisionAction::IgnoredStaleGeneration;
+    if (isDuplicateFailure(key)) {
+        return WorkerSupervisionAction::IgnoredDuplicateFailure;
     }
-    if (reason == WorkerExitReason::Clean) {
+    if (!isCurrent(key)) {
+        return WorkerSupervisionAction::IgnoredStaleAttempt;
+    }
+    if (state_ != WorkerSupervisorState::Running) {
         return WorkerSupervisionAction::None;
     }
-    return unexpectedFailure(nowMs);
-}
-
-bool WorkerSupervisor::isCrashLoop() const noexcept
-{
-    return crashLoop_;
-}
-
-quint64 WorkerSupervisor::activeGeneration() const noexcept
-{
-    return generation_;
-}
-
-WorkerSupervisionAction WorkerSupervisor::unexpectedFailure(const qint64 nowMs)
-{
-    if (crashLoop_) {
-        return WorkerSupervisionAction::CrashLoopRollback;
+    if (reason == WorkerExitReason::Clean) {
+        state_ = WorkerSupervisorState::Retired;
+        return WorkerSupervisionAction::None;
     }
-    const bool insideHealthWindow = nowMs <= launchTimeMs_ + policy_.healthWindowMs;
-    if (restartCount_ == 0) {
-        ++restartCount_;
-        launchTimeMs_ = nowMs;
-        lastHeartbeatMs_ = nowMs;
-        if (restart_) restart_();
+    return unexpectedFailure(key, nowMs);
+}
+
+bool WorkerSupervisor::isCrashLoop() const noexcept { return crashLoop_; }
+WorkerSupervisorState WorkerSupervisor::state() const noexcept { return state_; }
+WorkerActivationId WorkerSupervisor::activeActivation() const noexcept { return activation_; }
+
+std::optional<WorkerAttemptId> WorkerSupervisor::activeAttempt() const noexcept
+{
+    return hasAttempt_ && state_ == WorkerSupervisorState::Running
+        ? std::optional<WorkerAttemptId>(attempt_)
+        : std::nullopt;
+}
+
+bool WorkerSupervisor::isCurrent(const WorkerAttemptKey key) const noexcept
+{
+    return hasAttempt_ && key.activation == activation_ && key.attempt == attempt_;
+}
+
+bool WorkerSupervisor::isDuplicateFailure(const WorkerAttemptKey key) const noexcept
+{
+    return hasLastFailedAttempt_ && key == lastFailedAttempt_;
+}
+
+WorkerSupervisionAction WorkerSupervisor::unexpectedFailure(
+    const WorkerAttemptKey key,
+    const qint64 nowMs)
+{
+    lastFailedAttempt_ = key;
+    hasLastFailedAttempt_ = true;
+    state_ = WorkerSupervisorState::Stopped;
+    if (!restartUsed_) {
+        restartUsed_ = true;
+        if (restart_) restart_(activation_);
         return WorkerSupervisionAction::Restart;
     }
-    if (insideHealthWindow) {
+    if (nowMs <= activationStartMs_ + policy_.healthWindowMs) {
         crashLoop_ = true;
-        if (rollback_) rollback_();
+        state_ = WorkerSupervisorState::Retired;
+        if (!rollbackCalled_) {
+            rollbackCalled_ = true;
+            if (rollback_) rollback_(activation_);
+        }
         return WorkerSupervisionAction::CrashLoopRollback;
     }
-    restartCount_ = 1;
-    launchTimeMs_ = nowMs;
-    lastHeartbeatMs_ = nowMs;
-    if (restart_) restart_();
+    activationStartMs_ = nowMs;
+    restartUsed_ = true;
+    if (restart_) restart_(activation_);
     return WorkerSupervisionAction::Restart;
 }

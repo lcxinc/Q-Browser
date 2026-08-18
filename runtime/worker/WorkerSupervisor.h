@@ -2,11 +2,29 @@
 
 #include <QtGlobal>
 
+#include <compare>
 #include <functional>
+#include <optional>
 
 struct WorkerSupervisionPolicy final {
     qint64 healthWindowMs = 30'000;
     qint64 heartbeatTimeoutMs = 5'000;
+};
+
+struct WorkerActivationId final {
+    quint64 value = 0;
+    auto operator<=>(const WorkerActivationId &) const = default;
+};
+
+struct WorkerAttemptId final {
+    quint64 value = 0;
+    auto operator<=>(const WorkerAttemptId &) const = default;
+};
+
+struct WorkerAttemptKey final {
+    WorkerActivationId activation;
+    WorkerAttemptId attempt;
+    auto operator<=>(const WorkerAttemptKey &) const = default;
 };
 
 enum class WorkerExitReason {
@@ -15,40 +33,60 @@ enum class WorkerExitReason {
     StartupFailure,
 };
 
+enum class WorkerSupervisorState {
+    Stopped,
+    Running,
+    Retired,
+};
+
 enum class WorkerSupervisionAction {
     None,
     Restart,
     CrashLoopRollback,
-    IgnoredStaleGeneration,
+    IgnoredStaleAttempt,
+    IgnoredDuplicateFailure,
 };
 
 class WorkerSupervisor final
 {
 public:
-    using Callback = std::function<void()>;
+    using Callback = std::function<void(WorkerActivationId)>;
 
     WorkerSupervisor(WorkerSupervisionPolicy policy,
                      Callback restart,
                      Callback rollback);
 
-    quint64 beginActivation(qint64 nowMs);
-    void heartbeat(quint64 generation, qint64 nowMs);
-    WorkerSupervisionAction checkHealth(quint64 generation, qint64 nowMs);
-    WorkerSupervisionAction workerExited(quint64 generation,
+    WorkerActivationId beginActivation(qint64 nowMs);
+    std::optional<WorkerAttemptId> beginAttempt(WorkerActivationId activation,
+                                                qint64 nowMs);
+    void heartbeat(WorkerAttemptKey key, qint64 nowMs);
+    WorkerSupervisionAction checkHealth(WorkerAttemptKey key, qint64 nowMs);
+    WorkerSupervisionAction workerExited(WorkerAttemptKey key,
                                          WorkerExitReason reason,
                                          qint64 nowMs);
     bool isCrashLoop() const noexcept;
-    quint64 activeGeneration() const noexcept;
+    WorkerSupervisorState state() const noexcept;
+    WorkerActivationId activeActivation() const noexcept;
+    std::optional<WorkerAttemptId> activeAttempt() const noexcept;
 
 private:
-    WorkerSupervisionAction unexpectedFailure(qint64 nowMs);
+    bool isCurrent(WorkerAttemptKey key) const noexcept;
+    bool isDuplicateFailure(WorkerAttemptKey key) const noexcept;
+    WorkerSupervisionAction unexpectedFailure(WorkerAttemptKey key,
+                                               qint64 nowMs);
 
     WorkerSupervisionPolicy policy_;
     Callback restart_;
     Callback rollback_;
-    quint64 generation_ = 0;
-    qint64 launchTimeMs_ = 0;
+    WorkerActivationId activation_;
+    WorkerAttemptId attempt_;
+    WorkerAttemptKey lastFailedAttempt_;
+    WorkerSupervisorState state_ = WorkerSupervisorState::Retired;
+    qint64 activationStartMs_ = 0;
     qint64 lastHeartbeatMs_ = 0;
-    int restartCount_ = 0;
+    bool restartUsed_ = false;
+    bool rollbackCalled_ = false;
+    bool hasAttempt_ = false;
+    bool hasLastFailedAttempt_ = false;
     bool crashLoop_ = false;
 };

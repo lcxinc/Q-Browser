@@ -2,7 +2,7 @@ set(q_browser_worker_test_support
   WorkerTestEnvironment.cpp
   WorkerTestEnvironment.h)
 
-foreach(q_browser_worker_test IN ITEMS handshake surface crash)
+foreach(q_browser_worker_test IN ITEMS handshake surface crash confinement)
   add_executable(tst_worker_${q_browser_worker_test}
     tst_worker_${q_browser_worker_test}.cpp
     ${q_browser_worker_test_support})
@@ -10,6 +10,7 @@ foreach(q_browser_worker_test IN ITEMS handshake surface crash)
     PRIVATE
       q_browser_ipc
       q_browser_sandbox
+      q_browser_worker_app
       q_browser_worker_runtime
       Qt6::Gui
       Qt6::Quick

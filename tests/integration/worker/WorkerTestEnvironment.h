@@ -11,7 +11,7 @@
 class WorkerTestEnvironment final
 {
 public:
-    WorkerTestEnvironment();
+    explicit WorkerTestEnvironment(QByteArray mainQml = {});
     ~WorkerTestEnvironment();
 
     WorkerTestEnvironment(const WorkerTestEnvironment &) = delete;
@@ -49,4 +49,5 @@ private:
     QString workerExecutable_;
     QString error_;
     std::optional<SandboxTrustBoundary> boundary_;
+    QByteArray mainQml_;
 };

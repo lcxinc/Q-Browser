@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IpcSession.h"
+#include "PendingCapabilityQueue.h"
 #include "RuntimeFacade.h"
 
 #include <QObject>
@@ -30,6 +31,13 @@ private slots:
                                const QJsonObject &payload);
 
 private:
+    enum class State {
+        Authenticating,
+        Loading,
+        Ready,
+        Exiting,
+    };
+
     struct LaunchArguments final {
         HANDLE readHandle = nullptr;
         HANDLE writeHandle = nullptr;
@@ -41,6 +49,7 @@ private:
 
     static std::optional<LaunchArguments> parseArguments(const QStringList &arguments);
     bool finishAuthentication();
+    bool flushPendingCapabilities();
     void handleMessage(const ProtocolMessage &message);
     void failClosed(int exitCode = 70);
 
@@ -50,6 +59,6 @@ private:
     QTimer pollTimer_;
     QTimer heartbeatTimer_;
     LaunchArguments launch_;
-    bool ready_ = false;
-    bool exiting_ = false;
+    PendingCapabilityQueue pendingCapabilities_;
+    State state_ = State::Authenticating;
 };

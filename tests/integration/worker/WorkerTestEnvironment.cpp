@@ -90,9 +90,10 @@ WorkerTestEnvironment::Launch::Launch(IpcSession host, SandboxProcess child)
 {
 }
 
-WorkerTestEnvironment::WorkerTestEnvironment()
+WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml)
     : appId_(QStringLiteral("com.qbrowser.workertest.%1")
-                 .arg(QUuid::createUuid().toString(QUuid::Id128).toLower()))
+                 .arg(QUuid::createUuid().toString(QUuid::Id128).toLower())),
+      mainQml_(std::move(mainQml))
 {
     if (!prepare() && error_.isEmpty()) {
         error_ = QStringLiteral("worker test environment preparation failed");
@@ -151,8 +152,11 @@ bool WorkerTestEnvironment::prepare()
         error_ = QStringLiteral("worker descendants could not be created");
         return false;
     }
-    if (!writeNewFile(QDir(qmlDirectory).filePath(QStringLiteral("Main.qml")),
-                      QByteArrayLiteral("import QtQuick\nRectangle { width: 320; height: 200; color: \"#123456\" }\n"))) {
+    if (mainQml_.isEmpty()) {
+        mainQml_ = QByteArrayLiteral(
+            "import QtQuick\nRectangle { width: 320; height: 200; color: \"#123456\" }\n");
+    }
+    if (!writeNewFile(QDir(qmlDirectory).filePath(QStringLiteral("Main.qml")), mainQml_)) {
         error_ = QStringLiteral("test QML could not be written");
         return false;
     }
