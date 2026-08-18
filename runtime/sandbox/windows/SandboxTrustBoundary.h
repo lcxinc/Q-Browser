@@ -15,6 +15,14 @@ struct SandboxApprovedRoots final
     QStringList immutableRuntimeRoots;
 };
 
+#ifdef Q_BROWSER_SANDBOX_TESTING
+enum class SandboxCompatibilityCapabilityForTesting {
+    RegistryRead,
+    None,
+    LpacCom,
+};
+#endif
+
 struct SandboxLaunchRequest final
 {
     QString appId;
@@ -23,6 +31,10 @@ struct SandboxLaunchRequest final
     QString tempDirectory;
     QStringList arguments;
     SandboxResourceLimits resourceLimits;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    SandboxCompatibilityCapabilityForTesting compatibilityCapabilityForTesting =
+        SandboxCompatibilityCapabilityForTesting::RegistryRead;
+#endif
 };
 
 struct SandboxLaunchState;
@@ -40,6 +52,10 @@ public:
     [[nodiscard]] const QStringList &runtimeResources() const noexcept;
     [[nodiscard]] const QStringList &arguments() const noexcept;
     [[nodiscard]] const SandboxResourceLimits &resourceLimits() const noexcept;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    [[nodiscard]] SandboxCompatibilityCapabilityForTesting
+    compatibilityCapabilityForTesting() const noexcept;
+#endif
 
 private:
     friend class SandboxLauncher;

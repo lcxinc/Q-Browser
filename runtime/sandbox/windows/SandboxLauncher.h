@@ -31,7 +31,7 @@ public:
     bool waitForFinished(int timeoutMs) const noexcept;
     [[nodiscard]] DWORD exitCode() const noexcept;
     void terminate(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
-    void close() noexcept;
+    [[nodiscard]] SandboxValueResult<bool> close() noexcept;
 
 private:
     friend class SandboxLauncher;
@@ -40,6 +40,7 @@ private:
                    JobLimits job,
                    std::vector<AclGrant> grants,
                    QString appContainerSid) noexcept;
+    void closeBestEffort() noexcept;
 
     HANDLE process_ = nullptr;
     DWORD processId_ = 0;

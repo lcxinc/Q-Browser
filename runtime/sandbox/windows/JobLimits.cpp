@@ -14,7 +14,7 @@ bool validHandle(const HANDLE handle) noexcept
 
 JobLimits::~JobLimits()
 {
-    reset();
+    closeBestEffort();
 }
 
 JobLimits::JobLimits(JobLimits &&other) noexcept
@@ -25,7 +25,7 @@ JobLimits::JobLimits(JobLimits &&other) noexcept
 JobLimits &JobLimits::operator=(JobLimits &&other) noexcept
 {
     if (this != &other) {
-        reset();
+        closeBestEffort();
         job_ = std::exchange(other.job_, nullptr);
     }
     return *this;
@@ -97,12 +97,24 @@ SandboxValueResult<bool> JobLimits::assignProcess(
     return {true, {}, {}};
 }
 
-void JobLimits::reset() noexcept
+SandboxValueResult<bool> JobLimits::close() noexcept
 {
-    if (validHandle(job_)) {
-        CloseHandle(job_);
+    if (!validHandle(job_)) {
+        return {true, {}, {}};
+    }
+    if (!CloseHandle(job_)) {
+        const DWORD error = GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.close_failed"),
+                SandboxNativeError::win32(error)};
     }
     job_ = nullptr;
+    return {true, {}, {}};
+}
+
+void JobLimits::closeBestEffort() noexcept
+{
+    (void)close();
 }
 
 JobLimits::JobLimits(const HANDLE job) noexcept : job_(job) {}

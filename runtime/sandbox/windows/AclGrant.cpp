@@ -81,32 +81,40 @@ DWORD accessMask(const SandboxPathAccess access, const bool directory)
     return mask;
 }
 
-bool restoreDescriptor(const HANDLE target, const QByteArray &security) noexcept
+DWORD restoreDescriptor(const HANDLE target, const QByteArray &security) noexcept
 {
-    if (!validHandle(target) || security.isEmpty()) {
-        return false;
+    if (!validHandle(target)) {
+        return ERROR_INVALID_HANDLE;
+    }
+    if (security.isEmpty()) {
+        return ERROR_INVALID_SECURITY_DESCR;
     }
     auto *descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
         const_cast<char *>(security.constData()));
     BOOL present = FALSE;
     BOOL defaulted = FALSE;
     PACL dacl = nullptr;
-    return GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted)
-            != FALSE
-        && SetSecurityInfo(target,
+    if (!GetSecurityDescriptorDacl(descriptor,
+                                   &present,
+                                   &dacl,
+                                   &defaulted)) {
+        const DWORD error = GetLastError();
+        return error != ERROR_SUCCESS ? error : ERROR_INVALID_SECURITY_DESCR;
+    }
+    return SetSecurityInfo(target,
                            SE_FILE_OBJECT,
                            DACL_SECURITY_INFORMATION,
                            nullptr,
                            nullptr,
                            present != FALSE ? dacl : nullptr,
-                           nullptr) == ERROR_SUCCESS;
+                           nullptr);
 }
 
 } // namespace
 
 AclGrant::~AclGrant()
 {
-    close();
+    closeBestEffort();
 }
 
 AclGrant::AclGrant(AclGrant &&other) noexcept
@@ -119,7 +127,7 @@ AclGrant::AclGrant(AclGrant &&other) noexcept
 AclGrant &AclGrant::operator=(AclGrant &&other) noexcept
 {
     if (this != &other) {
-        close();
+        closeBestEffort();
         target_ = std::exchange(other.target_, INVALID_HANDLE_VALUE);
         originalSecurity_ = std::move(other.originalSecurity_);
         finalPath_ = std::move(other.finalPath_);
@@ -253,16 +261,43 @@ const QString &AclGrant::finalPath() const noexcept
     return finalPath_;
 }
 
-bool AclGrant::restore() noexcept
+SandboxValueResult<bool> AclGrant::restore() noexcept
 {
     if (!isValid()) {
-        return false;
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.restore_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_HANDLE)};
     }
-    const bool restored = restoreDescriptor(target_, originalSecurity_);
-    if (restored) {
-        originalSecurity_.clear();
+    const DWORD restored = restoreDescriptor(target_, originalSecurity_);
+    if (restored != ERROR_SUCCESS) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.restore_failed"),
+                SandboxNativeError::win32(restored)};
     }
-    return restored;
+    originalSecurity_.clear();
+    return {true, {}, {}};
+}
+
+SandboxValueResult<bool> AclGrant::close() noexcept
+{
+    if (!validHandle(target_)) {
+        return {true, {}, {}};
+    }
+    if (!originalSecurity_.isEmpty()) {
+        const auto restored = restore();
+        if (!restored.value.has_value()) {
+            return restored;
+        }
+    }
+    if (!CloseHandle(target_)) {
+        const DWORD error = GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.close_failed"),
+                SandboxNativeError::win32(error)};
+    }
+    target_ = INVALID_HANDLE_VALUE;
+    finalPath_.clear();
+    return {true, {}, {}};
 }
 
 AclGrant::AclGrant(HANDLE target,
@@ -274,15 +309,7 @@ AclGrant::AclGrant(HANDLE target,
 {
 }
 
-void AclGrant::close() noexcept
+void AclGrant::closeBestEffort() noexcept
 {
-    if (validHandle(target_)) {
-        if (!originalSecurity_.isEmpty()) {
-            (void)restoreDescriptor(target_, originalSecurity_);
-        }
-        CloseHandle(target_);
-    }
-    target_ = INVALID_HANDLE_VALUE;
-    originalSecurity_.clear();
-    finalPath_.clear();
+    (void)close();
 }

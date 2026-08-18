@@ -32,10 +32,11 @@ public:
     [[nodiscard]] HANDLE nativeHandle() const noexcept;
     [[nodiscard]] SandboxValueResult<bool> assignProcess(
         HANDLE process) const noexcept;
-    void reset() noexcept;
+    [[nodiscard]] SandboxValueResult<bool> close() noexcept;
 
 private:
     explicit JobLimits(HANDLE job) noexcept;
+    void closeBestEffort() noexcept;
 
     HANDLE job_ = nullptr;
 };

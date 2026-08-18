@@ -33,13 +33,14 @@ public:
 
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] const QString &finalPath() const noexcept;
-    bool restore() noexcept;
+    [[nodiscard]] SandboxValueResult<bool> restore() noexcept;
+    [[nodiscard]] SandboxValueResult<bool> close() noexcept;
 
 private:
     AclGrant(HANDLE target,
              QByteArray originalSecurity,
              QString finalPath) noexcept;
-    void close() noexcept;
+    void closeBestEffort() noexcept;
 
     HANDLE target_ = INVALID_HANDLE_VALUE;
     QByteArray originalSecurity_;

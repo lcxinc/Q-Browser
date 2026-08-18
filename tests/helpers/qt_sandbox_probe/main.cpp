@@ -60,8 +60,10 @@ bool sendFrame(const HANDLE handle, const QJsonObject &object)
 
 bool tokenInformationHasSid(const HANDLE token,
                             const TOKEN_INFORMATION_CLASS informationClass,
-                            PSID expected)
+                            PSID expected,
+                            bool &member)
 {
+    member = false;
     DWORD bytes = 0;
     GetTokenInformation(token, informationClass, nullptr, 0, &bytes);
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) {
@@ -79,10 +81,11 @@ bool tokenInformationHasSid(const HANDLE token,
     for (DWORD index = 0; index < groups->GroupCount; ++index) {
         if (EqualSid(groups->Groups[index].Sid, expected)
             && (groups->Groups[index].Attributes & SE_GROUP_ENABLED) != 0U) {
-            return true;
+            member = true;
+            break;
         }
     }
-    return false;
+    return true;
 }
 
 bool queryToken(QJsonObject &result)
@@ -141,11 +144,23 @@ bool queryToken(QJsonObject &result)
     }
     PSID allApplicationPackages = nullptr;
     bool allApplicationPackagesMember = false;
+    bool tokenGroupsQueried = false;
+    bool tokenRestrictedSidsQueried = false;
+    bool allApplicationPackagesQueried = false;
     if (ConvertStringSidToSidW(L"S-1-15-2-1", &allApplicationPackages)) {
-        allApplicationPackagesMember = tokenInformationHasSid(
-            token, TokenGroups, allApplicationPackages)
-            || tokenInformationHasSid(
-                token, TokenRestrictedSids, allApplicationPackages);
+        bool regularMember = false;
+        bool restrictedMember = false;
+        tokenGroupsQueried = tokenInformationHasSid(
+            token, TokenGroups, allApplicationPackages, regularMember);
+        tokenRestrictedSidsQueried = tokenInformationHasSid(
+            token,
+            TokenRestrictedSids,
+            allApplicationPackages,
+            restrictedMember);
+        allApplicationPackagesQueried = tokenGroupsQueried
+            && tokenRestrictedSidsQueried;
+        allApplicationPackagesMember = allApplicationPackagesQueried
+            && (regularMember || restrictedMember);
         LocalFree(allApplicationPackages);
     }
     CloseHandle(token);
@@ -160,7 +175,13 @@ bool queryToken(QJsonObject &result)
     result.insert(QStringLiteral("capabilitySid"), capabilitySid);
     result.insert(QStringLiteral("allApplicationPackagesMember"),
                   allApplicationPackagesMember);
-    return appContainerQueried && lessPrivilegedQueried && capabilitiesQueried;
+    result.insert(QStringLiteral("tokenGroupsQueried"), tokenGroupsQueried);
+    result.insert(QStringLiteral("tokenRestrictedSidsQueried"),
+                  tokenRestrictedSidsQueried);
+    result.insert(QStringLiteral("allApplicationPackagesQueried"),
+                  allApplicationPackagesQueried);
+    return appContainerQueried && lessPrivilegedQueried && capabilitiesQueried
+        && allApplicationPackagesQueried;
 }
 
 } // namespace

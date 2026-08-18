@@ -29,3 +29,9 @@ target_link_libraries(q_browser_sandbox
     Userenv)
 
 q_browser_enable_strict_warnings(q_browser_sandbox)
+
+if(BUILD_TESTING)
+  target_compile_definitions(q_browser_sandbox
+    PUBLIC
+      Q_BROWSER_SANDBOX_TESTING)
+endif()

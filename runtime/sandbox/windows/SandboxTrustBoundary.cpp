@@ -569,6 +569,14 @@ const SandboxResourceLimits &SandboxLaunchConfig::resourceLimits() const noexcep
     return request_.resourceLimits;
 }
 
+#ifdef Q_BROWSER_SANDBOX_TESTING
+SandboxCompatibilityCapabilityForTesting
+SandboxLaunchConfig::compatibilityCapabilityForTesting() const noexcept
+{
+    return request_.compatibilityCapabilityForTesting;
+}
+#endif
+
 SandboxValueResult<bool> SandboxLaunchConfig::revalidateTrust() const
 {
     if (!isValid()) {
@@ -720,9 +728,9 @@ SandboxTrustBoundary::makeLaunchConfig(
                     : temp.nativeError};
     }
     auto executable = openTrustedPath(request.executablePath, false);
-    bool executableTrusted = false;
+    bool executableWithinRuntime = false;
     if (executable.value.has_value()) {
-        executableTrusted = std::any_of(
+        executableWithinRuntime = std::any_of(
             state_->runtimeRoots.cbegin(),
             state_->runtimeRoots.cend(),
             [&executable](const StablePath &runtime) {
@@ -730,12 +738,27 @@ SandboxTrustBoundary::makeLaunchConfig(
                                         executable.value->finalPath);
             });
     }
-    if (!executable.value.has_value() || !executableTrusted) {
+    if (!executable.value.has_value() || !executableWithinRuntime) {
         return {std::nullopt,
                 QStringLiteral("sandbox.trust.executable_outside_runtime"),
                 executable.value.has_value()
                     ? SandboxNativeError::win32(ERROR_ACCESS_DENIED)
                     : executable.nativeError};
+    }
+    const bool executableCaptured = std::any_of(
+        state_->runtimeClosure.cbegin(),
+        state_->runtimeClosure.cend(),
+        [&executable](const StablePath &captured) {
+            return !captured.directory
+                && pathKey(captured.finalPath)
+                    == pathKey(executable.value->finalPath)
+                && captured.identity == executable.value->identity;
+        });
+    if (!executableCaptured) {
+        return {std::nullopt,
+                QStringLiteral(
+                    "sandbox.trust.executable_not_in_runtime_closure"),
+                SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
     }
 
     auto launchState = std::make_shared<SandboxLaunchState>();

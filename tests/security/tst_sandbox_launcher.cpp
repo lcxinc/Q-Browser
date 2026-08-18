@@ -571,6 +571,15 @@ void SandboxLauncherTest::profileCreationReusesTheSameSid()
 
 void SandboxLauncherTest::nativeFailuresAreExactAndTyped()
 {
+    const auto invalidRestore = AclGrant{}.restore();
+    QVERIFY(!invalidRestore.value.has_value());
+    QCOMPARE(invalidRestore.errorCode,
+             QStringLiteral("sandbox.acl.restore_failed"));
+    QCOMPARE(invalidRestore.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(invalidRestore.nativeError.value,
+             quint32(ERROR_INVALID_HANDLE));
+
     const auto invalidSidText = AppContainerProfile{}.sidString();
     QVERIFY(!invalidSidText.value.has_value());
     QCOMPARE(invalidSidText.errorCode,
@@ -804,6 +813,29 @@ void SandboxLauncherTest::trustBoundaryOnlyBuildsStrictDescendantRequests()
     QVERIFY2(boundary.value.has_value(),
              qPrintable(boundary.errorCode));
 
+    const QString lateExecutable = QDir(runtimeRoot).filePath(
+        QStringLiteral("late-sandbox-probe.exe"));
+    QVERIFY(QFile::copy(QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH),
+                        lateExecutable));
+    const QByteArray packageAclBeforeLate = daclSnapshot(packageRoot);
+    const QByteArray tempAclBeforeLate = daclSnapshot(tempRoot);
+    const QByteArray runtimeAclBeforeLate = daclSnapshot(runtimeRoot);
+    SandboxLaunchRequest lateRequest;
+    lateRequest.appId = uniqueAppId(QStringLiteral("late-runtime"));
+    lateRequest.executablePath = lateExecutable;
+    lateRequest.packageDirectory = package;
+    lateRequest.tempDirectory = workerTemp;
+    lateRequest.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    const auto lateRejected = boundary.value->makeLaunchConfig(lateRequest);
+    QVERIFY(!lateRejected.value.has_value());
+    QCOMPARE(lateRejected.errorCode,
+             QStringLiteral("sandbox.trust.executable_not_in_runtime_closure"));
+    QCOMPARE(daclSnapshot(packageRoot), packageAclBeforeLate);
+    QCOMPARE(daclSnapshot(tempRoot), tempAclBeforeLate);
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAclBeforeLate);
+
+    QVERIFY(!QFile::remove(stagedExecutable));
+
     SandboxLaunchRequest request;
     request.appId = uniqueAppId(QStringLiteral("boundary"));
     request.executablePath = stagedExecutable;
@@ -1001,6 +1033,16 @@ void SandboxLauncherTest::aclGrantsAreExplicitAndLeastPrivilege()
         QVERIFY(runtimeMask & FILE_READ_DATA);
         QVERIFY(runtimeMask & FILE_EXECUTE);
         QVERIFY(!(runtimeMask & FILE_WRITE_DATA));
+
+        const auto runtimeRestored = runtimeGrant->restore();
+        const auto tempRestored = tempGrant->restore();
+        const auto packageRestored = packageGrant->restore();
+        QVERIFY(runtimeRestored.value.has_value());
+        QVERIFY(tempRestored.value.has_value());
+        QVERIFY(packageRestored.value.has_value());
+        QVERIFY(runtimeGrant->close().value.has_value());
+        QVERIFY(tempGrant->close().value.has_value());
+        QVERIFY(packageGrant->close().value.has_value());
     }
 
     QCOMPARE(explicitAllowMask(packagePath, profile->sid()), quint32(0));
@@ -1213,6 +1255,11 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     QVERIFY(!result->value(QStringLiteral("cmdCreate")).toBool());
     QVERIFY(!result->value(QStringLiteral("selfCreate")).toBool());
     QVERIFY(result->value(QStringLiteral("appContainer")).toBool());
+    QVERIFY(result->value(QStringLiteral("tokenGroupsQueried")).toBool());
+    QVERIFY(result->value(
+        QStringLiteral("tokenRestrictedSidsQueried")).toBool());
+    QVERIFY(result->value(
+        QStringLiteral("allApplicationPackagesQueried")).toBool());
     QVERIFY(!result->value(
         QStringLiteral("allApplicationPackagesMember")).toBool());
     QVERIFY(result->contains(QStringLiteral("capabilitiesQueried")));
@@ -1225,6 +1272,8 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     QCOMPARE(result->value(QStringLiteral("appContainerSid")).toString(),
              launched.process->appContainerSid());
 
+    const auto closed = launched.process->close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
     launched.process.reset();
     deleteProfileIfPresent(profileName);
 }
@@ -1266,7 +1315,12 @@ void SandboxLauncherTest::dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeCl
     const QString stagedQtCore = QDir(runtimeRoot).filePath(
         QFileInfo(sourceQtCore).fileName());
     QVERIFY(QFile::copy(sourceHelper, stagedHelper));
-    QVERIFY(QFile::copy(sourceQtCore, stagedQtCore));
+    QFile qtCoreSource(sourceQtCore);
+    QVERIFY2(qtCoreSource.copy(stagedQtCore),
+             qPrintable(QStringLiteral("%1 -> %2: %3")
+                            .arg(sourceQtCore,
+                                 stagedQtCore,
+                                 qtCoreSource.errorString())));
     QCOMPARE(QDir(runtimeRoot).entryList(QDir::Files).size(), qsizetype(2));
 
     auto boundary = SandboxTrustBoundary::create(
@@ -1278,8 +1332,6 @@ void SandboxLauncherTest::dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeCl
     request.packageDirectory = package;
     request.tempDirectory = workerTemp;
     request.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
-    auto config = boundary.value->makeLaunchConfig(request);
-    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
     const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
     const QString untrackedRuntimeFile = QDir(runtimeRoot).filePath(
         QStringLiteral("not-in-approved-closure.dll"));
@@ -1287,6 +1339,46 @@ void SandboxLauncherTest::dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeCl
     QVERIFY(untracked.open(QIODevice::WriteOnly | QIODevice::NewOnly));
     QCOMPARE(untracked.write("untrusted"), qint64(9));
     untracked.close();
+
+    request.compatibilityCapabilityForTesting =
+        SandboxCompatibilityCapabilityForTesting::None;
+    auto zeroConfig = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(zeroConfig.value.has_value(), qPrintable(zeroConfig.errorCode));
+    WinPipePair zeroPair = WinPipeTransport::createHostPair();
+    QVERIFY(zeroPair.isValid());
+    auto zeroLaunch = SandboxLauncher::launch(
+        *zeroConfig.value, zeroPair.takeWorkerEnds());
+    QVERIFY2(zeroLaunch.process.has_value(), qPrintable(zeroLaunch.errorCode));
+    QVERIFY(zeroLaunch.process->waitForFinished(5000));
+    QCOMPARE(zeroLaunch.process->exitCode(), DWORD(0xC0000022UL));
+    const auto zeroClosed = zeroLaunch.process->close();
+    QVERIFY2(zeroClosed.value.has_value(), qPrintable(zeroClosed.errorCode));
+    zeroLaunch.process.reset();
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+
+    request.compatibilityCapabilityForTesting =
+        SandboxCompatibilityCapabilityForTesting::LpacCom;
+    auto lpacComConfig = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(lpacComConfig.value.has_value(),
+             qPrintable(lpacComConfig.errorCode));
+    WinPipePair lpacComPair = WinPipeTransport::createHostPair();
+    QVERIFY(lpacComPair.isValid());
+    auto lpacComLaunch = SandboxLauncher::launch(
+        *lpacComConfig.value, lpacComPair.takeWorkerEnds());
+    QVERIFY2(lpacComLaunch.process.has_value(),
+             qPrintable(lpacComLaunch.errorCode));
+    QVERIFY(lpacComLaunch.process->waitForFinished(5000));
+    QCOMPARE(lpacComLaunch.process->exitCode(), DWORD(0xC0000022UL));
+    const auto lpacComClosed = lpacComLaunch.process->close();
+    QVERIFY2(lpacComClosed.value.has_value(),
+             qPrintable(lpacComClosed.errorCode));
+    lpacComLaunch.process.reset();
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+
+    request.compatibilityCapabilityForTesting =
+        SandboxCompatibilityCapabilityForTesting::RegistryRead;
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
 
     WinPipePair pair = WinPipeTransport::createHostPair();
     QVERIFY(pair.isValid());
@@ -1315,21 +1407,38 @@ void SandboxLauncherTest::dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeCl
     QVERIFY2(result.has_value(), qPrintable(frameDiagnostic));
     QVERIFY(!result->value(QStringLiteral("qtVersion")).toString().isEmpty());
     QVERIFY(result->value(QStringLiteral("appContainer")).toBool());
+    QVERIFY(result->value(QStringLiteral("tokenGroupsQueried")).toBool());
+    QVERIFY(result->value(
+        QStringLiteral("tokenRestrictedSidsQueried")).toBool());
+    QVERIFY(result->value(
+        QStringLiteral("allApplicationPackagesQueried")).toBool());
     QVERIFY(!result->value(
         QStringLiteral("allApplicationPackagesMember")).toBool());
     QVERIFY(result->value(QStringLiteral("capabilitiesQueried")).toBool());
     QCOMPARE(result->value(QStringLiteral("capabilityCount")).toInt(), 1);
     const QString registryReadSid = capabilitySidString(L"registryRead");
     const QString internetClientSid = capabilitySidString(L"internetClient");
+    const QString internetClientServerSid = capabilitySidString(
+        L"internetClientServer");
+    const QString privateNetworkSid = capabilitySidString(
+        L"privateNetworkClientServer");
     QVERIFY(!registryReadSid.isEmpty());
     QVERIFY(!internetClientSid.isEmpty());
+    QVERIFY(!internetClientServerSid.isEmpty());
+    QVERIFY(!privateNetworkSid.isEmpty());
     QCOMPARE(result->value(QStringLiteral("capabilitySid")).toString(),
              registryReadSid);
     QVERIFY(result->value(QStringLiteral("capabilitySid")).toString()
             != internetClientSid);
+    QVERIFY(result->value(QStringLiteral("capabilitySid")).toString()
+            != internetClientServerSid);
+    QVERIFY(result->value(QStringLiteral("capabilitySid")).toString()
+            != privateNetworkSid);
     QVERIFY(host.writeAll(QByteArrayView("r", 1), 1000));
     QVERIFY(launched.process->waitForFinished(5000));
     QCOMPARE(launched.process->exitCode(), DWORD(0));
+    const auto closed = launched.process->close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
     launched.process.reset();
     QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
     deleteProfileIfPresent(profileName);

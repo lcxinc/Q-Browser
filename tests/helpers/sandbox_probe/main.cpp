@@ -224,7 +224,11 @@ bool tokenInformationHasEnabledSid(HANDLE token,
     return true;
 }
 
-bool tokenHasEnabledSid(HANDLE token, const wchar_t *sidText, bool &isMember)
+bool tokenHasEnabledSid(HANDLE token,
+                        const wchar_t *sidText,
+                        bool &isMember,
+                        bool &groupsQueried,
+                        bool &restrictedSidsQueried)
 {
     PSID sid = nullptr;
     if (!ConvertStringSidToSidW(sidText, &sid)) {
@@ -232,13 +236,14 @@ bool tokenHasEnabledSid(HANDLE token, const wchar_t *sidText, bool &isMember)
     }
     bool regularMember = false;
     bool restrictedMember = false;
-    const bool regularQueried = tokenInformationHasEnabledSid(
+    groupsQueried = tokenInformationHasEnabledSid(
         token, TokenGroups, sid, regularMember);
-    const bool restrictedQueried = tokenInformationHasEnabledSid(
+    restrictedSidsQueried = tokenInformationHasEnabledSid(
         token, TokenRestrictedSids, sid, restrictedMember);
     LocalFree(sid);
-    isMember = regularMember || restrictedMember;
-    return regularQueried && restrictedQueried;
+    isMember = groupsQueried && restrictedSidsQueried
+        && (regularMember || restrictedMember);
+    return groupsQueried && restrictedSidsQueried;
 }
 
 bool tokenIsAppContainer(DWORD &capabilityCount,
@@ -246,6 +251,9 @@ bool tokenIsAppContainer(DWORD &capabilityCount,
                          std::wstring &sidText,
                          bool &lessPrivileged,
                          DWORD &lessPrivilegedError,
+                         bool &tokenGroupsQueried,
+                         bool &tokenRestrictedSidsQueried,
+                         bool &allApplicationPackagesQueried,
                          bool &allApplicationPackagesMember,
                          bool &allRestrictedApplicationPackagesMember)
 {
@@ -269,17 +277,27 @@ bool tokenIsAppContainer(DWORD &capabilityCount,
         sizeof(lessPrivilegedValue),
         &lessPrivilegedSize) != FALSE;
     lessPrivilegedError = lessPrivilegedQueried ? ERROR_SUCCESS : GetLastError();
-    const bool aapQueried = tokenHasEnabledSid(
-        token, L"S-1-15-2-1", allApplicationPackagesMember);
-    (void)tokenHasEnabledSid(
-        token, L"S-1-15-2-2", allRestrictedApplicationPackagesMember);
+    allApplicationPackagesQueried = tokenHasEnabledSid(
+        token,
+        L"S-1-15-2-1",
+        allApplicationPackagesMember,
+        tokenGroupsQueried,
+        tokenRestrictedSidsQueried);
+    bool restrictedGroupsQueried = false;
+    bool restrictedSidsQueried = false;
+    (void)tokenHasEnabledSid(token,
+                             L"S-1-15-2-2",
+                             allRestrictedApplicationPackagesMember,
+                             restrictedGroupsQueried,
+                             restrictedSidsQueried);
     // TokenIsLessPrivilegedAppContainer is unavailable on some supported
     // Windows builds. LPAC's defining access-token property is that it does
     // not satisfy ALL APPLICATION PACKAGES, so use that property only as the
     // down-level fallback after the direct query reports unsupported.
     lessPrivileged = lessPrivilegedQueried
         ? lessPrivilegedValue != 0
-        : lessPrivilegedError == ERROR_INVALID_PARAMETER && aapQueried
+        : lessPrivilegedError == ERROR_INVALID_PARAMETER
+            && allApplicationPackagesQueried
             && !allApplicationPackagesMember;
     DWORD capabilitiesSize = 0;
     SetLastError(ERROR_SUCCESS);
@@ -426,12 +444,18 @@ int wmain(const int argc, wchar_t **argv)
     DWORD lessPrivilegedError = ERROR_SUCCESS;
     bool allApplicationPackagesMember = false;
     bool allRestrictedApplicationPackagesMember = false;
+    bool tokenGroupsQueried = false;
+    bool tokenRestrictedSidsQueried = false;
+    bool allApplicationPackagesQueried = false;
     const bool appContainer = tokenIsAppContainer(
         capabilityCount,
         capabilitiesQueried,
         sidText,
         lessPrivileged,
         lessPrivilegedError,
+        tokenGroupsQueried,
+        tokenRestrictedSidsQueried,
+        allApplicationPackagesQueried,
         allApplicationPackagesMember,
         allRestrictedApplicationPackagesMember);
     BOOL inJob = FALSE;
@@ -456,6 +480,11 @@ int wmain(const int argc, wchar_t **argv)
         + ",\"lessPrivilegedError\":" + std::to_string(lessPrivilegedError)
         + ",\"allApplicationPackagesMember\":"
         + jsonBoolean(allApplicationPackagesMember)
+        + ",\"tokenGroupsQueried\":" + jsonBoolean(tokenGroupsQueried)
+        + ",\"tokenRestrictedSidsQueried\":"
+        + jsonBoolean(tokenRestrictedSidsQueried)
+        + ",\"allApplicationPackagesQueried\":"
+        + jsonBoolean(allApplicationPackagesQueried)
         + ",\"allRestrictedApplicationPackagesMember\":"
         + jsonBoolean(allRestrictedApplicationPackagesMember)
         + ",\"capabilitiesQueried\":" + jsonBoolean(capabilitiesQueried)
