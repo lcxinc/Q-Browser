@@ -237,6 +237,11 @@ public:
         return S_OK;
     }
 
+    HRESULT captureForFileOk(IShellItem *item)
+    {
+        return capture(item) == S_OK ? S_OK : S_FALSE;
+    }
+
     [[nodiscard]] FileDialogResult takeResult()
     {
         if (status_ != FileDialogStatus::Opened || !file_.isValid()) {
@@ -283,10 +288,9 @@ public:
     {
         ComPointer<IShellItem> item;
         if (dialog == nullptr || FAILED(dialog->GetResult(item.put()))) {
-            return E_FAIL;
+            return S_FALSE;
         }
-        (void)capture(item.get());
-        return S_OK;
+        return captureForFileOk(item.get());
     }
     HRESULT STDMETHODCALLTYPE OnFolderChanging(IFileDialog *, IShellItem *) override
     {
@@ -363,7 +367,10 @@ FileDialogResult QtFileDialogBackend::openFile(const qint64 maximumBytes)
         }
         ComPointer<FileDialogEventHandler> handler;
         handler.attach(new FileDialogEventHandler(maximumBytes));
-        (void)handler->capture(item.get());
+        const HRESULT accepted = handler->captureForFileOk(item.get());
+        if (accepted == S_FALSE && hooks.cancelAfterRejectedSelection) {
+            return FileDialogResult::error(FileDialogStatus::Cancelled);
+        }
         return handler->takeResult();
     }
 #endif

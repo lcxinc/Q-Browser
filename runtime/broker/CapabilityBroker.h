@@ -5,10 +5,12 @@
 #include <QJsonObject>
 #include <QString>
 
+class UserGestureGrant;
+
 struct HostRequestContext {
     QString appIdentity;
     QString requestId;
-    QString sessionNonce;
+    UserGestureGrant *userGestureGrant = nullptr;
 };
 
 [[nodiscard]] constexpr qint64 maximumIpcBinaryResultBytes() noexcept

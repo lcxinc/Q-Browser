@@ -58,6 +58,7 @@ private slots:
     void intersectsEveryDeclaredCapability();
     void absentOnEitherSideMeansDeny();
     void hostPolicyRejectsRegexLikeAndInvalidValues();
+    void hostPolicyCanonicalizesIdnHostsToAce();
 };
 
 void PolicyEngineTest::intersectsEveryDeclaredCapability()
@@ -129,6 +130,34 @@ void PolicyEngineTest::hostPolicyRejectsRegexLikeAndInvalidValues()
     invalidNetwork.timeoutMs = 1;
     invalidNetwork.rules.first().host = QStringLiteral("127.1");
     QVERIFY(!HostPolicy::validatedNetwork(invalidNetwork).has_value());
+}
+
+void PolicyEngineTest::hostPolicyCanonicalizesIdnHostsToAce()
+{
+    HostNetworkPolicy policy;
+    policy.rules = {NetworkAllowRule{NetworkScheme::Https,
+                                     QStringLiteral("b\u00fccher.example"),
+                                     443,
+                                     QStringLiteral("/v1"),
+                                     {HttpMethod::Get},
+                                     {NetworkAddressClass::Public}}};
+    policy.maximumRequestBytes = 1024;
+    policy.maximumResponseBytes = 1024;
+    policy.timeoutMs = 1000;
+
+    const auto validated = HostPolicy::validatedNetwork(policy);
+    QVERIFY(validated.has_value());
+    QCOMPARE(validated->rules.first().host, QStringLiteral("xn--bcher-kva.example"));
+
+    policy.rules.append(policy.rules.first());
+    policy.rules.last().host = QStringLiteral("xn--bcher-kva.example");
+    QVERIFY(!HostPolicy::validatedNetwork(policy).has_value());
+    policy.rules.removeLast();
+
+    policy.rules.first().host = QStringLiteral("b\u00fccher.example.");
+    QVERIFY(!HostPolicy::validatedNetwork(policy).has_value());
+    policy.rules.first().host = QStringLiteral("xn--bcher-kva..example");
+    QVERIFY(!HostPolicy::validatedNetwork(policy).has_value());
 }
 
 QTEST_APPLESS_MAIN(PolicyEngineTest)

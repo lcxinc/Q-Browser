@@ -120,6 +120,57 @@ bool applyHostOnlyAcl(const QString &path)
     return result == ERROR_SUCCESS;
 }
 
+struct DaclSnapshot final
+{
+    QString path;
+    QByteArray acl;
+    bool protectedAcl = false;
+};
+
+bool freezeDirectoryMembership(const DaclSnapshot &original)
+{
+    if (original.acl.size() < static_cast<qsizetype>(sizeof(ACL))) {
+        return false;
+    }
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldSize = sizeof(worldBuffer);
+    if (CreateWellKnownSid(WinWorldSid, nullptr, worldBuffer, &worldSize) == FALSE) {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entry{};
+    entry.grfAccessPermissions = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY
+        | FILE_DELETE_CHILD;
+    entry.grfAccessMode = DENY_ACCESS;
+    entry.grfInheritance = NO_INHERITANCE;
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    entry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(worldBuffer);
+    PACL acl = nullptr;
+    if (SetEntriesInAclW(
+            1,
+            &entry,
+            reinterpret_cast<PACL>(const_cast<char *>(original.acl.constData())),
+            &acl)
+        != ERROR_SUCCESS) {
+        return false;
+    }
+    QString native = QDir::toNativeSeparators(QFileInfo(original.path).absoluteFilePath());
+    const SECURITY_INFORMATION protection = original.protectedAcl
+        ? PROTECTED_DACL_SECURITY_INFORMATION
+        : UNPROTECTED_DACL_SECURITY_INFORMATION;
+    const DWORD result = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | protection,
+        nullptr,
+        nullptr,
+        acl,
+        nullptr);
+    LocalFree(acl);
+    return result == ERROR_SUCCESS;
+}
+
 bool hasHostOnlyAcl(const QString &path)
 {
     HANDLE token = nullptr;
@@ -203,13 +254,6 @@ struct ValidatedStorageObject final
 {
     QString path;
     std::unique_ptr<qbrowser_archive_detail::WindowsStableFile> file;
-};
-
-struct DaclSnapshot final
-{
-    QString path;
-    QByteArray acl;
-    bool protectedAcl = false;
 };
 
 bool captureDacl(const QString &path, DaclSnapshot &snapshot)
@@ -354,45 +398,97 @@ bool validateExistingLayout(
     return stableRoot.isStable();
 }
 
-bool applyAclsTransactionally(
+bool frozenMembershipMatches(
     const QString &rootDirectory,
     const std::vector<ValidatedStorageObject> &objects,
     const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot)
+{
+    QHash<QString, const ValidatedStorageObject *> expected;
+    expected.reserve(static_cast<qsizetype>(objects.size()));
+    for (const ValidatedStorageObject &object : objects) {
+        const QString name = QFileInfo(object.path).fileName();
+        if (expected.contains(name)) {
+            return false;
+        }
+        expected.insert(name, &object);
+    }
+
+    QSet<QString> seen;
+    QDirIterator iterator(rootDirectory,
+                          QDir::AllEntries | QDir::Hidden | QDir::System
+                              | QDir::NoDotAndDotDot,
+                          QDirIterator::NoIteratorFlags);
+    while (iterator.hasNext()) {
+        iterator.next();
+        const QFileInfo information = iterator.fileInfo();
+        const QString name = information.fileName();
+        const auto object = expected.constFind(name);
+        bool lockFile = false;
+        if (object == expected.cend() || seen.contains(name) || !information.isFile()
+            || information.isSymLink() || !validStorageObjectName(name, lockFile)
+            || !(*object)->file->isSameIdentityAt(information.absoluteFilePath())
+            || !stableRoot.isStable()) {
+            return false;
+        }
+        seen.insert(name);
+    }
+    return seen.size() == expected.size() && stableRoot.isStable();
+}
+
+bool applyAclsTransactionally(
+    const std::vector<ValidatedStorageObject> &objects,
+    const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot,
+    DaclSnapshot originalRoot)
 {
     std::vector<DaclSnapshot> snapshots;
     snapshots.reserve(objects.size() + 1U);
     for (const ValidatedStorageObject &object : objects) {
         DaclSnapshot snapshot;
         if (!captureDacl(object.path, snapshot)) {
+            (void)restoreDacl(originalRoot);
             return false;
         }
         snapshots.push_back(std::move(snapshot));
     }
-    DaclSnapshot rootSnapshot;
-    if (!captureDacl(rootDirectory, rootSnapshot)) {
-        return false;
-    }
-    snapshots.push_back(std::move(rootSnapshot));
+    snapshots.push_back(std::move(originalRoot));
 
-    qsizetype applied = 0;
-    for (; applied < static_cast<qsizetype>(snapshots.size()); ++applied) {
+    std::vector<bool> dirty(snapshots.size(), false);
+    dirty.back() = true; // The membership-freeze DACL already changed the root.
+    bool complete = true;
+    for (qsizetype index = 0; index < static_cast<qsizetype>(snapshots.size()); ++index) {
 #ifdef Q_BROWSER_BROKER_TESTING
         const auto &hooks = qbrowser_broker_testing::storageTestHooks();
-        if (hooks.allowAclApply && !hooks.allowAclApply(snapshots[applied].path, applied)) {
+        if (hooks.allowAclApply && !hooks.allowAclApply(snapshots[index].path, index)) {
+            complete = false;
             break;
         }
 #endif
-        if (!applyHostOnlyAcl(snapshots[applied].path)
-            || !hasHostOnlyAcl(snapshots[applied].path)) {
+        if (!applyHostOnlyAcl(snapshots[index].path)) {
+            complete = false;
+            break;
+        }
+        dirty[static_cast<size_t>(index)] = true;
+#ifdef Q_BROWSER_BROKER_TESTING
+        if (hooks.allowAclPostcheck
+            && !hooks.allowAclPostcheck(snapshots[index].path, index)) {
+            complete = false;
+            break;
+        }
+#endif
+        if (!hasHostOnlyAcl(snapshots[index].path)) {
+            complete = false;
             break;
         }
     }
-    if (applied == static_cast<qsizetype>(snapshots.size()) && stableRoot.isStable()) {
+    if (complete && stableRoot.isStable()) {
         return true;
     }
     bool restored = true;
-    for (qsizetype index = applied; index > 0; --index) {
-        restored = restoreDacl(snapshots[static_cast<size_t>(index - 1)]) && restored;
+    for (qsizetype index = static_cast<qsizetype>(snapshots.size()); index > 0; --index) {
+        const size_t snapshotIndex = static_cast<size_t>(index - 1);
+        if (dirty[snapshotIndex]) {
+            restored = restoreDacl(snapshots[snapshotIndex]) && restored;
+        }
     }
     (void)restored;
     return false;
@@ -509,13 +605,34 @@ std::unique_ptr<StorageBroker> StorageBroker::create(EffectiveStoragePolicy poli
     broker->stableRoot_ =
         std::make_unique<qbrowser_archive_detail::WindowsStableDirectoryTree>();
     std::vector<ValidatedStorageObject> objects;
+    DaclSnapshot originalRoot;
     if (!broker->stableRoot_->openRoot(absoluteRoot)
-        || !broker->stableRoot_->isStable()
-        || !validateExistingLayout(absoluteRoot,
-                                   policy.quotaBytes,
-                                   *broker->stableRoot_,
-                                   objects)
-        || !applyAclsTransactionally(absoluteRoot, objects, *broker->stableRoot_)) {
+        || !broker->stableRoot_->isStable() || !captureDacl(absoluteRoot, originalRoot)) {
+        return fail(QStringLiteral("storage.invalid_root"));
+    }
+    if (!validateExistingLayout(absoluteRoot,
+                                policy.quotaBytes,
+                                *broker->stableRoot_,
+                                objects)) {
+        return fail(QStringLiteral("storage.invalid_root"));
+    }
+    if (!freezeDirectoryMembership(originalRoot)) {
+        (void)restoreDacl(originalRoot);
+        return fail(QStringLiteral("storage.invalid_root"));
+    }
+#ifdef Q_BROWSER_BROKER_TESTING
+    const auto &hooks = qbrowser_broker_testing::storageTestHooks();
+    if (hooks.afterMembershipFrozen) {
+        hooks.afterMembershipFrozen();
+    }
+#endif
+    if (!frozenMembershipMatches(absoluteRoot, objects, *broker->stableRoot_)) {
+        (void)restoreDacl(originalRoot);
+        return fail(QStringLiteral("storage.invalid_root"));
+    }
+    if (!applyAclsTransactionally(objects,
+                                  *broker->stableRoot_,
+                                  std::move(originalRoot))) {
         return fail(QStringLiteral("storage.invalid_root"));
     }
 #else

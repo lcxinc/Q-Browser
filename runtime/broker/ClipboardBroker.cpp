@@ -153,9 +153,10 @@ BrokerResult ClipboardBroker::invoke(const QString &operation,
             return BrokerResult::failure(QStringLiteral("capability.denied"),
                                          QStringLiteral("Capability is not permitted."));
         }
-        if (!grants_.consume(context.sessionNonce,
-                             context.appIdentity,
-                             context.requestId)) {
+        if (context.userGestureGrant == nullptr
+            || !grants_.consume(*context.userGestureGrant,
+                                context.appIdentity,
+                                context.requestId)) {
             return BrokerResult::failure(QStringLiteral("clipboard.gesture_required"),
                                          QStringLiteral("A user gesture is required."));
         }

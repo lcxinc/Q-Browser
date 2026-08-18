@@ -15,10 +15,19 @@
 #include <QSemaphore>
 
 #include <future>
+#include <type_traits>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
+
+static_assert(!std::is_default_constructible_v<UserGestureSession>);
+static_assert(!std::is_copy_constructible_v<UserGestureSession>);
+static_assert(std::is_nothrow_move_constructible_v<UserGestureSession>);
+static_assert(!std::is_default_constructible_v<UserGestureGrant>);
+static_assert(!std::is_copy_constructible_v<UserGestureGrant>);
+static_assert(std::is_nothrow_move_constructible_v<UserGestureGrant>);
 
 class RecordingService final : public CapabilityService
 {
@@ -109,9 +118,9 @@ private slots:
     void deniedOperationNeverTouchesService();
     void dispatchesAllowedCapabilityWithHostIdentity();
     void clipboardReadRequiresHostGesture();
-    void gestureGrantIsBoundExpiringAndSingleUse();
-    void gestureGrantTombstonesDoNotExhaustActiveCapacity();
-    void gestureGrantIsSessionBoundAndInvalidatedOnClose();
+    void gestureGrantIsOpaqueBoundExpiringAndSingleUse();
+    void gestureStoreBoundsRecordsAndPurgesClosedSessions();
+    void gestureSessionRaiiInvalidatesOnDestruction();
     void clipboardEnforcesNativeByteLimitAndStableStatuses();
     void enforcesExactIpcRequestAndResponseBudget();
     void fileCancellationAndSizeAreStable();
@@ -120,6 +129,7 @@ private slots:
     void nativeFileDialogReturnsBoundStreamAndChecksSizeBeforeRead();
     void nativeFileDialogRejectsReparseSelection();
     void nativeFileDialogRejectsReplacementAfterStreamBind();
+    void nativeFileDialogRejectedSelectionStaysOpenUntilCancel();
 };
 
 void CapabilityBrokerTest::deniedCapabilityNeverTouchesService()
@@ -180,119 +190,108 @@ void CapabilityBrokerTest::clipboardReadRequiresHostGesture()
     RecordingClipboard backend;
     UserGestureGrantStore grants;
     ClipboardBroker service(EffectiveClipboardPolicy{true, true}, backend, grants);
+    auto session = grants.openSession(QStringLiteral("host.identity"));
+    QVERIFY(session.has_value());
 
     BrokerResult result = service.invoke(
         QStringLiteral("read"),
         {},
-        {QStringLiteral("host.identity"), QStringLiteral("read-1"), QStringLiteral("session")});
+        {QStringLiteral("host.identity"), QStringLiteral("read-1")});
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("clipboard.gesture_required"));
     QCOMPARE(backend.reads, 0);
 
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("host.identity"),
-                         QStringLiteral("read-1"),
-                         1000));
+    auto grant = grants.issue(*session, QStringLiteral("read-1"), 1000);
+    QVERIFY(grant.has_value());
     result = service.invoke(QStringLiteral("read"),
                             {},
                             {QStringLiteral("host.identity"),
                              QStringLiteral("read-1"),
-                             QStringLiteral("session")});
+                             &*grant});
     QVERIFY(result.ok);
     QCOMPARE(result.value.value(QStringLiteral("text")).toString(),
              QStringLiteral("clipboard-value"));
     QCOMPARE(backend.reads, 1);
 }
 
-void CapabilityBrokerTest::gestureGrantIsBoundExpiringAndSingleUse()
+void CapabilityBrokerTest::gestureGrantIsOpaqueBoundExpiringAndSingleUse()
 {
     RecordingClipboard backend;
     UserGestureGrantStore grants;
     ClipboardBroker service(EffectiveClipboardPolicy{false, true}, backend, grants);
-    const auto read = [&](const QString &app, const QString &requestId) {
+    auto session = grants.openSession(QStringLiteral("app.one"));
+    QVERIFY(session.has_value());
+    const auto read = [&](const QString &app,
+                          const QString &requestId,
+                          UserGestureGrant *grant) {
         return service.invoke(QStringLiteral("read"),
                               {},
-                              {app, requestId, QStringLiteral("session")});
+                              {app, requestId, grant});
     };
 
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("request.one"),
-                         1000));
-    QCOMPARE(read(QStringLiteral("app.two"), QStringLiteral("request.one")).errorCode,
+    auto grant = grants.issue(*session, QStringLiteral("request.one"), 1000);
+    QVERIFY(grant.has_value());
+    QCOMPARE(read(QStringLiteral("app.two"), QStringLiteral("request.one"), &*grant).errorCode,
              QStringLiteral("clipboard.gesture_required"));
-    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("request.two")).errorCode,
+    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("request.two"), &*grant).errorCode,
              QStringLiteral("clipboard.gesture_required"));
-    QVERIFY(read(QStringLiteral("app.one"), QStringLiteral("request.one")).ok);
-    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("request.one")).errorCode,
+    QVERIFY(read(QStringLiteral("app.one"), QStringLiteral("request.one"), &*grant).ok);
+    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("request.one"), &*grant).errorCode,
              QStringLiteral("clipboard.gesture_required"));
 
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("stale"),
-                         1));
+    auto stale = grants.issue(*session, QStringLiteral("stale"), 1);
+    QVERIFY(stale.has_value());
     QTest::qWait(5);
-    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("stale")).errorCode,
+    QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("stale"), &*stale).errorCode,
              QStringLiteral("clipboard.gesture_required"));
     QCOMPARE(backend.reads, 1);
 }
 
-void CapabilityBrokerTest::gestureGrantTombstonesDoNotExhaustActiveCapacity()
+void CapabilityBrokerTest::gestureStoreBoundsRecordsAndPurgesClosedSessions()
 {
     UserGestureGrantStore grants;
+    auto session = grants.openSession(QStringLiteral("app.one"));
+    QVERIFY(session.has_value());
 
     for (int index = 0; index < 8192; ++index) {
         const QString requestId = QStringLiteral("request-%1").arg(index);
-        QVERIFY2(grants.issue(QStringLiteral("session"),
-                              QStringLiteral("app.one"),
-                              requestId,
-                              60000),
+        auto grant = grants.issue(*session, requestId, 60000);
+        QVERIFY2(grant.has_value(),
                  qPrintable(QStringLiteral("issue failed at %1").arg(index)));
-        QVERIFY2(grants.consume(QStringLiteral("session"),
-                                QStringLiteral("app.one"),
-                                requestId),
+        QVERIFY2(grants.consume(*grant, QStringLiteral("app.one"), requestId),
                  qPrintable(QStringLiteral("consume failed at %1").arg(index)));
     }
 
-    QVERIFY(!grants.issue(QStringLiteral("session"),
-                          QStringLiteral("app.one"),
-                          QStringLiteral("request-8191"),
-                          60000));
-    QVERIFY(!grants.consume(QStringLiteral("session"),
-                            QStringLiteral("app.one"),
-                            QStringLiteral("request-8191")));
-    QVERIFY(!grants.issue(QStringLiteral("session"),
-                          QStringLiteral("app.one"),
-                          QStringLiteral("beyond-bound"),
-                          60000));
-    grants.invalidateSession(QStringLiteral("session"));
-    QVERIFY(grants.issue(QStringLiteral("session.rotated"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("after-rotation"),
-                         60000));
+    QVERIFY(!grants.issue(*session, QStringLiteral("beyond-bound"), 60000).has_value());
+    session.reset();
+    auto replacement = grants.openSession(QStringLiteral("app.one"));
+    QVERIFY(replacement.has_value());
+    QVERIFY(grants.issue(*replacement, QStringLiteral("after-close"), 60000).has_value());
 }
 
-void CapabilityBrokerTest::gestureGrantIsSessionBoundAndInvalidatedOnClose()
+void CapabilityBrokerTest::gestureSessionRaiiInvalidatesOnDestruction()
 {
     UserGestureGrantStore grants;
-    QVERIFY(grants.issue(QStringLiteral("session.one"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("request.one"),
-                         60000));
-    QVERIFY(!grants.consume(QStringLiteral("session.two"),
+    std::optional<UserGestureGrant> grant;
+    {
+        auto session = grants.openSession(QStringLiteral("app.one"));
+        QVERIFY(session.has_value());
+        grant = grants.issue(*session, QStringLiteral("request.one"), 60000);
+        QVERIFY(grant.has_value());
+    }
+    QVERIFY(!grants.consume(*grant,
                             QStringLiteral("app.one"),
                             QStringLiteral("request.one")));
-    grants.invalidateSession(QStringLiteral("session.one"));
-    QVERIFY(!grants.consume(QStringLiteral("session.one"),
-                            QStringLiteral("app.one"),
-                            QStringLiteral("request.one")));
-    QVERIFY(grants.issue(QStringLiteral("session.two"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("request.one"),
-                         60000));
-    QVERIFY(grants.consume(QStringLiteral("session.two"),
-                           QStringLiteral("app.one"),
-                           QStringLiteral("request.one")));
+
+    std::vector<UserGestureSession> sessions;
+    for (int index = 0; index < 128; ++index) {
+        auto session = grants.openSession(QStringLiteral("app-%1").arg(index));
+        QVERIFY(session.has_value());
+        sessions.push_back(std::move(*session));
+    }
+    QVERIFY(!grants.openSession(QStringLiteral("overflow")).has_value());
+    sessions.pop_back();
+    QVERIFY(grants.openSession(QStringLiteral("replacement")).has_value());
 }
 
 void CapabilityBrokerTest::clipboardEnforcesNativeByteLimitAndStableStatuses()
@@ -300,29 +299,27 @@ void CapabilityBrokerTest::clipboardEnforcesNativeByteLimitAndStableStatuses()
     RecordingClipboard backend;
     UserGestureGrantStore grants;
     ClipboardBroker service(EffectiveClipboardPolicy{true, true}, backend, grants);
+    auto session = grants.openSession(QStringLiteral("app.one"));
+    QVERIFY(session.has_value());
     constexpr qint64 contentCharacters = maximumClipboardBytes() / 2 - 1;
 
     backend.readResult.text = QString(contentCharacters, u'x');
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("read-exact"),
-                         1000));
+    auto exactGrant = grants.issue(*session, QStringLiteral("read-exact"), 1000);
+    QVERIFY(exactGrant.has_value());
     QVERIFY(service.invoke(QStringLiteral("read"), {},
                            {QStringLiteral("app.one"),
                             QStringLiteral("read-exact"),
-                            QStringLiteral("session")})
+                            &*exactGrant})
                 .ok);
     QCOMPARE(backend.lastMaximumBytes, maximumClipboardBytes());
 
     backend.readResult.text.append(u'x');
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("read-large"),
-                         1000));
+    auto largeGrant = grants.issue(*session, QStringLiteral("read-large"), 1000);
+    QVERIFY(largeGrant.has_value());
     QCOMPARE(service.invoke(QStringLiteral("read"), {},
                             {QStringLiteral("app.one"),
                              QStringLiteral("read-large"),
-                             QStringLiteral("session")})
+                             &*largeGrant})
                  .errorCode,
              QStringLiteral("clipboard.too_large"));
 
@@ -341,14 +338,12 @@ void CapabilityBrokerTest::clipboardEnforcesNativeByteLimitAndStableStatuses()
     QCOMPARE(backend.writes, writesAtLimit);
 
     backend.readResult = ClipboardReadResult::error(ClipboardStatus::Unavailable);
-    QVERIFY(grants.issue(QStringLiteral("session"),
-                         QStringLiteral("app.one"),
-                         QStringLiteral("read-failed"),
-                         1000));
+    auto failedGrant = grants.issue(*session, QStringLiteral("read-failed"), 1000);
+    QVERIFY(failedGrant.has_value());
     QCOMPARE(service.invoke(QStringLiteral("read"), {},
                             {QStringLiteral("app.one"),
                              QStringLiteral("read-failed"),
-                             QStringLiteral("session")})
+                             &*failedGrant})
                  .errorCode,
              QStringLiteral("clipboard.failed"));
 }
@@ -474,6 +469,9 @@ void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()
     QVERIFY(implementation.contains("IFileOpenDialog"));
     QVERIFY(implementation.contains("IFileDialogEvents"));
     QVERIFY(implementation.contains("OnFileOk"));
+    QVERIFY(implementation.contains(
+        "if (dialog == nullptr || FAILED(dialog->GetResult(item.put()))) {\n"
+        "            return S_FALSE;"));
     QVERIFY(implementation.contains("CreateFileW"));
     QVERIFY(!implementation.contains("BindToHandler"));
     const qsizetype windowsBranch = implementation.indexOf("IFileOpenDialog");
@@ -589,6 +587,32 @@ void CapabilityBrokerTest::nativeFileDialogRejectsReplacementAfterStreamBind()
         QVERIFY(result.stream != nullptr);
         QCOMPARE(result.stream->readAll(), QByteArray("safe"));
     }
+#endif
+}
+
+void CapabilityBrokerTest::nativeFileDialogRejectedSelectionStaysOpenUntilCancel()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows native file dialog coverage");
+#else
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(QStringLiteral("large.txt"));
+    QFile file(selected);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write("oversized"), 9);
+    file.close();
+
+    qbrowser_broker_testing::setFileDialogTestHooks(
+        {.selectedPath = [selected] { return selected; },
+         .afterNativeHandleOpened = {},
+         .cancelAfterRejectedSelection = true});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend backend;
+
+    QCOMPARE(backend.openFile(4).status, FileDialogStatus::Cancelled);
 #endif
 }
 

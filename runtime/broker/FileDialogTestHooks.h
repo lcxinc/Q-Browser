@@ -12,6 +12,7 @@ struct FileDialogTestHooks final
 {
     std::function<QString()> selectedPath;
     std::function<void(const QString &)> afterNativeHandleOpened;
+    bool cancelAfterRejectedSelection = false;
 };
 
 void setFileDialogTestHooks(FileDialogTestHooks hooks);

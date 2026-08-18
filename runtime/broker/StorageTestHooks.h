@@ -10,7 +10,9 @@ namespace qbrowser_broker_testing
 {
 struct StorageTestHooks final
 {
+    std::function<void()> afterMembershipFrozen;
     std::function<bool(const QString &, qsizetype)> allowAclApply;
+    std::function<bool(const QString &, qsizetype)> allowAclPostcheck;
 };
 
 void setStorageTestHooks(StorageTestHooks hooks);

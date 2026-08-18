@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QCryptographicHash>
 #include <QFile>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -12,7 +13,6 @@
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #include <Aclapi.h>
-#include <sddl.h>
 #endif
 
 namespace {
@@ -139,18 +139,29 @@ QByteArray aclSnapshot(const QString &path)
     if (result != ERROR_SUCCESS || descriptor == nullptr) {
         return {};
     }
-    LPWSTR sddl = nullptr;
-    const BOOL converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(
-        descriptor,
-        SDDL_REVISION_1,
-        DACL_SECURITY_INFORMATION,
-        &sddl,
-        nullptr);
-    const QByteArray snapshot = converted != FALSE && sddl != nullptr
-        ? QString::fromWCharArray(sddl).toUtf8()
-        : QByteArray{};
-    if (sddl != nullptr) {
-        LocalFree(sddl);
+    PACL dacl = nullptr;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    ACL_SIZE_INFORMATION information{};
+    const bool valid = GetSecurityDescriptorDacl(descriptor,
+                                                 &present,
+                                                 &dacl,
+                                                 &defaulted)
+            != FALSE
+        && present != FALSE && dacl != nullptr
+        && GetSecurityDescriptorControl(descriptor, &control, &revision) != FALSE
+        && GetAclInformation(dacl,
+                             &information,
+                             static_cast<DWORD>(sizeof(information)),
+                             AclSizeInformation)
+            != FALSE;
+    QByteArray snapshot;
+    if (valid) {
+        snapshot.append(reinterpret_cast<const char *>(&control), sizeof(control));
+        snapshot.append(reinterpret_cast<const char *>(dacl),
+                        static_cast<qsizetype>(information.AclBytesInUse));
     }
     LocalFree(descriptor);
     return snapshot;
@@ -173,6 +184,8 @@ private slots:
     void invalidLayoutDoesNotMutateAcls();
     void rejectsAggregateExistingDataOverQuota();
     void aclMigrationFailureRollsBackEveryObject();
+    void aclPostcheckFailureRollsBackCurrentObject();
+    void freezesMembershipDuringValidationAndAclMigration();
     void serializesConcurrentQuotaUpdates();
     void rejectsReparseRoot();
     void rejectsReparseNamespaceFile();
@@ -389,7 +402,8 @@ void StorageBrokerTest::aclMigrationFailureRollsBackEveryObject()
         QVERIFY(!before.value(path).isEmpty());
     }
     qbrowser_broker_testing::setStorageTestHooks(
-        {.allowAclApply = [](const QString &, const qsizetype index) {
+        {.afterMembershipFrozen = {},
+         .allowAclApply = [](const QString &, const qsizetype index) {
              return index != 1;
          }});
     QString error;
@@ -399,6 +413,112 @@ void StorageBrokerTest::aclMigrationFailureRollsBackEveryObject()
     for (const QString &path : paths) {
         QCOMPARE(aclSnapshot(path), before.value(path));
     }
+#endif
+}
+
+void StorageBrokerTest::aclPostcheckFailureRollsBackCurrentObject()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows ACL transaction coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QStringList paths{root.path()};
+    const QString path = QDir(root.path()).filePath(
+        QString(64, u'a') + QStringLiteral(".json"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write("{}"), 2);
+    file.close();
+    paths.prepend(path);
+    for (const QString &item : paths) {
+        QVERIFY(grantWorldAccess(item));
+    }
+    QHash<QString, QByteArray> before;
+    for (const QString &item : paths) {
+        before.insert(item, aclSnapshot(item));
+        QVERIFY(!before.value(item).isEmpty());
+    }
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = [](const QString &, const qsizetype index) {
+             return index != 0;
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error) == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    for (const QString &item : paths) {
+        QCOMPARE(aclSnapshot(item), before.value(item));
+    }
+#endif
+}
+
+void StorageBrokerTest::freezesMembershipDuringValidationAndAclMigration()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows directory membership transaction coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QTemporaryDir destination;
+    QVERIFY(destination.isValid());
+    const QString injected = QDir(root.path()).filePath(
+        QString(64, u'b') + QStringLiteral(".json"));
+    const QString deletable = QDir(root.path()).filePath(
+        QString(64, u'c') + QStringLiteral(".json"));
+    const QString movable = QDir(root.path()).filePath(
+        QString(64, u'd') + QStringLiteral(".json"));
+    for (const QString &path : {deletable, movable}) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("{}"), 2);
+        file.close();
+        QVERIFY(grantWorldAccess(path));
+    }
+    const QString moved = QDir(destination.path()).filePath(QStringLiteral("moved.json"));
+    bool hookCalled = false;
+    bool injectionSucceeded = false;
+    bool deletionSucceeded = false;
+    bool moveSucceeded = false;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = [&] {
+             hookCalled = true;
+             QFile file(injected);
+             injectionSucceeded = file.open(QIODevice::WriteOnly);
+             if (injectionSucceeded) {
+                 (void)file.write("{}");
+             }
+             deletionSucceeded = DeleteFileW(
+                                      reinterpret_cast<LPCWSTR>(
+                                          QDir::toNativeSeparators(deletable).utf16()))
+                 != FALSE;
+             moveSucceeded = MoveFileExW(
+                                   reinterpret_cast<LPCWSTR>(
+                                       QDir::toNativeSeparators(movable).utf16()),
+                                   reinterpret_cast<LPCWSTR>(
+                                       QDir::toNativeSeparators(moved).utf16()),
+                                   MOVEFILE_WRITE_THROUGH)
+                 != FALSE;
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    auto broker = createBroker(EffectiveStoragePolicy{1024}, root.path());
+    QVERIFY(hookCalled);
+    QVERIFY(!injectionSucceeded);
+    QVERIFY(!deletionSucceeded);
+    QVERIFY(!moveSucceeded);
+    QVERIFY(broker != nullptr);
+    QVERIFY(!QFileInfo::exists(injected));
+    QVERIFY(QFileInfo::exists(deletable));
+    QVERIFY(QFileInfo::exists(movable));
+    QVERIFY(!QFileInfo::exists(moved));
 #endif
 }
 

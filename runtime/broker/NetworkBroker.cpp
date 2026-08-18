@@ -11,6 +11,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -91,6 +92,19 @@ bool inSubnet(const QHostAddress &address, const char *network, const int prefix
     return address.isInSubnet(QHostAddress(QString::fromLatin1(network)), prefix);
 }
 
+struct AddressPrefix final
+{
+    const char *address;
+    int length;
+};
+
+bool inAnySubnet(const QHostAddress &address, const auto &prefixes)
+{
+    return std::ranges::any_of(prefixes, [&](const AddressPrefix &prefix) {
+        return inSubnet(address, prefix.address, prefix.length);
+    });
+}
+
 int remaining(const QElapsedTimer &timer, const int timeoutMs)
 {
     return std::max(0, timeoutMs - static_cast<int>(timer.elapsed()));
@@ -162,7 +176,9 @@ HttpResponse exchangeHttp(QAbstractSocket &socket,
     QTimer timer;
     timer.setSingleShot(true);
     const auto process = [&] {
-        received.append(socket.readAll());
+        if (socket.isReadable() && socket.bytesAvailable() > 0) {
+            received.append(socket.readAll());
+        }
         if (received.size() > maximumHeaderBytes + maximumBodyBytes) {
             response.tooLarge = true;
             socket.abort();
@@ -296,12 +312,36 @@ std::optional<NetworkAddressClass> classifyNetworkAddress(const QHostAddress &in
     if (inSubnet(address, "fc00::", 7)) {
         return NetworkAddressClass::Private;
     }
-    const bool allocatedRirBlock = inSubnet(address, "2400::", 12)
-        || inSubnet(address, "2600::", 12)
-        || inSubnet(address, "2800::", 12)
-        || inSubnet(address, "2a00::", 12)
-        || inSubnet(address, "2c00::", 12);
-    if (!allocatedRirBlock) {
+    // IANA IPv6 Global Unicast Address Space, last updated 2025-10-10:
+    // https://www.iana.org/assignments/ipv6-unicast-address-assignments/
+    // The table is deliberately positive: unlisted 2000::/3 space is denied.
+    static constexpr std::array allocatedPrefixes{
+        AddressPrefix{"2001:200::", 23}, AddressPrefix{"2001:400::", 23},
+        AddressPrefix{"2001:600::", 23}, AddressPrefix{"2001:800::", 22},
+        AddressPrefix{"2001:c00::", 23}, AddressPrefix{"2001:e00::", 23},
+        AddressPrefix{"2001:1200::", 23}, AddressPrefix{"2001:1400::", 22},
+        AddressPrefix{"2001:1800::", 23}, AddressPrefix{"2001:1a00::", 23},
+        AddressPrefix{"2001:1c00::", 22}, AddressPrefix{"2001:2000::", 19},
+        AddressPrefix{"2001:4000::", 23}, AddressPrefix{"2001:4200::", 23},
+        AddressPrefix{"2001:4400::", 23}, AddressPrefix{"2001:4600::", 23},
+        AddressPrefix{"2001:4800::", 23}, AddressPrefix{"2001:4a00::", 23},
+        AddressPrefix{"2001:4c00::", 23}, AddressPrefix{"2001:5000::", 20},
+        AddressPrefix{"2001:8000::", 19}, AddressPrefix{"2001:a000::", 20},
+        AddressPrefix{"2001:b000::", 20}, AddressPrefix{"2003::", 18},
+        AddressPrefix{"2400::", 12}, AddressPrefix{"2410::", 12},
+        AddressPrefix{"2600::", 12}, AddressPrefix{"2610::", 23},
+        AddressPrefix{"2620::", 23}, AddressPrefix{"2630::", 12},
+        AddressPrefix{"2800::", 12}, AddressPrefix{"2a00::", 12},
+        AddressPrefix{"2a10::", 12}, AddressPrefix{"2c00::", 12},
+    };
+    // IANA IPv6 Special-Purpose Address Space, last updated 2025-10-09.
+    // These more-specific entries remain denied even inside an allocation.
+    static constexpr std::array specialPrefixes{
+        AddressPrefix{"2001:db8::", 32},
+        AddressPrefix{"2620:4f:8000::", 48},
+    };
+    if (!inAnySubnet(address, allocatedPrefixes)
+        || inAnySubnet(address, specialPrefixes)) {
         return std::nullopt;
     }
     return NetworkAddressClass::Public;
@@ -353,7 +393,12 @@ BrokerResult NetworkBroker::invoke(const QString &operation,
     if (path.isEmpty()) {
         path = QStringLiteral("/");
     }
-    const QString host = url.host(QUrl::FullyDecoded).toLower();
+    const auto canonicalHost = canonicalNetworkHost(url.host(QUrl::FullyDecoded));
+    if (!canonicalHost.has_value()) {
+        return failure(QStringLiteral("network.invalid_request"),
+                       QStringLiteral("Network request is invalid."));
+    }
+    const QString host = *canonicalHost;
     const int port = url.port(url.scheme() == QStringLiteral("https") ? 443 : 80);
     const NetworkScheme scheme = url.scheme() == QStringLiteral("https")
         ? NetworkScheme::Https

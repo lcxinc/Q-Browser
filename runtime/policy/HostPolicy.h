@@ -73,3 +73,4 @@ public:
 [[nodiscard]] QString httpMethodName(HttpMethod method);
 [[nodiscard]] std::optional<HttpMethod> parseHttpMethod(const QString &method);
 [[nodiscard]] QString networkSchemeName(NetworkScheme scheme);
+[[nodiscard]] std::optional<QString> canonicalNetworkHost(const QString &host);

@@ -22,6 +22,7 @@ public:
                         return;
                     }
                     ++requestCount;
+                    lastRequest = request;
                     const auto respond = [this, socket] {
                         if (socket->state() == QAbstractSocket::ConnectedState) {
                             const QByteArray response = QByteArray("HTTP/1.1 200 OK\r\nContent-Length: ")
@@ -51,18 +52,21 @@ public:
     int requestCount = 0;
     int responseDelayMs = 0;
     QByteArray responseBody = "ok";
+    QByteArray lastRequest;
 };
 
 class FixedResolver final : public NetworkAddressResolver
 {
 public:
-    QList<QHostAddress> resolve(const QString &, int, bool &timedOut) override
+    QList<QHostAddress> resolve(const QString &host, int, bool &timedOut) override
     {
+        lastHost = host;
         timedOut = false;
         return addresses;
     }
 
     QList<QHostAddress> addresses;
+    QString lastHost;
 };
 
 namespace {
@@ -102,6 +106,7 @@ private slots:
     void rejectsWrongSchemePortAndResolvedAddressClass();
     void classifiesOnlyGloballyRoutableAddressesAsPublic_data();
     void classifiesOnlyGloballyRoutableAddressesAsPublic();
+    void canonicalizesUnicodeIdnForPolicyDnsAndHostHeader();
 };
 
 void NetworkBrokerTest::performsAllowedRequestAgainstRealServer()
@@ -147,6 +152,7 @@ void NetworkBrokerTest::deniedPathAndMethodNeverReachServer()
 
 void NetworkBrokerTest::boundsRequestAndResponsePayloads()
 {
+    QTest::failOnWarning(QRegularExpression(QStringLiteral("QIODevice::read.*device not open")));
     LocalHttpServer server;
     QVERIFY(server.listen(QHostAddress::LocalHost));
     NetworkBroker broker(policyFor(server));
@@ -172,6 +178,7 @@ void NetworkBrokerTest::boundsRequestAndResponsePayloads()
 
 void NetworkBrokerTest::returnsStableTimeout()
 {
+    QTest::failOnWarning(QRegularExpression(QStringLiteral("QIODevice::read.*device not open")));
     LocalHttpServer server;
     QVERIFY(server.listen(QHostAddress::LocalHost));
     server.responseDelayMs = 250;
@@ -253,16 +260,144 @@ void NetworkBrokerTest::classifiesOnlyGloballyRoutableAddressesAsPublic_data()
     QTest::newRow("allocated-apnic-v6") << QStringLiteral("2404:6800:4001::1")
                                          << static_cast<int>(NetworkAddressClass::Public);
     QTest::newRow("allocated-ripe-v6") << QStringLiteral("2a02:6b8::1")
-                                        << static_cast<int>(NetworkAddressClass::Public);
+                                         << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-legacy-2001") << QStringLiteral("2001:4860::1")
+                                             << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4800-explicit") << QStringLiteral("2001:4800::1")
+                                                    << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0200") << QStringLiteral("2001:200::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0400") << QStringLiteral("2001:400::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0600") << QStringLiteral("2001:600::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0800") << QStringLiteral("2001:800::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0c00") << QStringLiteral("2001:c00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-0e00") << QStringLiteral("2001:e00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-1200") << QStringLiteral("2001:1200::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-1400") << QStringLiteral("2001:1400::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-1800") << QStringLiteral("2001:1800::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-1a00") << QStringLiteral("2001:1a00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-1c00") << QStringLiteral("2001:1c00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-2000") << QStringLiteral("2001:2000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4000") << QStringLiteral("2001:4000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4200") << QStringLiteral("2001:4200::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4400") << QStringLiteral("2001:4400::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4600") << QStringLiteral("2001:4600::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4a00") << QStringLiteral("2001:4a00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-4c00") << QStringLiteral("2001:4c00::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-5000") << QStringLiteral("2001:5000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-8000") << QStringLiteral("2001:8000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-a000") << QStringLiteral("2001:a000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2001-b000") << QStringLiteral("2001:b000::1")
+                                           << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2003") << QStringLiteral("2003::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2410") << QStringLiteral("2410::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2610") << QStringLiteral("2610::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2620") << QStringLiteral("2620::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2630") << QStringLiteral("2630::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2a10") << QStringLiteral("2a10::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2800") << QStringLiteral("2800::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("allocated-2c00") << QStringLiteral("2c00::1")
+                                      << static_cast<int>(NetworkAddressClass::Public);
     QTest::newRow("unallocated-3000-v6") << QStringLiteral("3000::1") << denied;
+    QTest::newRow("unallocated-before-2001-0200") << QStringLiteral("2001:1ff::1")
+                                                   << denied;
+    QTest::newRow("unallocated-2001-1000-gap") << QStringLiteral("2001:1000::1")
+                                                << denied;
+    QTest::newRow("unallocated-2001-4e00-gap") << QStringLiteral("2001:4e00::1")
+                                                << denied;
+    QTest::newRow("unallocated-2001-6000-gap") << QStringLiteral("2001:6000::1")
+                                                << denied;
+    QTest::newRow("unallocated-2001-c000-gap") << QStringLiteral("2001:c000::1")
+                                                << denied;
+    QTest::newRow("unallocated-after-2003-18") << QStringLiteral("2003:4000::1")
+                                                << denied;
+    QTest::newRow("unallocated-2500-gap") << QStringLiteral("2500::1") << denied;
+    QTest::newRow("unallocated-after-2610-23") << QStringLiteral("2610:200::1")
+                                                << denied;
+    QTest::newRow("unallocated-2700-gap") << QStringLiteral("2700::1") << denied;
+    QTest::newRow("unallocated-2b00-gap") << QStringLiteral("2b00::1") << denied;
     QTest::newRow("former-6bone-v6") << QStringLiteral("3ffe::1") << denied;
     QTest::newRow("unallocated-2d00-v6") << QStringLiteral("2d00::1") << denied;
     QTest::newRow("unspecified-v6") << QStringLiteral("::") << denied;
     QTest::newRow("documentation-v6") << QStringLiteral("2001:db8::1") << denied;
+    QTest::newRow("special-6to4-v6") << QStringLiteral("2002::1") << denied;
+    QTest::newRow("special-as112-v6") << QStringLiteral("2620:4f:8000::1") << denied;
+    QTest::newRow("documentation-3fff-v6") << QStringLiteral("3fff::1") << denied;
     QTest::newRow("private-v6") << QStringLiteral("fd00::1")
                                 << static_cast<int>(NetworkAddressClass::Private);
     QTest::newRow("link-local-v6") << QStringLiteral("fe80::1")
                                    << static_cast<int>(NetworkAddressClass::LinkLocal);
+}
+
+void NetworkBrokerTest::canonicalizesUnicodeIdnForPolicyDnsAndHostHeader()
+{
+    LocalHttpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    EffectiveNetworkPolicy policy{{NetworkAllowRule{NetworkScheme::Http,
+                                                     QStringLiteral("xn--bcher-kva.example"),
+                                                     server.serverPort(),
+                                                     QStringLiteral("/api"),
+                                                     {HttpMethod::Get},
+                                                     {NetworkAddressClass::Loopback}}},
+                                  8,
+                                  32,
+                                  1000};
+    FixedResolver resolver;
+    resolver.addresses = {QHostAddress::LocalHost};
+    NetworkBroker broker(policy, resolver);
+    const QJsonObject payload{{QStringLiteral("method"), QStringLiteral("GET")},
+                              {QStringLiteral("url"),
+                               QStringLiteral("http://b\u00fccher.example:%1/api")
+                                   .arg(server.serverPort())},
+                              {QStringLiteral("bodyBase64"), QString{}}};
+
+    const BrokerResult result = broker.invoke(
+        QStringLiteral("request"),
+        payload,
+        {QStringLiteral("host.identity"), QStringLiteral("request")});
+
+    QVERIFY2(result.ok, qPrintable(result.errorCode));
+    QCOMPARE(resolver.lastHost, QStringLiteral("xn--bcher-kva.example"));
+    QVERIFY(server.lastRequest.contains(
+        QByteArray("\r\nHost: xn--bcher-kva.example:")
+        + QByteArray::number(server.serverPort()) + QByteArray("\r\n")));
+
+    QJsonObject trailing = payload;
+    trailing.insert(QStringLiteral("url"),
+                    QStringLiteral("http://b\u00fccher.example.:%1/api")
+                        .arg(server.serverPort()));
+    QCOMPARE(broker.invoke(QStringLiteral("request"),
+                           trailing,
+                           {QStringLiteral("host.identity"), QStringLiteral("request-2")})
+                 .errorCode,
+             QStringLiteral("network.invalid_request"));
 }
 
 void NetworkBrokerTest::classifiesOnlyGloballyRoutableAddressesAsPublic()

@@ -2,6 +2,7 @@
 
 #include <QRegularExpression>
 #include <QSet>
+#include <QUrl>
 
 #include <algorithm>
 
@@ -57,12 +58,6 @@ bool isLegacyIpv4Alias(const QString &host)
     });
 }
 
-bool validHost(const QString &host)
-{
-    return isCanonicalIpv4(host)
-        || (!isLegacyIpv4Alias(host) && isCanonicalHostname(host));
-}
-
 bool validPathPrefix(const QString &path)
 {
     if (path.isEmpty() || path.size() > 2048 || !path.startsWith(u'/')
@@ -77,6 +72,28 @@ bool validPathPrefix(const QString &path)
 
 } // namespace
 
+std::optional<QString> canonicalNetworkHost(const QString &host)
+{
+    if (host.isEmpty() || host.endsWith(u'.') || host.contains(QChar::Null)) {
+        return std::nullopt;
+    }
+    if (isCanonicalIpv4(host)) {
+        return host;
+    }
+    if (isLegacyIpv4Alias(host)) {
+        return std::nullopt;
+    }
+    const QByteArray aceBytes = QUrl::toAce(host);
+    if (aceBytes.isEmpty()) {
+        return std::nullopt;
+    }
+    const QString ace = QString::fromLatin1(aceBytes).toLower();
+    if (!isCanonicalHostname(ace)) {
+        return std::nullopt;
+    }
+    return ace;
+}
+
 std::optional<HostNetworkPolicy>
 HostPolicy::validatedNetwork(const HostNetworkPolicy &candidate)
 {
@@ -88,12 +105,15 @@ HostPolicy::validatedNetwork(const HostNetworkPolicy &candidate)
         return std::nullopt;
     }
 
+    HostNetworkPolicy validated = candidate;
     QSet<QString> uniqueRules;
-    for (const NetworkAllowRule &rule : candidate.rules) {
-        if (!validHost(rule.host) || rule.port == 0 || !validPathPrefix(rule.pathPrefix)
+    for (NetworkAllowRule &rule : validated.rules) {
+        const auto canonicalHost = canonicalNetworkHost(rule.host);
+        if (!canonicalHost.has_value() || rule.port == 0 || !validPathPrefix(rule.pathPrefix)
             || rule.methods.isEmpty() || rule.addressClasses.isEmpty()) {
             return std::nullopt;
         }
+        rule.host = *canonicalHost;
         const QString key = networkSchemeName(rule.scheme) + u'\n' + rule.host + u'\n'
             + QString::number(rule.port) + u'\n' + rule.pathPrefix;
         if (uniqueRules.contains(key)) {
@@ -101,7 +121,7 @@ HostPolicy::validatedNetwork(const HostNetworkPolicy &candidate)
         }
         uniqueRules.insert(key);
     }
-    return candidate;
+    return validated;
 }
 
 std::optional<HostStoragePolicy>
