@@ -8,9 +8,9 @@ namespace {
 
 bool completeHandshake(WorkerTestEnvironment::Launch &launch)
 {
-    const auto handshake = launch.hostSession.receive(15000);
-    const auto surface = launch.hostSession.receive(15000);
-    const auto ready = launch.hostSession.receive(15000);
+    const auto handshake = receiveUntil(launch.hostSession, ProtocolType::Handshake);
+    const auto surface = receiveUntil(launch.hostSession, ProtocolType::SurfaceReady);
+    const auto ready = receiveUntil(launch.hostSession, ProtocolType::Ready);
     return handshake.status == SessionStatus::MessageReady
         && handshake.message->type() == ProtocolType::Handshake
         && surface.status == SessionStatus::MessageReady
@@ -35,8 +35,11 @@ class WorkerCrashTest final : public QObject
     Q_OBJECT
 private slots:
     void restartBudgetBelongsToActivationNotAttempt();
+    void healthWindowStartsWithRestartedAttempt();
     void timeoutAndExitOfSameAttemptCountOnce();
     void staleAttemptSignalsAndCleanShutdownAreIgnored();
+    void startupFailureRollsBackWithoutRestart();
+    void realStartupFailureLaunchesRecoveredWorker();
     void realLpacWorkerRestartsThenRollsBack();
 };
 
@@ -60,6 +63,24 @@ void WorkerCrashTest::restartBudgetBelongsToActivationNotAttempt()
     QCOMPARE(supervisor.state(), WorkerSupervisorState::Retired);
     QCOMPARE(supervisor.workerExited({activation, second}, WorkerExitReason::Crashed, 301),
              WorkerSupervisionAction::IgnoredDuplicateFailure);
+    QCOMPARE(rollbacks, 1);
+}
+
+void WorkerCrashTest::healthWindowStartsWithRestartedAttempt()
+{
+    int restarts = 0;
+    int rollbacks = 0;
+    WorkerSupervisor supervisor({5000, 1000},
+                                [&](WorkerActivationId) { ++restarts; },
+                                [&](WorkerActivationId) { ++rollbacks; });
+    const WorkerActivationId activation = supervisor.beginActivation(0);
+    const WorkerAttemptId first = *supervisor.beginAttempt(activation, 0);
+    QCOMPARE(supervisor.workerExited({activation, first}, WorkerExitReason::Crashed, 10'000),
+             WorkerSupervisionAction::Restart);
+    const WorkerAttemptId second = *supervisor.beginAttempt(activation, 10'001);
+    QCOMPARE(supervisor.workerExited({activation, second}, WorkerExitReason::Crashed, 10'002),
+             WorkerSupervisionAction::CrashLoopRollback);
+    QCOMPARE(restarts, 1);
     QCOMPARE(rollbacks, 1);
 }
 
@@ -110,6 +131,96 @@ void WorkerCrashTest::staleAttemptSignalsAndCleanShutdownAreIgnored()
     QCOMPARE(restarts, 1);
 }
 
+void WorkerCrashTest::startupFailureRollsBackWithoutRestart()
+{
+    int restarts = 0;
+    int rollbacks = 0;
+    WorkerSupervisor supervisor({5000, 1000},
+                                [&](WorkerActivationId) { ++restarts; },
+                                [&](WorkerActivationId) { ++rollbacks; });
+    const WorkerActivationId failedActivation = supervisor.beginActivation(0);
+    const WorkerAttemptId failedAttempt = *supervisor.beginAttempt(failedActivation, 0);
+    QCOMPARE(supervisor.workerExited({failedActivation, failedAttempt},
+                                     WorkerExitReason::StartupFailure, 100),
+             WorkerSupervisionAction::StartupRollback);
+    QCOMPARE(supervisor.state(), WorkerSupervisorState::Retired);
+    QCOMPARE(restarts, 0);
+    QCOMPARE(rollbacks, 1);
+    QCOMPARE(supervisor.workerExited({failedActivation, failedAttempt},
+                                     WorkerExitReason::StartupFailure, 101),
+             WorkerSupervisionAction::IgnoredDuplicateFailure);
+    QCOMPARE(rollbacks, 1);
+
+    const WorkerActivationId replacement = supervisor.beginActivation(200);
+    QVERIFY(replacement != failedActivation);
+    QCOMPARE(supervisor.workerExited({failedActivation, failedAttempt},
+                                     WorkerExitReason::StartupFailure, 201),
+             WorkerSupervisionAction::IgnoredStaleAttempt);
+    QCOMPARE(rollbacks, 1);
+}
+
+void WorkerCrashTest::realStartupFailureLaunchesRecoveredWorker()
+{
+    WorkerTestEnvironment failingEnvironment;
+    WorkerTestEnvironment previousEnvironment(QByteArrayLiteral(
+        "import QtQuick\nRectangle { width: 100; height: 100; "
+        "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", { kind: \"recovered\" }) }\n"));
+    QVERIFY2(failingEnvironment.isValid(), qPrintable(failingEnvironment.error()));
+    QVERIFY2(previousEnvironment.isValid(), qPrintable(previousEnvironment.error()));
+    auto failed = failingEnvironment.launch(QStringLiteral("wrong-startup-nonce"),
+                                            QStringLiteral("expected-startup-nonce"), 1000);
+    QVERIFY2(failed.has_value(), qPrintable(failingEnvironment.error()));
+    const auto failedHandshake = failed->hostSession.receive(15000);
+    QCOMPARE(failedHandshake.status, SessionStatus::Failed);
+    QCOMPARE(failedHandshake.errorCode, QStringLiteral("ipc.session.nonce_mismatch"));
+    QVERIFY(failed->process.waitForFinished(5000));
+
+    int restarts = 0;
+    int rollbacks = 0;
+    std::optional<WorkerTestEnvironment::Launch> recovered;
+    WorkerSupervisor supervisor(
+        {5000, 1000},
+        [&](WorkerActivationId) { ++restarts; },
+        [&](WorkerActivationId) {
+            ++rollbacks;
+            recovered = previousEnvironment.launch(QStringLiteral("startup-rollback"),
+                                                   QStringLiteral("startup-rollback"), 20);
+            QVERIFY2(recovered.has_value(), qPrintable(previousEnvironment.error()));
+            QVERIFY(completeHandshake(*recovered));
+            const auto request = receiveUntil(recovered->hostSession,
+                                              ProtocolType::Request, 5000);
+            QCOMPARE(request.status, SessionStatus::MessageReady);
+            QCOMPARE(request.message->type(), ProtocolType::Request);
+            QCOMPARE(request.message->payload().value(QStringLiteral("payload")).toObject()
+                         .value(QStringLiteral("kind")).toString(),
+                     QStringLiteral("recovered"));
+            const auto response = ProtocolMessage::successResponse(
+                request.message->requestId(), {});
+            QVERIFY(response.has_value());
+            QVERIFY(recovered->hostSession.send(*response, 5000));
+        });
+    const WorkerActivationId activation = supervisor.beginActivation(0);
+    const WorkerAttemptId attempt = *supervisor.beginAttempt(activation, 0);
+    QCOMPARE(supervisor.workerExited({activation, attempt},
+                                     WorkerExitReason::StartupFailure, 100),
+             WorkerSupervisionAction::StartupRollback);
+    QCOMPARE(restarts, 0);
+    QCOMPARE(rollbacks, 1);
+    QVERIFY(recovered.has_value());
+    QVERIFY(!recovered->process.waitForFinished(100));
+    QTest::qWait(100);
+
+    const auto failedClosed = failed->process.close();
+    QVERIFY2(failedClosed.value.has_value(), qPrintable(failedClosed.errorCode));
+    QVERIFY(recovered->hostSession.send(
+        *ProtocolMessage::shutdown(QStringLiteral("test.done")), 5000));
+    QCOMPARE(receiveUntil(recovered->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(recovered->process.waitForFinished(5000));
+    const auto recoveredClosed = recovered->process.close();
+    QVERIFY2(recoveredClosed.value.has_value(), qPrintable(recoveredClosed.errorCode));
+}
+
 void WorkerCrashTest::realLpacWorkerRestartsThenRollsBack()
 {
     WorkerTestEnvironment environment;
@@ -141,10 +252,11 @@ void WorkerCrashTest::realLpacWorkerRestartsThenRollsBack()
         [&](WorkerActivationId) {
             ++rollbackCount;
             recovered = previousEnvironment.launch(QStringLiteral("rollback-worker"),
-                                                   QStringLiteral("rollback-worker"), 1000);
+                                                   QStringLiteral("rollback-worker"), 20);
             QVERIFY2(recovered.has_value(), qPrintable(previousEnvironment.error()));
             QVERIFY(completeHandshake(*recovered));
-            const auto previousRequest = recovered->hostSession.receive(5000);
+            const auto previousRequest = receiveUntil(recovered->hostSession,
+                                                      ProtocolType::Request, 5000);
             QCOMPARE(previousRequest.status, SessionStatus::MessageReady);
             QCOMPARE(previousRequest.message->type(), ProtocolType::Request);
             QCOMPARE(previousRequest.message->payload()
@@ -176,10 +288,12 @@ void WorkerCrashTest::realLpacWorkerRestartsThenRollsBack()
     QCOMPARE(rollbackCount, 1);
     QVERIFY(recovered.has_value());
     QVERIFY(recovered->process.processId() != firstPid);
+    QTest::qWait(100);
 
     QVERIFY(recovered->hostSession.send(
         *ProtocolMessage::shutdown(QStringLiteral("test.done")), 5000));
-    QCOMPARE(recovered->hostSession.receive(5000).message->type(), ProtocolType::Shutdown);
+    QCOMPARE(receiveUntil(recovered->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
     QVERIFY(recovered->process.waitForFinished(5000));
     const auto closed = recovered->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));

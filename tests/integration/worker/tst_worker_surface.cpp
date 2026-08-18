@@ -20,11 +20,13 @@ void WorkerSurfaceTest::embedsOnlyTheLaunchedWorkersWindow()
     auto launch = environment.launch(QStringLiteral("surface-nonce"),
                                      QStringLiteral("surface-nonce"), 1000);
     QVERIFY2(launch.has_value(), qPrintable(environment.error()));
-    QCOMPARE(launch->hostSession.receive(15000).status, SessionStatus::MessageReady);
-    const auto surfaceMessage = launch->hostSession.receive(15000);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceMessage = receiveUntil(launch->hostSession,
+                                             ProtocolType::SurfaceReady);
     QCOMPARE(surfaceMessage.status, SessionStatus::MessageReady);
     QCOMPARE(surfaceMessage.message->type(), ProtocolType::SurfaceReady);
-    const auto ready = launch->hostSession.receive(15000);
+    const auto ready = receiveUntil(launch->hostSession, ProtocolType::Ready);
     QCOMPARE(ready.status, SessionStatus::MessageReady);
     QCOMPARE(ready.message->type(), ProtocolType::Ready);
 

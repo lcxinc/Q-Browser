@@ -26,7 +26,6 @@ WorkerActivationId WorkerSupervisor::beginActivation(const qint64 nowMs)
 {
     activation_.value = nextId(activation_.value);
     state_ = WorkerSupervisorState::Stopped;
-    activationStartMs_ = nowMs;
     lastHeartbeatMs_ = nowMs;
     restartUsed_ = false;
     rollbackCalled_ = false;
@@ -47,6 +46,7 @@ std::optional<WorkerAttemptId> WorkerSupervisor::beginAttempt(
     attempt_.value = nextId(attempt_.value);
     hasAttempt_ = true;
     state_ = WorkerSupervisorState::Running;
+    attemptStartMs_ = nowMs;
     lastHeartbeatMs_ = nowMs;
     return attempt_;
 }
@@ -92,6 +92,16 @@ WorkerSupervisionAction WorkerSupervisor::workerExited(const WorkerAttemptKey ke
         state_ = WorkerSupervisorState::Retired;
         return WorkerSupervisionAction::None;
     }
+    if (reason == WorkerExitReason::StartupFailure) {
+        lastFailedAttempt_ = key;
+        hasLastFailedAttempt_ = true;
+        state_ = WorkerSupervisorState::Retired;
+        if (!rollbackCalled_) {
+            rollbackCalled_ = true;
+            if (rollback_) rollback_(activation_);
+        }
+        return WorkerSupervisionAction::StartupRollback;
+    }
     return unexpectedFailure(key, nowMs);
 }
 
@@ -128,7 +138,7 @@ WorkerSupervisionAction WorkerSupervisor::unexpectedFailure(
         if (restart_) restart_(activation_);
         return WorkerSupervisionAction::Restart;
     }
-    if (nowMs <= activationStartMs_ + policy_.healthWindowMs) {
+    if (nowMs <= attemptStartMs_ + policy_.healthWindowMs) {
         crashLoop_ = true;
         state_ = WorkerSupervisorState::Retired;
         if (!rollbackCalled_) {
@@ -137,7 +147,6 @@ WorkerSupervisionAction WorkerSupervisor::unexpectedFailure(
         }
         return WorkerSupervisionAction::CrashLoopRollback;
     }
-    activationStartMs_ = nowMs;
     restartUsed_ = true;
     if (restart_) restart_(activation_);
     return WorkerSupervisionAction::Restart;

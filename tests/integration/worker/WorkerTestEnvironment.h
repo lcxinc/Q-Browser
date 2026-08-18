@@ -8,6 +8,10 @@
 
 #include <optional>
 
+SessionReceiveResult receiveUntil(IpcSession &session,
+                                  ProtocolType expectedType,
+                                  int timeoutMs = 15000);
+
 class WorkerTestEnvironment final
 {
 public:

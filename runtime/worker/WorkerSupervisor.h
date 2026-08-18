@@ -42,6 +42,7 @@ enum class WorkerSupervisorState {
 enum class WorkerSupervisionAction {
     None,
     Restart,
+    StartupRollback,
     CrashLoopRollback,
     IgnoredStaleAttempt,
     IgnoredDuplicateFailure,
@@ -82,7 +83,7 @@ private:
     WorkerAttemptId attempt_;
     WorkerAttemptKey lastFailedAttempt_;
     WorkerSupervisorState state_ = WorkerSupervisorState::Retired;
-    qint64 activationStartMs_ = 0;
+    qint64 attemptStartMs_ = 0;
     qint64 lastHeartbeatMs_ = 0;
     bool restartUsed_ = false;
     bool rollbackCalled_ = false;

@@ -10,6 +10,7 @@ class WorkerHandshakeTest final : public QObject
 private slots:
     void directLaunchWithoutInheritedHandlesFailsClosed();
     void sandboxedWorkerCompletesLifecycle();
+    void heartbeatInterleavingIsDispatched();
     void wrongNonceFailsClosed();
 };
 
@@ -30,45 +31,68 @@ void WorkerHandshakeTest::sandboxedWorkerCompletesLifecycle()
     auto launch = environment.launch(QStringLiteral("launch-nonce"),
                                      QStringLiteral("launch-nonce"));
     QVERIFY2(launch.has_value(), qPrintable(environment.error()));
-    const auto handshake = launch->hostSession.receive(15000);
+    const auto handshake = receiveUntil(launch->hostSession, ProtocolType::Handshake);
     QCOMPARE(handshake.status, SessionStatus::MessageReady);
     QCOMPARE(handshake.message->type(), ProtocolType::Handshake);
     QVERIFY(launch->hostSession.isAuthenticated());
-    const auto surface = launch->hostSession.receive(15000);
+    const auto surface = receiveUntil(launch->hostSession, ProtocolType::SurfaceReady);
     QCOMPARE(surface.status, SessionStatus::MessageReady);
     QCOMPARE(surface.message->type(), ProtocolType::SurfaceReady);
     QVERIFY(!surface.message->payload().value(QStringLiteral("windowHandle")).toString().isEmpty());
-    const auto ready = launch->hostSession.receive(15000);
+    const auto ready = receiveUntil(launch->hostSession, ProtocolType::Ready);
     QCOMPARE(ready.status, SessionStatus::MessageReady);
     QCOMPARE(ready.message->type(), ProtocolType::Ready);
     QCOMPARE(launch->hostSession.appIdentity(), environment.appId());
 
     QVERIFY(launch->hostSession.sendRouteLoad(QStringLiteral("route-1"),
                                               QStringLiteral("/orders/42"), 5000));
-    bool sawHeartbeat = false;
-    auto routeAck = launch->hostSession.receive(5000);
-    while (routeAck.status == SessionStatus::MessageReady
-           && routeAck.message->type() == ProtocolType::Heartbeat) {
-        sawHeartbeat = true;
-        routeAck = launch->hostSession.receive(5000);
-    }
+    const auto routeAck = receiveUntil(launch->hostSession, ProtocolType::Response, 5000);
     QCOMPARE(routeAck.status, SessionStatus::MessageReady);
     QCOMPARE(routeAck.message->type(), ProtocolType::Response);
     QCOMPARE(routeAck.message->requestId(), QStringLiteral("route-1"));
     QVERIFY(routeAck.message->payload().value(QStringLiteral("ok")).toBool());
 
-    if (!sawHeartbeat) {
-        const auto heartbeat = launch->hostSession.receive(5000);
-        QCOMPARE(heartbeat.status, SessionStatus::MessageReady);
-        QCOMPARE(heartbeat.message->type(), ProtocolType::Heartbeat);
-    }
     QVERIFY(launch->hostSession.send(*ProtocolMessage::shutdown(QStringLiteral("host.close")),
                                     5000));
-    const auto shutdown = launch->hostSession.receive(5000);
+    const auto shutdown = receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000);
     QCOMPARE(shutdown.status, SessionStatus::MessageReady);
     QCOMPARE(shutdown.message->type(), ProtocolType::Shutdown);
     QVERIFY(launch->process.waitForFinished(5000));
     QCOMPARE(launch->process.exitCode(), DWORD(0));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void WorkerHandshakeTest::heartbeatInterleavingIsDispatched()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto launch = environment.launch(QStringLiteral("dispatch-nonce"),
+                                     QStringLiteral("dispatch-nonce"), 20);
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::SurfaceReady).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+
+    for (int index = 0; index < 10; ++index) {
+        QTest::qWait(30);
+        const QString requestId = QStringLiteral("route-%1").arg(index);
+        QVERIFY(launch->hostSession.sendRouteLoad(
+            requestId, QStringLiteral("/stress/%1").arg(index), 5000));
+        const auto response = receiveUntil(launch->hostSession,
+                                           ProtocolType::Response, 5000);
+        QCOMPARE(response.status, SessionStatus::MessageReady);
+        QCOMPARE(response.message->requestId(), requestId);
+    }
+    QTest::qWait(100);
+    QVERIFY(launch->hostSession.send(
+        *ProtocolMessage::shutdown(QStringLiteral("stress.done")), 5000));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }

@@ -1,12 +1,19 @@
 #include "PendingCapabilityQueue.h"
 #include "RuntimeFacade.h"
 #include "WorkerTestEnvironment.h"
+#include "WorkerNetworkAccess.h"
 #include "WorkerWindow.h"
 
 #include <QApplication>
 #include <QDir>
 #include <QFile>
+#include <QHostAddress>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QSet>
+#include <QSignalSpy>
+#include <QTcpServer>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -47,6 +54,7 @@ private slots:
     void pendingCapabilityQueueIsTypedBoundedAndFifo();
     void rejectsEntryOutsideVerifiedPackage();
     void rejectsPollutedImportAndNativePlugin();
+    void inProcessQmlNetworkIsDeniedBeforeSocketConnect();
     void loadingFacadeCallsAndRawNetworkAreBrokeredOrDenied();
     void loadingQueueOverflowFailsClosedBeforeReady();
 };
@@ -128,12 +136,109 @@ void WorkerConfinementTest::rejectsPollutedImportAndNativePlugin()
              QStringLiteral("worker.qml.native_plugin_forbidden"));
 }
 
+void WorkerConfinementTest::inProcessQmlNetworkIsDeniedBeforeSocketConnect()
+{
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    int acceptedConnections = 0;
+    connect(&server, &QTcpServer::newConnection, this, [&] {
+        ++acceptedConnections;
+        while (server.hasPendingConnections()) {
+            delete server.nextPendingConnection();
+        }
+    });
+    const QString baseUrl = QStringLiteral("http://127.0.0.1:%1")
+                                .arg(server.serverPort());
+
+    WorkerNetworkAccessManagerFactory factory;
+    std::unique_ptr<QNetworkAccessManager> manager(factory.create(nullptr));
+    QNetworkReply *probe = manager->get(
+        QNetworkRequest(QUrl(baseUrl + QStringLiteral("/probe"))));
+    QSignalSpy probeFinished(probe, &QNetworkReply::finished);
+    QVERIFY(probeFinished.wait(1000));
+    QCOMPARE(probe->error(), QNetworkReply::ContentAccessDenied);
+
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString package = QDir(root.path()).filePath(QStringLiteral("package"));
+    const QString qmlDirectory = QDir(package).filePath(QStringLiteral("qml"));
+    QVERIFY(QDir().mkpath(qmlDirectory));
+    const QString qml = QStringLiteral(R"QML(import QtQuick
+import QtQml
+Rectangle {
+    width: 100; height: 100
+    property bool xhrReported: false
+    property var rawRequest: {
+        let xhr = new XMLHttpRequest()
+        xhr.onreadystatechange = function() {
+            if (!xhrReported && xhr.readyState === XMLHttpRequest.DONE) {
+                xhrReported = true
+                Runtime.invoke("test", "observe", { kind: "xhrDenied", status: xhr.status })
+            }
+        }
+        xhr.open("GET", "%1/data.json")
+        xhr.send()
+        return xhr
+    }
+    Image {
+        source: "%1/image.png"
+        onStatusChanged: if (status === Image.Error)
+            Runtime.invoke("test", "observe", { kind: "imageDenied" })
+    }
+    Loader {
+        source: "%1/Raw.qml"
+        onStatusChanged: if (status === Loader.Error)
+            Runtime.invoke("test", "observe", { kind: "loaderDenied" })
+    }
+}
+)QML").arg(baseUrl);
+    QVERIFY(writeNewFile(QDir(qmlDirectory).filePath(QStringLiteral("Main.qml")),
+                         qml.toUtf8()));
+    RuntimeFacade facade;
+    QSet<QString> deniedKinds;
+    bool xhrStatusWasZero = false;
+    connect(&facade, &RuntimeFacade::capabilityRequested, this,
+            [&](const QString &, const QString &, const QString &,
+                const QJsonObject &payload) {
+                const QString kind = payload.value(QStringLiteral("kind")).toString();
+                deniedKinds.insert(kind);
+                if (kind == QStringLiteral("xhrDenied")) {
+                    xhrStatusWasZero = payload.value(QStringLiteral("status")).toInt(-1) == 0;
+                }
+            });
+    WorkerWindow window;
+    QVERIFY2(window.load(package, QStringLiteral("qml/Main.qml"), &facade),
+             qPrintable(window.errorString()));
+    QTRY_COMPARE_WITH_TIMEOUT(deniedKinds.size(), 3, 5000);
+    QCOMPARE(deniedKinds,
+             QSet<QString>({QStringLiteral("xhrDenied"), QStringLiteral("imageDenied"),
+                            QStringLiteral("loaderDenied")}));
+    QVERIFY(xhrStatusWasZero);
+    QTest::qWait(100);
+    QCOMPARE(acceptedConnections, 0);
+    QVERIFY(!server.hasPendingConnections());
+}
+
 void WorkerConfinementTest::loadingFacadeCallsAndRawNetworkAreBrokeredOrDenied()
 {
     const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
 Rectangle {
     width: 320; height: 200
     property bool xhrReported: false
+    property string startupRequestId: ""
+    Connections {
+        target: Runtime
+        function onCapabilityFinished(requestId, response) {
+            if (requestId === startupRequestId && response.ok === true
+                    && response.result.token === "host-result") {
+                Runtime.invoke("storage", "put",
+                               { kind: "responseConfirmed",
+                                 identity: Runtime.appIdentity,
+                                 originalRequestId: requestId,
+                                 token: response.result.token })
+            }
+        }
+    }
     Image {
         source: "http://127.0.0.1:9/raw-image.png"
         onStatusChanged: if (status === Image.Error)
@@ -145,7 +250,8 @@ Rectangle {
             Runtime.invoke("storage", "put", { kind: "loaderDenied", identity: Runtime.appIdentity })
     }
     Component.onCompleted: {
-        Runtime.invoke("storage", "get", { kind: "startup", identity: Runtime.appIdentity })
+        startupRequestId = Runtime.invoke(
+            "storage", "get", { kind: "startup", identity: Runtime.appIdentity })
         let xhr = new XMLHttpRequest()
         xhr.onreadystatechange = function() {
             if (!xhrReported && xhr.readyState === XMLHttpRequest.DONE) {
@@ -162,19 +268,22 @@ Rectangle {
     WorkerTestEnvironment environment(qml);
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
     auto launch = environment.launch(QStringLiteral("confine-nonce"),
-                                     QStringLiteral("confine-nonce"), 1000);
+                                     QStringLiteral("confine-nonce"), 20);
     QVERIFY2(launch.has_value(), qPrintable(environment.error()));
-    QCOMPARE(launch->hostSession.receive(15000).message->type(), ProtocolType::Handshake);
-    QCOMPARE(launch->hostSession.receive(15000).message->type(), ProtocolType::SurfaceReady);
-    QCOMPARE(launch->hostSession.receive(15000).message->type(), ProtocolType::Ready);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::SurfaceReady).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    QTest::qWait(100);
 
-    QSet<QString> kinds;
-    for (int index = 0; index < 4; ++index) {
-        auto request = launch->hostSession.receive(15000);
-        while (request.status == SessionStatus::MessageReady
-               && request.message->type() == ProtocolType::Heartbeat) {
-            request = launch->hostSession.receive(15000);
-        }
+    QSet<QString> deniedAndStartupKinds;
+    QString startupRequestId;
+    bool responseConfirmed = false;
+    for (int index = 0; index < 5; ++index) {
+        const auto request = receiveUntil(launch->hostSession,
+                                          ProtocolType::Request);
         QCOMPARE(request.status, SessionStatus::MessageReady);
         QCOMPARE(request.message->type(), ProtocolType::Request);
         QCOMPARE(request.message->payload().value(QStringLiteral("capability")).toString(),
@@ -182,17 +291,35 @@ Rectangle {
         const QJsonObject body = request.message->payload()
                                      .value(QStringLiteral("payload")).toObject();
         QCOMPARE(body.value(QStringLiteral("identity")).toString(), environment.appId());
-        kinds.insert(body.value(QStringLiteral("kind")).toString());
-        const auto response = ProtocolMessage::successResponse(request.message->requestId(), {});
+        const QString kind = body.value(QStringLiteral("kind")).toString();
+        QJsonObject result;
+        if (kind == QStringLiteral("startup")) {
+            startupRequestId = request.message->requestId();
+            result.insert(QStringLiteral("token"), QStringLiteral("host-result"));
+            deniedAndStartupKinds.insert(kind);
+        } else if (kind == QStringLiteral("responseConfirmed")) {
+            responseConfirmed = true;
+            QCOMPARE(body.value(QStringLiteral("originalRequestId")).toString(),
+                     startupRequestId);
+            QCOMPARE(body.value(QStringLiteral("token")).toString(),
+                     QStringLiteral("host-result"));
+        } else {
+            deniedAndStartupKinds.insert(kind);
+        }
+        const auto response = ProtocolMessage::successResponse(
+            request.message->requestId(), result);
         QVERIFY(response.has_value());
         QVERIFY(launch->hostSession.send(*response, 5000));
     }
-    QCOMPARE(kinds, QSet<QString>({QStringLiteral("startup"), QStringLiteral("xhrDenied"),
-                                  QStringLiteral("imageDenied"), QStringLiteral("loaderDenied")}));
+    QCOMPARE(deniedAndStartupKinds,
+             QSet<QString>({QStringLiteral("startup"), QStringLiteral("xhrDenied"),
+                            QStringLiteral("imageDenied"), QStringLiteral("loaderDenied")}));
+    QVERIFY(responseConfirmed);
     QVERIFY(!launch->process.waitForFinished(100));
     QVERIFY(launch->hostSession.send(*ProtocolMessage::shutdown(QStringLiteral("test.done")),
                                     5000));
-    QCOMPARE(launch->hostSession.receive(5000).message->type(), ProtocolType::Shutdown);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
@@ -214,7 +341,7 @@ Rectangle {
     auto launch = environment.launch(QStringLiteral("overflow-nonce"),
                                      QStringLiteral("overflow-nonce"), 1000);
     QVERIFY2(launch.has_value(), qPrintable(environment.error()));
-    const auto handshake = launch->hostSession.receive(15000);
+    const auto handshake = receiveUntil(launch->hostSession, ProtocolType::Handshake);
     QCOMPARE(handshake.status, SessionStatus::MessageReady);
     QCOMPARE(handshake.message->type(), ProtocolType::Handshake);
     const auto afterHandshake = launch->hostSession.receive(15000);

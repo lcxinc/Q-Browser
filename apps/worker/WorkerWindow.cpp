@@ -1,64 +1,18 @@
 #include "WorkerWindow.h"
 
 #include "RuntimeFacade.h"
+#include "WorkerNetworkAccess.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
-#include <QMetaObject>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QQmlContext>
 #include <QQmlEngine>
 
 namespace {
-
-class DeniedReply final : public QNetworkReply
-{
-public:
-    explicit DeniedReply(const QNetworkRequest &request, QObject *parent)
-        : QNetworkReply(parent)
-    {
-        setRequest(request);
-        setUrl(request.url());
-        setOpenMode(QIODevice::ReadOnly);
-        setError(QNetworkReply::ContentAccessDenied,
-                 QStringLiteral("worker network access is broker-only"));
-        QMetaObject::invokeMethod(this, [this] {
-            emit errorOccurred(error());
-            emit finished();
-        }, Qt::QueuedConnection);
-    }
-    void abort() override {}
-protected:
-    qint64 readData(char *, qint64) override { return -1; }
-};
-
-class DeniedNetworkAccessManager final : public QNetworkAccessManager
-{
-public:
-    explicit DeniedNetworkAccessManager(QObject *parent) : QNetworkAccessManager(parent) {}
-protected:
-    QNetworkReply *createRequest(Operation,
-                                 const QNetworkRequest &request,
-                                 QIODevice *) override
-    {
-        return new DeniedReply(request, this);
-    }
-};
-
-class DeniedNetworkAccessManagerFactory final
-    : public QQmlNetworkAccessManagerFactory
-{
-public:
-    QNetworkAccessManager *create(QObject *parent) override
-    {
-        return new DeniedNetworkAccessManager(parent);
-    }
-};
 
 bool isStrictLocalEntry(const QString &packageDirectory,
                         const QString &entryPoint,
@@ -106,7 +60,7 @@ bool packageDeclaresNativeQmlPlugin(const QString &packageDirectory)
 } // namespace
 
 WorkerWindow::WorkerWindow()
-    : networkFactory_(std::make_unique<DeniedNetworkAccessManagerFactory>())
+    : networkFactory_(std::make_unique<WorkerNetworkAccessManagerFactory>())
 {
     view_.setResizeMode(QQuickView::SizeRootObjectToView);
     view_.setFlags(Qt::FramelessWindowHint | Qt::Tool);

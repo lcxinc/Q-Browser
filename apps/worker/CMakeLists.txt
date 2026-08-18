@@ -5,6 +5,8 @@ add_library(q_browser_worker_app STATIC
   RuntimeFacade.h
   WorkerApplication.cpp
   WorkerApplication.h
+  WorkerNetworkAccess.cpp
+  WorkerNetworkAccess.h
   WorkerWindow.cpp
   WorkerWindow.h)
 

@@ -3,6 +3,7 @@
 #include "AppContainerProfile.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
@@ -11,6 +12,8 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <userenv.h>
+
+#include <algorithm>
 
 namespace {
 
@@ -84,6 +87,23 @@ bool writeNewFile(const QString &path, const QByteArray &contents)
 }
 
 } // namespace
+
+SessionReceiveResult receiveUntil(IpcSession &session,
+                                  const ProtocolType expectedType,
+                                  const int timeoutMs)
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (;;) {
+        const int remaining = std::max(0, timeoutMs - static_cast<int>(elapsed.elapsed()));
+        SessionReceiveResult result = session.receive(remaining);
+        if (result.status != SessionStatus::MessageReady || !result.message.has_value()
+            || result.message->type() == expectedType
+            || result.message->type() != ProtocolType::Heartbeat) {
+            return result;
+        }
+    }
+}
 
 WorkerTestEnvironment::Launch::Launch(IpcSession host, SandboxProcess child)
     : hostSession(std::move(host)), process(std::move(child))
