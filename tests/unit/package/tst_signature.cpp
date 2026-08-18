@@ -97,6 +97,7 @@ private slots:
     void validatesCanonicalPayloadMetadata();
     void rejectsAmbiguousDigestInputs();
     void rejectsNonCanonicalUnicodeDigestPaths();
+    void rejectsUnsafeArchivePathsAndCollisions();
     void signsAndVerifiesRfc8032Vector();
     void rejectsChangedMessageWrongKeyAndMalformedSizes();
     void generatesStrictPemKeyPairs();
@@ -263,6 +264,45 @@ void SignatureTest::rejectsNonCanonicalUnicodeDigestPaths()
         ContentDigest::payload({{nfdPath, QByteArrayLiteral("data")}}).error().code,
         ContentDigestErrorCode::InvalidPath);
     QVERIFY(ContentDigest::payload({{nfcPath, QByteArrayLiteral("data")}}).hasValue());
+}
+
+void SignatureTest::rejectsUnsafeArchivePathsAndCollisions()
+{
+    const QByteArray componentByteLimit = QString(
+        90, QChar(0x4e00U)).toUtf8();
+    const QByteArray totalByteLimitPart = QString(
+        60, QChar(0x4e00U)).toUtf8();
+    const QVector<QByteArray> invalidPaths{
+        QByteArrayLiteral("control/\x1f.txt"),
+        QByteArrayLiteral("colon:name.txt"),
+        QByteArrayLiteral("trailing-dot."),
+        QByteArrayLiteral("trailing-space "),
+        QByteArrayLiteral("CON.txt"),
+        QByteArray(121, 'a'),
+        QByteArray(121, 'a') + '/' + QByteArray(120, 'b'),
+        componentByteLimit,
+        totalByteLimitPart + '/' + totalByteLimitPart + '/'
+            + totalByteLimitPart};
+    for (const QByteArray &path : invalidPaths) {
+        const ContentDigestResult result = ContentDigest::payload(
+            {{path, QByteArrayLiteral("data")}});
+        QCOMPARE(result.error().code, ContentDigestErrorCode::InvalidPath);
+        QCOMPARE(result.error().path, path);
+    }
+
+    QCOMPARE(
+        ContentDigest::payload({file("Folder/A.txt", "1"),
+                                file("folder/a.TXT", "2")}).error().code,
+        ContentDigestErrorCode::DuplicatePath);
+    QCOMPARE(
+        ContentDigest::payload({{QStringLiteral("\u00c9.txt").toUtf8(), "1"},
+                                {QStringLiteral("\u00e9.TXT").toUtf8(), "2"}})
+            .error().code,
+        ContentDigestErrorCode::DuplicatePath);
+    QCOMPARE(
+        ContentDigest::payload({file("prefix", "1"),
+                                file("prefix/child.txt", "2")}).error().code,
+        ContentDigestErrorCode::DuplicatePath);
 }
 
 void SignatureTest::signsAndVerifiesRfc8032Vector()

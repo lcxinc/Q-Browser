@@ -12,3 +12,10 @@ if(WIN32)
 endif()
 
 q_browser_enable_strict_warnings(qbrowser-package)
+
+if(BUILD_TESTING)
+  target_compile_definitions(qbrowser-package
+    PRIVATE
+      Q_BROWSER_ARCHIVE_TESTING
+      Q_BROWSER_PACKAGE_CLI_TESTING)
+endif()

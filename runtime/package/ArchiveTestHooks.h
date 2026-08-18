@@ -14,6 +14,7 @@ struct ArchiveTestHooks final
 {
     std::function<void(const QString &)> afterArchiveSizeChecked;
     std::function<void(const QString &, const QByteArray &)> beforeSourceRead;
+    std::function<void(const QString &, const QString &)> beforeArchivePublish;
     std::function<void(const QString &)> afterStagingGuardOpened;
     std::function<void(const QString &, const QByteArray &)> afterParentGuardOpened;
     std::function<void(const QString &, const QByteArray &)> afterTemporaryReady;

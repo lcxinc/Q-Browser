@@ -1,4 +1,7 @@
 #include "Archive.h"
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+#include "ArchiveTestHooks.h"
+#endif
 #include "ContentDigest.h"
 #include "Manifest.h"
 #include "SignatureVerifier.h"
@@ -6,18 +9,26 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTextStream>
+#include <QUuid>
 
 #include <openssl/crypto.h>
 
 #ifdef Q_OS_WIN
+#include "WindowsStableIo.h"
 #include <Aclapi.h>
 #include <qt_windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -28,6 +39,33 @@ constexpr int Success = 0;
 constexpr int InvalidArguments = 2;
 constexpr int OperationFailed = 3;
 constexpr qsizetype MaximumPemBytes = 16 * 1024;
+
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+void configureArchiveRaceTestHook()
+{
+    const QString target = qEnvironmentVariable(
+        "Q_BROWSER_TEST_ARCHIVE_RACE_TARGET");
+    if (target.isEmpty()) {
+        return;
+    }
+    const QByteArray content = qEnvironmentVariable(
+        "Q_BROWSER_TEST_ARCHIVE_RACE_CONTENT").toUtf8();
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.beforeArchivePublish =
+        [expected = QFileInfo(target).absoluteFilePath(), content](
+            const QString &, const QString &destination) {
+            if (QFileInfo(destination).absoluteFilePath() != expected) {
+                return;
+            }
+            QFile sentinel(destination);
+            if (sentinel.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+                (void)sentinel.write(content);
+                (void)sentinel.flush();
+            }
+        };
+    qbrowser_archive_testing::setArchiveTestHooks(std::move(hooks));
+}
+#endif
 
 int commandError(const QString &code)
 {
@@ -70,107 +108,337 @@ bool outputIsNew(const QString &path)
         && QFileInfo(path).dir().exists();
 }
 
-bool writeNewFile(
-    const QString &path,
-    const QByteArray &contents,
-    QFileDevice::Permissions permissions)
+#ifdef Q_OS_WIN
+enum class OwnedKeyStageStatus
 {
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
-        return false;
+    Ready,
+    ParentUnavailable,
+    TemporaryCreateFailed,
+    WriteFailed,
+    FlushFailed,
+};
+
+class PrivateKeySecurity final
+{
+public:
+    ~PrivateKeySecurity()
+    {
+        if (m_acl != nullptr) {
+            LocalFree(m_acl);
+        }
     }
-    const bool succeeded = file.setPermissions(permissions)
-        && file.write(contents) == contents.size() && file.flush();
-    file.close();
-    if (!succeeded) {
-        (void)QFile::remove(path);
+
+    [[nodiscard]] bool initialize()
+    {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            return false;
+        }
+        DWORD required = 0;
+        (void)GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+        m_tokenBuffer.resize(static_cast<qsizetype>(required));
+        const bool tokenRead = required > 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                m_tokenBuffer.data(),
+                required,
+                &required);
+        CloseHandle(token);
+        if (!tokenRead) {
+            return false;
+        }
+        auto *tokenUser = reinterpret_cast<TOKEN_USER *>(m_tokenBuffer.data());
+        EXPLICIT_ACCESSW access{};
+        access.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | DELETE
+            | READ_CONTROL | WRITE_DAC;
+        access.grfAccessMode = SET_ACCESS;
+        access.grfInheritance = NO_INHERITANCE;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        access.Trustee.ptstrName = static_cast<LPWSTR>(tokenUser->User.Sid);
+        if (SetEntriesInAclW(1, &access, nullptr, &m_acl) != ERROR_SUCCESS
+            || !InitializeSecurityDescriptor(
+                &m_descriptor, SECURITY_DESCRIPTOR_REVISION)
+            || !SetSecurityDescriptorDacl(
+                &m_descriptor, TRUE, m_acl, FALSE)
+            || !SetSecurityDescriptorControl(
+                &m_descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+            return false;
+        }
+        m_attributes.nLength = sizeof(m_attributes);
+        m_attributes.lpSecurityDescriptor = &m_descriptor;
+        return true;
     }
-    return succeeded;
+
+    [[nodiscard]] SECURITY_ATTRIBUTES *attributes() noexcept
+    {
+        return m_attributes.lpSecurityDescriptor != nullptr
+            ? &m_attributes
+            : nullptr;
+    }
+
+private:
+    QByteArray m_tokenBuffer;
+    PACL m_acl = nullptr;
+    SECURITY_DESCRIPTOR m_descriptor{};
+    SECURITY_ATTRIBUTES m_attributes{};
+};
+
+class OwnedKeyOutput final
+{
+public:
+    ~OwnedKeyOutput()
+    {
+        if (!m_committed && m_file.isOpen()) {
+            (void)m_file.deleteOwned();
+        }
+    }
+
+    [[nodiscard]] OwnedKeyStageStatus stage(
+        const QString &destination,
+        const QByteArray &contents,
+        qbrowser_archive_detail::WindowsStableDirectoryTree &directory,
+        SECURITY_ATTRIBUTES *securityAttributes)
+    {
+        m_destination = QFileInfo(destination).absoluteFilePath();
+        const QString parent = QFileInfo(m_destination).dir().absolutePath();
+        m_directory = &directory;
+        if (!m_directory->contains(parent) || !m_directory->isStable()) {
+            return OwnedKeyStageStatus::ParentUnavailable;
+        }
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            m_temporary = QDir(parent).absoluteFilePath(
+                QStringLiteral(".qbrowser-key-")
+                + QUuid::createUuid().toString(QUuid::Id128)
+                + QStringLiteral(".tmp"));
+            if (m_file.createOwnedOutput(
+                    m_temporary, *m_directory, securityAttributes)) {
+                break;
+            }
+            m_temporary.clear();
+        }
+        if (m_temporary.isEmpty()) {
+            return OwnedKeyStageStatus::TemporaryCreateFailed;
+        }
+        if (!m_file.writeAll(
+                contents.constData(), static_cast<size_t>(contents.size()))) {
+            return OwnedKeyStageStatus::WriteFailed;
+        }
+        return m_file.flush()
+            ? OwnedKeyStageStatus::Ready
+            : OwnedKeyStageStatus::FlushFailed;
+    }
+
+    [[nodiscard]] bool publish()
+    {
+        injectKeyRace(m_destination);
+        return m_directory != nullptr && m_directory->isStable()
+            && m_file.publishNoReplace(m_destination, *m_directory);
+    }
+
+    void commit() noexcept { m_committed = true; }
+
+private:
+    static void injectKeyRace(const QString &destination)
+    {
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+        const QString target = qEnvironmentVariable(
+            "Q_BROWSER_TEST_KEYGEN_RACE_TARGET");
+        if (!target.isEmpty()
+            && QFileInfo(target).absoluteFilePath()
+                == QFileInfo(destination).absoluteFilePath()) {
+            QFile sentinel(destination);
+            if (sentinel.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+                const QByteArray content = qEnvironmentVariable(
+                    "Q_BROWSER_TEST_KEYGEN_RACE_CONTENT").toUtf8();
+                (void)sentinel.write(content);
+                (void)sentinel.flush();
+            }
+        }
+#else
+        Q_UNUSED(destination);
+#endif
+    }
+
+    qbrowser_archive_detail::WindowsStableDirectoryTree *m_directory = nullptr;
+    qbrowser_archive_detail::WindowsStableFile m_file;
+    QString m_destination;
+    QString m_temporary;
+    bool m_committed = false;
+};
+#else
+enum class OwnedKeyStageStatus
+{
+    Ready,
+    ParentUnavailable,
+    TemporaryCreateFailed,
+    WriteFailed,
+    FlushFailed,
+};
+
+int openStableDirectory(const QString &absoluteDirectory)
+{
+    int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current < 0) {
+        return -1;
+    }
+    const QStringList components = QDir::fromNativeSeparators(
+        absoluteDirectory).split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    for (const QString &component : components) {
+        const QByteArray encoded = QFile::encodeName(component);
+        const int next = ::openat(
+            current,
+            encoded.constData(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        (void)::close(current);
+        if (next < 0) {
+            return -1;
+        }
+        current = next;
+    }
+    return current;
 }
 
-#ifdef Q_OS_WIN
-bool writePrivateKey(const QString &path, const QByteArray &contents)
+class OwnedKeyOutput final
 {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-        return false;
+public:
+    ~OwnedKeyOutput()
+    {
+        if (!m_committed) {
+            removeOwned();
+        }
+        if (m_fileFd >= 0) {
+            (void)::close(m_fileFd);
+        }
+        if (m_directoryFd >= 0) {
+            (void)::close(m_directoryFd);
+        }
     }
-    DWORD required = 0;
-    (void)GetTokenInformation(token, TokenUser, nullptr, 0, &required);
-    QByteArray tokenBuffer(static_cast<qsizetype>(required), Qt::Uninitialized);
-    const bool tokenRead = required > 0
-        && GetTokenInformation(
-            token,
-            TokenUser,
-            tokenBuffer.data(),
-            required,
-            &required);
-    CloseHandle(token);
-    if (!tokenRead) {
-        return false;
+
+    [[nodiscard]] OwnedKeyStageStatus stage(
+        const QString &destination,
+        const QByteArray &contents,
+        mode_t mode)
+    {
+        m_absoluteDestination = QFileInfo(destination).absoluteFilePath();
+        m_destination = QFile::encodeName(QFileInfo(destination).fileName());
+        m_directoryFd = openStableDirectory(
+            QFileInfo(destination).dir().absolutePath());
+        if (m_directoryFd < 0 || m_destination.isEmpty()) {
+            return OwnedKeyStageStatus::ParentUnavailable;
+        }
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            m_temporary = QByteArrayLiteral(".qbrowser-key-")
+                + QUuid::createUuid().toString(QUuid::Id128).toLatin1()
+                + QByteArrayLiteral(".tmp");
+            m_fileFd = ::openat(
+                m_directoryFd,
+                m_temporary.constData(),
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                mode);
+            if (m_fileFd >= 0) {
+                break;
+            }
+        }
+        qsizetype offset = 0;
+        while (m_fileFd >= 0 && offset < contents.size()) {
+            const ssize_t written = ::write(
+                m_fileFd,
+                contents.constData() + offset,
+                static_cast<size_t>(contents.size() - offset));
+            if (written <= 0) {
+                return OwnedKeyStageStatus::WriteFailed;
+            }
+            offset += static_cast<qsizetype>(written);
+        }
+        if (m_fileFd < 0) {
+            return OwnedKeyStageStatus::TemporaryCreateFailed;
+        }
+        return ::fsync(m_fileFd) == 0
+            ? OwnedKeyStageStatus::Ready
+            : OwnedKeyStageStatus::FlushFailed;
     }
-    auto *tokenUser = reinterpret_cast<TOKEN_USER *>(tokenBuffer.data());
-    EXPLICIT_ACCESSW access{};
-    access.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | DELETE
-        | READ_CONTROL | WRITE_DAC;
-    access.grfAccessMode = SET_ACCESS;
-    access.grfInheritance = NO_INHERITANCE;
-    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
-    access.Trustee.ptstrName = static_cast<LPWSTR>(tokenUser->User.Sid);
-    PACL acl = nullptr;
-    if (SetEntriesInAclW(1, &access, nullptr, &acl) != ERROR_SUCCESS) {
-        return false;
+
+    [[nodiscard]] bool publish()
+    {
+        injectKeyRace();
+        if (::linkat(
+                m_directoryFd,
+                m_temporary.constData(),
+                m_directoryFd,
+                m_destination.constData(),
+                0) != 0) {
+            return false;
+        }
+        m_published = true;
+        return ::unlinkat(m_directoryFd, m_temporary.constData(), 0) == 0
+            && ::fsync(m_directoryFd) == 0;
     }
-    SECURITY_DESCRIPTOR descriptor{};
-    if (!InitializeSecurityDescriptor(
-            &descriptor, SECURITY_DESCRIPTOR_REVISION)
-        || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)
-        || !SetSecurityDescriptorControl(
-            &descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
-        LocalFree(acl);
-        return false;
+
+    void commit() noexcept { m_committed = true; }
+
+private:
+    void injectKeyRace() const
+    {
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+        const QString target = qEnvironmentVariable(
+            "Q_BROWSER_TEST_KEYGEN_RACE_TARGET");
+        if (!target.isEmpty()
+            && QFileInfo(target).absoluteFilePath() == m_absoluteDestination) {
+            const QByteArray content = qEnvironmentVariable(
+                "Q_BROWSER_TEST_KEYGEN_RACE_CONTENT").toUtf8();
+            const int marker = ::openat(
+                m_directoryFd,
+                m_destination.constData(),
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR);
+            if (marker >= 0) {
+                (void)::write(marker, content.constData(), content.size());
+                (void)::fsync(marker);
+                (void)::close(marker);
+            }
+        }
+#endif
     }
-    SECURITY_ATTRIBUTES attributes{};
-    attributes.nLength = sizeof(attributes);
-    attributes.lpSecurityDescriptor = &descriptor;
-    const QString absolutePath = QFileInfo(path).absoluteFilePath();
-    HANDLE file = CreateFileW(
-        reinterpret_cast<LPCWSTR>(absolutePath.utf16()),
-        GENERIC_WRITE,
-        0,
-        &attributes,
-        CREATE_NEW,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
-    LocalFree(acl);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
+
+    void removeOwned() noexcept
+    {
+        if (m_directoryFd < 0 || m_fileFd < 0) {
+            return;
+        }
+        struct stat owned{};
+        if (::fstat(m_fileFd, &owned) != 0) {
+            return;
+        }
+        auto removeIfOwned = [&](const QByteArray &name) {
+            struct stat candidate{};
+            if (!name.isEmpty()
+                && ::fstatat(
+                    m_directoryFd,
+                    name.constData(),
+                    &candidate,
+                    AT_SYMLINK_NOFOLLOW) == 0
+                && owned.st_dev == candidate.st_dev
+                && owned.st_ino == candidate.st_ino) {
+                (void)::unlinkat(m_directoryFd, name.constData(), 0);
+            }
+        };
+        if (m_published) {
+            removeIfOwned(m_destination);
+        }
+        removeIfOwned(m_temporary);
+        (void)::fsync(m_directoryFd);
     }
-    DWORD written = 0;
-    const bool succeeded = contents.size() <= static_cast<qsizetype>(MAXDWORD)
-        && WriteFile(
-            file,
-            contents.constData(),
-            static_cast<DWORD>(contents.size()),
-            &written,
-            nullptr)
-        && written == static_cast<DWORD>(contents.size())
-        && FlushFileBuffers(file);
-    CloseHandle(file);
-    if (!succeeded) {
-        (void)DeleteFileW(reinterpret_cast<LPCWSTR>(absolutePath.utf16()));
-    }
-    return succeeded;
-}
-#else
-bool writePrivateKey(const QString &path, const QByteArray &contents)
-{
-    return writeNewFile(
-        path,
-        contents,
-        QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-}
+
+    int m_directoryFd = -1;
+    int m_fileFd = -1;
+    QByteArray m_temporary;
+    QByteArray m_destination;
+    QString m_absoluteDestination;
+    bool m_published = false;
+    bool m_committed = false;
+};
 #endif
 
 int keygen(const QString &privatePath, const QString &publicPath)
@@ -184,19 +452,64 @@ int keygen(const QString &privatePath, const QString &publicPath)
     if (!pair.hasValue()) {
         return commandError(QStringLiteral("crypto_failure"));
     }
-    if (!writePrivateKey(privatePath, pair.value().privateKeyPem)) {
-        (void)QFile::remove(privatePath);
-        return commandError(QStringLiteral("private_key_write_failed"));
+    OwnedKeyOutput privateOutput;
+    OwnedKeyOutput publicOutput;
+#ifdef Q_OS_WIN
+    const QString privateParent = QFileInfo(privatePath).dir().absolutePath();
+    const QString publicParent = QFileInfo(publicPath).dir().absolutePath();
+    qbrowser_archive_detail::WindowsStableDirectoryTree privateDirectory;
+    qbrowser_archive_detail::WindowsStableDirectoryTree publicDirectory;
+    if (!privateDirectory.openRoot(privateParent)
+        || !privateDirectory.isStable()) {
+        return commandError(QStringLiteral("private_key_stage_failed"));
     }
-    if (!writeNewFile(
+    qbrowser_archive_detail::WindowsStableDirectoryTree *publicDirectoryPtr =
+        &privateDirectory;
+    if (QDir::toNativeSeparators(privateParent).compare(
+            QDir::toNativeSeparators(publicParent), Qt::CaseInsensitive) != 0) {
+        if (!publicDirectory.openRoot(publicParent)
+            || !publicDirectory.isStable()) {
+            return commandError(QStringLiteral("public_key_stage_failed"));
+        }
+        publicDirectoryPtr = &publicDirectory;
+    }
+    PrivateKeySecurity privateSecurity;
+    const OwnedKeyStageStatus privateStage = privateSecurity.initialize()
+        ? privateOutput.stage(
+              privatePath,
+              pair.value().privateKeyPem,
+              privateDirectory,
+              privateSecurity.attributes())
+        : OwnedKeyStageStatus::ParentUnavailable;
+#else
+    const OwnedKeyStageStatus privateStage = privateOutput.stage(
+        privatePath,
+        pair.value().privateKeyPem,
+        S_IRUSR | S_IWUSR);
+#endif
+    if (privateStage != OwnedKeyStageStatus::Ready) {
+        return commandError(QStringLiteral("private_key_stage_failed"));
+    }
+    const OwnedKeyStageStatus publicStage = publicOutput.stage(
             publicPath,
             pair.value().publicKeyPem,
-            QFileDevice::ReadOwner | QFileDevice::WriteOwner
-                | QFileDevice::ReadUser | QFileDevice::ReadGroup
-                | QFileDevice::ReadOther)) {
-        (void)QFile::remove(privatePath);
-        return commandError(QStringLiteral("public_key_write_failed"));
+#ifdef Q_OS_WIN
+            *publicDirectoryPtr,
+            nullptr);
+#else
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+#endif
+    if (publicStage != OwnedKeyStageStatus::Ready) {
+        return commandError(QStringLiteral("public_key_stage_failed"));
     }
+    if (!privateOutput.publish()) {
+        return commandError(QStringLiteral("private_key_publish_failed"));
+    }
+    if (!publicOutput.publish()) {
+        return commandError(QStringLiteral("public_key_publish_failed"));
+    }
+    privateOutput.commit();
+    publicOutput.commit();
     return Success;
 }
 
@@ -313,41 +626,17 @@ int inspectPackage(const QString &package, const QString &publicKeyPath)
         return emitInspection(inspectionResult(false, false, false, {}, {}, code), false);
     }
     const QVector<ArchiveFile> &files = snapshot.files();
-    const ArchiveFile *manifestFile = findFile(files, QByteArrayLiteral("manifest.json"));
-    if (manifestFile == nullptr) {
-        return emitInspection(
-            inspectionResult(false, true, false, {}, {}, QStringLiteral("manifest_invalid")),
-            false);
-    }
-    const ManifestParseResult manifestResult = Manifest::parse(manifestFile->contents);
-    if (!manifestResult.hasValue()) {
-        return emitInspection(
-            inspectionResult(false, true, false, {}, {}, QStringLiteral("manifest_invalid")),
-            false);
-    }
-    const Manifest &manifest = manifestResult.value();
-    const ContentDigestValidation content = ContentDigest::validatePayload(files);
-    if (!content.isValid()) {
-        const QString code = content.error().code == ContentDigestErrorCode::MissingMetadata
-            ? QStringLiteral("content_digest_missing")
-            : content.error().code == ContentDigestErrorCode::InvalidMetadata
-                ? QStringLiteral("content_digest_invalid")
-                : QStringLiteral("content_digest_mismatch");
-        return emitInspection(
-            inspectionResult(false, true, false, manifest.appId(), manifest.version(), code),
-            false);
-    }
     const ArchiveFile *signatureFile = findFile(
         files, QByteArrayLiteral("metadata/signature.ed25519"));
     if (signatureFile == nullptr) {
         return emitInspection(
-            inspectionResult(false, true, true, manifest.appId(), manifest.version(),
+            inspectionResult(false, true, false, {}, {},
                              QStringLiteral("signature_missing")),
             false);
     }
     if (signatureFile->contents.size() != 64) {
         return emitInspection(
-            inspectionResult(false, true, true, manifest.appId(), manifest.version(),
+            inspectionResult(false, true, false, {}, {},
                              QStringLiteral("signature_invalid")),
             false);
     }
@@ -355,7 +644,7 @@ int inspectPackage(const QString &package, const QString &publicKeyPath)
     const QByteArray publicPem = readBounded(publicKeyPath, MaximumPemBytes);
     if (!digest.hasValue() || publicPem.isEmpty()) {
         return emitInspection(
-            inspectionResult(false, true, true, manifest.appId(), manifest.version(),
+            inspectionResult(false, true, false, {}, {},
                              QStringLiteral("key_invalid")),
             false);
     }
@@ -368,9 +657,32 @@ int inspectPackage(const QString &package, const QString &publicKeyPath)
                 ? QStringLiteral("signature_mismatch")
                 : QStringLiteral("signature_invalid");
         return emitInspection(
-            inspectionResult(false, true, true, manifest.appId(), manifest.version(), code),
+            inspectionResult(false, true, false, {}, {}, code),
             false);
     }
+    const ContentDigestValidation content = ContentDigest::validatePayload(files);
+    if (!content.isValid()) {
+        const QString code = content.error().code == ContentDigestErrorCode::MissingMetadata
+            ? QStringLiteral("content_digest_missing")
+            : content.error().code == ContentDigestErrorCode::InvalidMetadata
+                ? QStringLiteral("content_digest_invalid")
+                : QStringLiteral("content_digest_mismatch");
+        return emitInspection(
+            inspectionResult(false, true, false, {}, {}, code), false);
+    }
+    const ArchiveFile *manifestFile = findFile(files, QByteArrayLiteral("manifest.json"));
+    if (manifestFile == nullptr) {
+        return emitInspection(
+            inspectionResult(false, true, true, {}, {}, QStringLiteral("manifest_invalid")),
+            false);
+    }
+    const ManifestParseResult manifestResult = Manifest::parse(manifestFile->contents);
+    if (!manifestResult.hasValue()) {
+        return emitInspection(
+            inspectionResult(false, true, true, {}, {}, QStringLiteral("manifest_invalid")),
+            false);
+    }
+    const Manifest &manifest = manifestResult.value();
     return emitInspection(
         inspectionResult(true, true, true, manifest.appId(), manifest.version(),
                          QStringLiteral("ok")),
@@ -392,6 +704,9 @@ bool onlyOptions(
 int main(int argc, char **argv)
 {
     QCoreApplication application(argc, argv);
+#ifdef Q_BROWSER_PACKAGE_CLI_TESTING
+    configureArchiveRaceTestHook();
+#endif
     QCoreApplication::setApplicationName(QStringLiteral("qbrowser-package"));
     QCoreApplication::setApplicationVersion(QStringLiteral("1.0"));
     QCommandLineParser parser;

@@ -340,7 +340,8 @@ bool WindowsStableFile::openSource(
 
 bool WindowsStableFile::createOwnedOutput(
     const QString &path,
-    const WindowsStableDirectoryTree &tree)
+    const WindowsStableDirectoryTree &tree,
+    SECURITY_ATTRIBUTES *securityAttributes)
 {
     constexpr DWORD desiredAccess =
         GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES;
@@ -348,7 +349,7 @@ bool WindowsStableFile::createOwnedOutput(
         reinterpret_cast<LPCWSTR>(path.utf16()),
         desiredAccess,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
+        securityAttributes,
         CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
             | FILE_FLAG_SEQUENTIAL_SCAN,

@@ -85,7 +85,8 @@ public:
         const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool createOwnedOutput(
         const QString &path,
-        const WindowsStableDirectoryTree &tree);
+        const WindowsStableDirectoryTree &tree,
+        SECURITY_ATTRIBUTES *securityAttributes = nullptr);
     [[nodiscard]] bool writeAll(const char *bytes, size_t size);
     [[nodiscard]] bool flush();
     [[nodiscard]] bool readExact(

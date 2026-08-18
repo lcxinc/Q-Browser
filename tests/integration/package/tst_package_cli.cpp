@@ -1,4 +1,7 @@
 #include "Archive.h"
+#include "ContentDigest.h"
+#include "Manifest.h"
+#include "SignatureVerifier.h"
 
 #include <QDir>
 #include <QFile>
@@ -6,6 +9,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -39,11 +43,20 @@ QByteArray readFile(const QString &path)
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
 }
 
-ProcessResult runCli(const QStringList &arguments)
+ProcessResult runCli(
+    const QStringList &arguments,
+    const QHash<QString, QString> &environmentOverrides = {})
 {
     QProcess process;
     process.setProgram(QString::fromUtf8(Q_BROWSER_PACKAGE_EXE));
     process.setArguments(arguments);
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    for (auto iterator = environmentOverrides.cbegin();
+         iterator != environmentOverrides.cend();
+         ++iterator) {
+        environment.insert(iterator.key(), iterator.value());
+    }
+    process.setProcessEnvironment(environment);
     process.start();
     if (!process.waitForStarted() || !process.waitForFinished(30000)) {
         return {};
@@ -93,6 +106,28 @@ bool createSource(const QString &root)
         && writeFile(root + QStringLiteral("/empty.txt"), QByteArray{});
 }
 
+bool resignFiles(QVector<ArchiveFile> &files, const QString &privateKeyPath)
+{
+    const auto signature = std::find_if(
+        files.begin(), files.end(), [](const ArchiveFile &entry) {
+            return entry.path == QByteArrayLiteral("metadata/signature.ed25519");
+        });
+    if (signature == files.end()) {
+        return false;
+    }
+    const ContentDigestResult digest = ContentDigest::signedPackage(files);
+    if (!digest.hasValue()) {
+        return false;
+    }
+    const SignatureOperationResult signedDigest = SignatureVerifier::signPem(
+        digest.bytes(), readFile(privateKeyPath));
+    if (!signedDigest.hasValue()) {
+        return false;
+    }
+    signature->contents = signedDigest.value();
+    return true;
+}
+
 QJsonObject expectInspectFailure(
     const QString &package,
     const QString &publicKey,
@@ -108,7 +143,9 @@ QJsonObject expectInspectFailure(
     }
     const QJsonObject object = parseOneLineJson(result.standardOutput);
     if (object.value(QStringLiteral("verified")).toBool(true)
-        || object.value(QStringLiteral("errorCode")).toString() != expectedCode) {
+        || object.value(QStringLiteral("errorCode")).toString() != expectedCode
+        || !object.value(QStringLiteral("appId")).toString().isEmpty()
+        || !object.value(QStringLiteral("version")).toString().isEmpty()) {
         return {};
     }
     return object;
@@ -156,8 +193,11 @@ class PackageCliTest final : public QObject
 private slots:
     void keygenPackSignInspectRoundTrip();
     void rejectsOverwriteAndProtectsPrivateKey();
+    void keygenNeverDeletesRacingTargets();
     void packAndSignAreReproducible();
+    void packAndSignNeverReplaceRacingOutputs();
     void inspectFailsClosedForTamperingAndWrongKey();
+    void inspectDoesNotExposeUnauthenticatedIdentity();
     void inspectRejectsMalformedMetadataAndManifest();
     void rejectsNonCanonicalArchiveMetadata();
     void reportsInvalidCommandLinesWithoutSecrets();
@@ -243,6 +283,43 @@ void PackageCliTest::rejectsOverwriteAndProtectsPrivateKey()
 #endif
 }
 
+void PackageCliTest::keygenNeverDeletesRacingTargets()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QByteArray sentinel("key-race-marker");
+
+    const QString privateRace = temporary.filePath(QStringLiteral("private-race.pem"));
+    const QString unusedPublic = temporary.filePath(QStringLiteral("unused-public.pem"));
+    const QHash<QString, QString> privateEnvironment{
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_RACE_TARGET"), privateRace},
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_RACE_CONTENT"),
+         QString::fromLatin1(sentinel)}};
+    const ProcessResult privateResult = runCli(
+        {"keygen", "--private-key", privateRace, "--public-key", unusedPublic},
+        privateEnvironment);
+    QVERIFY(privateResult.exitCode != 0);
+    QCOMPARE(readFile(privateRace), sentinel);
+    QVERIFY(!QFileInfo::exists(unusedPublic));
+
+    const QString ownedPrivate = temporary.filePath(QStringLiteral("owned-private.pem"));
+    const QString publicRace = temporary.filePath(QStringLiteral("public-race.pem"));
+    const QHash<QString, QString> publicEnvironment{
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_RACE_TARGET"), publicRace},
+        {QStringLiteral("Q_BROWSER_TEST_KEYGEN_RACE_CONTENT"),
+         QString::fromLatin1(sentinel)}};
+    const ProcessResult publicResult = runCli(
+        {"keygen", "--private-key", ownedPrivate, "--public-key", publicRace},
+        publicEnvironment);
+    QVERIFY(publicResult.exitCode != 0);
+    QCOMPARE(readFile(publicRace), sentinel);
+    QVERIFY(!QFileInfo::exists(ownedPrivate));
+
+    const QStringList temporaryOutputs = QDir(temporary.path()).entryList(
+        {QStringLiteral(".qbrowser-key-*.tmp")}, QDir::Files | QDir::Hidden);
+    QVERIFY(temporaryOutputs.isEmpty());
+}
+
 void PackageCliTest::packAndSignAreReproducible()
 {
     QTemporaryDir temporary;
@@ -273,6 +350,46 @@ void PackageCliTest::packAndSignAreReproducible()
     QCOMPARE(readFile(firstSigned), originalSigned);
 }
 
+void PackageCliTest::packAndSignNeverReplaceRacingOutputs()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(createSource(source));
+    const QString privateKey = temporary.filePath(QStringLiteral("private.pem"));
+    const QString publicKey = temporary.filePath(QStringLiteral("public.pem"));
+    QCOMPARE(runCli({"keygen", "--private-key", privateKey, "--public-key", publicKey}).exitCode, 0);
+
+    const QByteArray sentinel("racing-output");
+    const QString racingPack = temporary.filePath(QStringLiteral("racing-pack.qapkg"));
+    const QHash<QString, QString> packEnvironment{
+        {QStringLiteral("Q_BROWSER_TEST_ARCHIVE_RACE_TARGET"), racingPack},
+        {QStringLiteral("Q_BROWSER_TEST_ARCHIVE_RACE_CONTENT"),
+         QString::fromLatin1(sentinel)}};
+    const ProcessResult packResult = runCli(
+        {"pack", "--source", source, "--output", racingPack}, packEnvironment);
+    QVERIFY(packResult.exitCode != 0);
+    QCOMPARE(readFile(racingPack), sentinel);
+
+    const QString unsignedPackage = temporary.filePath(QStringLiteral("unsigned.qapkg"));
+    QCOMPARE(runCli({"pack", "--source", source, "--output", unsignedPackage}).exitCode, 0);
+    const QString racingSigned = temporary.filePath(QStringLiteral("racing-signed.qapkg"));
+    const QHash<QString, QString> signEnvironment{
+        {QStringLiteral("Q_BROWSER_TEST_ARCHIVE_RACE_TARGET"), racingSigned},
+        {QStringLiteral("Q_BROWSER_TEST_ARCHIVE_RACE_CONTENT"),
+         QString::fromLatin1(sentinel)}};
+    const ProcessResult signResult = runCli(
+        {"sign", "--package", unsignedPackage, "--private-key", privateKey,
+         "--output", racingSigned},
+        signEnvironment);
+    QVERIFY(signResult.exitCode != 0);
+    QCOMPARE(readFile(racingSigned), sentinel);
+
+    const QStringList temporaryOutputs = QDir(temporary.path()).entryList(
+        {QStringLiteral(".qbrowser-*.tmp")}, QDir::Files | QDir::Hidden);
+    QVERIFY(temporaryOutputs.isEmpty());
+}
+
 void PackageCliTest::inspectFailsClosedForTamperingAndWrongKey()
 {
     QTemporaryDir temporary;
@@ -290,7 +407,11 @@ void PackageCliTest::inspectFailsClosedForTamperingAndWrongKey()
     QCOMPARE(runCli({"pack", "--source", source, "--output", packed}).exitCode, 0);
     QCOMPARE(runCli({"sign", "--package", packed, "--private-key", privateKey,
                      "--output", signedPackage}).exitCode, 0);
-    QVERIFY(!expectInspectFailure(signedPackage, wrongPublic, "signature_mismatch").isEmpty());
+    const QJsonObject wrongKeyFailure = expectInspectFailure(
+        signedPackage, wrongPublic, "signature_mismatch");
+    QVERIFY(!wrongKeyFailure.isEmpty());
+    QVERIFY(wrongKeyFailure.value(QStringLiteral("appId")).toString().isEmpty());
+    QVERIFY(wrongKeyFailure.value(QStringLiteral("version")).toString().isEmpty());
 
     const QVector<ArchiveFile> signedFiles = Archive::snapshot(signedPackage).files();
     QVector<ArchiveFile> files = signedFiles;
@@ -301,10 +422,24 @@ void PackageCliTest::inspectFailsClosedForTamperingAndWrongKey()
     payload->contents.append("// changed");
     const QString changed = temporary.filePath(QStringLiteral("changed.qapkg"));
     QVERIFY(Archive::createFromFiles(files, changed).hasValue());
-    const QJsonObject failure = expectInspectFailure(changed, publicKey, "content_digest_mismatch");
+    const QJsonObject failure = expectInspectFailure(changed, publicKey, "signature_mismatch");
     QVERIFY(!failure.isEmpty());
     QVERIFY(failure.value(QStringLiteral("archiveValid")).toBool());
     QVERIFY(!failure.value(QStringLiteral("contentDigestValid")).toBool());
+
+    files = signedFiles;
+    const auto authenticatedPayload = std::find_if(
+        files.begin(), files.end(), [](const ArchiveFile &entry) {
+            return entry.path == QByteArrayLiteral("qml/Main.qml");
+        });
+    QVERIFY(authenticatedPayload != files.end());
+    authenticatedPayload->contents.append("// signer changed payload");
+    QVERIFY(resignFiles(files, privateKey));
+    const QString authenticatedMismatch = temporary.filePath(
+        QStringLiteral("authenticated-mismatch.qapkg"));
+    QVERIFY(Archive::createFromFiles(files, authenticatedMismatch).hasValue());
+    QVERIFY(!expectInspectFailure(
+        authenticatedMismatch, publicKey, "content_digest_mismatch").isEmpty());
 
     files = signedFiles;
     auto signature = std::find_if(files.begin(), files.end(), [](const ArchiveFile &entry) {
@@ -333,7 +468,21 @@ void PackageCliTest::inspectFailsClosedForTamperingAndWrongKey()
     contentHash->contents[0] = contentHash->contents.at(0) == '0' ? '1' : '0';
     const QString changedHash = temporary.filePath(QStringLiteral("changed-hash.qapkg"));
     QVERIFY(Archive::createFromFiles(files, changedHash).hasValue());
-    QVERIFY(!expectInspectFailure(changedHash, publicKey, "content_digest_mismatch").isEmpty());
+    QVERIFY(!expectInspectFailure(changedHash, publicKey, "signature_mismatch").isEmpty());
+
+    files = signedFiles;
+    const auto malformedContentHash = std::find_if(
+        files.begin(), files.end(), [](const ArchiveFile &entry) {
+            return entry.path == QByteArrayLiteral("metadata/content.sha256");
+        });
+    QVERIFY(malformedContentHash != files.end());
+    malformedContentHash->contents.fill('A');
+    QVERIFY(resignFiles(files, privateKey));
+    const QString authenticatedInvalidHash = temporary.filePath(
+        QStringLiteral("authenticated-invalid-hash.qapkg"));
+    QVERIFY(Archive::createFromFiles(files, authenticatedInvalidHash).hasValue());
+    QVERIFY(!expectInspectFailure(
+        authenticatedInvalidHash, publicKey, "content_digest_invalid").isEmpty());
 
     files = signedFiles;
     files.erase(std::remove_if(files.begin(), files.end(), [](const ArchiveFile &entry) {
@@ -342,6 +491,47 @@ void PackageCliTest::inspectFailsClosedForTamperingAndWrongKey()
     const QString missingSignature = temporary.filePath(QStringLiteral("missing-signature.qapkg"));
     QVERIFY(Archive::createFromFiles(files, missingSignature).hasValue());
     QVERIFY(!expectInspectFailure(missingSignature, publicKey, "signature_missing").isEmpty());
+}
+
+void PackageCliTest::inspectDoesNotExposeUnauthenticatedIdentity()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(createSource(source));
+    const QString privateKey = temporary.filePath(QStringLiteral("private.pem"));
+    const QString publicKey = temporary.filePath(QStringLiteral("public.pem"));
+    QCOMPARE(runCli({"keygen", "--private-key", privateKey,
+                     "--public-key", publicKey}).exitCode, 0);
+    const QString packed = temporary.filePath(QStringLiteral("packed.qapkg"));
+    const QString signedPackage = temporary.filePath(QStringLiteral("signed.qapkg"));
+    QCOMPARE(runCli({"pack", "--source", source, "--output", packed}).exitCode, 0);
+    QCOMPARE(runCli({"sign", "--package", packed, "--private-key", privateKey,
+                     "--output", signedPackage}).exitCode, 0);
+
+    QVector<ArchiveFile> files = Archive::snapshot(signedPackage).files();
+    const auto changedManifest = std::find_if(
+        files.begin(), files.end(), [](const ArchiveFile &entry) {
+            return entry.path == QByteArrayLiteral("manifest.json");
+        });
+    QVERIFY(changedManifest != files.end());
+    QVERIFY(changedManifest->contents.contains("com.qbrowser.pilot"));
+    QVERIFY(changedManifest->contents.contains("\"version\": \"1.0.0\""));
+    changedManifest->contents.replace(
+        QByteArrayLiteral("com.qbrowser.pilot"),
+        QByteArrayLiteral("com.attacker.spoofed"));
+    changedManifest->contents.replace(
+        QByteArrayLiteral("\"version\": \"1.0.0\""),
+        QByteArrayLiteral("\"version\": \"9.9.9\""));
+    QVERIFY(Manifest::parse(changedManifest->contents).hasValue());
+    const QString spoofed = temporary.filePath(QStringLiteral("spoofed.qapkg"));
+    QVERIFY(Archive::createFromFiles(files, spoofed).hasValue());
+
+    const QJsonObject failure = expectInspectFailure(
+        spoofed, publicKey, QStringLiteral("signature_mismatch"));
+    QVERIFY(!failure.isEmpty());
+    QVERIFY(failure.value(QStringLiteral("appId")).toString().isEmpty());
+    QVERIFY(failure.value(QStringLiteral("version")).toString().isEmpty());
 }
 
 void PackageCliTest::inspectRejectsMalformedMetadataAndManifest()
@@ -357,20 +547,20 @@ void PackageCliTest::inspectRejectsMalformedMetadataAndManifest()
                                {"metadata/signature.ed25519", QByteArray(63, '\0')}};
     const QString invalidDigest = temporary.filePath(QStringLiteral("digest.qapkg"));
     QVERIFY(Archive::createFromFiles(files, invalidDigest).hasValue());
-    QVERIFY(!expectInspectFailure(invalidDigest, publicKey, "content_digest_invalid").isEmpty());
+    QVERIFY(!expectInspectFailure(invalidDigest, publicKey, "signature_invalid").isEmpty());
 
     files[2].contents = QByteArray(64, '0');
     files[3].contents = QByteArray(63, '\0');
     const QString badSignature = temporary.filePath(QStringLiteral("signature.qapkg"));
     QVERIFY(Archive::createFromFiles(files, badSignature).hasValue());
     const QJsonObject signatureFailure = expectInspectFailure(
-        badSignature, publicKey, "content_digest_mismatch");
+        badSignature, publicKey, "signature_invalid");
     QVERIFY(!signatureFailure.isEmpty());
 
     files[0].contents = "{}";
     const QString badManifest = temporary.filePath(QStringLiteral("manifest.qapkg"));
     QVERIFY(Archive::createFromFiles(files, badManifest).hasValue());
-    QVERIFY(!expectInspectFailure(badManifest, publicKey, "manifest_invalid").isEmpty());
+    QVERIFY(!expectInspectFailure(badManifest, publicKey, "signature_invalid").isEmpty());
 }
 
 void PackageCliTest::rejectsNonCanonicalArchiveMetadata()

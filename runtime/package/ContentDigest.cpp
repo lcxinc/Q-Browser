@@ -1,13 +1,11 @@
 #include "ContentDigest.h"
+#include "CanonicalArchivePath.h"
 
 #include <QCryptographicHash>
 #include <QByteArrayView>
-#include <QSet>
-#include <QStringDecoder>
 #include <QtEndian>
 
 #include <algorithm>
-#include <cstring>
 
 namespace
 {
@@ -15,33 +13,6 @@ constexpr char PayloadDomain[] = "Q-Browser qapkg payload v1\0";
 constexpr char SignedDomain[] = "Q-Browser qapkg signed v1\0";
 constexpr auto ContentPath = "metadata/content.sha256";
 constexpr auto SignaturePath = "metadata/signature.ed25519";
-
-bool bytewiseLess(const ArchiveFile &left, const ArchiveFile &right)
-{
-    const qsizetype common = std::min(left.path.size(), right.path.size());
-    const int comparison = std::memcmp(
-        left.path.constData(), right.path.constData(), static_cast<size_t>(common));
-    return comparison < 0 || (comparison == 0 && left.path.size() < right.path.size());
-}
-
-bool isCanonicalPath(const QByteArray &path)
-{
-    if (path.isEmpty() || path.startsWith('/') || path.endsWith('/')
-        || path.contains('\\') || path.contains('\0')) {
-        return false;
-    }
-    QStringDecoder decoder(QStringDecoder::Utf8);
-    const QString decoded = decoder.decode(path);
-    if (decoder.hasError() || decoded.toUtf8() != path
-        || decoded.normalized(QString::NormalizationForm_C) != decoded) {
-        return false;
-    }
-    const QList<QByteArray> components = path.split('/');
-    return std::all_of(
-        components.cbegin(), components.cend(), [](const QByteArray &component) {
-            return !component.isEmpty() && component != "." && component != "..";
-        });
-}
 
 void addLength(QCryptographicHash &hash, quint64 length)
 {
@@ -57,26 +28,36 @@ ContentDigestResult calculate(
     bool payload)
 {
     QVector<ArchiveFile> included;
-    QSet<QByteArray> paths;
+    QVector<qbrowser_archive_detail::ArchiveCollisionPath> paths;
+    paths.reserve(files.size());
     for (const ArchiveFile &entry : files) {
-        if (!isCanonicalPath(entry.path)) {
+        const auto checked = qbrowser_archive_detail::validateArchivePath(
+            entry.path);
+        if (!checked.has_value() || !checked->isCanonical) {
             return ContentDigestResult({ContentDigestErrorCode::InvalidPath,
                                         entry.path,
                                         QStringLiteral("digest path is invalid")});
         }
-        if (paths.contains(entry.path)) {
-            return ContentDigestResult({ContentDigestErrorCode::DuplicatePath,
-                                        entry.path,
-                                        QStringLiteral("digest path is duplicated")});
-        }
-        paths.insert(entry.path);
+        paths.push_back({checked->collisionKey, entry.path, true});
         if (entry.path == SignaturePath
             || (payload && entry.path == ContentPath)) {
             continue;
         }
         included.push_back(entry);
     }
-    std::sort(included.begin(), included.end(), bytewiseLess);
+    if (const auto collision =
+            qbrowser_archive_detail::findArchivePathCollision(paths);
+        collision.has_value()) {
+        return ContentDigestResult({ContentDigestErrorCode::DuplicatePath,
+                                    *collision,
+                                    QStringLiteral("digest path is duplicated")});
+    }
+    std::sort(
+        included.begin(), included.end(), [](const ArchiveFile &left,
+                                             const ArchiveFile &right) {
+            return qbrowser_archive_detail::archivePathBytewiseLess(
+                left.path, right.path);
+        });
 
     QCryptographicHash hash(QCryptographicHash::Sha256);
     const char *domain = payload ? PayloadDomain : SignedDomain;

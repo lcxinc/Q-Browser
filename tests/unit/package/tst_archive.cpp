@@ -1282,6 +1282,14 @@ void ArchiveTest::usesMinimumWindowsHandleAccess()
                 QVERIFY2(
                     (record.access & DELETE) != 0U,
                     qPrintable(record.path));
+            } else if (isAtOrBelow(
+                           record.path,
+                           QFileInfo(package).dir().absolutePath())) {
+                if ((record.access & DELETE) != 0U) {
+                    sawLockedExisting = true;
+                } else {
+                    sawUnlockedAncestor = true;
+                }
             } else {
                 sawUnlockedAncestor = true;
                 QVERIFY2(

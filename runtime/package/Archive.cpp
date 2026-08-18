@@ -1,15 +1,13 @@
 #include "Archive.h"
 #include "ArchiveTestHooks.h"
+#include "CanonicalArchivePath.h"
 #include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
-#include <QHash>
 #include <QSaveFile>
-#include <QSet>
-#include <QStringDecoder>
 #include <QTemporaryDir>
 #include <QUuid>
 #include <QtEndian>
@@ -31,6 +29,13 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+
+#ifndef Q_OS_WIN
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace qbrowser_archive_detail
 {
@@ -69,6 +74,9 @@ ArchiveResult createFromBuffers(
     const QVector<ArchiveFile> &files,
     const QString &archivePath,
     const ArchiveLimits &limits);
+bool publishArchiveBytes(
+    const QByteArray &bytes,
+    const QString &archivePath);
 bool isReparsePoint(const QString &path);
 bool pathChainContainsReparsePoint(const QString &path);
 
@@ -147,10 +155,7 @@ BoundedReadResult readExact(QFile &file, quint64 expected, quint64 maximum)
 
 bool bytewiseLess(const QByteArray &left, const QByteArray &right)
 {
-    const qsizetype common = std::min(left.size(), right.size());
-    const int comparison = std::memcmp(
-        left.constData(), right.constData(), static_cast<size_t>(common));
-    return comparison < 0 || (comparison == 0 && left.size() < right.size());
+    return qbrowser_archive_detail::archivePathBytewiseLess(left, right);
 }
 
 quint16 readLittle16(const QByteArray &bytes, qsizetype offset)
@@ -391,135 +396,25 @@ std::optional<QByteArray> readArchiveName(mz_zip_archive *zip, mz_uint index)
     return name;
 }
 
-bool isWindowsDeviceName(const QString &component)
-{
-    const QString base = component.section(QLatin1Char('.'), 0, 0).toUpper();
-    static const QSet<QString> fixedNames{
-        QStringLiteral("CON"),
-        QStringLiteral("PRN"),
-        QStringLiteral("AUX"),
-        QStringLiteral("NUL"),
-        QStringLiteral("CLOCK$")};
-    if (fixedNames.contains(base)) {
-        return true;
-    }
-    if (base.size() == 4
-        && (base.startsWith(QStringLiteral("COM"))
-            || base.startsWith(QStringLiteral("LPT")))) {
-        const QChar suffix = base.back();
-        return (suffix >= QLatin1Char('1') && suffix <= QLatin1Char('9'))
-            || suffix == QChar(0x00B9U) || suffix == QChar(0x00B2U)
-            || suffix == QChar(0x00B3U);
-    }
-    return false;
-}
+using CheckedPath = qbrowser_archive_detail::CheckedArchivePath;
+using CollisionPath = qbrowser_archive_detail::ArchiveCollisionPath;
 
-struct CheckedPath final
+std::optional<QByteArray> findPathCollision(const QVector<CollisionPath> &paths)
 {
-    QString collisionKey;
-    bool isCanonical = true;
-};
-
-struct CollisionPath final
-{
-    QString key;
-    QByteArray path;
-    bool isCanonical = true;
-};
-
-std::optional<QByteArray> findPathCollision(
-    const QVector<CollisionPath> &paths)
-{
-    QHash<QString, QByteArray> firstPathByKey;
-    QSet<QString> keys;
-    QVector<QByteArray> candidates;
-    for (const CollisionPath &path : paths) {
-        const auto existing = firstPathByKey.constFind(path.key);
-        if (existing != firstPathByKey.cend()) {
-            candidates.push_back(
-                bytewiseLess(*existing, path.path) ? path.path : *existing);
-        } else {
-            firstPathByKey.insert(path.key, path.path);
-            keys.insert(path.key);
-        }
-    }
-    for (const CollisionPath &path : paths) {
-        qsizetype separator = path.key.indexOf(QLatin1Char('/'));
-        while (separator >= 0) {
-            if (keys.contains(path.key.left(separator))) {
-                candidates.push_back(path.path);
-                break;
-            }
-            separator = path.key.indexOf(QLatin1Char('/'), separator + 1);
-        }
-    }
-    if (candidates.isEmpty()) {
-        return std::nullopt;
-    }
-    return *std::min_element(
-        candidates.cbegin(),
-        candidates.cend(),
-        [](const QByteArray &left, const QByteArray &right) {
-            return bytewiseLess(left, right);
-        });
+    return qbrowser_archive_detail::findArchivePathCollision(paths);
 }
 
 std::optional<QByteArray> firstNonCanonicalPath(
     const QVector<CollisionPath> &paths)
 {
-    std::optional<QByteArray> result;
-    for (const CollisionPath &path : paths) {
-        if (!path.isCanonical
-            && (!result.has_value() || bytewiseLess(path.path, *result))) {
-            result = path.path;
-        }
-    }
-    return result;
+    return qbrowser_archive_detail::firstNonCanonicalArchivePath(paths);
 }
 
 std::optional<CheckedPath> validateEntryPath(
     const QByteArray &path,
     const ArchiveLimits &limits)
 {
-    if (path.isEmpty() || path.size() > limits.maximumPathBytes
-        || path.contains('\0') || path.contains('\\') || path.startsWith('/')) {
-        return std::nullopt;
-    }
-
-    QStringDecoder decoder(QStringDecoder::Utf8);
-    const QString decoded = decoder.decode(path);
-    if (decoder.hasError() || decoded.isEmpty()
-        || decoded.size() > limits.maximumPathUtf16Units) {
-        return std::nullopt;
-    }
-    const QString normalized = decoded.normalized(QString::NormalizationForm_C);
-
-    const QList<QByteArray> rawComponents = path.split('/');
-    const QStringList components = decoded.split(QLatin1Char('/'));
-    if (rawComponents.size() != components.size()) {
-        return std::nullopt;
-    }
-    static const QString reserved = QStringLiteral("<>:\"|?*");
-    for (qsizetype index = 0; index < components.size(); ++index) {
-        const QByteArray &raw = rawComponents.at(index);
-        const QString &component = components.at(index);
-        if (raw.isEmpty() || raw.size() > limits.maximumComponentBytes
-            || component.isEmpty()
-            || component.size() > limits.maximumComponentUtf16Units
-            || component == QStringLiteral(".")
-            || component == QStringLiteral("..")
-            || component.endsWith(QLatin1Char('.'))
-            || component.endsWith(QLatin1Char(' '))
-            || isWindowsDeviceName(component)) {
-            return std::nullopt;
-        }
-        for (const QChar character : component) {
-            if (character.unicode() < 0x20U || reserved.contains(character)) {
-                return std::nullopt;
-            }
-        }
-    }
-    return CheckedPath{normalized.toCaseFolded(), normalized == decoded};
+    return qbrowser_archive_detail::validateArchivePath(path, limits);
 }
 
 class ZipReader final
@@ -917,13 +812,7 @@ ArchiveResult Archive::create(
         return verified;
     }
 
-    QSaveFile output(archivePath);
-    const bool opened = output.open(QIODevice::WriteOnly);
-    const qint64 expectedSize = deterministicBytes.size();
-    const bool wrote = opened
-        && output.write(deterministicBytes) == expectedSize;
-    if (!wrote || !output.commit()) {
-        output.cancelWriting();
+    if (!publishArchiveBytes(deterministicBytes, archivePath)) {
         return fail(
             ArchiveErrorCode::DestinationUnavailable,
             {},
@@ -1289,18 +1178,154 @@ ArchiveResult createFromBuffers(
     if (!verified.hasValue()) {
         return verified;
     }
-    QSaveFile output(archivePath);
-    const bool opened = output.open(QIODevice::WriteOnly);
-    const bool wrote = opened
-        && output.write(deterministicBytes) == deterministicBytes.size();
-    if (!wrote || !output.commit()) {
-        output.cancelWriting();
+    if (!publishArchiveBytes(deterministicBytes, archivePath)) {
         return fail(
             ArchiveErrorCode::DestinationUnavailable,
             {},
             QStringLiteral("archive destination is unavailable"));
     }
     return verified;
+}
+
+bool publishArchiveBytes(
+    const QByteArray &bytes,
+    const QString &archivePath)
+{
+    const QString destination = QFileInfo(archivePath).absoluteFilePath();
+    const QString parent = QFileInfo(destination).dir().absolutePath();
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree directory;
+    if (!directory.openRoot(parent) || !directory.isStable()) {
+        return false;
+    }
+    qbrowser_archive_detail::WindowsStableFile owned;
+    QString temporaryPath;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        temporaryPath = QDir(parent).absoluteFilePath(
+            QStringLiteral(".qbrowser-")
+            + QUuid::createUuid().toString(QUuid::Id128)
+            + QStringLiteral(".tmp"));
+        if (owned.createOwnedOutput(temporaryPath, directory)) {
+            break;
+        }
+        temporaryPath.clear();
+    }
+    if (temporaryPath.isEmpty()) {
+        return false;
+    }
+    auto cleanup = [&owned] {
+        (void)owned.deleteOwned();
+    };
+    if (!owned.writeAll(bytes.constData(), static_cast<size_t>(bytes.size()))
+        || !owned.flush()) {
+        cleanup();
+        return false;
+    }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish) {
+        qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish(
+            temporaryPath, destination);
+    }
+#endif
+    if (!directory.isStable()
+        || !owned.publishNoReplace(destination, directory)) {
+        cleanup();
+        return false;
+    }
+    return true;
+#else
+    const QByteArray parentBytes = QFile::encodeName(parent);
+    const QByteArray destinationName = QFile::encodeName(
+        QFileInfo(destination).fileName());
+    if (destinationName.isEmpty() || destinationName.contains('/')) {
+        return false;
+    }
+    const int directoryFd = ::open(
+        parentBytes.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directoryFd < 0) {
+        return false;
+    }
+    QByteArray temporaryName;
+    int fileFd = -1;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        temporaryName = QByteArrayLiteral(".qbrowser-")
+            + QUuid::createUuid().toString(QUuid::Id128).toLatin1()
+            + QByteArrayLiteral(".tmp");
+        fileFd = ::openat(
+            directoryFd,
+            temporaryName.constData(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        if (fileFd >= 0) {
+            break;
+        }
+    }
+    if (fileFd < 0) {
+        (void)::close(directoryFd);
+        return false;
+    }
+    auto unlinkOwned = [&](const QByteArray &name) {
+        struct stat owned{};
+        struct stat candidate{};
+        return !name.isEmpty()
+            && ::fstat(fileFd, &owned) == 0
+            && ::fstatat(
+                   directoryFd,
+                   name.constData(),
+                   &candidate,
+                   AT_SYMLINK_NOFOLLOW) == 0
+            && owned.st_dev == candidate.st_dev
+            && owned.st_ino == candidate.st_ino
+            && ::unlinkat(directoryFd, name.constData(), 0) == 0;
+    };
+    bool published = false;
+    auto cleanup = [&] {
+        if (published) {
+            (void)unlinkOwned(destinationName);
+        }
+        (void)unlinkOwned(temporaryName);
+        (void)::fsync(directoryFd);
+        (void)::close(fileFd);
+        (void)::close(directoryFd);
+    };
+    qsizetype offset = 0;
+    while (offset < bytes.size()) {
+        const ssize_t written = ::write(
+            fileFd,
+            bytes.constData() + offset,
+            static_cast<size_t>(bytes.size() - offset));
+        if (written <= 0) {
+            cleanup();
+            return false;
+        }
+        offset += static_cast<qsizetype>(written);
+    }
+    if (::fsync(fileFd) != 0) {
+        cleanup();
+        return false;
+    }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish) {
+        qbrowser_archive_testing::archiveTestHooks().beforeArchivePublish(
+            QDir(parent).absoluteFilePath(QString::fromUtf8(temporaryName)),
+            destination);
+    }
+#endif
+    published = ::linkat(
+        directoryFd,
+        temporaryName.constData(),
+        directoryFd,
+        destinationName.constData(),
+        0) == 0;
+    if (!published || !unlinkOwned(temporaryName)
+        || ::fsync(directoryFd) != 0) {
+        cleanup();
+        return false;
+    }
+    (void)::close(fileFd);
+    (void)::close(directoryFd);
+    return true;
+#endif
 }
 
 bool isReparsePoint(const QString &path)
