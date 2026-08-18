@@ -6,6 +6,7 @@
 #include <QList>
 
 #include <memory>
+#include <optional>
 
 class NetworkAddressResolver
 {
@@ -15,6 +16,9 @@ public:
                                                       int timeoutMs,
                                                       bool &timedOut) = 0;
 };
+
+[[nodiscard]] std::optional<NetworkAddressClass>
+classifyNetworkAddress(const QHostAddress &address);
 
 class NetworkBroker final : public CapabilityService
 {

@@ -10,6 +10,7 @@
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
+#include <Aclapi.h>
 #endif
 
 namespace {
@@ -35,6 +36,92 @@ std::unique_ptr<StorageBroker> createBroker(const EffectiveStoragePolicy policy,
     return broker;
 }
 
+#ifdef Q_OS_WIN
+bool grantWorldAccess(const QString &path)
+{
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldSize = sizeof(worldBuffer);
+    if (CreateWellKnownSid(WinWorldSid, nullptr, worldBuffer, &worldSize) == FALSE) {
+        return false;
+    }
+    EXPLICIT_ACCESSW entry{};
+    entry.grfAccessPermissions = GENERIC_ALL;
+    entry.grfAccessMode = GRANT_ACCESS;
+    entry.grfInheritance = NO_INHERITANCE;
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    entry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(worldBuffer);
+    PACL acl = nullptr;
+    if (SetEntriesInAclW(1, &entry, nullptr, &acl) != ERROR_SUCCESS) {
+        return false;
+    }
+    QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    const DWORD result = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        acl,
+        nullptr);
+    LocalFree(acl);
+    return result == ERROR_SUCCESS;
+}
+
+bool hasProtectedHostOnlyDacl(const QString &path)
+{
+    QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL dacl = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &dacl,
+        nullptr,
+        &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr || dacl == nullptr) {
+        if (descriptor != nullptr) {
+            LocalFree(descriptor);
+        }
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    bool valid = GetSecurityDescriptorControl(descriptor, &control, &revision) != FALSE
+        && (control & SE_DACL_PROTECTED) != 0U;
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldSize = sizeof(worldBuffer);
+    valid = valid
+        && CreateWellKnownSid(WinWorldSid, nullptr, worldBuffer, &worldSize) != FALSE;
+    ACL_SIZE_INFORMATION information{};
+    valid = valid
+        && GetAclInformation(dacl,
+                             &information,
+                             static_cast<DWORD>(sizeof(information)),
+                             AclSizeInformation)
+            != FALSE;
+    for (DWORD index = 0; valid && index < information.AceCount; ++index) {
+        void *ace = nullptr;
+        if (GetAce(dacl, index, &ace) == FALSE) {
+            valid = false;
+            break;
+        }
+        const auto *header = static_cast<const ACE_HEADER *>(ace);
+        if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+            if (EqualSid(const_cast<DWORD *>(&allowed->SidStart), worldBuffer) != FALSE) {
+                valid = false;
+            }
+        }
+    }
+    LocalFree(descriptor);
+    return valid;
+}
+#endif
+
 } // namespace
 
 class StorageBrokerTest final : public QObject
@@ -46,6 +133,8 @@ private slots:
     void enforcesQuotaWithoutMutatingExistingValue();
     void rejectsPayloadIdentityAndInvalidKeys();
     void rejectsExistingNamespaceOverQuota();
+    void validatesAndTightensExistingNamespaceLayout();
+    void rejectsUnexpectedExistingStorageObjects();
     void serializesConcurrentQuotaUpdates();
     void rejectsReparseRoot();
     void rejectsReparseNamespaceFile();
@@ -143,14 +232,51 @@ void StorageBrokerTest::rejectsExistingNamespaceOverQuota()
             > 40);
     file.close();
 
-    auto broker = createBroker(EffectiveStoragePolicy{40}, root.path());
-    QVERIFY(broker != nullptr);
-    const BrokerResult result = broker->invoke(QStringLiteral("get"),
-                                              keyPayload(QStringLiteral("key")),
-                                              {identity, QStringLiteral("request")});
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{40}, root.path(), &error) == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+}
 
-    QVERIFY(!result.ok);
-    QCOMPARE(result.errorCode, QStringLiteral("storage.quota"));
+void StorageBrokerTest::validatesAndTightensExistingNamespaceLayout()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows ACL validation coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString identity = QStringLiteral("host.app");
+    const QString fileName = QString::fromLatin1(
+                                 QCryptographicHash::hash(identity.toUtf8(),
+                                                          QCryptographicHash::Sha256)
+                                     .toHex())
+        + QStringLiteral(".json");
+    const QString path = QDir(root.path()).filePath(fileName);
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write("{\"theme\":\"dark\"}"), 16);
+    file.close();
+    QVERIFY(grantWorldAccess(path));
+    QVERIFY(!hasProtectedHostOnlyDacl(path));
+
+    auto broker = createBroker(EffectiveStoragePolicy{1024}, root.path());
+    QVERIFY(broker != nullptr);
+    QVERIFY(hasProtectedHostOnlyDacl(path));
+    const BrokerResult result = broker->invoke(QStringLiteral("get"),
+                                               keyPayload(QStringLiteral("theme")),
+                                               {identity, QStringLiteral("request")});
+    QVERIFY(result.ok);
+    QCOMPARE(result.value.value(QStringLiteral("value")).toString(), QStringLiteral("dark"));
+#endif
+}
+
+void StorageBrokerTest::rejectsUnexpectedExistingStorageObjects()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QVERIFY(QDir(root.path()).mkdir(QStringLiteral("unexpected")));
+    QString error;
+    QVERIFY(StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error) == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
 }
 
 void StorageBrokerTest::serializesConcurrentQuotaUpdates()

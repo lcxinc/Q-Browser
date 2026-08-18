@@ -1,15 +1,24 @@
 #include "CapabilityBroker.h"
 #include "ClipboardBroker.h"
 #include "FileBroker.h"
+#include "FileDialogTestHooks.h"
 #include "FrameCodec.h"
 #include "ProtocolMessage.h"
 #include "UserGestureGrantStore.h"
 
 #include <QTest>
 #include <QBuffer>
+#include <QDir>
+#include <QFile>
+#include <QScopeGuard>
+#include <QTemporaryDir>
 #include <QSemaphore>
 
 #include <future>
+
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
 
 class RecordingService final : public CapabilityService
 {
@@ -37,21 +46,27 @@ public:
 class RecordingClipboard final : public ClipboardBackend
 {
 public:
-    QString readText() override
+    ClipboardReadResult readText(const qint64 maximumBytes) override
     {
         ++reads;
-        return QStringLiteral("clipboard-value");
+        lastMaximumBytes = maximumBytes;
+        return readResult;
     }
-    bool writeText(const QString &text) override
+    ClipboardStatus writeText(const QString &text, const qint64 maximumBytes) override
     {
         ++writes;
         lastText = text;
-        return true;
+        lastMaximumBytes = maximumBytes;
+        return writeStatus;
     }
 
     int reads = 0;
     int writes = 0;
     QString lastText;
+    qint64 lastMaximumBytes = 0;
+    ClipboardReadResult readResult{ClipboardStatus::Success,
+                                   QStringLiteral("clipboard-value")};
+    ClipboardStatus writeStatus = ClipboardStatus::Success;
 };
 
 class RecordingFileDialog final : public FileDialogBackend
@@ -95,9 +110,15 @@ private slots:
     void dispatchesAllowedCapabilityWithHostIdentity();
     void clipboardReadRequiresHostGesture();
     void gestureGrantIsBoundExpiringAndSingleUse();
+    void gestureGrantTombstonesDoNotExhaustActiveCapacity();
+    void clipboardEnforcesNativeByteLimitAndStableStatuses();
     void enforcesExactIpcRequestAndResponseBudget();
     void fileCancellationAndSizeAreStable();
     void fileBackendStatusAndConcurrencyAreFailClosed();
+    void nativeFileDialogUsesStableShellStream();
+    void nativeFileDialogReturnsBoundStreamAndChecksSizeBeforeRead();
+    void nativeFileDialogRejectsReparseSelection();
+    void nativeFileDialogRejectsReplacementAfterStreamBind();
 };
 
 void CapabilityBrokerTest::deniedCapabilityNeverTouchesService()
@@ -199,6 +220,65 @@ void CapabilityBrokerTest::gestureGrantIsBoundExpiringAndSingleUse()
     QCOMPARE(read(QStringLiteral("app.one"), QStringLiteral("stale")).errorCode,
              QStringLiteral("clipboard.gesture_required"));
     QCOMPARE(backend.reads, 1);
+}
+
+void CapabilityBrokerTest::gestureGrantTombstonesDoNotExhaustActiveCapacity()
+{
+    UserGestureGrantStore grants;
+
+    for (int index = 0; index < 5000; ++index) {
+        const QString requestId = QStringLiteral("request-%1").arg(index);
+        QVERIFY2(grants.issue(QStringLiteral("app.one"), requestId, 60000),
+                 qPrintable(QStringLiteral("issue failed at %1").arg(index)));
+        QVERIFY2(grants.consume(QStringLiteral("app.one"), requestId),
+                 qPrintable(QStringLiteral("consume failed at %1").arg(index)));
+    }
+
+    QVERIFY(!grants.issue(QStringLiteral("app.one"), QStringLiteral("request-4999"), 60000));
+    QVERIFY(!grants.consume(QStringLiteral("app.one"), QStringLiteral("request-4999")));
+}
+
+void CapabilityBrokerTest::clipboardEnforcesNativeByteLimitAndStableStatuses()
+{
+    RecordingClipboard backend;
+    UserGestureGrantStore grants;
+    ClipboardBroker service(EffectiveClipboardPolicy{true, true}, backend, grants);
+    constexpr qint64 contentCharacters = maximumClipboardBytes() / 2 - 1;
+
+    backend.readResult.text = QString(contentCharacters, u'x');
+    QVERIFY(grants.issue(QStringLiteral("app.one"), QStringLiteral("read-exact"), 1000));
+    QVERIFY(service.invoke(QStringLiteral("read"), {},
+                           {QStringLiteral("app.one"), QStringLiteral("read-exact")})
+                .ok);
+    QCOMPARE(backend.lastMaximumBytes, maximumClipboardBytes());
+
+    backend.readResult.text.append(u'x');
+    QVERIFY(grants.issue(QStringLiteral("app.one"), QStringLiteral("read-large"), 1000));
+    QCOMPARE(service.invoke(QStringLiteral("read"), {},
+                            {QStringLiteral("app.one"), QStringLiteral("read-large")})
+                 .errorCode,
+             QStringLiteral("clipboard.too_large"));
+
+    const QJsonObject exactWrite{{QStringLiteral("text"),
+                                  QString(contentCharacters, u'x')}};
+    QVERIFY(service.invoke(QStringLiteral("write"), exactWrite,
+                           {QStringLiteral("app.one"), QStringLiteral("write-exact")})
+                .ok);
+    const int writesAtLimit = backend.writes;
+    const QJsonObject largeWrite{{QStringLiteral("text"),
+                                  QString(contentCharacters + 1, u'x')}};
+    QCOMPARE(service.invoke(QStringLiteral("write"), largeWrite,
+                            {QStringLiteral("app.one"), QStringLiteral("write-large")})
+                 .errorCode,
+             QStringLiteral("clipboard.too_large"));
+    QCOMPARE(backend.writes, writesAtLimit);
+
+    backend.readResult = ClipboardReadResult::error(ClipboardStatus::Unavailable);
+    QVERIFY(grants.issue(QStringLiteral("app.one"), QStringLiteral("read-failed"), 1000));
+    QCOMPARE(service.invoke(QStringLiteral("read"), {},
+                            {QStringLiteral("app.one"), QStringLiteral("read-failed")})
+                 .errorCode,
+             QStringLiteral("clipboard.failed"));
 }
 
 void CapabilityBrokerTest::enforcesExactIpcRequestAndResponseBudget()
@@ -311,6 +391,126 @@ void CapabilityBrokerTest::fileBackendStatusAndConcurrencyAreFailClosed()
     QCOMPARE(backend.calls, 2); // failed status call plus one active dialog
     backend.proceed.release();
     QVERIFY(first.get().ok);
+}
+
+void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()
+{
+    QFile source(QStringLiteral(Q_BROWSER_FILE_BROKER_SOURCE_FILE));
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    const QByteArray implementation = source.readAll();
+#ifdef Q_OS_WIN
+    QVERIFY(implementation.contains("IFileOpenDialog"));
+    QVERIFY(implementation.contains("BindToHandler"));
+    const qsizetype windowsBranch = implementation.indexOf("IFileOpenDialog");
+    const qsizetype fallback = implementation.indexOf("QFileDialog::getOpenFileName");
+    QVERIFY(windowsBranch >= 0);
+    QVERIFY(fallback > windowsBranch);
+    QVERIFY(implementation.mid(windowsBranch, fallback - windowsBranch)
+                .contains("BindToHandler"));
+    QVERIFY(!implementation.contains("_open_osfhandle"));
+#endif
+}
+
+void CapabilityBrokerTest::nativeFileDialogReturnsBoundStreamAndChecksSizeBeforeRead()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows stable shell stream coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString selected = QDir(root.path()).filePath(QStringLiteral("selected.txt"));
+    QFile selectedFile(selected);
+    QVERIFY(selectedFile.open(QIODevice::WriteOnly));
+    QCOMPARE(selectedFile.write("safe"), 4);
+    selectedFile.close();
+    qbrowser_broker_testing::setFileDialogTestHooks(
+        {.selectedPath = [selected] { return selected; }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend backend;
+    FileDialogResult result = backend.openFile(4);
+    QCOMPARE(result.status, FileDialogStatus::Opened);
+    QVERIFY(result.stream != nullptr);
+    QCOMPARE(result.stream->readAll(), QByteArray("safe"));
+
+    result = backend.openFile(3);
+    QCOMPARE(result.status, FileDialogStatus::TooLarge);
+    QVERIFY(result.stream == nullptr);
+#endif
+}
+
+void CapabilityBrokerTest::nativeFileDialogRejectsReparseSelection()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows shell stream coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString target = QDir(root.path()).filePath(QStringLiteral("target.txt"));
+    QFile targetFile(target);
+    QVERIFY(targetFile.open(QIODevice::WriteOnly));
+    QCOMPARE(targetFile.write("safe"), 4);
+    targetFile.close();
+    const QString link = QDir(root.path()).filePath(QStringLiteral("selected.txt"));
+    if (CreateSymbolicLinkW(
+            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(link).utf16()),
+            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(target).utf16()),
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
+        == FALSE) {
+        QSKIP("File symlink creation is unavailable");
+    }
+    qbrowser_broker_testing::setFileDialogTestHooks(
+        {.selectedPath = [link] { return link; }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend backend;
+    QCOMPARE(backend.openFile(1024).status, FileDialogStatus::Failed);
+#endif
+}
+
+void CapabilityBrokerTest::nativeFileDialogRejectsReplacementAfterStreamBind()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows stable shell stream coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString selected = QDir(root.path()).filePath(QStringLiteral("selected.txt"));
+    const QString replacement = QDir(root.path()).filePath(QStringLiteral("replacement.txt"));
+    const QString backup = QDir(root.path()).filePath(QStringLiteral("backup.txt"));
+    QFile selectedFile(selected);
+    QVERIFY(selectedFile.open(QIODevice::WriteOnly));
+    QCOMPARE(selectedFile.write("safe"), 4);
+    selectedFile.close();
+    QFile replacementFile(replacement);
+    QVERIFY(replacementFile.open(QIODevice::WriteOnly));
+    QCOMPARE(replacementFile.write("evil"), 4);
+    replacementFile.close();
+
+    bool replaced = false;
+    qbrowser_broker_testing::setFileDialogTestHooks(
+        {.selectedPath = [selected] { return selected; },
+         .afterStreamBound = [&](const QString &path) {
+             replaced = ReplaceFileW(
+                            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(path).utf16()),
+                            reinterpret_cast<LPCWSTR>(
+                                QDir::toNativeSeparators(replacement).utf16()),
+                            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(backup).utf16()),
+                            REPLACEFILE_IGNORE_MERGE_ERRORS,
+                            nullptr,
+                            nullptr)
+                 != FALSE;
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend backend;
+    const FileDialogResult result = backend.openFile(1024);
+    QVERIFY(replaced);
+    QCOMPARE(result.status, FileDialogStatus::Failed);
+#endif
 }
 
 QTEST_GUILESS_MAIN(CapabilityBrokerTest)

@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QDirIterator>
 #include <QJsonDocument>
 #include <QLockFile>
 #include <QRegularExpression>
@@ -49,6 +50,18 @@ QString storagePath(const QString &rootDirectory, const QString &identity)
                                                        QCryptographicHash::Sha256)
                                   .toHex();
     return QDir(rootDirectory).filePath(QString::fromLatin1(digest) + QStringLiteral(".json"));
+}
+
+constexpr qsizetype maximumExistingStorageObjects = 8192;
+constexpr qint64 maximumLockBytes = 64 * 1024;
+
+bool validStorageObjectName(const QString &name, bool &lockFile)
+{
+    static const QRegularExpression dataPattern(QStringLiteral(R"(^[0-9a-f]{64}\.json$)"));
+    static const QRegularExpression lockPattern(
+        QStringLiteral(R"(^[0-9a-f]{64}\.json\.lock$)"));
+    lockFile = lockPattern.match(name).hasMatch();
+    return lockFile || dataPattern.match(name).hasMatch();
 }
 
 #ifdef Q_OS_WIN
@@ -138,6 +151,48 @@ BrokerResult loadValues(const QString &path,
     values = document.object();
     return BrokerResult::success();
 }
+
+bool validateExistingLayout(
+    const QString &rootDirectory,
+    const qint64 quotaBytes,
+    const qbrowser_archive_detail::WindowsStableDirectoryTree &stableRoot)
+{
+    QDirIterator iterator(rootDirectory,
+                          QDir::AllEntries | QDir::Hidden | QDir::System
+                              | QDir::NoDotAndDotDot,
+                          QDirIterator::NoIteratorFlags);
+    qsizetype count = 0;
+    while (iterator.hasNext()) {
+        iterator.next();
+        if (++count > maximumExistingStorageObjects) {
+            return false;
+        }
+        const QFileInfo information = iterator.fileInfo();
+        bool lockFile = false;
+        if (!information.isFile() || information.isSymLink()
+            || !validStorageObjectName(information.fileName(), lockFile)) {
+            return false;
+        }
+        const qint64 maximumBytes = lockFile ? maximumLockBytes : quotaBytes;
+        const qint64 expected = information.size();
+        if (expected < 0 || expected > maximumBytes) {
+            return false;
+        }
+        qbrowser_archive_detail::WindowsStableFile file;
+        QByteArray content;
+        if (!applyHostOnlyAcl(information.absoluteFilePath())
+            || !file.openReadLocked(information.absoluteFilePath(), stableRoot)
+            || !file.readExact(static_cast<quint64>(expected),
+                               static_cast<quint64>(maximumBytes),
+                               content)
+            || !applyHostOnlyAcl(information.absoluteFilePath())
+            || !file.isSameIdentityAt(information.absoluteFilePath())
+            || !stableRoot.isStable()) {
+            return false;
+        }
+    }
+    return stableRoot.isStable();
+}
 #else
 bool containsSymlinkAncestor(const QString &path)
 {
@@ -181,6 +236,40 @@ BrokerResult loadValues(const QString &path, const qint64 quotaBytes, QJsonObjec
     values = document.object();
     return BrokerResult::success();
 }
+
+bool validateExistingLayout(const QString &rootDirectory, const qint64 quotaBytes)
+{
+    QDirIterator iterator(rootDirectory,
+                          QDir::AllEntries | QDir::Hidden | QDir::System
+                              | QDir::NoDotAndDotDot,
+                          QDirIterator::NoIteratorFlags);
+    qsizetype count = 0;
+    while (iterator.hasNext()) {
+        iterator.next();
+        if (++count > maximumExistingStorageObjects) {
+            return false;
+        }
+        const QFileInfo information = iterator.fileInfo();
+        bool lockFile = false;
+        if (!information.isFile() || information.isSymLink()
+            || !validStorageObjectName(information.fileName(), lockFile)) {
+            return false;
+        }
+        const qint64 maximumBytes = lockFile ? maximumLockBytes : quotaBytes;
+        if (information.size() < 0 || information.size() > maximumBytes
+            || !QFile::setPermissions(information.absoluteFilePath(),
+                                      QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+            return false;
+        }
+        QFile file(information.absoluteFilePath());
+        if (!file.open(QIODevice::ReadOnly)
+            || file.read(static_cast<qsizetype>(maximumBytes) + 1).size()
+                > maximumBytes) {
+            return false;
+        }
+    }
+    return true;
+}
 #endif
 
 } // namespace
@@ -213,14 +302,16 @@ std::unique_ptr<StorageBroker> StorageBroker::create(EffectiveStoragePolicy poli
     broker->stableRoot_ =
         std::make_unique<qbrowser_archive_detail::WindowsStableDirectoryTree>();
     if (!broker->stableRoot_->openRoot(absoluteRoot) || !applyHostOnlyAcl(absoluteRoot)
-        || !broker->stableRoot_->isStable()) {
+        || !broker->stableRoot_->isStable()
+        || !validateExistingLayout(absoluteRoot, policy.quotaBytes, *broker->stableRoot_)) {
         return fail(QStringLiteral("storage.invalid_root"));
     }
 #else
     if (containsSymlinkAncestor(absoluteRoot)
         || !QFile::setPermissions(absoluteRoot,
                                   QFileDevice::ReadOwner | QFileDevice::WriteOwner
-                                      | QFileDevice::ExeOwner)) {
+                                      | QFileDevice::ExeOwner)
+        || !validateExistingLayout(absoluteRoot, policy.quotaBytes)) {
         return fail(QStringLiteral("storage.invalid_root"));
     }
 #endif
@@ -307,6 +398,7 @@ BrokerResult StorageBroker::invoke(const QString &operation,
     qbrowser_archive_detail::WindowsStableFile published;
     QByteArray verified;
     if (!published.openReadLocked(path, *stableRoot_)
+        || !applyHostOnlyAcl(path)
         || !published.readExact(static_cast<quint64>(bytes.size()),
                                 static_cast<quint64>(policy_.quotaBytes),
                                 verified)

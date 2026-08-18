@@ -3,7 +3,6 @@
 #include <QElapsedTimer>
 #include <QHash>
 #include <QMutex>
-#include <QSet>
 #include <QString>
 
 class UserGestureGrantStore final
@@ -25,5 +24,5 @@ private:
     QElapsedTimer clock_;
     QMutex mutex_;
     QHash<QString, qint64> grants_;
-    QSet<QString> used_;
+    QHash<QString, qint64> used_;
 };

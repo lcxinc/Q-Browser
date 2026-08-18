@@ -1,4 +1,5 @@
 #include "FileBroker.h"
+#include "FileDialogTestHooks.h"
 
 #include <QFile>
 #include <QFileDialog>
@@ -10,10 +11,196 @@
 #include <utility>
 
 #ifdef Q_OS_WIN
-#include <fcntl.h>
-#include <io.h>
 #include <qt_windows.h>
+#include <shobjidl.h>
+#include <shlguid.h>
+
+#include <limits>
 #endif
+
+namespace {
+#ifdef Q_OS_WIN
+template<typename Interface>
+class ComPointer final
+{
+public:
+    ~ComPointer()
+    {
+        if (value_ != nullptr) {
+            value_->Release();
+        }
+    }
+    ComPointer(const ComPointer &) = delete;
+    ComPointer &operator=(const ComPointer &) = delete;
+    ComPointer() = default;
+
+    [[nodiscard]] Interface *get() const { return value_; }
+    [[nodiscard]] Interface **put() { return &value_; }
+    [[nodiscard]] Interface *operator->() const { return value_; }
+    [[nodiscard]] Interface *releaseOwnership()
+    {
+        Interface *result = value_;
+        value_ = nullptr;
+        return result;
+    }
+
+private:
+    Interface *value_ = nullptr;
+};
+
+class WindowsComStreamDevice final : public QIODevice
+{
+public:
+    explicit WindowsComStreamDevice(IStream *stream) : stream_(stream)
+    {
+        QIODevice::open(QIODevice::ReadOnly);
+    }
+    ~WindowsComStreamDevice() override
+    {
+        if (stream_ != nullptr) {
+            stream_->Release();
+        }
+    }
+
+protected:
+    qint64 readData(char *data, const qint64 maximumSize) override
+    {
+        if (stream_ == nullptr || data == nullptr || maximumSize < 0) {
+            return -1;
+        }
+        const ULONG request = static_cast<ULONG>(std::min<quint64>(
+            static_cast<quint64>(maximumSize),
+            static_cast<quint64>(std::numeric_limits<ULONG>::max())));
+        ULONG count = 0;
+        const HRESULT result = stream_->Read(data, request, &count);
+        return (result == S_OK || result == S_FALSE) ? static_cast<qint64>(count) : -1;
+    }
+    qint64 writeData(const char *, qint64) override { return -1; }
+
+private:
+    IStream *stream_ = nullptr;
+};
+
+struct WindowsFileIdentity final
+{
+    DWORD volume = 0;
+    DWORD indexHigh = 0;
+    DWORD indexLow = 0;
+
+    [[nodiscard]] bool operator==(const WindowsFileIdentity &) const noexcept = default;
+};
+
+bool queryPlainFileIdentity(const QString &path, WindowsFileIdentity &identity)
+{
+    HANDLE handle = CreateFileW(
+        reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(path).utf16()),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    BY_HANDLE_FILE_INFORMATION information{};
+    const bool valid = GetFileType(handle) == FILE_TYPE_DISK
+        && GetFileInformationByHandleEx(handle,
+                                        FileAttributeTagInfo,
+                                        &tag,
+                                        static_cast<DWORD>(sizeof(tag)))
+            != FALSE
+        && (tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT
+                                  | FILE_ATTRIBUTE_DIRECTORY))
+            == 0U
+        && GetFileInformationByHandle(handle, &information) != FALSE;
+    CloseHandle(handle);
+    if (!valid) {
+        return false;
+    }
+    identity = {information.dwVolumeSerialNumber,
+                information.nFileIndexHigh,
+                information.nFileIndexLow};
+    return true;
+}
+
+bool hasNoReparseComponents(const QString &path)
+{
+    QString current = QFileInfo(path).absoluteFilePath();
+    for (;;) {
+        HANDLE handle = CreateFileW(
+            reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(current).utf16()),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        const bool valid = GetFileInformationByHandleEx(
+                               handle,
+                               FileAttributeTagInfo,
+                               &tag,
+                               static_cast<DWORD>(sizeof(tag)))
+                != FALSE
+            && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+        CloseHandle(handle);
+        if (!valid) {
+            return false;
+        }
+        const QString parent = QFileInfo(current).dir().absolutePath();
+        if (parent == current) {
+            return true;
+        }
+        current = parent;
+    }
+}
+
+FileDialogStatus selectedShellItem(ComPointer<IShellItem> &item)
+{
+#ifdef Q_BROWSER_BROKER_TESTING
+    const auto &hooks = qbrowser_broker_testing::fileDialogTestHooks();
+    if (hooks.selectedPath) {
+        const QString path = hooks.selectedPath();
+        return !path.isEmpty()
+                && SUCCEEDED(SHCreateItemFromParsingName(
+                    reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(path).utf16()),
+                    nullptr,
+                    IID_IShellItem,
+                    reinterpret_cast<void **>(item.put())))
+            ? FileDialogStatus::Opened
+            : FileDialogStatus::Failed;
+    }
+#endif
+    ComPointer<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog,
+                                nullptr,
+                                CLSCTX_INPROC_SERVER,
+                                IID_IFileOpenDialog,
+                                reinterpret_cast<void **>(dialog.put())))) {
+        return FileDialogStatus::Failed;
+    }
+    FILEOPENDIALOGOPTIONS options = 0;
+    if (FAILED(dialog->GetOptions(&options))
+        || FAILED(dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST
+                                     | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR
+                                     | FOS_DONTADDTORECENT | FOS_NODEREFERENCELINKS))) {
+        return FileDialogStatus::Failed;
+    }
+    const HRESULT shown = dialog->Show(nullptr);
+    if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return FileDialogStatus::Cancelled;
+    }
+    return SUCCEEDED(shown) && SUCCEEDED(dialog->GetResult(item.put()))
+        ? FileDialogStatus::Opened
+        : FileDialogStatus::Failed;
+}
+#endif
+}
 
 FileDialogResult FileDialogResult::opened(QString name,
                                           const qint64 size,
@@ -29,55 +216,76 @@ FileDialogResult FileDialogResult::error(const FileDialogStatus status)
 
 FileDialogResult QtFileDialogBackend::openFile(const qint64 maximumBytes)
 {
+#ifdef Q_OS_WIN
+    if (maximumBytes < 0) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialized)) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    const auto uninitialize = qScopeGuard([] { CoUninitialize(); });
+    ComPointer<IShellItem> item;
+    const FileDialogStatus selected = selectedShellItem(item);
+    if (selected != FileDialogStatus::Opened) {
+        return FileDialogResult::error(selected);
+    }
+    SFGAOF attributes = 0;
+    if (FAILED(item->GetAttributes(SFGAO_FILESYSTEM | SFGAO_STREAM | SFGAO_LINK
+                                       | SFGAO_FOLDER,
+                                   &attributes))
+        || (attributes & SFGAO_FILESYSTEM) == 0U
+        || (attributes & SFGAO_STREAM) == 0U
+        || (attributes & (SFGAO_LINK | SFGAO_FOLDER)) != 0U) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    ComPointer<IStream> stream;
+    if (FAILED(item->BindToHandler(nullptr,
+                                   BHID_Stream,
+                                   IID_IStream,
+                                   reinterpret_cast<void **>(stream.put())))) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    PWSTR selectedPath = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &selectedPath))
+        || selectedPath == nullptr) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    const QString path = QString::fromWCharArray(selectedPath);
+    CoTaskMemFree(selectedPath);
+    WindowsFileIdentity before;
+    if (!queryPlainFileIdentity(path, before)) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+#ifdef Q_BROWSER_BROKER_TESTING
+    const auto &hooks = qbrowser_broker_testing::fileDialogTestHooks();
+    if (hooks.afterStreamBound) {
+        hooks.afterStreamBound(path);
+    }
+#endif
+    WindowsFileIdentity after;
+    if (!queryPlainFileIdentity(path, after) || !(after == before)
+        || !hasNoReparseComponents(path)) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    STATSTG statistics{};
+    if (FAILED(stream->Stat(&statistics, STATFLAG_NONAME))) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    if (statistics.cbSize.HighPart != 0U) {
+        return FileDialogResult::error(FileDialogStatus::TooLarge);
+    }
+    const qint64 size = static_cast<qint64>(statistics.cbSize.LowPart);
+    if (size > maximumBytes) {
+        return FileDialogResult::error(FileDialogStatus::TooLarge);
+    }
+    auto device = std::make_unique<WindowsComStreamDevice>(stream.releaseOwnership());
+    return FileDialogResult::opened(QFileInfo(path).fileName(), size, std::move(device));
+#else
     const QString path = QFileDialog::getOpenFileName(nullptr, QStringLiteral("Open file"));
     if (path.isEmpty()) {
         return FileDialogResult::error(FileDialogStatus::Cancelled);
     }
-
-#ifdef Q_OS_WIN
-    HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(path).utf16()),
-                                GENERIC_READ | FILE_READ_ATTRIBUTES,
-                                FILE_SHARE_READ,
-                                nullptr,
-                                OPEN_EXISTING,
-                                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
-                                nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return FileDialogResult::error(FileDialogStatus::Failed);
-    }
-    FILE_ATTRIBUTE_TAG_INFO attributes{};
-    LARGE_INTEGER size{};
-    if (GetFileType(handle) != FILE_TYPE_DISK
-        || GetFileInformationByHandleEx(handle,
-                                        FileAttributeTagInfo,
-                                        &attributes,
-                                        static_cast<DWORD>(sizeof(attributes)))
-               == FALSE
-        || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U
-        || (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U
-        || GetFileSizeEx(handle, &size) == FALSE || size.QuadPart < 0) {
-        CloseHandle(handle);
-        return FileDialogResult::error(FileDialogStatus::Failed);
-    }
-    if (size.QuadPart > maximumBytes) {
-        CloseHandle(handle);
-        return FileDialogResult::error(FileDialogStatus::TooLarge);
-    }
-    const int descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(handle),
-                                           _O_RDONLY | _O_BINARY);
-    if (descriptor < 0) {
-        CloseHandle(handle);
-        return FileDialogResult::error(FileDialogStatus::Failed);
-    }
-    auto file = std::make_unique<QFile>();
-    if (!file->open(descriptor, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
-        _close(descriptor);
-        return FileDialogResult::error(FileDialogStatus::Failed);
-    }
-    return FileDialogResult::opened(QFileInfo(path).fileName(),
-                                    size.QuadPart,
-                                    std::move(file));
-#else
     const QFileInfo information(path);
     if (information.isSymLink() || !information.isFile()) {
         return FileDialogResult::error(FileDialogStatus::Failed);

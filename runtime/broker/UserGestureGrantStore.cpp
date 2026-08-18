@@ -4,6 +4,7 @@
 
 namespace {
 constexpr qsizetype maximumRememberedGrants = 4096;
+constexpr qint64 replayWindowMs = 60000;
 }
 
 UserGestureGrantStore::UserGestureGrantStore()
@@ -24,7 +25,7 @@ bool UserGestureGrantStore::issue(const QString &appIdentity,
     purgeExpired(now);
     const QString grantKey = key(appIdentity, requestId);
     if (grants_.contains(grantKey) || used_.contains(grantKey)
-        || grants_.size() + used_.size() >= maximumRememberedGrants) {
+        || grants_.size() >= maximumRememberedGrants) {
         return false;
     }
     grants_.insert(grantKey, now + lifetimeMs);
@@ -45,7 +46,7 @@ bool UserGestureGrantStore::consume(const QString &appIdentity, const QString &r
         return false;
     }
     grants_.remove(grantKey);
-    used_.insert(grantKey);
+    used_.insert(grantKey, now + replayWindowMs);
     return true;
 }
 
@@ -71,8 +72,15 @@ void UserGestureGrantStore::purgeExpired(const qint64 now)
 {
     for (auto iterator = grants_.begin(); iterator != grants_.end();) {
         if (iterator.value() <= now) {
-            used_.insert(iterator.key());
+            used_.insert(iterator.key(), now + replayWindowMs);
             iterator = grants_.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+    for (auto iterator = used_.begin(); iterator != used_.end();) {
+        if (iterator.value() <= now) {
+            iterator = used_.erase(iterator);
         } else {
             ++iterator;
         }

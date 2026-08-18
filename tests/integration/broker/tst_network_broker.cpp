@@ -100,6 +100,8 @@ private slots:
     void boundsRequestAndResponsePayloads();
     void returnsStableTimeout();
     void rejectsWrongSchemePortAndResolvedAddressClass();
+    void classifiesOnlyGloballyRoutableAddressesAsPublic_data();
+    void classifiesOnlyGloballyRoutableAddressesAsPublic();
 };
 
 void NetworkBrokerTest::performsAllowedRequestAgainstRealServer()
@@ -222,6 +224,46 @@ void NetworkBrokerTest::rejectsWrongSchemePortAndResolvedAddressClass()
                                   context);
     QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
     QCOMPARE(server.requestCount, 0);
+}
+
+void NetworkBrokerTest::classifiesOnlyGloballyRoutableAddressesAsPublic_data()
+{
+    QTest::addColumn<QString>("address");
+    QTest::addColumn<int>("expected");
+    const int denied = -1;
+    QTest::newRow("public-v4") << QStringLiteral("8.8.8.8")
+                               << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("zero-net") << QStringLiteral("0.1.2.3") << denied;
+    QTest::newRow("private-10") << QStringLiteral("10.1.2.3")
+                                << static_cast<int>(NetworkAddressClass::Private);
+    QTest::newRow("carrier-grade") << QStringLiteral("100.64.0.1") << denied;
+    QTest::newRow("loopback") << QStringLiteral("127.0.0.1")
+                              << static_cast<int>(NetworkAddressClass::Loopback);
+    QTest::newRow("link-local") << QStringLiteral("169.254.1.1")
+                               << static_cast<int>(NetworkAddressClass::LinkLocal);
+    QTest::newRow("documentation") << QStringLiteral("192.0.2.1") << denied;
+    QTest::newRow("benchmark") << QStringLiteral("198.18.0.1") << denied;
+    QTest::newRow("broadcast") << QStringLiteral("255.255.255.255") << denied;
+    QTest::newRow("mapped-private") << QStringLiteral("::ffff:192.168.1.1")
+                                    << static_cast<int>(NetworkAddressClass::Private);
+    QTest::newRow("mapped-loopback") << QStringLiteral("::ffff:127.0.0.1")
+                                     << static_cast<int>(NetworkAddressClass::Loopback);
+    QTest::newRow("public-v6") << QStringLiteral("2606:4700:4700::1111")
+                               << static_cast<int>(NetworkAddressClass::Public);
+    QTest::newRow("unspecified-v6") << QStringLiteral("::") << denied;
+    QTest::newRow("documentation-v6") << QStringLiteral("2001:db8::1") << denied;
+    QTest::newRow("private-v6") << QStringLiteral("fd00::1")
+                                << static_cast<int>(NetworkAddressClass::Private);
+    QTest::newRow("link-local-v6") << QStringLiteral("fe80::1")
+                                   << static_cast<int>(NetworkAddressClass::LinkLocal);
+}
+
+void NetworkBrokerTest::classifiesOnlyGloballyRoutableAddressesAsPublic()
+{
+    QFETCH(QString, address);
+    QFETCH(int, expected);
+    const auto classification = classifyNetworkAddress(QHostAddress(address));
+    QCOMPARE(classification.has_value() ? static_cast<int>(*classification) : -1, expected);
 }
 
 QTEST_GUILESS_MAIN(NetworkBrokerTest)

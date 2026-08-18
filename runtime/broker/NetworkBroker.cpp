@@ -86,29 +86,9 @@ bool hasDotSegment(const QString &path)
     });
 }
 
-NetworkAddressClass classify(const QHostAddress &address)
+bool inSubnet(const QHostAddress &address, const char *network, const int prefix)
 {
-    if (address.isLoopback()) {
-        return NetworkAddressClass::Loopback;
-    }
-    if (address.isLinkLocal()) {
-        return NetworkAddressClass::LinkLocal;
-    }
-    if (address.protocol() == QAbstractSocket::IPv4Protocol) {
-        const quint32 value = address.toIPv4Address();
-        if ((value & 0xff000000U) == 0x0a000000U
-            || (value & 0xfff00000U) == 0xac100000U
-            || (value & 0xffff0000U) == 0xc0a80000U
-            || (value & 0xffc00000U) == 0x64400000U) {
-            return NetworkAddressClass::Private;
-        }
-    } else if (address.protocol() == QAbstractSocket::IPv6Protocol) {
-        const Q_IPV6ADDR bytes = address.toIPv6Address();
-        if ((bytes[0] & 0xfeU) == 0xfcU) {
-            return NetworkAddressClass::Private;
-        }
-    }
-    return NetworkAddressClass::Public;
+    return address.isInSubnet(QHostAddress(QString::fromLatin1(network)), prefix);
 }
 
 int remaining(const QElapsedTimer &timer, const int timeoutMs)
@@ -276,6 +256,56 @@ HttpResponse exchangeHttp(QAbstractSocket &socket,
 
 } // namespace
 
+std::optional<NetworkAddressClass> classifyNetworkAddress(const QHostAddress &input)
+{
+    if (input.isNull() || input.isMulticast()) {
+        return std::nullopt;
+    }
+    bool hasIpv4 = false;
+    const quint32 ipv4 = input.toIPv4Address(&hasIpv4);
+    const QHostAddress address = hasIpv4 ? QHostAddress(ipv4) : input;
+    if (address.isLoopback()) {
+        return NetworkAddressClass::Loopback;
+    }
+    if (address.isLinkLocal()) {
+        return NetworkAddressClass::LinkLocal;
+    }
+    if (hasIpv4) {
+        if (inSubnet(address, "10.0.0.0", 8)
+            || inSubnet(address, "172.16.0.0", 12)
+            || inSubnet(address, "192.168.0.0", 16)) {
+            return NetworkAddressClass::Private;
+        }
+        if (inSubnet(address, "0.0.0.0", 8)
+            || inSubnet(address, "100.64.0.0", 10)
+            || inSubnet(address, "192.0.0.0", 24)
+            || inSubnet(address, "192.0.2.0", 24)
+            || inSubnet(address, "192.88.99.0", 24)
+            || inSubnet(address, "198.18.0.0", 15)
+            || inSubnet(address, "198.51.100.0", 24)
+            || inSubnet(address, "203.0.113.0", 24)
+            || inSubnet(address, "224.0.0.0", 4)
+            || inSubnet(address, "240.0.0.0", 4)) {
+            return std::nullopt;
+        }
+        return NetworkAddressClass::Public;
+    }
+    if (address.protocol() != QAbstractSocket::IPv6Protocol) {
+        return std::nullopt;
+    }
+    if (inSubnet(address, "fc00::", 7)) {
+        return NetworkAddressClass::Private;
+    }
+    if (!inSubnet(address, "2000::", 3)
+        || inSubnet(address, "2001::", 23)
+        || inSubnet(address, "2001:db8::", 32)
+        || inSubnet(address, "2002::", 16)
+        || inSubnet(address, "3fff::", 20)) {
+        return std::nullopt;
+    }
+    return NetworkAddressClass::Public;
+}
+
 NetworkBroker::NetworkBroker(EffectiveNetworkPolicy policy)
     : policy_(std::move(policy)), ownedResolver_(std::make_unique<QtNetworkAddressResolver>()),
       resolver_(ownedResolver_.get())
@@ -357,8 +387,9 @@ BrokerResult NetworkBroker::invoke(const QString &operation,
                        QStringLiteral("Network request failed."));
     }
     for (const QHostAddress &address : addresses) {
-        if (address.isNull() || address.isMulticast()
-            || !allowedRule->addressClasses.contains(classify(address))) {
+        const auto classification = classifyNetworkAddress(address);
+        if (!classification.has_value()
+            || !allowedRule->addressClasses.contains(*classification)) {
             return failure(QStringLiteral("network.host_denied"),
                            QStringLiteral("Network destination is not permitted."));
         }
