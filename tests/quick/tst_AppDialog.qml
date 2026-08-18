@@ -13,6 +13,12 @@ TestCase {
         AppDialog {
             title: "Confirm order"
             accessibleDescription: "Confirm the pending order"
+            property alias selectionField: selectionField
+
+            TextField {
+                id: selectionField
+                text: "Selectable dialog text"
+            }
         }
     }
 
@@ -50,14 +56,22 @@ TestCase {
         compare(dialog.palette.windowText.toString(), Theme.textPrimary.toString())
         compare(dialog.palette.button.toString(), Theme.primary.toString())
         compare(dialog.palette.buttonText.toString(), Theme.textOnPrimary.toString())
+        compare(dialog.selectionField.selectionColor.toString(),
+                Theme.focusOnPrimary.toString())
+        compare(dialog.selectionField.selectedTextColor.toString(),
+                Theme.textOnFocus.toString())
+        verify(contrast(dialog.selectionField.selectionColor,
+                        dialog.selectionField.selectedTextColor) >= 4.5)
 
         dialog.open()
         tryVerify(function() { return dialog.opened })
         const acceptButton = dialog.standardButton(Dialog.Ok)
         verify(acceptButton)
-        dialog.accessibilityContainer.forceActiveFocus(Qt.TabFocusReason)
-        for (let index = 0; index < 4 && !acceptButton.activeFocus; ++index)
-            keyClick(Qt.Key_Tab)
+        acceptButton.forceActiveFocus()
+        verify(acceptButton.activeFocus)
+        keyClick(Qt.Key_Tab)
+        keyClick(Qt.Key_Backtab)
+        tryVerify(function() { return acceptButton.activeFocus })
         verify(acceptButton.activeFocus)
         verify(acceptButton.visualFocus)
         compare(acceptButton.background.border.color.toString(),

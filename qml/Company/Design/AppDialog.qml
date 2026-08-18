@@ -10,6 +10,7 @@ Dialog {
 
     modal: true
     focus: true
+    implicitWidth: Spacing.md * 24
     closePolicy: Popup.CloseOnEscape
     padding: Spacing.lg
     standardButtons: Dialog.Ok | Dialog.Cancel
@@ -22,7 +23,7 @@ Dialog {
     palette.button: Theme.primary
     palette.buttonText: Theme.textOnPrimary
     palette.highlight: Theme.focusOnPrimary
-    palette.highlightedText: Theme.textOnPrimary
+    palette.highlightedText: Theme.textOnFocus
 
     Overlay.modal: Rectangle {
         color: Theme.scrim

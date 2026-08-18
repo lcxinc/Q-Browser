@@ -16,6 +16,7 @@ QtObject {
     readonly property color textOnPrimary: "#ffffff"
     readonly property color focus: dark ? "#fbbf24" : "#b45309"
     readonly property color focusOnPrimary: "#ffffff"
+    readonly property color textOnFocus: "#111827"
     readonly property color error: dark ? "#fca5a5" : "#b91c1c"
     readonly property color errorSurface: dark ? "#451a1a" : "#fef2f2"
     readonly property color success: dark ? "#86efac" : "#15803d"
