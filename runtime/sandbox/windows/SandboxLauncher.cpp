@@ -90,15 +90,29 @@ std::vector<wchar_t> makeCommandLine(const QString &executable,
     return mutableCommand;
 }
 
-std::optional<std::vector<wchar_t>> makeEnvironmentBlock(
+SandboxValueResult<std::vector<wchar_t>> makeEnvironmentBlock(
     const QString &tempDirectory)
 {
     std::array<wchar_t, MAX_PATH + 1> windowsBuffer{};
     const UINT windowsLength = GetWindowsDirectoryW(
         windowsBuffer.data(), static_cast<UINT>(windowsBuffer.size()));
-    if (windowsLength == 0 || windowsLength >= windowsBuffer.size()
-        || tempDirectory.contains(u'\0')) {
-        return std::nullopt;
+    if (windowsLength == 0) {
+        const DWORD error = GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.launch.environment_failed"),
+                SandboxNativeError::win32(error != ERROR_SUCCESS
+                                              ? error
+                                              : ERROR_INVALID_ENVIRONMENT)};
+    }
+    if (windowsLength >= windowsBuffer.size()) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.launch.environment_failed"),
+                SandboxNativeError::win32(ERROR_INSUFFICIENT_BUFFER)};
+    }
+    if (tempDirectory.contains(u'\0')) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.launch.environment_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_NAME)};
     }
     const QString windowsDirectory = QString::fromWCharArray(
         windowsBuffer.data(), static_cast<qsizetype>(windowsLength));
@@ -124,7 +138,9 @@ std::optional<std::vector<wchar_t>> makeEnvironmentBlock(
     for (const char *name : safeHostVariables) {
         const QString value = qEnvironmentVariable(name);
         if (value.contains(u'\0')) {
-            return std::nullopt;
+            return {std::nullopt,
+                    QStringLiteral("sandbox.launch.environment_failed"),
+                    SandboxNativeError::win32(ERROR_INVALID_ENVIRONMENT)};
         }
         if (!value.isEmpty()) {
             variables.push_back(QString::fromLatin1(name) + u'=' + value);
@@ -145,7 +161,7 @@ std::optional<std::vector<wchar_t>> makeEnvironmentBlock(
         block.push_back(L'\0');
     }
     block.push_back(L'\0');
-    return block;
+    return {std::move(block), {}, {}};
 }
 
 class ProcThreadAttributeList final
@@ -159,24 +175,30 @@ public:
         }
     }
 
-    bool initialize(const DWORD count)
+    [[nodiscard]] DWORD initialize(const DWORD count)
     {
         SIZE_T bytes = 0;
-        if (InitializeProcThreadAttributeList(nullptr, count, 0, &bytes) != FALSE
-            || GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) {
-            return false;
+        if (InitializeProcThreadAttributeList(nullptr, count, 0, &bytes)
+            != FALSE) {
+            return ERROR_INVALID_DATA;
+        }
+        const DWORD sizingError = GetLastError();
+        if (sizingError != ERROR_INSUFFICIENT_BUFFER || bytes == 0) {
+            return sizingError != ERROR_SUCCESS ? sizingError
+                                                : ERROR_INVALID_DATA;
         }
         list_ = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
             HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes));
-        if (list_ == nullptr
-            || !InitializeProcThreadAttributeList(list_, count, 0, &bytes)) {
-            if (list_ != nullptr) {
-                HeapFree(GetProcessHeap(), 0, list_);
-                list_ = nullptr;
-            }
-            return false;
+        if (list_ == nullptr) {
+            return ERROR_NOT_ENOUGH_MEMORY;
         }
-        return true;
+        if (!InitializeProcThreadAttributeList(list_, count, 0, &bytes)) {
+            const DWORD error = GetLastError();
+            HeapFree(GetProcessHeap(), 0, list_);
+            list_ = nullptr;
+            return error;
+        }
+        return ERROR_SUCCESS;
     }
 
     LPPROC_THREAD_ATTRIBUTE_LIST get() const noexcept { return list_; }
@@ -208,10 +230,75 @@ private:
     HANDLE handle_ = nullptr;
 };
 
+class CapabilitySet final
+{
+public:
+    CapabilitySet() = default;
+    ~CapabilitySet()
+    {
+        for (PSID sid : sids_) {
+            LocalFree(sid);
+        }
+    }
+
+    CapabilitySet(const CapabilitySet &) = delete;
+    CapabilitySet &operator=(const CapabilitySet &) = delete;
+
+    bool add(const wchar_t *name, DWORD &error)
+    {
+        PSID *groupSids = nullptr;
+        DWORD groupCount = 0;
+        PSID *capabilitySids = nullptr;
+        DWORD capabilityCount = 0;
+        if (!DeriveCapabilitySidsFromName(name,
+                                          &groupSids,
+                                          &groupCount,
+                                          &capabilitySids,
+                                          &capabilityCount)) {
+            error = GetLastError();
+            return false;
+        }
+        for (DWORD index = 0; index < groupCount; ++index) {
+            LocalFree(groupSids[index]);
+        }
+        LocalFree(groupSids);
+        if (capabilityCount != 1 || capabilitySids == nullptr) {
+            for (DWORD index = 0; index < capabilityCount; ++index) {
+                LocalFree(capabilitySids[index]);
+            }
+            LocalFree(capabilitySids);
+            error = ERROR_INVALID_SID;
+            return false;
+        }
+        sids_.push_back(capabilitySids[0]);
+        LocalFree(capabilitySids);
+        attributes_.push_back({sids_.back(), SE_GROUP_ENABLED});
+        error = ERROR_SUCCESS;
+        return true;
+    }
+
+    SID_AND_ATTRIBUTES *data() noexcept { return attributes_.data(); }
+    [[nodiscard]] DWORD size() const noexcept
+    {
+        return static_cast<DWORD>(attributes_.size());
+    }
+
+private:
+    std::vector<PSID> sids_;
+    std::vector<SID_AND_ATTRIBUTES> attributes_;
+};
+
 SandboxLaunchResult failure(const QString &code,
-                            const DWORD nativeError = ERROR_INVALID_DATA)
+                            const SandboxNativeError nativeError)
 {
     return {std::nullopt, code, nativeError};
+}
+
+SandboxLaunchResult win32Failure(
+    const QString &code,
+    const DWORD nativeError = ERROR_INVALID_DATA)
+{
+    return failure(code, SandboxNativeError::win32(nativeError));
 }
 
 bool inheritablePipeHandle(const HANDLE handle)
@@ -332,33 +419,38 @@ SandboxLaunchResult SandboxLauncher::launch(
 {
     static_assert(!std::is_copy_constructible_v<WorkerPipeEnds>);
     if (!workerPipeEnds.isValid()) {
-        return failure(QStringLiteral("sandbox.ipc.invalid_handles"),
-                       ERROR_INVALID_HANDLE);
+        return win32Failure(QStringLiteral("sandbox.ipc.invalid_handles"),
+                            ERROR_INVALID_HANDLE);
     }
     const HANDLE workerRead = workerPipeEnds.nativeReadHandle();
     const HANDLE workerWrite = workerPipeEnds.nativeWriteHandle();
     if (workerRead == workerWrite || !inheritablePipeHandle(workerRead)
         || !inheritablePipeHandle(workerWrite)) {
-        return failure(QStringLiteral("sandbox.ipc.invalid_handles"),
-                       ERROR_INVALID_HANDLE);
+        return win32Failure(QStringLiteral("sandbox.ipc.invalid_handles"),
+                            ERROR_INVALID_HANDLE);
     }
 
-    const QFileInfo executableInfo(config.executablePath);
-    const QFileInfo packageInfo(config.packageDirectory);
-    const QFileInfo tempInfo(config.tempDirectory);
+    auto trusted = config.revalidateTrust();
+    if (!trusted.value.has_value()) {
+        return failure(trusted.errorCode, trusted.nativeError);
+    }
+
+    const QFileInfo executableInfo(config.executablePath());
+    const QFileInfo packageInfo(config.packageDirectory());
+    const QFileInfo tempInfo(config.tempDirectory());
     if (!executableInfo.isAbsolute() || !executableInfo.isFile()
         || executableInfo.isSymLink() || !packageInfo.isAbsolute()
         || !packageInfo.isDir() || packageInfo.isSymLink()
         || !tempInfo.isAbsolute() || !tempInfo.isDir() || tempInfo.isSymLink()) {
-        return failure(QStringLiteral("sandbox.path.invalid"),
-                       ERROR_PATH_NOT_FOUND);
+        return win32Failure(QStringLiteral("sandbox.path.invalid"),
+                            ERROR_PATH_NOT_FOUND);
     }
-    const QString executable = absolutePath(config.executablePath);
-    const QString packageDirectory = absolutePath(config.packageDirectory);
-    const QString tempDirectory = absolutePath(config.tempDirectory);
+    const QString executable = absolutePath(config.executablePath());
+    const QString packageDirectory = absolutePath(config.packageDirectory());
+    const QString tempDirectory = absolutePath(config.tempDirectory());
     if (pathWithin(packageDirectory, tempDirectory)
         || pathWithin(tempDirectory, packageDirectory)) {
-        return failure(QStringLiteral("sandbox.path.overlap"));
+        return win32Failure(QStringLiteral("sandbox.path.overlap"));
     }
 
     // Keep the validated image open without write/delete sharing through
@@ -381,22 +473,38 @@ SandboxLaunchResult SandboxLauncher::launch(
             != 0U
         || (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             != 0U) {
-        return failure(QStringLiteral("sandbox.path.executable_unstable"),
-                       GetLastError());
+        const DWORD error = !validHandle(executableLock.get())
+            ? GetLastError()
+            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                != 0U
+            ? ERROR_REPARSE_TAG_INVALID
+            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                != 0U
+            ? ERROR_DIRECTORY
+            : GetLastError();
+        return win32Failure(
+            QStringLiteral("sandbox.path.executable_unstable"), error);
     }
 
-    auto profile = AppContainerProfile::createOrOpen(config.appId);
-    if (!profile.has_value()) {
-        return failure(QStringLiteral("sandbox.profile.create_failed"),
-                       GetLastError());
+    // Resource limits are caller-selected launch data. Validate and construct
+    // the Job before the first filesystem ACL mutation.
+    auto job = JobLimits::create(config.resourceLimits());
+    if (!job.value.has_value()) {
+        return failure(job.errorCode, job.nativeError);
     }
-    const QString sidText = profile->sidString();
-    if (sidText.isEmpty()) {
-        return failure(QStringLiteral("sandbox.profile.sid_failed"));
+
+    auto profile = AppContainerProfile::createOrOpen(config.appId());
+    if (!profile.has_value()) {
+        return failure(profile.errorCode, profile.nativeError);
+    }
+    auto sidText = profile->sidString();
+    if (!sidText.value.has_value()) {
+        return failure(sidText.errorCode, sidText.nativeError);
     }
 
     std::vector<AclGrant> grants;
-    grants.reserve(3);
+    grants.reserve(static_cast<size_t>(config.runtimeResources().size())
+                   + 2U);
     auto packageGrant = AclGrant::apply(packageDirectory,
                                         profile->sid(),
                                         SandboxPathAccess::ReadOnly,
@@ -405,38 +513,50 @@ SandboxLaunchResult SandboxLauncher::launch(
                                      profile->sid(),
                                      SandboxPathAccess::ReadWrite,
                                      true);
-    auto executableGrant = AclGrant::apply(executable,
-                                           profile->sid(),
-                                           SandboxPathAccess::ReadOnly,
-                                           false);
-    if (!packageGrant.has_value() || !tempGrant.has_value()
-        || !executableGrant.has_value()) {
-        return failure(QStringLiteral("sandbox.acl.grant_failed"),
-                       GetLastError());
+    if (!packageGrant.has_value()) {
+        return failure(packageGrant.errorCode, packageGrant.nativeError);
+    }
+    if (!tempGrant.has_value()) {
+        return failure(tempGrant.errorCode, tempGrant.nativeError);
     }
     if (pathWithin(packageGrant->finalPath(), tempGrant->finalPath())
         || pathWithin(tempGrant->finalPath(), packageGrant->finalPath())) {
-        return failure(QStringLiteral("sandbox.path.overlap"));
+        return win32Failure(QStringLiteral("sandbox.path.overlap"));
     }
     grants.push_back(std::move(*packageGrant));
     grants.push_back(std::move(*tempGrant));
-    grants.push_back(std::move(*executableGrant));
-
-    auto job = JobLimits::create(config.resourceLimits);
-    if (!job.has_value()) {
-        return failure(QStringLiteral("sandbox.job.create_failed"),
-                       GetLastError());
+    for (const QString &runtimeResource : config.runtimeResources()) {
+        auto runtimeGrant = AclGrant::apply(runtimeResource,
+                                            profile->sid(),
+                                            SandboxPathAccess::ReadExecute,
+                                            false);
+        if (!runtimeGrant.has_value()) {
+            return failure(runtimeGrant.errorCode,
+                           runtimeGrant.nativeError);
+        }
+        grants.push_back(std::move(*runtimeGrant));
     }
 
     ProcThreadAttributeList attributes;
-    if (!attributes.initialize(3)) {
-        return failure(QStringLiteral("sandbox.launch.attribute_list_failed"),
-                       GetLastError());
+    const DWORD attributeListError = attributes.initialize(3);
+    if (attributeListError != ERROR_SUCCESS) {
+        return win32Failure(
+            QStringLiteral("sandbox.launch.attribute_list_failed"),
+            attributeListError);
     }
     SECURITY_CAPABILITIES capabilities{};
+    CapabilitySet compatibilityCapabilities;
+    DWORD capabilityError = ERROR_SUCCESS;
+    // Desktop Qt6Core reads Windows configuration during image startup. The
+    // official LPAC model requires registryRead for registry access; the
+    // launch tests pin this as the sole capability and prove network denial.
+    if (!compatibilityCapabilities.add(L"registryRead", capabilityError)) {
+        return win32Failure(QStringLiteral("sandbox.launch.capability_failed"),
+                            capabilityError);
+    }
     capabilities.AppContainerSid = profile->sid();
-    capabilities.Capabilities = nullptr;
-    capabilities.CapabilityCount = 0;
+    capabilities.Capabilities = compatibilityCapabilities.data();
+    capabilities.CapabilityCount = compatibilityCapabilities.size();
     capabilities.Reserved = 0;
     std::array<HANDLE, 2> inheritedHandles{workerRead, workerWrite};
     DWORD allApplicationPackagesPolicy =
@@ -462,16 +582,16 @@ SandboxLaunchResult SandboxLauncher::launch(
                                       sizeof(allApplicationPackagesPolicy),
                                       nullptr,
                                       nullptr)) {
-        return failure(QStringLiteral("sandbox.launch.attribute_failed"),
-                       GetLastError());
+        return win32Failure(QStringLiteral("sandbox.launch.attribute_failed"),
+                            GetLastError());
     }
 
     std::vector<wchar_t> commandLine = makeCommandLine(
-        executable, config.arguments, workerRead, workerWrite);
+        executable, config.arguments(), workerRead, workerWrite);
     auto environmentBlock = makeEnvironmentBlock(tempDirectory);
-    if (!environmentBlock.has_value()) {
-        return failure(QStringLiteral("sandbox.launch.environment_failed"),
-                       ERROR_INVALID_ENVIRONMENT);
+    if (!environmentBlock.value.has_value()) {
+        return failure(environmentBlock.errorCode,
+                       environmentBlock.nativeError);
     }
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
@@ -485,34 +605,35 @@ SandboxLaunchResult SandboxLauncher::launch(
                         nullptr,
                         TRUE,
                         flags,
-                        environmentBlock->data(),
+                         environmentBlock.value->data(),
                         reinterpret_cast<LPCWSTR>(tempDirectory.utf16()),
                         &startup.StartupInfo,
                         &process)) {
-        return failure(QStringLiteral("sandbox.launch.create_failed"),
-                       GetLastError());
+        return win32Failure(QStringLiteral("sandbox.launch.create_failed"),
+                            GetLastError());
     }
     UniqueHandle processHandle(process.hProcess);
     UniqueHandle threadHandle(process.hThread);
     workerPipeEnds.close();
 
-    if (!job->assignProcess(processHandle.get())) {
-        const DWORD error = GetLastError();
+    auto assignment = job->assignProcess(processHandle.get());
+    if (!assignment.value.has_value()) {
         TerminateProcess(processHandle.get(), ERROR_PROCESS_ABORTED);
         WaitForSingleObject(processHandle.get(), 5000);
-        return failure(QStringLiteral("sandbox.job.assign_failed"), error);
+        return failure(assignment.errorCode, assignment.nativeError);
     }
     if (ResumeThread(threadHandle.get()) == DWORD(-1)) {
         const DWORD error = GetLastError();
         TerminateProcess(processHandle.get(), ERROR_PROCESS_ABORTED);
         WaitForSingleObject(processHandle.get(), 5000);
-        return failure(QStringLiteral("sandbox.launch.resume_failed"), error);
+        return win32Failure(QStringLiteral("sandbox.launch.resume_failed"),
+                            error);
     }
     return {SandboxProcess(processHandle.release(),
                            process.dwProcessId,
                            std::move(*job),
                            std::move(grants),
-                           sidText),
+                            *sidText.value),
             {},
-            ERROR_SUCCESS};
+            {}};
 }

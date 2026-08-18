@@ -24,24 +24,31 @@ QString absoluteNativePath(const QString &path)
 
 bool inspectTarget(const HANDLE target,
                    bool &directory,
-                   QString &finalPath)
+                   QString &finalPath,
+                   DWORD &error)
 {
     FILE_ATTRIBUTE_TAG_INFO attributes{};
     if (!GetFileInformationByHandleEx(target,
                                       FileAttributeTagInfo,
                                       &attributes,
-                                      sizeof(attributes))
-        || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+                                      sizeof(attributes))) {
+        error = GetLastError();
+        return false;
+    }
+    if ((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        error = ERROR_REPARSE_TAG_INVALID;
         return false;
     }
     directory = (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U;
     if (!directory && GetFileType(target) != FILE_TYPE_DISK) {
+        error = ERROR_INVALID_HANDLE;
         return false;
     }
     const DWORD required = GetFinalPathNameByHandleW(
         target, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (required == 0
         || required > static_cast<DWORD>(std::numeric_limits<int>::max())) {
+        error = required == 0 ? GetLastError() : ERROR_ARITHMETIC_OVERFLOW;
         return false;
     }
     std::vector<wchar_t> buffer(static_cast<size_t>(required) + 1U);
@@ -51,15 +58,20 @@ bool inspectTarget(const HANDLE target,
         static_cast<DWORD>(buffer.size()),
         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (length == 0 || length >= buffer.size()) {
+        error = length == 0 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER;
         return false;
     }
     finalPath = QString::fromWCharArray(buffer.data(), length);
+    error = ERROR_SUCCESS;
     return true;
 }
 
 DWORD accessMask(const SandboxPathAccess access, const bool directory)
 {
-    DWORD mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    DWORD mask = FILE_GENERIC_READ;
+    if (access == SandboxPathAccess::ReadExecute) {
+        mask |= FILE_GENERIC_EXECUTE;
+    }
     if (access == SandboxPathAccess::ReadWrite) {
         mask |= FILE_GENERIC_WRITE | DELETE;
         if (directory) {
@@ -115,14 +127,22 @@ AclGrant &AclGrant::operator=(AclGrant &&other) noexcept
     return *this;
 }
 
-std::optional<AclGrant> AclGrant::apply(const QString &path,
-                                        PSID appContainerSid,
-                                        const SandboxPathAccess access,
-                                        const bool inheritToChildren)
+SandboxValueResult<AclGrant> AclGrant::apply(
+    const QString &path,
+    PSID appContainerSid,
+    const SandboxPathAccess access,
+    const bool inheritToChildren)
 {
-    if (path.isEmpty() || appContainerSid == nullptr
+    if (path.isEmpty()) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.invalid_path"),
+                SandboxNativeError::win32(ERROR_INVALID_PARAMETER)};
+    }
+    if (appContainerSid == nullptr
         || IsValidSid(appContainerSid) == FALSE) {
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.invalid_sid"),
+                SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
     const QString normalized = absoluteNativePath(path);
     HANDLE target = CreateFileW(
@@ -135,12 +155,24 @@ std::optional<AclGrant> AclGrant::apply(const QString &path,
         nullptr);
     bool directory = false;
     QString finalPath;
-    if (!validHandle(target) || !inspectTarget(target, directory, finalPath)
+    DWORD inspectError = ERROR_SUCCESS;
+    if (!validHandle(target)) {
+        const DWORD openError = GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.open_failed"),
+                SandboxNativeError::win32(openError)};
+    }
+    if (!inspectTarget(target, directory, finalPath, inspectError)
         || (inheritToChildren && !directory)) {
         if (validHandle(target)) {
             CloseHandle(target);
         }
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.target_invalid"),
+                SandboxNativeError::win32(
+                    inspectError != ERROR_SUCCESS
+                        ? inspectError
+                        : ERROR_DIRECTORY)};
     }
 
     PACL existingDacl = nullptr;
@@ -158,9 +190,21 @@ std::optional<AclGrant> AclGrant::apply(const QString &path,
             LocalFree(descriptor);
         }
         CloseHandle(target);
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.read_security_failed"),
+                SandboxNativeError::win32(
+                    securityResult != ERROR_SUCCESS
+                        ? securityResult
+                        : ERROR_INVALID_SECURITY_DESCR)};
     }
     const DWORD descriptorLength = GetSecurityDescriptorLength(descriptor);
+    if (descriptorLength == 0) {
+        LocalFree(descriptor);
+        CloseHandle(target);
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.read_security_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_SECURITY_DESCR)};
+    }
     const QByteArray originalSecurity(static_cast<const char *>(descriptor),
                                       descriptorLength);
 
@@ -192,9 +236,11 @@ std::optional<AclGrant> AclGrant::apply(const QString &path,
     LocalFree(descriptor);
     if (applyResult != ERROR_SUCCESS) {
         CloseHandle(target);
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.apply_failed"),
+                SandboxNativeError::win32(applyResult)};
     }
-    return AclGrant(target, originalSecurity, finalPath);
+    return {AclGrant(target, originalSecurity, finalPath), {}, {}};
 }
 
 bool AclGrant::isValid() const noexcept

@@ -81,6 +81,22 @@ bool canWriteFile(const std::wstring &path)
     return ok;
 }
 
+bool canOpenFileForExecute(const std::wstring &path)
+{
+    HANDLE file = CreateFileW(path.c_str(),
+                              GENERIC_EXECUTE,
+                              FILE_SHARE_READ,
+                              nullptr,
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(file);
+    return true;
+}
+
 bool canConnectLoopback(const unsigned short port, int &error)
 {
     WSADATA data{};
@@ -389,6 +405,9 @@ int wmain(const int argc, wchar_t **argv)
     int networkError = 0;
     const bool packageRead = canReadFile(packageFile);
     const bool tempWrite = canWriteFile(tempFile);
+    const bool packageExecuteOpen = canOpenFileForExecute(packageFile);
+    const bool tempExecuteOpen = canOpenFileForExecute(tempFile);
+    const bool runtimeExecuteOpen = canOpenFileForExecute(selfPath);
     const bool privateRead = canReadFile(privateFile);
     const bool windowsRead = canReadFile(L"C:\\Windows\\win.ini");
     const bool networkAttempted = portEnd != nullptr && *portEnd == L'\0'
@@ -422,6 +441,9 @@ int wmain(const int argc, wchar_t **argv)
     const std::string json = std::string("{")
         + "\"packageRead\":" + jsonBoolean(packageRead)
         + ",\"tempWrite\":" + jsonBoolean(tempWrite)
+        + ",\"packageExecuteOpen\":" + jsonBoolean(packageExecuteOpen)
+        + ",\"tempExecuteOpen\":" + jsonBoolean(tempExecuteOpen)
+        + ",\"runtimeExecuteOpen\":" + jsonBoolean(runtimeExecuteOpen)
         + ",\"privateRead\":" + jsonBoolean(privateRead)
         + ",\"windowsRead\":" + jsonBoolean(windowsRead)
         + ",\"networkAttempted\":" + jsonBoolean(networkAttempted)

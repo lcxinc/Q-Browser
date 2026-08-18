@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SandboxError.h"
+
 #include <QString>
 
 #include <qt_windows.h>
@@ -18,13 +20,14 @@ public:
     AppContainerProfile &operator=(AppContainerProfile &&other) noexcept;
 
     static std::optional<QString> deterministicName(const QString &appId);
-    static std::optional<AppContainerProfile> createOrOpen(const QString &appId);
+    static SandboxValueResult<AppContainerProfile> createOrOpen(
+        const QString &appId);
 
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] bool wasCreated() const noexcept;
     [[nodiscard]] const QString &name() const noexcept;
     [[nodiscard]] PSID sid() const noexcept;
-    [[nodiscard]] QString sidString() const;
+    [[nodiscard]] SandboxValueResult<QString> sidString() const;
 
 private:
     AppContainerProfile(QString name, PSID sid, bool created) noexcept;

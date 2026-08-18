@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SandboxError.h"
+
 #include <QByteArray>
 #include <QString>
 
@@ -9,6 +11,7 @@
 
 enum class SandboxPathAccess {
     ReadOnly,
+    ReadExecute,
     ReadWrite,
 };
 
@@ -23,10 +26,10 @@ public:
     AclGrant(AclGrant &&other) noexcept;
     AclGrant &operator=(AclGrant &&other) noexcept;
 
-    static std::optional<AclGrant> apply(const QString &path,
-                                         PSID appContainerSid,
-                                         SandboxPathAccess access,
-                                         bool inheritToChildren);
+    static SandboxValueResult<AclGrant> apply(const QString &path,
+                                              PSID appContainerSid,
+                                              SandboxPathAccess access,
+                                              bool inheritToChildren);
 
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] const QString &finalPath() const noexcept;

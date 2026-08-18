@@ -1,6 +1,7 @@
 if(BUILD_TESTING)
   if(WIN32)
     add_subdirectory(helpers/sandbox_probe)
+    add_subdirectory(helpers/qt_sandbox_probe)
     add_subdirectory(security)
   endif()
 

@@ -4,7 +4,7 @@
 
 **Goal:** Make Windows sandbox launch paths valid by construction, grant the complete minimal trusted Qt runtime closure, and preserve exact native failure codes.
 
-**Architecture:** A move-only `SandboxTrustBoundary` factory validates and holds stable handles for Host-owned package-store, sandbox-temp, and immutable runtime roots. Only this boundary can construct a launch configuration, and `SandboxLauncher` revalidates the retained identities before applying transactional ACL grants. A dynamically Qt6Core-linked helper staged with its minimal DLL closure proves that the zero-capability LPAC can load the real runtime and handshake.
+**Architecture:** A move-only `SandboxTrustBoundary` factory validates and holds stable handles for Host-owned package-store, sandbox-temp, and immutable runtime roots. Only this boundary can construct a launch configuration, and `SandboxLauncher` revalidates the retained identities before applying transactional ACL grants. A dynamically Qt6Core-linked helper staged with its minimal DLL closure proves that the LPAC can load the real runtime and handshake with exactly the non-network `registryRead` compatibility capability required by the desktop Qt build.
 
 **Tech Stack:** C++20, Qt 6.11.1 Core/Test/Network, CMake 3.30, MSVC 2022, Windows AppContainer, Win32 security descriptors and stable file handles, Qt Test.
 
@@ -94,7 +94,7 @@ Run the targeted sandbox test and require every rejection plus no-mutation asser
 
 **Step 1: Write the failing dynamic launch test**
 
-Build a helper linked to `Qt6::Core`. In the test, create a protected Host/SYSTEM-only runtime staging directory, copy only the helper and `$<TARGET_FILE:Qt6::Core>` into it, and construct a trust boundary with that directory as the runtime closure. Launch the staged helper and assert an IPC JSON handshake containing the Qt version, `TokenIsAppContainer=true`, LPAC semantics, and a successfully queried capability count of zero. Assert the runtime-root DACL is restored after process destruction.
+Build a helper linked to `Qt6::Core`. In the test, create a protected Host/SYSTEM-only runtime staging directory, copy only the helper and `$<TARGET_FILE:Qt6::Core>` into it, and construct a trust boundary with that directory as the runtime closure. Launch the staged helper and assert an IPC JSON handshake containing the Qt version, `TokenIsAppContainer=true`, LPAC semantics, and the exact allowlisted capability SID. Assert the runtime-root DACL is restored after process destruction.
 
 **Step 2: Verify RED**
 
@@ -102,11 +102,11 @@ Run the dynamic helper test. Expected: boundary/config compilation failure or pr
 
 **Step 3: Implement transactional runtime grants**
 
-Before process creation, revalidate all retained root and selected-path identities. Grant recursive read/execute access to each minimal immutable runtime closure root, read-only access to the package version, and read/write access only to worker temp. Validate all relations before the first grant. Keep all grants in `SandboxProcess`, restore in reverse order, and return the exact grant failure if any step fails.
+Before process creation, revalidate all retained root and selected-path identities and their recorded owner/DACL evidence. Grant non-inherited read/execute access to each object captured in the minimal immutable runtime closure, read-only (never execute) access to the package version, and read/write (never execute) access only to worker temp. A file added to the runtime root after boundary construction receives no Worker ACE. Validate all relations and Job limits before the first grant. Keep all grants in `SandboxProcess`, restore in reverse order, and return the exact grant failure if any step fails.
 
 **Step 4: Verify GREEN**
 
-Run the targeted test and require both the static negative probe and dynamic Qt helper to pass under zero capabilities.
+Run a controlled capability matrix: zero capabilities, `registryRead` only, `lpacCom` only, then their combination only if required. On the current Qt 6.11.1 desktop build, zero and `lpacCom` alone fail before `main` with `0xC0000022`, while `registryRead` alone loads Qt6Core and handshakes. Keep exactly `registryRead`; assert capability count one, its derived SID, absence of `internetClient`, absence of enabled `ALL APPLICATION PACKAGES`, and all private-file/network/process/self-spawn negatives. With this compatibility capability, the current Windows build reports zero for `TokenIsLessPrivilegedAppContainer` even though the opt-out token has no enabled `ALL APPLICATION PACKAGES`; use the latter documented defining property as the portable LPAC invariant rather than weakening to an ordinary AppContainer.
 
 ### Task 4: Documentation and final verification
 

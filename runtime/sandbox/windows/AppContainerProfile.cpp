@@ -69,12 +69,14 @@ std::optional<QString> AppContainerProfile::deterministicName(
         + QString::fromLatin1(digest.first(48));
 }
 
-std::optional<AppContainerProfile> AppContainerProfile::createOrOpen(
+SandboxValueResult<AppContainerProfile> AppContainerProfile::createOrOpen(
     const QString &appId)
 {
     const auto profileName = deterministicName(appId);
     if (!profileName.has_value()) {
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.invalid_name"),
+                SandboxNativeError::win32(ERROR_INVALID_NAME)};
     }
 
     PSID profileSid = nullptr;
@@ -86,22 +88,32 @@ std::optional<AppContainerProfile> AppContainerProfile::createOrOpen(
         0,
         &profileSid);
     if (SUCCEEDED(created) && profileSid != nullptr && IsValidSid(profileSid)) {
-        return AppContainerProfile(*profileName, profileSid, true);
+        return {AppContainerProfile(*profileName, profileSid, true), {}, {}};
     }
     if (profileSid != nullptr) {
         FreeSid(profileSid);
         profileSid = nullptr;
     }
-    if (created != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)
-        || FAILED(DeriveAppContainerSidFromAppContainerName(
-            reinterpret_cast<PCWSTR>(profileName->utf16()), &profileSid))
-        || profileSid == nullptr || !IsValidSid(profileSid)) {
+    if (created != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.create_failed"),
+                SUCCEEDED(created)
+                    ? SandboxNativeError::win32(ERROR_INVALID_SID)
+                    : SandboxNativeError::hresult(created)};
+    }
+    const HRESULT derived = DeriveAppContainerSidFromAppContainerName(
+        reinterpret_cast<PCWSTR>(profileName->utf16()), &profileSid);
+    if (FAILED(derived) || profileSid == nullptr || !IsValidSid(profileSid)) {
         if (profileSid != nullptr) {
             FreeSid(profileSid);
         }
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.derive_failed"),
+                FAILED(derived)
+                    ? SandboxNativeError::hresult(derived)
+                    : SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
-    return AppContainerProfile(*profileName, profileSid, false);
+    return {AppContainerProfile(*profileName, profileSid, false), {}, {}};
 }
 
 bool AppContainerProfile::isValid() const noexcept
@@ -124,18 +136,30 @@ PSID AppContainerProfile::sid() const noexcept
     return sid_;
 }
 
-QString AppContainerProfile::sidString() const
+SandboxValueResult<QString> AppContainerProfile::sidString() const
 {
     if (!isValid()) {
-        return {};
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.sid_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
     LPWSTR converted = nullptr;
-    if (!ConvertSidToStringSidW(sid_, &converted) || converted == nullptr) {
-        return {};
+    const BOOL convertedOk = ConvertSidToStringSidW(sid_, &converted);
+    const DWORD conversionError = convertedOk ? ERROR_SUCCESS : GetLastError();
+    if (!convertedOk || converted == nullptr) {
+        const DWORD error = !convertedOk ? conversionError : ERROR_INVALID_SID;
+        if (converted != nullptr) {
+            LocalFree(converted);
+        }
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.sid_failed"),
+                SandboxNativeError::win32(error != ERROR_SUCCESS
+                                              ? error
+                                              : ERROR_INVALID_SID)};
     }
     const QString value = QString::fromWCharArray(converted);
     LocalFree(converted);
-    return value;
+    return {value, {}, {}};
 }
 
 AppContainerProfile::AppContainerProfile(QString name,

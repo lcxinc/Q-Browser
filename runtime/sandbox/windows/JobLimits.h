@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SandboxError.h"
+
 #include <QtGlobal>
 
 #include <qt_windows.h>
@@ -23,11 +25,13 @@ public:
     JobLimits(JobLimits &&other) noexcept;
     JobLimits &operator=(JobLimits &&other) noexcept;
 
-    static std::optional<JobLimits> create(const SandboxResourceLimits &limits);
+    static SandboxValueResult<JobLimits> create(
+        const SandboxResourceLimits &limits);
 
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] HANDLE nativeHandle() const noexcept;
-    bool assignProcess(HANDLE process) const noexcept;
+    [[nodiscard]] SandboxValueResult<bool> assignProcess(
+        HANDLE process) const noexcept;
     void reset() noexcept;
 
 private:

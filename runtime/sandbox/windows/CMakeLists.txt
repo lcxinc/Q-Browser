@@ -10,7 +10,10 @@ add_library(q_browser_sandbox STATIC
   JobLimits.cpp
   JobLimits.h
   SandboxLauncher.cpp
-  SandboxLauncher.h)
+  SandboxLauncher.h
+  SandboxError.h
+  SandboxTrustBoundary.cpp
+  SandboxTrustBoundary.h)
 
 target_include_directories(q_browser_sandbox
   PUBLIC
@@ -22,6 +25,7 @@ target_link_libraries(q_browser_sandbox
     Qt6::Core
   PRIVATE
     Advapi32
+    OneCoreUAP
     Userenv)
 
 q_browser_enable_strict_warnings(q_browser_sandbox)

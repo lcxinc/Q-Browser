@@ -2,7 +2,9 @@
 #include "AppContainerProfile.h"
 #include "FrameCodec.h"
 #include "JobLimits.h"
+#include "SandboxError.h"
 #include "SandboxLauncher.h"
+#include "SandboxTrustBoundary.h"
 #include "WinPipeTransport.h"
 
 #include <QDir>
@@ -19,8 +21,10 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <userenv.h>
+#include <winioctl.h>
 
 #include <optional>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -195,6 +199,38 @@ QString currentUserSidString()
     return result;
 }
 
+QString capabilitySidString(const wchar_t *name)
+{
+    PSID *groupSids = nullptr;
+    DWORD groupCount = 0;
+    PSID *capabilitySids = nullptr;
+    DWORD capabilityCount = 0;
+    if (!DeriveCapabilitySidsFromName(name,
+                                      &groupSids,
+                                      &groupCount,
+                                      &capabilitySids,
+                                      &capabilityCount)) {
+        return {};
+    }
+    for (DWORD index = 0; index < groupCount; ++index) {
+        LocalFree(groupSids[index]);
+    }
+    LocalFree(groupSids);
+    QString result;
+    if (capabilityCount == 1) {
+        LPWSTR converted = nullptr;
+        if (ConvertSidToStringSidW(capabilitySids[0], &converted)) {
+            result = QString::fromWCharArray(converted);
+            LocalFree(converted);
+        }
+    }
+    for (DWORD index = 0; index < capabilityCount; ++index) {
+        LocalFree(capabilitySids[index]);
+    }
+    LocalFree(capabilitySids);
+    return result;
+}
+
 bool createProtectedPrivateFile(const QString &path,
                                 const QString &userSid)
 {
@@ -299,6 +335,172 @@ bool hasProtectedHostSystemOnlyDacl(const QString &path,
     return exact && sawUser && sawSystem;
 }
 
+bool protectHostSystemDirectory(const QString &path,
+                                const QString &userSid)
+{
+    const QString sddl = QStringLiteral(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;%1)").arg(userSid);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            reinterpret_cast<LPCWSTR>(sddl.utf16()),
+            SDDL_REVISION_1,
+            &descriptor,
+            nullptr)) {
+        return false;
+    }
+    PACL dacl = nullptr;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    const bool extracted = GetSecurityDescriptorDacl(
+        descriptor, &present, &dacl, &defaulted) != FALSE && present != FALSE;
+    const DWORD result = extracted
+        ? SetNamedSecurityInfoW(
+              const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+              SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr,
+              nullptr,
+              dacl,
+              nullptr)
+        : ERROR_INVALID_SECURITY_DESCR;
+    LocalFree(descriptor);
+    return result == ERROR_SUCCESS;
+}
+
+bool protectHostSystemDirectoryWithWorldAccess(const QString &path,
+                                               const QString &userSid,
+                                               const QString &rights)
+{
+    const QString sddl = QStringLiteral(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;%1)(A;OICI;%2;;;WD)")
+                             .arg(userSid, rights);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            reinterpret_cast<LPCWSTR>(sddl.utf16()),
+            SDDL_REVISION_1,
+            &descriptor,
+            nullptr)) {
+        return false;
+    }
+    PACL dacl = nullptr;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    const bool extracted = GetSecurityDescriptorDacl(
+        descriptor, &present, &dacl, &defaulted) != FALSE && present != FALSE;
+    const DWORD result = extracted
+        ? SetNamedSecurityInfoW(
+              const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+              SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr,
+              nullptr,
+              dacl,
+              nullptr)
+        : ERROR_INVALID_SECURITY_DESCR;
+    LocalFree(descriptor);
+    return result == ERROR_SUCCESS;
+}
+
+QByteArray daclSnapshot(const QString &path)
+{
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr) {
+        if (descriptor != nullptr) {
+            LocalFree(descriptor);
+        }
+        return {};
+    }
+    const DWORD bytes = GetSecurityDescriptorLength(descriptor);
+    const QByteArray snapshot(static_cast<const char *>(descriptor), bytes);
+    LocalFree(descriptor);
+    return snapshot;
+}
+
+bool createDirectoryJunction(const QString &junctionPath,
+                             const QString &targetPath)
+{
+    struct MountPointReparseData final
+    {
+        DWORD tag;
+        USHORT dataLength;
+        USHORT reserved;
+        USHORT substituteNameOffset;
+        USHORT substituteNameLength;
+        USHORT printNameOffset;
+        USHORT printNameLength;
+        wchar_t pathBuffer[1];
+    };
+    constexpr DWORD reparseHeaderBytes = sizeof(DWORD) + sizeof(USHORT) * 2U;
+    if (!CreateDirectoryW(
+            reinterpret_cast<LPCWSTR>(junctionPath.utf16()), nullptr)) {
+        return false;
+    }
+    UniqueHandle junction(CreateFileW(
+        reinterpret_cast<LPCWSTR>(junctionPath.utf16()),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr));
+    if (junction.get() == nullptr || junction.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const QString printName = QDir::toNativeSeparators(
+        QFileInfo(targetPath).absoluteFilePath());
+    const QString substituteName = QStringLiteral("\\??\\") + printName;
+    std::vector<unsigned char> storage(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    auto *reparse = reinterpret_cast<MountPointReparseData *>(storage.data());
+    reparse->tag = IO_REPARSE_TAG_MOUNT_POINT;
+    reparse->reserved = 0;
+    reparse->substituteNameOffset = 0;
+    reparse->substituteNameLength =
+        static_cast<USHORT>(substituteName.size() * sizeof(wchar_t));
+    reparse->printNameOffset = reparse->substituteNameLength
+        + sizeof(wchar_t);
+    reparse->printNameLength =
+        static_cast<USHORT>(printName.size() * sizeof(wchar_t));
+    wchar_t *pathBuffer = reparse->pathBuffer;
+    std::memcpy(pathBuffer,
+                substituteName.utf16(),
+                reparse->substituteNameLength);
+    pathBuffer[substituteName.size()] = L'\0';
+    auto *printBuffer = reinterpret_cast<wchar_t *>(
+        reinterpret_cast<unsigned char *>(pathBuffer)
+        + reparse->printNameOffset);
+    std::memcpy(printBuffer,
+                printName.utf16(),
+                reparse->printNameLength);
+    printBuffer[printName.size()] = L'\0';
+    reparse->dataLength = static_cast<USHORT>(
+        sizeof(reparse->substituteNameOffset)
+        + sizeof(reparse->substituteNameLength)
+        + sizeof(reparse->printNameOffset)
+        + sizeof(reparse->printNameLength)
+        + reparse->printNameOffset
+        + reparse->printNameLength
+        + sizeof(wchar_t));
+    DWORD returned = 0;
+    return DeviceIoControl(
+               junction.get(),
+               FSCTL_SET_REPARSE_POINT,
+               reparse,
+               reparseHeaderBytes + reparse->dataLength,
+               nullptr,
+               0,
+               &returned,
+               nullptr) != FALSE;
+}
+
 } // namespace
 
 class SandboxLauncherTest final : public QObject
@@ -308,10 +510,16 @@ class SandboxLauncherTest final : public QObject
 private slots:
     void deterministicProfileNamesAreBoundedAndRejectInvalidIds();
     void profileCreationReusesTheSameSid();
+    void nativeFailuresAreExactAndTyped();
+    void trustBoundaryRejectsUntrustedRootsWithoutAclMutation();
+    void trustBoundaryOnlyBuildsStrictDescendantRequests();
+    void trustBoundaryRejectsSecurityStateChangesBeforeAclMutation();
+    void invalidJobLimitsDoNotMutateAnyAcl();
     void aclGrantsAreExplicitAndLeastPrivilege();
     void jobObjectHasKillProcessAndMemoryLimits();
     void closingJobKillsAssignedProcess();
     void launchProbeProvesPositiveAndNegativeBoundaries();
+    void dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeClosure();
 };
 
 void SandboxLauncherTest::deterministicProfileNamesAreBoundedAndRejectInvalidIds()
@@ -345,16 +553,410 @@ void SandboxLauncherTest::profileCreationReusesTheSameSid()
         QVERIFY(first.has_value());
         QVERIFY(first->isValid());
         QVERIFY(first->wasCreated());
-        firstSid = first->sidString();
+        const auto firstSidResult = first->sidString();
+        QVERIFY(firstSidResult.value.has_value());
+        firstSid = *firstSidResult.value;
         QVERIFY(firstSid.startsWith(QStringLiteral("S-1-15-2-")));
 
         auto reused = AppContainerProfile::createOrOpen(appId);
         QVERIFY(reused.has_value());
         QVERIFY(reused->isValid());
         QVERIFY(!reused->wasCreated());
-        QCOMPARE(reused->sidString(), firstSid);
+        const auto reusedSid = reused->sidString();
+        QVERIFY(reusedSid.value.has_value());
+        QCOMPARE(*reusedSid.value, firstSid);
     }
     deleteProfileIfPresent(profileName);
+}
+
+void SandboxLauncherTest::nativeFailuresAreExactAndTyped()
+{
+    const auto invalidSidText = AppContainerProfile{}.sidString();
+    QVERIFY(!invalidSidText.value.has_value());
+    QCOMPARE(invalidSidText.errorCode,
+             QStringLiteral("sandbox.profile.sid_failed"));
+    QCOMPARE(invalidSidText.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(invalidSidText.nativeError.value,
+             quint32(ERROR_INVALID_SID));
+
+    const auto invalidProfile = AppContainerProfile::createOrOpen(
+        QStringLiteral("../invalid"));
+    QVERIFY(!invalidProfile.value.has_value());
+    QCOMPARE(invalidProfile.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(invalidProfile.nativeError.value,
+             quint32(ERROR_INVALID_NAME));
+
+    const QString appId = uniqueAppId(QStringLiteral("errors"));
+    const QString profileName = *AppContainerProfile::deterministicName(appId);
+    deleteProfileIfPresent(profileName);
+    auto profileResult = AppContainerProfile::createOrOpen(appId);
+    QVERIFY(profileResult.value.has_value());
+
+    SetLastError(ERROR_ACCESS_DENIED);
+    const auto missingGrant = AclGrant::apply(
+        QStringLiteral("L:\\qbrowser-definitely-missing\\target"),
+        profileResult.value->sid(),
+        SandboxPathAccess::ReadOnly,
+        false);
+    QVERIFY(!missingGrant.value.has_value());
+    QCOMPARE(missingGrant.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(missingGrant.nativeError.value,
+             quint32(ERROR_PATH_NOT_FOUND));
+
+    const auto invalidSidGrant = AclGrant::apply(
+        QStringLiteral("L:\\qbrowser-definitely-missing\\target"),
+        nullptr,
+        SandboxPathAccess::ReadOnly,
+        false);
+    QVERIFY(!invalidSidGrant.value.has_value());
+    QCOMPARE(invalidSidGrant.nativeError.value,
+             quint32(ERROR_INVALID_SID));
+
+    const auto invalidJob = JobLimits::create(
+        SandboxResourceLimits{2, 96ULL * 1024ULL * 1024ULL});
+    QVERIFY(!invalidJob.value.has_value());
+    QCOMPARE(invalidJob.nativeError.value,
+             quint32(ERROR_INVALID_PARAMETER));
+
+    SetLastError(ERROR_BAD_ENVIRONMENT);
+    const SandboxLaunchResult invalidLaunch = SandboxLauncher::launch(
+        SandboxLaunchConfig{}, WorkerPipeEnds{});
+    QVERIFY(!invalidLaunch.process.has_value());
+    QCOMPARE(invalidLaunch.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(invalidLaunch.nativeError.value,
+             quint32(ERROR_INVALID_HANDLE));
+
+    profileResult.value.reset();
+    deleteProfileIfPresent(profileName);
+}
+
+void SandboxLauncherTest::trustBoundaryRejectsUntrustedRootsWithoutAclMutation()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    QVERIFY(QDir().mkpath(packageRoot));
+    QVERIFY(QDir().mkpath(tempRoot));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+    const QByteArray packageAcl = daclSnapshot(packageRoot);
+    const QByteArray tempAcl = daclSnapshot(tempRoot);
+    const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
+    QVERIFY(!packageAcl.isEmpty());
+    QVERIFY(!tempAcl.isEmpty());
+    QVERIFY(!runtimeAcl.isEmpty());
+
+    QVERIFY(protectHostSystemDirectoryWithWorldAccess(
+        runtimeRoot, userSid, QStringLiteral("GR")));
+    const QByteArray broadReadAcl = daclSnapshot(runtimeRoot);
+    auto broadReadAccepted = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY2(broadReadAccepted.value.has_value(),
+             qPrintable(broadReadAccepted.errorCode));
+    broadReadAccepted.value.reset();
+    QCOMPARE(daclSnapshot(runtimeRoot), broadReadAcl);
+
+    QVERIFY(protectHostSystemDirectoryWithWorldAccess(
+        runtimeRoot, userSid, QStringLiteral("GW")));
+    const QByteArray genericWriteAcl = daclSnapshot(runtimeRoot);
+    const auto genericWriteRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY(!genericWriteRejected.value.has_value());
+    QCOMPARE(genericWriteRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_not_host_owned"));
+    QCOMPARE(daclSnapshot(runtimeRoot), genericWriteAcl);
+
+    QVERIFY(protectHostSystemDirectoryWithWorldAccess(
+        runtimeRoot, userSid, QStringLiteral("GA")));
+    const QByteArray genericAllAcl = daclSnapshot(runtimeRoot);
+    const auto genericAllRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY(!genericAllRejected.value.has_value());
+    QCOMPARE(genericAllRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_not_host_owned"));
+    QCOMPARE(daclSnapshot(runtimeRoot), genericAllAcl);
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+
+    const auto volumeRootRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{QDir(packageRoot).rootPath(),
+                             tempRoot,
+                             {runtimeRoot}});
+    QVERIFY(!volumeRootRejected.value.has_value());
+    QCOMPARE(volumeRootRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_too_broad"));
+
+    const QString nestedTemp = QDir(packageRoot).filePath(
+        QStringLiteral("nested-temp"));
+    QVERIFY(QDir().mkpath(nestedTemp));
+    const auto overlapRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, nestedTemp, {runtimeRoot}});
+    QVERIFY(!overlapRejected.value.has_value());
+    QCOMPARE(overlapRejected.errorCode,
+             QStringLiteral("sandbox.trust.roots_overlap"));
+
+    const auto broadRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{QDir::currentPath(), tempRoot, {runtimeRoot}});
+    QVERIFY(!broadRejected.value.has_value());
+    QCOMPARE(broadRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_too_broad"));
+
+    const QString extendedCurrent = QStringLiteral("\\\\?\\")
+        + QDir::toNativeSeparators(QDir::currentPath());
+    const auto extendedBroadRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{extendedCurrent, tempRoot, {runtimeRoot}});
+    QVERIFY(!extendedBroadRejected.value.has_value());
+    QCOMPARE(extendedBroadRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_too_broad"));
+
+    BYTE everyoneBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD everyoneBytes = sizeof(everyoneBuffer);
+    QVERIFY(CreateWellKnownSid(WinWorldSid,
+                               nullptr,
+                               everyoneBuffer,
+                               &everyoneBytes));
+    auto dangerousGrant = AclGrant::apply(runtimeRoot,
+                                          everyoneBuffer,
+                                          SandboxPathAccess::ReadWrite,
+                                          true);
+    QVERIFY(dangerousGrant.value.has_value());
+    const QByteArray dangerousAcl = daclSnapshot(runtimeRoot);
+    const auto writableRootRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY(!writableRootRejected.value.has_value());
+    QCOMPARE(writableRootRejected.errorCode,
+             QStringLiteral("sandbox.trust.root_not_host_owned"));
+    QCOMPARE(daclSnapshot(runtimeRoot), dangerousAcl);
+    dangerousGrant.value.reset();
+
+    const QString junctionTarget = QDir(root.path()).filePath(
+        QStringLiteral("junction-target"));
+    const QString targetPackageRoot = QDir(junctionTarget).filePath(
+        QStringLiteral("package-store"));
+    const QString junctionPath = QDir(root.path()).filePath(
+        QStringLiteral("junction"));
+    QVERIFY(QDir().mkpath(targetPackageRoot));
+    QVERIFY(protectHostSystemDirectory(targetPackageRoot, userSid));
+    QVERIFY(createDirectoryJunction(junctionPath, junctionTarget));
+    const QString packageThroughJunction = QDir(junctionPath).filePath(
+        QStringLiteral("package-store"));
+    const QByteArray junctionTargetAcl = daclSnapshot(targetPackageRoot);
+    const auto reparseRejected = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageThroughJunction,
+                             tempRoot,
+                             {runtimeRoot}});
+    QVERIFY(!reparseRejected.value.has_value());
+    QCOMPARE(reparseRejected.errorCode,
+             QStringLiteral("sandbox.trust.reparse_ancestor"));
+    QCOMPARE(daclSnapshot(targetPackageRoot), junctionTargetAcl);
+
+    QCOMPARE(daclSnapshot(packageRoot), packageAcl);
+    QCOMPARE(daclSnapshot(tempRoot), tempAcl);
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+}
+
+void SandboxLauncherTest::trustBoundaryOnlyBuildsStrictDescendantRequests()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    QVERIFY(QDir().mkpath(packageRoot));
+    QVERIFY(QDir().mkpath(tempRoot));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+
+    const QString package = QDir(packageRoot).filePath(
+        QStringLiteral("orders/versions/1.0.0"));
+    const QString workerTemp = QDir(tempRoot).filePath(
+        QStringLiteral("orders/session-1"));
+    QVERIFY(QDir().mkpath(package));
+    QVERIFY(QDir().mkpath(workerTemp));
+    const QString stagedExecutable = QDir(runtimeRoot).filePath(
+        QStringLiteral("sandbox-probe.exe"));
+    QVERIFY(QFile::copy(QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH),
+                        stagedExecutable));
+
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot + u'\\',
+                             tempRoot + u'\\',
+                             {runtimeRoot + u'\\'}});
+    QVERIFY2(boundary.value.has_value(),
+             qPrintable(boundary.errorCode));
+
+    SandboxLaunchRequest request;
+    request.appId = uniqueAppId(QStringLiteral("boundary"));
+    request.executablePath = stagedExecutable;
+    request.packageDirectory = package;
+    request.tempDirectory = workerTemp;
+    request.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    auto accepted = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(accepted.value.has_value(), qPrintable(accepted.errorCode));
+
+    const QByteArray packageAcl = daclSnapshot(packageRoot);
+    const QByteArray tempAcl = daclSnapshot(tempRoot);
+    const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
+    request.packageDirectory = packageRoot;
+    const auto equalRootRejected = boundary.value->makeLaunchConfig(request);
+    QVERIFY(!equalRootRejected.value.has_value());
+    QCOMPARE(equalRootRejected.errorCode,
+             QStringLiteral("sandbox.trust.package_outside_root"));
+
+    request.packageDirectory = package;
+    request.tempDirectory = QDir(root.path()).filePath(
+        QStringLiteral("outside-temp"));
+    QVERIFY(QDir().mkpath(request.tempDirectory));
+    const auto outsideTempRejected = boundary.value->makeLaunchConfig(request);
+    QVERIFY(!outsideTempRejected.value.has_value());
+
+    request.tempDirectory = workerTemp;
+    request.executablePath = QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH);
+    const auto outsideRuntimeRejected = boundary.value->makeLaunchConfig(request);
+    QVERIFY(!outsideRuntimeRejected.value.has_value());
+
+    QCOMPARE(daclSnapshot(packageRoot), packageAcl);
+    QCOMPARE(daclSnapshot(tempRoot), tempAcl);
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+}
+
+void SandboxLauncherTest::invalidJobLimitsDoNotMutateAnyAcl()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    const QString package = QDir(packageRoot).filePath(
+        QStringLiteral("orders/versions/1.0.0"));
+    const QString workerTemp = QDir(tempRoot).filePath(
+        QStringLiteral("orders/session-invalid-limits"));
+    QVERIFY(QDir().mkpath(package));
+    QVERIFY(QDir().mkpath(workerTemp));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+    const QString executable = QDir(runtimeRoot).filePath(
+        QStringLiteral("sandbox-probe.exe"));
+    QVERIFY(QFile::copy(QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH),
+                        executable));
+
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY2(boundary.value.has_value(), qPrintable(boundary.errorCode));
+    SandboxLaunchRequest request;
+    request.appId = uniqueAppId(QStringLiteral("invalid-limits"));
+    request.executablePath = executable;
+    request.packageDirectory = package;
+    request.tempDirectory = workerTemp;
+    request.resourceLimits = {2, 128ULL * 1024ULL * 1024ULL};
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
+
+    const QByteArray packageAcl = daclSnapshot(package);
+    const QByteArray tempAcl = daclSnapshot(workerTemp);
+    const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
+    const QByteArray executableAcl = daclSnapshot(executable);
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    const auto launched = SandboxLauncher::launch(
+        *config.value, pair.takeWorkerEnds());
+    QVERIFY(!launched.process.has_value());
+    QCOMPARE(launched.errorCode,
+             QStringLiteral("sandbox.job.invalid_limits"));
+    QCOMPARE(launched.nativeError.value,
+             quint32(ERROR_INVALID_PARAMETER));
+    QCOMPARE(daclSnapshot(package), packageAcl);
+    QCOMPARE(daclSnapshot(workerTemp), tempAcl);
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+    QCOMPARE(daclSnapshot(executable), executableAcl);
+}
+
+void SandboxLauncherTest::trustBoundaryRejectsSecurityStateChangesBeforeAclMutation()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    const QString package = QDir(packageRoot).filePath(
+        QStringLiteral("orders/versions/1.0.0"));
+    const QString workerTemp = QDir(tempRoot).filePath(
+        QStringLiteral("orders/session-security-change"));
+    QVERIFY(QDir().mkpath(package));
+    QVERIFY(QDir().mkpath(workerTemp));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(package, userSid));
+    QVERIFY(protectHostSystemDirectory(workerTemp, userSid));
+    const QString executable = QDir(runtimeRoot).filePath(
+        QStringLiteral("sandbox-probe.exe"));
+    QVERIFY(QFile::copy(QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH),
+                        executable));
+
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY2(boundary.value.has_value(), qPrintable(boundary.errorCode));
+    SandboxLaunchRequest request;
+    request.appId = uniqueAppId(QStringLiteral("security-change"));
+    request.executablePath = executable;
+    request.packageDirectory = package;
+    request.tempDirectory = workerTemp;
+    request.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
+
+    QVERIFY(protectHostSystemDirectoryWithWorldAccess(
+        package, userSid, QStringLiteral("GR")));
+    const QByteArray changedPackageAcl = daclSnapshot(package);
+    const QByteArray tempAcl = daclSnapshot(workerTemp);
+    const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
+    const QByteArray executableAcl = daclSnapshot(executable);
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    const auto launched = SandboxLauncher::launch(
+        *config.value, pair.takeWorkerEnds());
+    QVERIFY(!launched.process.has_value());
+    QCOMPARE(launched.errorCode,
+             QStringLiteral("sandbox.trust.security_changed"));
+    QCOMPARE(launched.nativeError.value,
+             quint32(ERROR_ACCESS_DENIED));
+    QCOMPARE(daclSnapshot(package), changedPackageAcl);
+    QCOMPARE(daclSnapshot(workerTemp), tempAcl);
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
+    QCOMPARE(daclSnapshot(executable), executableAcl);
 }
 
 void SandboxLauncherTest::aclGrantsAreExplicitAndLeastPrivilege()
@@ -368,30 +970,42 @@ void SandboxLauncherTest::aclGrantsAreExplicitAndLeastPrivilege()
     QVERIFY(root.isValid());
     const QString packagePath = QDir(root.path()).filePath(QStringLiteral("package"));
     const QString tempPath = QDir(root.path()).filePath(QStringLiteral("temp"));
+    const QString runtimePath = QDir(root.path()).filePath(QStringLiteral("runtime"));
     QVERIFY(QDir().mkpath(packagePath));
     QVERIFY(QDir().mkpath(tempPath));
+    QVERIFY(QDir().mkpath(runtimePath));
 
     {
         auto packageGrant = AclGrant::apply(
             packagePath, profile->sid(), SandboxPathAccess::ReadOnly, true);
         auto tempGrant = AclGrant::apply(
             tempPath, profile->sid(), SandboxPathAccess::ReadWrite, true);
+        auto runtimeGrant = AclGrant::apply(
+            runtimePath, profile->sid(), SandboxPathAccess::ReadExecute, false);
         QVERIFY(packageGrant.has_value());
         QVERIFY(tempGrant.has_value());
+        QVERIFY(runtimeGrant.has_value());
         const quint32 packageMask = explicitAllowMask(packagePath, profile->sid());
         const quint32 tempMask = explicitAllowMask(tempPath, profile->sid());
+        const quint32 runtimeMask = explicitAllowMask(runtimePath, profile->sid());
         QVERIFY(packageMask & FILE_LIST_DIRECTORY);
         QVERIFY(packageMask & FILE_READ_DATA);
         QVERIFY(!(packageMask & FILE_WRITE_DATA));
         QVERIFY(!(packageMask & FILE_DELETE_CHILD));
+        QVERIFY(!(packageMask & FILE_EXECUTE));
         QVERIFY(tempMask & FILE_LIST_DIRECTORY);
         QVERIFY(tempMask & FILE_ADD_FILE);
         QVERIFY(tempMask & FILE_WRITE_DATA);
         QVERIFY(tempMask & FILE_DELETE_CHILD);
+        QVERIFY(!(tempMask & FILE_EXECUTE));
+        QVERIFY(runtimeMask & FILE_READ_DATA);
+        QVERIFY(runtimeMask & FILE_EXECUTE);
+        QVERIFY(!(runtimeMask & FILE_WRITE_DATA));
     }
 
     QCOMPARE(explicitAllowMask(packagePath, profile->sid()), quint32(0));
     QCOMPARE(explicitAllowMask(tempPath, profile->sid()), quint32(0));
+    QCOMPARE(explicitAllowMask(runtimePath, profile->sid()), quint32(0));
     profile.reset();
     deleteProfileIfPresent(profileName);
 }
@@ -416,6 +1030,16 @@ void SandboxLauncherTest::jobObjectHasKillProcessAndMemoryLimits()
     QVERIFY(flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY);
     QCOMPARE(information.BasicLimitInformation.ActiveProcessLimit, DWORD(1));
     QCOMPARE(static_cast<quint64>(information.ProcessMemoryLimit), memoryLimit);
+
+    SetLastError(ERROR_ACCESS_DENIED);
+    const auto invalidAssignment = job->assignProcess(INVALID_HANDLE_VALUE);
+    QVERIFY(!invalidAssignment.value.has_value());
+    QCOMPARE(invalidAssignment.errorCode,
+             QStringLiteral("sandbox.job.assign_failed"));
+    QCOMPARE(invalidAssignment.nativeError.kind,
+             SandboxNativeErrorKind::Win32);
+    QCOMPARE(invalidAssignment.nativeError.value,
+             quint32(ERROR_INVALID_HANDLE));
 }
 
 void SandboxLauncherTest::closingJobKillsAssignedProcess()
@@ -443,7 +1067,7 @@ void SandboxLauncherTest::closingJobKillsAssignedProcess()
         auto job = JobLimits::create(
             SandboxResourceLimits{1, 64ULL * 1024ULL * 1024ULL});
         QVERIFY(job.has_value());
-        QVERIFY(job->assignProcess(processHandle.get()));
+        QVERIFY(job->assignProcess(processHandle.get()).value.has_value());
         QVERIFY(ResumeThread(threadHandle.get()) != DWORD(-1));
         QCOMPARE(WaitForSingleObject(processHandle.get(), 50), DWORD(WAIT_TIMEOUT));
     }
@@ -460,8 +1084,24 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     deleteProfileIfPresent(profileName);
     QTemporaryDir root;
     QVERIFY(root.isValid());
-    const QString packagePath = QDir(root.path()).filePath(QStringLiteral("package"));
-    const QString tempPath = QDir(root.path()).filePath(QStringLiteral("temp"));
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    QVERIFY(QDir().mkpath(packageRoot));
+    QVERIFY(QDir().mkpath(tempRoot));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+    const QString packagePath = QDir(packageRoot).filePath(
+        QStringLiteral("apps/probe/versions/1"));
+    const QString tempPath = QDir(tempRoot).filePath(
+        QStringLiteral("apps/probe/session"));
     QVERIFY(QDir().mkpath(packagePath));
     QVERIFY(QDir().mkpath(tempPath));
     const QString packageFile = QDir(packagePath).filePath(QStringLiteral("allowed.txt"));
@@ -472,8 +1112,6 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     QVERIFY(allowed.open(QIODevice::WriteOnly | QIODevice::NewOnly));
     QCOMPARE(allowed.write("allowed"), qint64(7));
     allowed.close();
-    const QString userSid = currentUserSidString();
-    QVERIFY(!userSid.isEmpty());
     QVERIFY(createProtectedPrivateFile(privateFile, userSid));
     QVERIFY(hasProtectedHostSystemOnlyDacl(privateFile, userSid));
     QFile privateHostRead(privateFile);
@@ -496,25 +1134,33 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     WinPipePair pair = WinPipeTransport::createHostPair();
     QVERIFY(pair.isValid());
     WinPipeTransport host = pair.takeHost();
-    const QString executable = QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH);
-    SandboxLaunchConfig config;
-    config.appId = appId;
-    config.executablePath = executable;
-    config.packageDirectory = packagePath;
-    config.tempDirectory = tempPath;
-    config.arguments = {
+    const QString executable = QDir(runtimeRoot).filePath(
+        QStringLiteral("q_browser_sandbox_probe.exe"));
+    QVERIFY(QFile::copy(QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH),
+                        executable));
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY2(boundary.value.has_value(), qPrintable(boundary.errorCode));
+    SandboxLaunchRequest request;
+    request.appId = appId;
+    request.executablePath = executable;
+    request.packageDirectory = packagePath;
+    request.tempDirectory = tempPath;
+    request.arguments = {
         QStringLiteral("--package-file"), packageFile,
         QStringLiteral("--temp-file"), tempFile,
         QStringLiteral("--private-file"), privateFile,
         QStringLiteral("--loopback-port"), QString::number(listener.serverPort()),
         QStringLiteral("--self-path"), executable};
-    config.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    request.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
 
     SandboxLaunchResult launched = SandboxLauncher::launch(
-        config, pair.takeWorkerEnds());
+        *config.value, pair.takeWorkerEnds());
     const QString launchDiagnostic = QStringLiteral("%1 native=%2")
                                          .arg(launched.errorCode)
-                                         .arg(launched.nativeError);
+                                         .arg(launched.nativeError.value);
     QVERIFY2(launched.process.has_value(),
              qPrintable(launchDiagnostic));
     QVERIFY(CloseHandle(sentinelWrite.release()));
@@ -554,6 +1200,9 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     QCOMPARE(launched.process->exitCode(), DWORD(0));
     QVERIFY(result->value(QStringLiteral("packageRead")).toBool());
     QVERIFY(result->value(QStringLiteral("tempWrite")).toBool());
+    QVERIFY(!result->value(QStringLiteral("packageExecuteOpen")).toBool());
+    QVERIFY(!result->value(QStringLiteral("tempExecuteOpen")).toBool());
+    QVERIFY(result->value(QStringLiteral("runtimeExecuteOpen")).toBool());
     const QByteArray probeJson = QJsonDocument(*result).toJson(QJsonDocument::Compact);
     QVERIFY2(!result->value(QStringLiteral("privateRead")).toBool(),
              probeJson.constData());
@@ -564,12 +1213,11 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
     QVERIFY(!result->value(QStringLiteral("cmdCreate")).toBool());
     QVERIFY(!result->value(QStringLiteral("selfCreate")).toBool());
     QVERIFY(result->value(QStringLiteral("appContainer")).toBool());
-    QVERIFY(result->value(QStringLiteral("lessPrivileged")).toBool());
     QVERIFY(!result->value(
         QStringLiteral("allApplicationPackagesMember")).toBool());
     QVERIFY(result->contains(QStringLiteral("capabilitiesQueried")));
     QVERIFY(result->value(QStringLiteral("capabilitiesQueried")).toBool());
-    QCOMPARE(result->value(QStringLiteral("capabilityCount")).toInt(), 0);
+    QCOMPARE(result->value(QStringLiteral("capabilityCount")).toInt(), 1);
     QVERIFY(result->contains(QStringLiteral("environmentSecretPresent")));
     QVERIFY(!result->value(
         QStringLiteral("environmentSecretPresent")).toBool());
@@ -578,6 +1226,112 @@ void SandboxLauncherTest::launchProbeProvesPositiveAndNegativeBoundaries()
              launched.process->appContainerSid());
 
     launched.process.reset();
+    deleteProfileIfPresent(profileName);
+}
+
+void SandboxLauncherTest::dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeClosure()
+{
+    const QString appId = uniqueAppId(QStringLiteral("qtcore"));
+    const QString profileName = *AppContainerProfile::deterministicName(appId);
+    deleteProfileIfPresent(profileName);
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString packageRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-package-store"));
+    const QString tempRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-sandbox-temp"));
+    const QString runtimeRoot = QDir(root.path()).filePath(
+        QStringLiteral("approved-runtime"));
+    QVERIFY(QDir().mkpath(packageRoot));
+    QVERIFY(QDir().mkpath(tempRoot));
+    QVERIFY(QDir().mkpath(runtimeRoot));
+    const QString userSid = currentUserSidString();
+    QVERIFY(!userSid.isEmpty());
+    QVERIFY(protectHostSystemDirectory(packageRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(tempRoot, userSid));
+    QVERIFY(protectHostSystemDirectory(runtimeRoot, userSid));
+    const QString package = QDir(packageRoot).filePath(
+        QStringLiteral("apps/qtcore/version"));
+    const QString workerTemp = QDir(tempRoot).filePath(
+        QStringLiteral("apps/qtcore/session"));
+    QVERIFY(QDir().mkpath(package));
+    QVERIFY(QDir().mkpath(workerTemp));
+
+    const QString sourceHelper = QString::fromUtf8(
+        Q_BROWSER_QT_SANDBOX_PROBE_PATH);
+    const QString sourceQtCore = QString::fromUtf8(
+        Q_BROWSER_QT_CORE_DLL_PATH);
+    const QString stagedHelper = QDir(runtimeRoot).filePath(
+        QFileInfo(sourceHelper).fileName());
+    const QString stagedQtCore = QDir(runtimeRoot).filePath(
+        QFileInfo(sourceQtCore).fileName());
+    QVERIFY(QFile::copy(sourceHelper, stagedHelper));
+    QVERIFY(QFile::copy(sourceQtCore, stagedQtCore));
+    QCOMPARE(QDir(runtimeRoot).entryList(QDir::Files).size(), qsizetype(2));
+
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{packageRoot, tempRoot, {runtimeRoot}});
+    QVERIFY2(boundary.value.has_value(), qPrintable(boundary.errorCode));
+    SandboxLaunchRequest request;
+    request.appId = appId;
+    request.executablePath = stagedHelper;
+    request.packageDirectory = package;
+    request.tempDirectory = workerTemp;
+    request.resourceLimits = {1, 128ULL * 1024ULL * 1024ULL};
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
+    const QByteArray runtimeAcl = daclSnapshot(runtimeRoot);
+    const QString untrackedRuntimeFile = QDir(runtimeRoot).filePath(
+        QStringLiteral("not-in-approved-closure.dll"));
+    QFile untracked(untrackedRuntimeFile);
+    QVERIFY(untracked.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+    QCOMPARE(untracked.write("untrusted"), qint64(9));
+    untracked.close();
+
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport host = pair.takeHost();
+    SandboxLaunchResult launched = SandboxLauncher::launch(
+        *config.value, pair.takeWorkerEnds());
+    const QString diagnostic = QStringLiteral("%1 native=%2")
+                                   .arg(launched.errorCode)
+                                   .arg(launched.nativeError.value);
+    QVERIFY2(launched.process.has_value(), qPrintable(diagnostic));
+    PSID launchedSid = nullptr;
+    QVERIFY(ConvertStringSidToSidW(
+        reinterpret_cast<LPCWSTR>(launched.process->appContainerSid().utf16()),
+        &launchedSid));
+    QVERIFY(explicitAllowMask(runtimeRoot, launchedSid) & FILE_LIST_DIRECTORY);
+    QVERIFY(explicitAllowMask(stagedHelper, launchedSid) & FILE_EXECUTE);
+    QVERIFY(explicitAllowMask(stagedQtCore, launchedSid) & FILE_EXECUTE);
+    QCOMPARE(explicitAllowMask(untrackedRuntimeFile, launchedSid), quint32(0));
+    LocalFree(launchedSid);
+    FrameCodec codec;
+    QList<QJsonObject> frames;
+    const auto result = receiveProbeFrame(host, 5000, codec, frames);
+    const QString frameDiagnostic = QStringLiteral("exit=%1 pipe=%2")
+                                        .arg(launched.process->exitCode())
+                                        .arg(static_cast<int>(host.lastStatus()));
+    QVERIFY2(result.has_value(), qPrintable(frameDiagnostic));
+    QVERIFY(!result->value(QStringLiteral("qtVersion")).toString().isEmpty());
+    QVERIFY(result->value(QStringLiteral("appContainer")).toBool());
+    QVERIFY(!result->value(
+        QStringLiteral("allApplicationPackagesMember")).toBool());
+    QVERIFY(result->value(QStringLiteral("capabilitiesQueried")).toBool());
+    QCOMPARE(result->value(QStringLiteral("capabilityCount")).toInt(), 1);
+    const QString registryReadSid = capabilitySidString(L"registryRead");
+    const QString internetClientSid = capabilitySidString(L"internetClient");
+    QVERIFY(!registryReadSid.isEmpty());
+    QVERIFY(!internetClientSid.isEmpty());
+    QCOMPARE(result->value(QStringLiteral("capabilitySid")).toString(),
+             registryReadSid);
+    QVERIFY(result->value(QStringLiteral("capabilitySid")).toString()
+            != internetClientSid);
+    QVERIFY(host.writeAll(QByteArrayView("r", 1), 1000));
+    QVERIFY(launched.process->waitForFinished(5000));
+    QCOMPARE(launched.process->exitCode(), DWORD(0));
+    launched.process.reset();
+    QCOMPARE(daclSnapshot(runtimeRoot), runtimeAcl);
     deleteProfileIfPresent(profileName);
 }
 

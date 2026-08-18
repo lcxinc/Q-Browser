@@ -31,18 +31,22 @@ JobLimits &JobLimits::operator=(JobLimits &&other) noexcept
     return *this;
 }
 
-std::optional<JobLimits> JobLimits::create(
+SandboxValueResult<JobLimits> JobLimits::create(
     const SandboxResourceLimits &limits)
 {
     if (limits.activeProcessLimit != 1
         || limits.processMemoryBytes < 16ULL * 1024ULL * 1024ULL
         || limits.processMemoryBytes
             > static_cast<quint64>(std::numeric_limits<SIZE_T>::max())) {
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.invalid_limits"),
+                SandboxNativeError::win32(ERROR_INVALID_PARAMETER)};
     }
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (!validHandle(job)) {
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.create_failed"),
+                SandboxNativeError::win32(GetLastError())};
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION information{};
     information.BasicLimitInformation.LimitFlags =
@@ -57,10 +61,13 @@ std::optional<JobLimits> JobLimits::create(
                                  JobObjectExtendedLimitInformation,
                                  &information,
                                  sizeof(information))) {
+        const DWORD error = GetLastError();
         CloseHandle(job);
-        return std::nullopt;
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.set_limits_failed"),
+                SandboxNativeError::win32(error)};
     }
-    return JobLimits(job);
+    return {JobLimits(job), {}, {}};
 }
 
 bool JobLimits::isValid() const noexcept
@@ -73,10 +80,21 @@ HANDLE JobLimits::nativeHandle() const noexcept
     return job_;
 }
 
-bool JobLimits::assignProcess(const HANDLE process) const noexcept
+SandboxValueResult<bool> JobLimits::assignProcess(
+    const HANDLE process) const noexcept
 {
-    return isValid() && validHandle(process)
-        && AssignProcessToJobObject(job_, process) != FALSE;
+    if (!isValid() || !validHandle(process)) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.assign_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_HANDLE)};
+    }
+    if (!AssignProcessToJobObject(job_, process)) {
+        const DWORD error = GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.job.assign_failed"),
+                SandboxNativeError::win32(error)};
+    }
+    return {true, {}, {}};
 }
 
 void JobLimits::reset() noexcept

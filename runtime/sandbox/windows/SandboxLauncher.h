@@ -2,6 +2,7 @@
 
 #include "AclGrant.h"
 #include "JobLimits.h"
+#include "SandboxTrustBoundary.h"
 #include "WinPipeTransport.h"
 
 #include <QString>
@@ -11,16 +12,6 @@
 
 #include <optional>
 #include <vector>
-
-struct SandboxLaunchConfig final
-{
-    QString appId;
-    QString executablePath;
-    QString packageDirectory;
-    QString tempDirectory;
-    QStringList arguments;
-    SandboxResourceLimits resourceLimits;
-};
 
 class SandboxProcess final
 {
@@ -61,7 +52,7 @@ struct SandboxLaunchResult final
 {
     std::optional<SandboxProcess> process;
     QString errorCode;
-    quint32 nativeError = ERROR_SUCCESS;
+    SandboxNativeError nativeError;
 };
 
 class SandboxLauncher final

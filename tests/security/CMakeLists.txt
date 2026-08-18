@@ -10,9 +10,13 @@ target_link_libraries(tst_sandbox_launcher
 
 target_compile_definitions(tst_sandbox_launcher
   PRIVATE
-    Q_BROWSER_SANDBOX_PROBE_PATH="$<TARGET_FILE:q_browser_sandbox_probe>")
+    Q_BROWSER_SANDBOX_PROBE_PATH="$<TARGET_FILE:q_browser_sandbox_probe>"
+    Q_BROWSER_QT_SANDBOX_PROBE_PATH="$<TARGET_FILE:q_browser_qt_sandbox_probe>"
+    Q_BROWSER_QT_CORE_DLL_PATH="$<TARGET_FILE:Qt6::Core>")
 
-add_dependencies(tst_sandbox_launcher q_browser_sandbox_probe)
+add_dependencies(tst_sandbox_launcher
+  q_browser_qt_sandbox_probe
+  q_browser_sandbox_probe)
 
 q_browser_enable_strict_warnings(tst_sandbox_launcher)
 
