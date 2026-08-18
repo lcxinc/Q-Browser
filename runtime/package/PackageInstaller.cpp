@@ -2,6 +2,7 @@
 
 #include "Archive.h"
 #include "ArchiveTestHooks.h"
+#include "CanonicalArchivePath.h"
 #include "ContentDigest.h"
 #include "PackageStore.h"
 #include "PackageInstallerTestHooks.h"
@@ -13,6 +14,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QVersionNumber>
 
@@ -22,9 +24,33 @@
 namespace
 {
 #ifdef Q_OS_WIN
+QString stagingMemberKey(
+    const QString &root,
+    const QString &path,
+    const bool directory)
+{
+    return (directory ? QStringLiteral("d:") : QStringLiteral("f:"))
+        + QDir::fromNativeSeparators(QDir(root).relativeFilePath(path))
+              .toCaseFolded();
+}
+
+void addStagingParentDirectories(
+    const QString &prefix,
+    const QString &relativeFile,
+    QSet<QString> &members)
+{
+    QString parent = QFileInfo(relativeFile).path();
+    while (!parent.isEmpty() && parent != QLatin1String(".")) {
+        members.insert(QStringLiteral("d:")
+                       + (prefix + QLatin1Char('/') + parent).toCaseFolded());
+        parent = QFileInfo(parent).path();
+    }
+}
+
 bool deleteOwnedStagingTree(
     const QString &root,
-    qbrowser_archive_detail::WindowsStableDirectoryTree &tree)
+    qbrowser_archive_detail::WindowsStableDirectoryTree &tree,
+    const QSet<QString> &expectedMembers)
 {
 #ifdef Q_BROWSER_ARCHIVE_TESTING
     if (qbrowser_archive_testing::archiveTestHooks().beforeFailureCleanup) {
@@ -32,6 +58,7 @@ bool deleteOwnedStagingTree(
     }
 #endif
     QStringList files;
+    qsizetype scannedMembers = 0;
     QDirIterator iterator(
         root,
         QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
@@ -42,6 +69,12 @@ bool deleteOwnedStagingTree(
         if (info.isSymLink()) {
             return false;
         }
+        const QString key = stagingMemberKey(root, path, info.isDir());
+        if (scannedMembers >= expectedMembers.size()
+            || !expectedMembers.contains(key)) {
+            return false;
+        }
+        ++scannedMembers;
         if (info.isDir()) {
             if (!tree.addExistingDirectory(path)) {
                 return false;
@@ -73,19 +106,49 @@ public:
         : m_root(std::move(root))
         , m_tree(tree)
     {
+        m_expectedMembers.insert(QStringLiteral("f:candidate.qapkg"));
     }
 
     ~WindowsStagingCleanup()
     {
-        (void)deleteOwnedStagingTree(m_root, m_tree);
+        (void)deleteOwnedStagingTree(m_root, m_tree, m_expectedMembers);
     }
 
     WindowsStagingCleanup(const WindowsStagingCleanup &) = delete;
     WindowsStagingCleanup &operator=(const WindowsStagingCleanup &) = delete;
 
+    [[nodiscard]] bool setAuthenticatedSnapshot(
+        const QVector<ArchiveFile> &files,
+        const ArchiveLimits &limits)
+    {
+        if (static_cast<quint64>(files.size()) > limits.maximumEntries) {
+            return false;
+        }
+        QSet<QString> expected{QStringLiteral("f:candidate.qapkg"),
+                               QStringLiteral("d:preflight"),
+                               QStringLiteral("d:candidate")};
+        for (const ArchiveFile &file : files) {
+            if (!qbrowser_archive_detail::validateArchivePath(file.path, limits)
+                     .has_value()) {
+                return false;
+            }
+            const QString relative = QString::fromUtf8(file.path);
+            for (const QString &prefix : {QStringLiteral("preflight"),
+                                          QStringLiteral("candidate")}) {
+                expected.insert(QStringLiteral("f:")
+                                + (prefix + QLatin1Char('/') + relative)
+                                      .toCaseFolded());
+                addStagingParentDirectories(prefix, relative, expected);
+            }
+        }
+        m_expectedMembers = std::move(expected);
+        return true;
+    }
+
 private:
     QString m_root;
     qbrowser_archive_detail::WindowsStableDirectoryTree &m_tree;
+    QSet<QString> m_expectedMembers;
 };
 #endif
 
@@ -219,6 +282,13 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
                        QStringLiteral("archive_invalid"));
     }
     const QVector<ArchiveFile> &files = snapshot.files();
+#ifdef Q_OS_WIN
+    if (!stagingCleanup.setAuthenticatedSnapshot(files, m_policy.archiveLimits)) {
+        return failure(InstallPhase::Verify,
+                       InstallError::ArchiveInvalid,
+                       QStringLiteral("archive_invalid"));
+    }
+#endif
     const ArchiveFile *signatureFile = findFile(
         files, QByteArrayLiteral("metadata/signature.ed25519"));
     if (signatureFile == nullptr) {
@@ -305,12 +375,15 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
     }
 #endif
 
-    const PackageStoreResult candidate = m_store.commitCandidate(
+    const PackageStoreResult candidate = m_store.commitVerifiedCandidate(
         manifest.appId(),
         manifest.version(),
         content.digest().toHex(),
         candidateRoot,
-        signedDigest.bytes());
+        signedDigest.bytes(),
+        signatureFile->contents,
+        files,
+        m_policy.archiveLimits);
     if (!candidate.succeeded()) {
         return failure(InstallPhase::Candidate,
                        InstallError::CandidateFailed,
@@ -324,7 +397,7 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
             .beforeActivate(manifest.appId(), versionDirectory);
     }
 #endif
-    const PackageStoreResult activated = m_store.activate(
+    const PackageStoreResult activated = m_store.activateVerified(
         manifest.appId(), versionDirectory);
     if (!activated.succeeded()) {
         InstallResult result = failure(InstallPhase::Activate,

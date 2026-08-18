@@ -18,6 +18,8 @@ add_library(q_browser_package STATIC
   ManifestResourceLimits.h
   PackageStore.cpp
   PackageStore.h
+  PackageStoreTestHooks.cpp
+  PackageStoreTestHooks.h
   PackageInstaller.cpp
   PackageInstaller.h
   PackageInstallerTestHooks.cpp
@@ -54,5 +56,6 @@ if(BUILD_TESTING)
     PRIVATE
       Q_BROWSER_ARCHIVE_TESTING
       Q_BROWSER_PACKAGE_INSTALLER_TESTING
+      Q_BROWSER_PACKAGE_STORE_TESTING
       Q_BROWSER_SIGNATURE_TESTING)
 endif()

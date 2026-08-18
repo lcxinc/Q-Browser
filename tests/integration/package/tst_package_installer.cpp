@@ -149,6 +149,9 @@ private slots:
     void rejectsFailedPreflightWithoutChangingCurrent();
     void preflightMutationCannotEnterCommittedVersion();
     void changedCandidateFailsBeforeActivation();
+    void changedSignatureFailsBeforeActivation();
+    void archiveEntryLimitAcceptsMaximumAndRejectsMaximumPlusOne();
+    void injectedCandidateMembersKeepCleanupHandleCountBounded();
     void activationFailureDoesNotChangeCurrent();
     void postVerificationNewMemberCannotPublishUnderOldDigest();
     void postVerificationReplacementCannotPublishUnderOldDigest();
@@ -402,6 +405,168 @@ void PackageInstallerTest::changedCandidateFailsBeforeActivation()
     QCOMPARE(rejected.error, InstallError::CandidateFailed);
     QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::changedSignatureFailsBeforeActivation()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("signature-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool hookRan = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.beforeCandidateCommit = [&hookRan](const QString &candidateRoot) {
+        hookRan = true;
+        QFile signature(candidateRoot
+                        + QStringLiteral("/metadata/signature.ed25519"));
+        QVERIFY(signature.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(signature.write(QByteArray(64, 'x')), qint64(64));
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("signature-changed"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(hookRan);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QCOMPARE(rejected.stableError, QStringLiteral("candidate_failed"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::archiveEntryLimitAcceptsMaximumAndRejectsMaximumPlusOne()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+
+    InstallPolicy maximumPolicy = policy();
+    maximumPolicy.archiveLimits.maximumEntries = 4;
+    maximumPolicy.archiveLimits.maximumPathBytes = 26;
+    maximumPolicy.archiveLimits.maximumPathUtf16Units = 26;
+    maximumPolicy.archiveLimits.maximumComponentBytes = 17;
+    maximumPolicy.archiveLimits.maximumComponentUtf16Units = 17;
+    PackageInstaller maximumInstaller(
+        store, keys.value().publicKeyPem, std::move(maximumPolicy));
+    const InstallResult accepted = maximumInstaller.install(signedPackage(
+        temporary, QStringLiteral("entry-limit-maximum"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(accepted.succeeded(), qPrintable(accepted.stableError));
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    InstallPolicy exceededPolicy = policy();
+    exceededPolicy.archiveLimits.maximumEntries = 3;
+    PackageInstaller exceededInstaller(
+        store, keys.value().publicKeyPem, std::move(exceededPolicy));
+    const InstallResult rejected = exceededInstaller.install(signedPackage(
+        temporary, QStringLiteral("entry-limit-exceeded"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Verify);
+    QCOMPARE(rejected.error, InstallError::ArchiveInvalid);
+    QCOMPARE(rejected.stableError, QStringLiteral("archive_invalid"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+
+    InstallPolicy componentExceededPolicy = policy();
+    componentExceededPolicy.archiveLimits.maximumComponentBytes = 16;
+    componentExceededPolicy.archiveLimits.maximumComponentUtf16Units = 16;
+    PackageInstaller componentExceededInstaller(
+        store, keys.value().publicKeyPem, std::move(componentExceededPolicy));
+    const InstallResult componentRejected = componentExceededInstaller.install(
+        signedPackage(temporary,
+                      QStringLiteral("component-limit-exceeded"),
+                      keys.value().privateKeyPem,
+                      manifest(QStringLiteral("1.2.0"))));
+    QVERIFY(!componentRejected.succeeded());
+    QCOMPARE(componentRejected.phase, InstallPhase::Verify);
+    QCOMPARE(componentRejected.error, InstallError::ArchiveInvalid);
+
+    InstallPolicy pathExceededPolicy = policy();
+    pathExceededPolicy.archiveLimits.maximumPathBytes = 25;
+    pathExceededPolicy.archiveLimits.maximumPathUtf16Units = 25;
+    PackageInstaller pathExceededInstaller(
+        store, keys.value().publicKeyPem, std::move(pathExceededPolicy));
+    const InstallResult pathRejected = pathExceededInstaller.install(signedPackage(
+        temporary, QStringLiteral("path-limit-exceeded"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.3.0"))));
+    QVERIFY(!pathRejected.succeeded());
+    QCOMPARE(pathRejected.phase, InstallPhase::Verify);
+    QCOMPARE(pathRejected.error, InstallError::ArchiveInvalid);
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+}
+
+void PackageInstallerTest::injectedCandidateMembersKeepCleanupHandleCountBounded()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows owned staging handles are unavailable");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    InstallPolicy boundedPolicy = policy();
+    boundedPolicy.archiveLimits.maximumEntries = 4;
+    PackageInstaller installer(
+        store, keys.value().publicKeyPem, std::move(boundedPolicy));
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("bounded-cleanup-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY(first.succeeded());
+    const QString before = store.resolveCurrent(QStringLiteral("company.pilot")).path;
+
+    bool injected = false;
+    qsizetype handlesAfterInjection = 0;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks installerHooks;
+    installerHooks.beforeCandidateCommit = [&](const QString &candidateRoot) {
+        for (int index = 0; index < 128; ++index) {
+            QVERIFY(QDir().mkdir(
+                candidateRoot
+                + QStringLiteral("/unauthenticated-%1").arg(index, 3, 10, QLatin1Char('0'))));
+        }
+        injected = true;
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(installerHooks));
+    qbrowser_archive_testing::ArchiveTestHooks archiveHooks;
+    archiveHooks.afterWindowsHandleOpened = [&](const QString &path,
+                                                 const quint32,
+                                                 const bool) {
+        if (injected
+            && QDir::fromNativeSeparators(path).contains(
+                QStringLiteral("/.staging/install-"))) {
+            ++handlesAfterInjection;
+        }
+    };
+    qbrowser_archive_testing::setArchiveTestHooks(std::move(archiveHooks));
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("bounded-cleanup-injected"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    qbrowser_archive_testing::resetArchiveTestHooks();
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(injected);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.phase, InstallPhase::Candidate);
+    QCOMPARE(rejected.error, InstallError::CandidateFailed);
+    QVERIFY2(handlesAfterInjection <= 20,
+             qPrintable(QStringLiteral("held %1 post-injection handles")
+                            .arg(handlesAfterInjection)));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path, before);
+#endif
 }
 
 void PackageInstallerTest::activationFailureDoesNotChangeCurrent()

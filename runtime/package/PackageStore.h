@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ActivationState.h"
+#include "Archive.h"
+#include "ArchiveLimits.h"
 
 #include <QByteArray>
 #include <QString>
@@ -55,23 +57,47 @@ public:
         const QString &appId,
         const QString &versionDirectory) const;
 
-    [[nodiscard]] PackageStoreResult commitCandidate(
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+    [[nodiscard]] PackageStoreResult commitCandidateForTesting(
         const QString &appId,
         const QString &version,
         const QByteArray &digestHex,
-        const QString &candidateRoot,
-        const QByteArray &expectedSignedDigest = {}) const;
-    [[nodiscard]] ActivationStateResult activationState(
-        const QString &appId) const;
-    [[nodiscard]] PackageStoreResult activate(
+        const QString &candidateRoot) const;
+    [[nodiscard]] PackageStoreResult activateForTesting(
         const QString &appId,
         const QString &versionDirectory) const;
+#endif
+    [[nodiscard]] ActivationStateResult activationState(
+        const QString &appId) const;
     [[nodiscard]] PackageStoreResult markCurrentLastKnownGood(
         const QString &appId) const;
     [[nodiscard]] PackageStoreResult rollback(const QString &appId) const;
     [[nodiscard]] PackageStoreResult resolveCurrent(const QString &appId) const;
 
 private:
+    friend class PackageInstaller;
+
+    [[nodiscard]] PackageStoreResult commitVerifiedCandidate(
+        const QString &appId,
+        const QString &version,
+        const QByteArray &digestHex,
+        const QString &candidateRoot,
+        const QByteArray &expectedSignedDigest,
+        const QByteArray &expectedSignature,
+        const QVector<ArchiveFile> &authenticatedFiles,
+        const ArchiveLimits &limits) const;
+    [[nodiscard]] PackageStoreResult commitCandidateImpl(
+        const QString &appId,
+        const QString &version,
+        const QByteArray &digestHex,
+        const QString &candidateRoot,
+        const QByteArray &expectedSignedDigest,
+        const QByteArray &expectedSignature,
+        const QVector<ArchiveFile> *authenticatedFiles,
+        const ArchiveLimits &limits) const;
+    [[nodiscard]] PackageStoreResult activateVerified(
+        const QString &appId,
+        const QString &versionDirectory) const;
     [[nodiscard]] PackageStoreResult writeState(
         const QString &appId,
         const ActivationState &state) const;

@@ -65,6 +65,7 @@ target_link_libraries(tst_package_store
     Qt6::Test)
 
 target_compile_definitions(tst_package_store PRIVATE Q_BROWSER_ARCHIVE_TESTING)
+target_compile_definitions(tst_package_store PRIVATE Q_BROWSER_PACKAGE_STORE_TESTING)
 
 q_browser_enable_strict_warnings(tst_package_store)
 

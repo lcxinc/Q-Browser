@@ -1,18 +1,22 @@
 #include "PackageStore.h"
 #include "Archive.h"
+#include "CanonicalArchivePath.h"
 #include "ContentDigest.h"
 #include "PackageInstallerTestHooks.h"
+#include "PackageStoreTestHooks.h"
 #include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
 
 #include <optional>
+#include <memory>
 
 namespace
 {
@@ -51,6 +55,18 @@ bool validVersionDirectory(const QString &directory)
     return directory.at(separator) == QLatin1Char('-')
         && VersionPattern.match(directory.first(separator)).hasMatch()
         && DigestPattern.match(directory.sliced(separator + 1)).hasMatch();
+}
+
+std::unique_ptr<QLockFile> acquireActivationTransactionLock(
+    const QString &applicationRoot)
+{
+    auto lock = std::make_unique<QLockFile>(
+        applicationRoot + QStringLiteral("/.activation.lock"));
+    lock->setStaleLockTime(30000);
+    if (!lock->tryLock(5000)) {
+        return {};
+    }
+    return lock;
 }
 
 bool existingPlainDirectory(const QString &path)
@@ -104,7 +120,16 @@ QString candidateMemberKey(
     return (directory ? QStringLiteral("d:") : QStringLiteral("f:")) + relative;
 }
 
-std::optional<QSet<QString>> candidateMemberSet(const QString &root)
+qsizetype candidateDepth(const QString &relative)
+{
+    return relative.split(QLatin1Char('/'), Qt::SkipEmptyParts).size();
+}
+
+std::optional<QSet<QString>> candidateMemberSet(
+    const QString &root,
+    const QSet<QString> &expectedMembers,
+    const qsizetype maximumDepth,
+    const ArchiveLimits &limits)
 {
     QSet<QString> result;
     QDirIterator iterator(
@@ -117,7 +142,18 @@ std::optional<QSet<QString>> candidateMemberSet(const QString &root)
         if (info.isSymLink() || (!info.isDir() && !info.isFile())) {
             return std::nullopt;
         }
-        result.insert(candidateMemberKey(root, path, info.isDir()));
+        const QString relative = QDir::fromNativeSeparators(
+            QDir(root).relativeFilePath(path));
+        const QString key = candidateMemberKey(root, path, info.isDir());
+        if (result.size() >= expectedMembers.size()
+            || !expectedMembers.contains(key)
+            || candidateDepth(relative) > maximumDepth
+            || !qbrowser_archive_detail::validateArchivePath(
+                    relative.toUtf8(), limits)
+                    .has_value()) {
+            return std::nullopt;
+        }
+        result.insert(key);
     }
     return result;
 }
@@ -221,12 +257,36 @@ bool PackageStore::ensureAppDirectories(const QString &appId) const
     return true;
 }
 
-PackageStoreResult PackageStore::commitCandidate(
+PackageStoreResult PackageStore::commitVerifiedCandidate(
     const QString &appId,
     const QString &version,
     const QByteArray &digestHex,
     const QString &candidateRoot,
-    const QByteArray &expectedSignedDigest) const
+    const QByteArray &expectedSignedDigest,
+    const QByteArray &expectedSignature,
+    const QVector<ArchiveFile> &authenticatedFiles,
+    const ArchiveLimits &limits) const
+{
+    return commitCandidateImpl(
+        appId,
+        version,
+        digestHex,
+        candidateRoot,
+        expectedSignedDigest,
+        expectedSignature,
+        &authenticatedFiles,
+        limits);
+}
+
+PackageStoreResult PackageStore::commitCandidateImpl(
+    const QString &appId,
+    const QString &version,
+    const QByteArray &digestHex,
+    const QString &candidateRoot,
+    const QByteArray &expectedSignedDigest,
+    const QByteArray &expectedSignature,
+    const QVector<ArchiveFile> *authenticatedFiles,
+    const ArchiveLimits &limits) const
 {
     if (!validAppId(appId) || version.size() > 128
         || !VersionPattern.match(version).hasMatch()
@@ -274,10 +334,51 @@ PackageStoreResult PackageStore::commitCandidate(
     }
     QSet<QString> verifiedMembers;
     QStringList verifiedRelativeFiles;
-    if (!expectedSignedDigest.isEmpty()) {
+    qsizetype maximumCandidateDepth = 0;
+    if (authenticatedFiles != nullptr) {
+        if (expectedSignedDigest.size() != 32 || expectedSignature.size() != 64
+            || static_cast<quint64>(authenticatedFiles->size())
+                > limits.maximumEntries) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("authenticated candidate is invalid"));
+        }
+        bool authenticatedSignatureMatched = false;
+        for (const ArchiveFile &file : *authenticatedFiles) {
+            const auto checked = qbrowser_archive_detail::validateArchivePath(
+                file.path, limits);
+            if (!checked.has_value()) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("authenticated candidate is invalid"));
+            }
+            const QString relative = QString::fromUtf8(file.path);
+            verifiedMembers.insert(
+                QStringLiteral("f:")
+#ifdef Q_OS_WIN
+                + relative.toCaseFolded()
+#else
+                + relative
+#endif
+            );
+            QSet<QString> parentDirectories;
+            addExpectedParentDirectories(relative, parentDirectories);
+            for (const QString &parentDirectory : std::as_const(parentDirectories)) {
+                verifiedMembers.insert(QStringLiteral("d:") + parentDirectory);
+            }
+            maximumCandidateDepth = std::max(
+                maximumCandidateDepth, candidateDepth(relative));
+            if (file.path == QByteArrayLiteral("metadata/signature.ed25519")) {
+                authenticatedSignatureMatched = file.contents == expectedSignature;
+            }
+        }
+        if (!authenticatedSignatureMatched) {
+            return failure(PackageStoreError::CandidateCommitFailed,
+                           QStringLiteral("authenticated signature is invalid"));
+        }
         QVector<ArchiveFile> actualFiles;
         QSet<QString> actualDirectories;
         QSet<QString> expectedDirectories;
+        QSet<QString> actualMembers;
+        bool actualSignatureMatched = false;
         quint64 totalBytes = 0;
         QDirIterator iterator(
             candidateRoot,
@@ -290,6 +391,20 @@ PackageStoreResult PackageStore::commitCandidate(
                 return failure(PackageStoreError::CandidateCommitFailed,
                                QStringLiteral("candidate identity changed"));
             }
+            const QString relative = QDir::fromNativeSeparators(
+                QDir(candidateRoot).relativeFilePath(path));
+            const QString memberKey = candidateMemberKey(
+                candidateRoot, path, info.isDir());
+            if (actualMembers.size() >= verifiedMembers.size()
+                || !verifiedMembers.contains(memberKey)
+                || candidateDepth(relative) > maximumCandidateDepth
+                || !qbrowser_archive_detail::validateArchivePath(
+                        relative.toUtf8(), limits)
+                        .has_value()) {
+                return failure(PackageStoreError::CandidateCommitFailed,
+                               QStringLiteral("candidate members changed"));
+            }
+            actualMembers.insert(memberKey);
             if (info.isDir()) {
 #ifdef Q_OS_WIN
                 if (!candidateTree.addExistingDirectory(path)) {
@@ -297,21 +412,19 @@ PackageStoreResult PackageStore::commitCandidate(
                                    QStringLiteral("candidate identity changed"));
                 }
 #endif
-                QString relative = QDir::fromNativeSeparators(
-                    QDir(candidateRoot).relativeFilePath(path));
+                QString relativeDirectory = relative;
 #ifdef Q_OS_WIN
-                relative = relative.toCaseFolded();
+                relativeDirectory = relativeDirectory.toCaseFolded();
 #endif
-                actualDirectories.insert(relative);
-                verifiedMembers.insert(candidateMemberKey(candidateRoot, path, true));
+                actualDirectories.insert(relativeDirectory);
                 continue;
             }
             if (!info.isFile() || info.size() < 0
                 || static_cast<quint64>(info.size())
-                    > ArchiveLimits::DefaultMaximumEntryBytes
-                || totalBytes > ArchiveLimits::DefaultMaximumTotalBytes
+                    > limits.maximumEntryBytes
+                || totalBytes > limits.maximumTotalBytes
                 || static_cast<quint64>(info.size())
-                    > ArchiveLimits::DefaultMaximumTotalBytes - totalBytes) {
+                    > limits.maximumTotalBytes - totalBytes) {
                 return failure(PackageStoreError::CandidateCommitFailed,
                                QStringLiteral("candidate contents are invalid"));
             }
@@ -320,7 +433,7 @@ PackageStoreResult PackageStore::commitCandidate(
             qbrowser_archive_detail::WindowsStableFile locked;
             if (!locked.openReadMoveLocked(path, candidateTree)
                 || !locked.readExact(static_cast<quint64>(info.size()),
-                                     ArchiveLimits::DefaultMaximumEntryBytes,
+                                     limits.maximumEntryBytes,
                                      bytes)) {
                 return failure(PackageStoreError::CandidateCommitFailed,
                                QStringLiteral("candidate identity changed"));
@@ -339,11 +452,12 @@ PackageStoreResult PackageStore::commitCandidate(
             }
 #endif
             totalBytes += static_cast<quint64>(bytes.size());
-            const QString relativeFile = QDir::fromNativeSeparators(
-                QDir(candidateRoot).relativeFilePath(path));
+            const QString relativeFile = relative;
             addExpectedParentDirectories(relativeFile, expectedDirectories);
             verifiedRelativeFiles.push_back(relativeFile);
-            verifiedMembers.insert(candidateMemberKey(candidateRoot, path, false));
+            if (relativeFile == QStringLiteral("metadata/signature.ed25519")) {
+                actualSignatureMatched = bytes == expectedSignature;
+            }
             actualFiles.push_back(
                 {relativeFile.toUtf8(),
                  std::move(bytes)});
@@ -353,7 +467,9 @@ PackageStoreResult PackageStore::commitCandidate(
         if (!actualSigned.hasValue() || actualSigned.bytes() != expectedSignedDigest
             || !actualPayload.isValid()
             || actualPayload.digest().toHex() != digestHex
+            || !actualSignatureMatched
             || actualDirectories != expectedDirectories
+            || actualMembers != verifiedMembers
 #ifdef Q_OS_WIN
             || !candidateTree.isStable()
             || !std::ranges::all_of(
@@ -375,9 +491,12 @@ PackageStoreResult PackageStore::commitCandidate(
     }
 #endif
 #ifdef Q_OS_WIN
-    if (!expectedSignedDigest.isEmpty()) {
+    if (authenticatedFiles != nullptr) {
         const std::optional<QSet<QString>> currentMembers = candidateMemberSet(
-            candidateRoot);
+            candidateRoot,
+            verifiedMembers,
+            maximumCandidateDepth,
+            limits);
         if (!currentMembers.has_value()
             || *currentMembers != verifiedMembers
             || !candidateTree.isStable()
@@ -415,7 +534,10 @@ PackageStoreResult PackageStore::commitCandidate(
         }
 #endif
         const std::optional<QSet<QString>> sealedMembers = candidateMemberSet(
-            candidateRoot);
+            candidateRoot,
+            verifiedMembers,
+            maximumCandidateDepth,
+            limits);
         if (!sealedMembers.has_value()
             || *sealedMembers != verifiedMembers
             || !candidateTree.isStable()
@@ -456,9 +578,12 @@ PackageStoreResult PackageStore::commitCandidate(
                        QStringLiteral("candidate could not be committed"));
     }
 #ifdef Q_OS_WIN
-    if (!expectedSignedDigest.isEmpty()) {
+    if (authenticatedFiles != nullptr) {
         const std::optional<QSet<QString>> publishedMembers = candidateMemberSet(
-            destination);
+            destination,
+            verifiedMembers,
+            maximumCandidateDepth,
+            limits);
         bool identitiesMatch = publishedMembers.has_value()
             && *publishedMembers == verifiedMembers
             && candidateTree.verifyMovedTree(destination);
@@ -475,7 +600,7 @@ PackageStoreResult PackageStore::commitCandidate(
     }
 #endif
 #ifdef Q_OS_WIN
-    if (expectedSignedDigest.isEmpty()
+    if (authenticatedFiles == nullptr
         && !makeVersionFilesReadOnly(destination)) {
 #else
     if (!makeVersionFilesReadOnly(destination)) {
@@ -599,10 +724,26 @@ PackageStoreResult PackageStore::writeState(
     return {};
 }
 
-PackageStoreResult PackageStore::activate(
+PackageStoreResult PackageStore::activateVerified(
     const QString &appId,
     const QString &versionDirectory) const
 {
+    if (!ensureAppDirectories(appId)) {
+        return failure(PackageStoreError::UnsafeStore,
+                       QStringLiteral("package store is unavailable"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+    if (qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired) {
+        qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired(appId, QStringLiteral("activate"));
+    }
+#endif
     if (!stateTargetIsValid(appId, versionDirectory, false)) {
         return failure(PackageStoreError::VersionUnavailable,
                        QStringLiteral("version is unavailable"));
@@ -620,9 +761,51 @@ PackageStoreResult PackageStore::activate(
     return writeState(appId, next);
 }
 
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+PackageStoreResult PackageStore::commitCandidateForTesting(
+    const QString &appId,
+    const QString &version,
+    const QByteArray &digestHex,
+    const QString &candidateRoot) const
+{
+    return commitCandidateImpl(
+        appId,
+        version,
+        digestHex,
+        candidateRoot,
+        {},
+        {},
+        nullptr,
+        {});
+}
+
+PackageStoreResult PackageStore::activateForTesting(
+    const QString &appId,
+    const QString &versionDirectory) const
+{
+    return activateVerified(appId, versionDirectory);
+}
+#endif
+
 PackageStoreResult PackageStore::markCurrentLastKnownGood(
     const QString &appId) const
 {
+    if (!ensureAppDirectories(appId)) {
+        return failure(PackageStoreError::UnsafeStore,
+                       QStringLiteral("package store is unavailable"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+    if (qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired) {
+        qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired(appId, QStringLiteral("mark_lkg"));
+    }
+#endif
     const ActivationStateResult loaded = activationState(appId);
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
@@ -641,6 +824,22 @@ PackageStoreResult PackageStore::markCurrentLastKnownGood(
 
 PackageStoreResult PackageStore::rollback(const QString &appId) const
 {
+    if (!ensureAppDirectories(appId)) {
+        return failure(PackageStoreError::UnsafeStore,
+                       QStringLiteral("package store is unavailable"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+#ifdef Q_BROWSER_PACKAGE_STORE_TESTING
+    if (qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired) {
+        qbrowser_package_store_testing::packageStoreTestHooks()
+            .afterActivationLockAcquired(appId, QStringLiteral("rollback"));
+    }
+#endif
     const ActivationStateResult loaded = activationState(appId);
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
