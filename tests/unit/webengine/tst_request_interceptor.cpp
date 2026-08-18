@@ -200,6 +200,10 @@ void RequestInterceptorTest::rejectsUnsafeSandboxConfiguration()
         {}, {}, QByteArrayLiteral("--disable-gpu --no-sandbox")));
     QVERIFY(!WebSurface::isChromiumSandboxConfigurationSafe(
         {}, {}, QByteArrayLiteral("--disable-setuid-sandbox")));
+    QVERIFY(!WebSurface::isChromiumSandboxConfigurationSafe(
+        {}, {}, QByteArrayLiteral("\"--no-sandbox\"")));
+    QVERIFY(!WebSurface::isChromiumSandboxConfigurationSafe(
+        {}, {}, QByteArrayLiteral("--disable-gpu \"--disable-setuid-sandbox\"")));
 }
 
 void RequestInterceptorTest::invalidOriginDoesNotInitializeWebEngine()

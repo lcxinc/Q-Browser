@@ -5,7 +5,7 @@
 #include <QApplication>
 #include <QByteArrayView>
 #include <QCoreApplication>
-#include <QRegularExpression>
+#include <QProcess>
 #include <QVBoxLayout>
 #include <QWebEngineCertificateError>
 #include <QWebEngineDownloadRequest>
@@ -31,7 +31,16 @@ namespace {
 
 bool disablesSandbox(const QString &argument)
 {
-    const QString token = argument.section(u'=', 0, 0);
+    QString normalized = argument.trimmed();
+    while (!normalized.isEmpty()
+           && (normalized.front() == u'"' || normalized.front() == u'\'')) {
+        normalized.removeFirst();
+    }
+    while (!normalized.isEmpty()
+           && (normalized.back() == u'"' || normalized.back() == u'\'')) {
+        normalized.chop(1);
+    }
+    const QString token = normalized.section(u'=', 0, 0);
     return token == QStringLiteral("--no-sandbox")
         || token == QStringLiteral("--single-process")
         || (token.startsWith(QStringLiteral("--disable-"))
@@ -202,8 +211,7 @@ bool WebSurface::isChromiumSandboxConfigurationSafe(
         }
     }
     const QString flags = QString::fromUtf8(chromiumFlagsEnvironment);
-    const QStringList tokens = flags.split(QRegularExpression(QStringLiteral("\\s+")),
-                                           Qt::SkipEmptyParts);
+    const QStringList tokens = QProcess::splitCommand(flags);
     for (const QString &token : tokens) {
         if (disablesSandbox(token)) {
             return false;
