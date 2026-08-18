@@ -97,6 +97,7 @@ bool MainWindow::navigate(const QStringView input)
 
     const AppUrl parsed = AppUrl::parse(input, QStringLiteral("pilot"));
     if (!parsed.isValid()) {
+        showTrustedError(QStringLiteral("The address is not a valid Q-Browser route."));
         navigationBar_->setAddressText(currentAppUrl_);
         return false;
     }

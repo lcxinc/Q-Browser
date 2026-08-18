@@ -15,6 +15,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
+#include <QToolButton>
 #include <QWebEnginePage>
 
 namespace {
@@ -145,6 +146,15 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     window.show();
     QSignalSpy workerRouteSpy(&window, &MainWindow::workerRouteRequested);
     QSignalSpy currentUrlSpy(&window, &MainWindow::currentUrlChanged);
+    QLineEdit *address = window.navigationBar()->findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QToolButton *backButton = window.navigationBar()->findChild<QToolButton *>(
+        QStringLiteral("navigation-back"));
+    QToolButton *forwardButton = window.navigationBar()->findChild<QToolButton *>(
+        QStringLiteral("navigation-forward"));
+    QVERIFY(address != nullptr);
+    QVERIFY(backButton != nullptr);
+    QVERIFY(forwardButton != nullptr);
 
     const QString workerAppUrl = QStringLiteral(
         "app://pilot/web-shaped-worker/order%2042?tab=summary");
@@ -162,6 +172,25 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QVERIFY(workerSurface->isVisible());
     QVERIFY(!window.webSurface()->page()->isVisible());
     QCOMPARE(window.webSurface()->page()->renderProcessPid(), 0);
+
+    const int workerCurrentUrlSignals = currentUrlSpy.count();
+    address->setText(QStringLiteral("https://example.com/not-an-app-route"));
+    QTest::keyClick(address, Qt::Key_Return);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    QCOMPARE(window.surfaceStack()->currentWidget()->objectName(),
+             QStringLiteral("trusted-error-surface"));
+    QCOMPARE(window.currentAppUrl(), workerAppUrl);
+    QCOMPARE(window.historyCount(), 1);
+    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(address->text(), workerAppUrl);
+    QVERIFY(!backButton->isEnabled());
+    QVERIFY(!forwardButton->isEnabled());
+    QCOMPARE(currentUrlSpy.count(), workerCurrentUrlSignals);
+
+    QVERIFY(window.navigate(workerAppUrl));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QCOMPARE(window.historyCount(), 1);
+    QCOMPARE(window.historyIndex(), 0);
 
     const QString webAppUrl = QStringLiteral("app://pilot/worker-shaped-web");
     QSignalSpy webNavigationSpy(window.webSurface(), &WebSurface::navigationFinished);
@@ -210,9 +239,6 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QCOMPARE(window.currentAppUrl(), webAppUrl);
     QCOMPARE(window.historyIndex(), 1);
 
-    QLineEdit *address = window.navigationBar()->findChild<QLineEdit *>(
-        QStringLiteral("navigation-address"));
-    QVERIFY(address != nullptr);
     address->setText(missingAppUrl);
     QTest::keyClick(address, Qt::Key_Return);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
@@ -246,6 +272,15 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     const QString webAppUrl = QStringLiteral("app://pilot/worker-shaped-web");
     const QString unavailableWorkerAppUrl =
         QStringLiteral("app://pilot/web-shaped-worker/42");
+    QLineEdit *address = window.navigationBar()->findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QToolButton *backButton = window.navigationBar()->findChild<QToolButton *>(
+        QStringLiteral("navigation-back"));
+    QToolButton *forwardButton = window.navigationBar()->findChild<QToolButton *>(
+        QStringLiteral("navigation-forward"));
+    QVERIFY(address != nullptr);
+    QVERIFY(backButton != nullptr);
+    QVERIFY(forwardButton != nullptr);
 
     QVERIFY(window.navigate(webAppUrl));
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
@@ -322,6 +357,27 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QCOMPARE(window.currentAppUrl(), webAppUrl);
     QCOMPARE(window.historyIndex(), 0);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
+
+    QSignalSpy invalidInputUrlSpy(&window, &MainWindow::currentUrlChanged);
+    address->setText(QStringLiteral("file:///C:/Windows/win.ini"));
+    QTest::keyClick(address, Qt::Key_Return);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    QCOMPARE(window.surfaceStack()->currentWidget()->objectName(),
+             QStringLiteral("trusted-error-surface"));
+    QCOMPARE(window.currentAppUrl(), webAppUrl);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(address->text(), webAppUrl);
+    QVERIFY(!backButton->isEnabled());
+    QVERIFY(forwardButton->isEnabled());
+    QCOMPARE(invalidInputUrlSpy.count(), 0);
+
+    QVERIFY(window.navigate(webAppUrl));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 0);
+    QVERIFY(!backButton->isEnabled());
+    QVERIFY(forwardButton->isEnabled());
 
     bool forwardReceiverRan = false;
     bool forwardReceiverSawCommittedState = false;
