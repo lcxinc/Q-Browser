@@ -14,6 +14,7 @@
 #include <qt_windows.h>
 #endif
 
+#include <algorithm>
 #include <ctime>
 #include <limits>
 #include <type_traits>
@@ -335,7 +336,11 @@ private slots:
     void stagingRootCannotBeReplacedAfterGuard();
     void createdParentCannotBeReplacedAfterGuard();
     void doesNotOverwriteConcurrentTargetOrDeleteUserFiles();
+    void publishesTheOriginallyCreatedTemporaryFile();
+    void handlesShortWindowsWrites();
+    void cleansOwnedTemporaryWhenFlushFails();
     void cleansOnlyOwnedObjectsAfterFailure();
+    void usesMinimumWindowsHandleAccess();
     void sourceParentsRemainStableDuringRead();
     void writesByteForByteDeterministicArchives();
     void rejectsUnsafeSourceTreesBeforeWriting();
@@ -1117,6 +1122,187 @@ void ArchiveTest::doesNotOverwriteConcurrentTargetOrDeleteUserFiles()
     QVERIFY(QFileInfo::exists(marker));
 #else
     QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::publishesTheOriginallyCreatedTemporaryFile()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    RawEntry entry{QByteArrayLiteral("safe.txt")};
+    entry.data = QByteArrayLiteral("owned-safe-bytes");
+    const QString package = writeArchive(temporary, makeZip({entry}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    const QString captured = temporary.filePath(QStringLiteral("captured.tmp"));
+    QVERIFY(QDir().mkdir(staging));
+
+    bool hookRan = false;
+    bool replacementSucceeded = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.afterTemporaryReady = [&](const QString &path, const QByteArray &) {
+        hookRan = true;
+        replacementSucceeded = movePathNoReplace(path, captured);
+        if (replacementSucceeded) {
+            QVERIFY(writeFile(path, "attacker-bytes"));
+        }
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(hookRan);
+    if (replacementSucceeded) {
+        QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+        QFile wronglyPublished(staging + QStringLiteral("/safe.txt"));
+        QVERIFY(wronglyPublished.open(QIODevice::ReadOnly));
+        QCOMPARE(wronglyPublished.readAll(), QByteArray("attacker-bytes"));
+        QFile orphaned(captured);
+        QVERIFY(orphaned.open(QIODevice::ReadOnly));
+        QCOMPARE(orphaned.readAll(), entry.data);
+    }
+    QVERIFY(!replacementSucceeded);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    QFile published(staging + QStringLiteral("/safe.txt"));
+    QVERIFY(published.open(QIODevice::ReadOnly));
+    QCOMPARE(published.readAll(), entry.data);
+    QVERIFY(!QFileInfo::exists(captured));
+#else
+    QSKIP("Windows archive race tests are unavailable");
+#endif
+}
+
+void ArchiveTest::handlesShortWindowsWrites()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    RawEntry entry{QByteArrayLiteral("data.bin")};
+    entry.data = QByteArray(257, 's');
+    const QString package = writeArchive(temporary, makeZip({entry}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+
+    int writeRequests = 0;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.limitWindowsWriteRequest = [&](quint32 requested) {
+        ++writeRequests;
+        return std::min<quint32>(requested, 3U);
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY2(result.hasValue(), qPrintable(result.error().message));
+    QVERIFY(writeRequests > 1);
+    QFile extracted(staging + QStringLiteral("/data.bin"));
+    QVERIFY(extracted.open(QIODevice::ReadOnly));
+    QCOMPARE(extracted.readAll(), entry.data);
+#else
+    QSKIP("Windows archive write tests are unavailable");
+#endif
+}
+
+void ArchiveTest::cleansOwnedTemporaryWhenFlushFails()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString package = writeArchive(
+        temporary, makeZip({RawEntry{QByteArrayLiteral("safe.txt")}}));
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+
+    bool flushHookRan = false;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.allowWindowsFlush = [&] {
+        flushHookRan = true;
+        return false;
+    };
+    ArchiveHookGuard guard(std::move(hooks));
+    const ArchiveResult result = Archive::extract(package, staging);
+    QVERIFY(flushHookRan);
+    QVERIFY(!result.hasValue());
+    QCOMPARE(result.error().code, ArchiveErrorCode::ExtractionFailed);
+    QVERIFY(QDir(staging).isEmpty());
+#else
+    QSKIP("Windows archive write tests are unavailable");
+#endif
+}
+
+void ArchiveTest::usesMinimumWindowsHandleAccess()
+{
+#if defined(Q_OS_WIN) && defined(Q_BROWSER_ARCHIVE_TESTING)
+    struct AccessRecord final
+    {
+        QString path;
+        quint32 access = 0;
+        bool owned = false;
+    };
+
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString source = temporary.filePath(QStringLiteral("source"));
+    QVERIFY(QDir().mkpath(source + QStringLiteral("/nested")));
+    QVERIFY(writeFile(source + QStringLiteral("/nested/file.txt"), "safe"));
+    QVector<AccessRecord> records;
+    qbrowser_archive_testing::ArchiveTestHooks hooks;
+    hooks.afterWindowsHandleOpened =
+        [&](const QString &path, quint32 access, bool owned) {
+            records.push_back({path, access, owned});
+        };
+    ArchiveHookGuard guard(std::move(hooks));
+
+    const QString package = temporary.filePath(QStringLiteral("output.qapkg"));
+    QVERIFY(Archive::create(source, package).hasValue());
+    const QString staging = temporary.filePath(QStringLiteral("staging"));
+    QVERIFY(QDir().mkdir(staging));
+    QVERIFY(Archive::extract(package, staging).hasValue());
+
+    const auto isAtOrBelow = [](const QString &candidate,
+                                const QString &root) {
+        const QString foldedCandidate = QDir::cleanPath(candidate).toCaseFolded();
+        const QString foldedRoot = QDir::cleanPath(root).toCaseFolded();
+        return foldedCandidate == foldedRoot
+            || foldedCandidate.startsWith(foldedRoot + QLatin1Char('/'))
+            || foldedCandidate.startsWith(foldedRoot + QLatin1Char('\\'));
+    };
+    bool sawUnlockedAncestor = false;
+    bool sawLockedExisting = false;
+    bool sawCreatedDirectory = false;
+    bool sawOwnedTemporary = false;
+    for (const AccessRecord &record : records) {
+        if (!record.owned) {
+            if ((record.access & GENERIC_READ) != 0U) {
+                QVERIFY2(
+                    (record.access & DELETE) == 0U,
+                    qPrintable(record.path));
+                continue;
+            }
+            const bool mustLockRename = isAtOrBelow(record.path, source)
+                || isAtOrBelow(record.path, staging);
+            if (mustLockRename) {
+                sawLockedExisting = true;
+                QVERIFY2(
+                    (record.access & DELETE) != 0U,
+                    qPrintable(record.path));
+            } else {
+                sawUnlockedAncestor = true;
+                QVERIFY2(
+                    (record.access & DELETE) == 0U,
+                    qPrintable(record.path));
+            }
+            continue;
+        }
+        QVERIFY((record.access & DELETE) != 0U);
+        if ((record.access & GENERIC_WRITE) != 0U) {
+            sawOwnedTemporary = true;
+        } else {
+            sawCreatedDirectory = true;
+        }
+    }
+    QVERIFY(sawUnlockedAncestor);
+    QVERIFY(sawLockedExisting);
+    QVERIFY(sawCreatedDirectory);
+    QVERIFY(sawOwnedTemporary);
+#else
+    QSKIP("Windows archive access tests are unavailable");
 #endif
 }
 

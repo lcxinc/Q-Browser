@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
 
 namespace qbrowser_archive_detail
@@ -326,7 +327,7 @@ bool readEntryStream(
     mz_zip_archive *reader,
     mz_uint index,
     quint64 expectedSize,
-    QIODevice *output)
+    const std::function<bool(const char *, size_t)> &writeChunk)
 {
     mz_zip_reader_extract_iter_state *state =
         mz_zip_reader_extract_iter_new(reader, index, 0);
@@ -344,10 +345,8 @@ bool readEntryStream(
         const size_t extracted = mz_zip_reader_extract_iter_read(
             state, buffer.data(), request);
         if (extracted == 0U
-            || (output != nullptr
-                && output->write(
-                       buffer.constData(), static_cast<qint64>(extracted))
-                    != static_cast<qint64>(extracted))) {
+            || (writeChunk
+                && !writeChunk(buffer.constData(), extracted))) {
             succeeded = false;
             break;
         }
@@ -1112,7 +1111,7 @@ ArchiveResult inspectBytes(
                 reader.get(),
                 index,
                 entries.at(static_cast<qsizetype>(index)).uncompressedSize,
-                nullptr)) {
+                {})) {
             return fail(
                 ArchiveErrorCode::InvalidArchive,
                 entries.at(static_cast<qsizetype>(index)).path,
@@ -1353,12 +1352,13 @@ ArchiveResult Archive::extract(
         const QString outputPath = QDir(parentPath).absoluteFilePath(
             components.back());
         QString temporaryPath;
+        qbrowser_archive_detail::WindowsStableFile owned;
         for (int attempt = 0; attempt < 8; ++attempt) {
             temporaryPath = QDir(parentPath).absoluteFilePath(
                 QStringLiteral(".qbrowser-")
                 + QUuid::createUuid().toString(QUuid::Id128)
                 + QStringLiteral(".tmp"));
-            if (!QFileInfo::exists(temporaryPath)) {
+            if (owned.createOwnedOutput(temporaryPath, stagingTree)) {
                 break;
             }
             temporaryPath.clear();
@@ -1369,27 +1369,28 @@ ArchiveResult Archive::extract(
                 entry.path,
                 QStringLiteral("archive entry could not be written"));
         }
-
-        QSaveFile output(temporaryPath);
-        if (!output.open(QIODevice::WriteOnly)
-            || !readEntryStream(
-                reader.get(), index, entry.uncompressedSize, &output)
-            || !output.commit()) {
-            output.cancelWriting();
+        ownedFiles.push_back(std::move(owned));
+        qbrowser_archive_detail::WindowsStableFile &ownedOutput =
+            ownedFiles.back();
+        if (!readEntryStream(
+                reader.get(),
+                index,
+                entry.uncompressedSize,
+                [&ownedOutput](const char *data, size_t size) {
+                    return ownedOutput.writeAll(data, size);
+                })
+            || !ownedOutput.flush()) {
             return extractionFailure(
                 ArchiveErrorCode::ExtractionFailed,
                 entry.path,
                 QStringLiteral("archive entry extraction failed"));
         }
-
-        qbrowser_archive_detail::WindowsStableFile owned;
-        if (!owned.openOwnedOutput(temporaryPath, stagingTree)) {
-            return extractionFailure(
-                ArchiveErrorCode::ExtractionFailed,
-                entry.path,
-                QStringLiteral("archive entry could not be secured"));
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks().afterTemporaryReady) {
+            qbrowser_archive_testing::archiveTestHooks().afterTemporaryReady(
+                temporaryPath, entry.path);
         }
-        ownedFiles.push_back(std::move(owned));
+#endif
 #ifdef Q_BROWSER_ARCHIVE_TESTING
         if (qbrowser_archive_testing::archiveTestHooks().beforePublish) {
             qbrowser_archive_testing::archiveTestHooks().beforePublish(
@@ -1397,7 +1398,7 @@ ArchiveResult Archive::extract(
         }
 #endif
         if (!stagingTree.isStable()
-            || !ownedFiles.back().publishNoReplace(outputPath, stagingTree)) {
+            || !ownedOutput.publishNoReplace(outputPath, stagingTree)) {
             return extractionFailure(
                 ArchiveErrorCode::ExtractionFailed,
                 entry.path,
@@ -1481,7 +1482,15 @@ ArchiveResult Archive::extract(
                 QStringLiteral("archive entry could not be written"));
         }
 
-        if (!readEntryStream(reader.get(), index, entry.uncompressedSize, &output)
+        if (!readEntryStream(
+                reader.get(),
+                index,
+                entry.uncompressedSize,
+                [&output](const char *data, size_t size) {
+                    return output.write(
+                               data, static_cast<qint64>(size))
+                        == static_cast<qint64>(size);
+                })
             || !output.commit()) {
             output.cancelWriting();
             return extractionFailure(

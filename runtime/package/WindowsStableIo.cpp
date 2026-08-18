@@ -1,4 +1,5 @@
 #include "WindowsStableIo.h"
+#include "ArchiveTestHooks.h"
 
 #ifdef Q_OS_WIN
 
@@ -84,16 +85,26 @@ bool finalPathIsWithin(const QString &root, const QString &candidate)
         || foldedCandidate.startsWith(foldedRoot + QLatin1Char('\\'));
 }
 
-UniqueWindowsHandle openDirectory(const QString &path, bool lockRename)
+UniqueWindowsHandle openDirectory(const QString &path, DWORD desiredAccess)
 {
     return UniqueWindowsHandle(CreateFileW(
         reinterpret_cast<LPCWSTR>(path.utf16()),
-        FILE_READ_ATTRIBUTES | (lockRename ? DELETE : 0U),
+        desiredAccess,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
         nullptr));
+}
+
+void deleteOnClose(HANDLE handle) noexcept
+{
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    (void)SetFileInformationByHandle(
+        handle,
+        FileDispositionInfo,
+        &disposition,
+        static_cast<DWORD>(sizeof(disposition)));
 }
 }
 
@@ -280,13 +291,21 @@ bool WindowsStableDirectoryTree::addDirectory(const QString &path, bool created)
     const QString key = pathKey(normalized);
     const bool lockRename = key == m_rootKey
         || key.startsWith(m_rootKey + QLatin1Char('\\'));
-    UniqueWindowsHandle handle = openDirectory(normalized, lockRename);
+    const DWORD desiredAccess = FILE_READ_ATTRIBUTES
+        | ((created || lockRename) ? DELETE : 0U);
+    UniqueWindowsHandle handle = openDirectory(normalized, desiredAccess);
     WindowsFileIdentity identity;
     QString finalPath;
     if (!handle.isValid()
         || !queryHandle(handle.get(), true, identity, finalPath)) {
         return false;
     }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened) {
+        qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened(
+            normalized, static_cast<quint32>(desiredAccess), created);
+    }
+#endif
     if (!m_rootFinalPath.isEmpty()
         && (!finalPathIsWithin(m_rootFinalPath, finalPath)
             || identity.volumeSerial != m_rootVolumeSerial)) {
@@ -311,14 +330,93 @@ bool WindowsStableFile::openSource(
     const QString &path,
     const WindowsStableDirectoryTree &tree)
 {
-    return openAndVerify(path, GENERIC_READ | FILE_READ_ATTRIBUTES, tree);
+    return openAndVerify(
+        path, GENERIC_READ | FILE_READ_ATTRIBUTES, tree);
 }
 
-bool WindowsStableFile::openOwnedOutput(
+bool WindowsStableFile::createOwnedOutput(
     const QString &path,
     const WindowsStableDirectoryTree &tree)
 {
-    return openAndVerify(path, DELETE | FILE_READ_ATTRIBUTES, tree);
+    constexpr DWORD desiredAccess =
+        GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES;
+    m_handle.reset(CreateFileW(
+        reinterpret_cast<LPCWSTR>(path.utf16()),
+        desiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+            | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr));
+    QString finalPath;
+    WindowsFileIdentity identity;
+    if (!m_handle.isValid()
+        || !queryHandle(m_handle.get(), false, identity, finalPath)
+        || identity.volumeSerial != tree.rootVolumeSerial()
+        || !finalPathIsWithin(tree.rootFinalPath(), finalPath)) {
+        if (m_handle.isValid()) {
+            deleteOnClose(m_handle.get());
+        }
+        m_handle.reset();
+        return false;
+    }
+    m_identity = identity;
+    m_path = absolutePath(path);
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened) {
+        qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened(
+            m_path, static_cast<quint32>(desiredAccess), true);
+    }
+#endif
+    return true;
+}
+
+bool WindowsStableFile::writeAll(const char *bytes, size_t size)
+{
+    if (!m_handle.isValid() || (size > 0U && bytes == nullptr)) {
+        return false;
+    }
+    constexpr DWORD maximumRequest = 64U * 1024U;
+    size_t offset = 0;
+    while (offset < size) {
+        DWORD request = static_cast<DWORD>(std::min<size_t>(
+            size - offset, static_cast<size_t>(maximumRequest)));
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+        if (qbrowser_archive_testing::archiveTestHooks()
+                .limitWindowsWriteRequest) {
+            const quint32 limited = qbrowser_archive_testing::archiveTestHooks()
+                .limitWindowsWriteRequest(static_cast<quint32>(request));
+            if (limited == 0U || limited > request) {
+                return false;
+            }
+            request = static_cast<DWORD>(limited);
+        }
+#endif
+        DWORD written = 0;
+        if (WriteFile(
+                m_handle.get(), bytes + offset, request, &written, nullptr)
+                == FALSE
+            || written == 0U || written > request) {
+            return false;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool WindowsStableFile::flush()
+{
+    if (!m_handle.isValid()) {
+        return false;
+    }
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().allowWindowsFlush
+        && !qbrowser_archive_testing::archiveTestHooks().allowWindowsFlush()) {
+        return false;
+    }
+#endif
+    return FlushFileBuffers(m_handle.get()) != FALSE;
 }
 
 bool WindowsStableFile::readExact(
@@ -445,6 +543,12 @@ bool WindowsStableFile::openAndVerify(
     }
     m_identity = identity;
     m_path = absolutePath(path);
+#ifdef Q_BROWSER_ARCHIVE_TESTING
+    if (qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened) {
+        qbrowser_archive_testing::archiveTestHooks().afterWindowsHandleOpened(
+            m_path, static_cast<quint32>(access), false);
+    }
+#endif
     return true;
 }
 }

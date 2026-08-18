@@ -9,6 +9,7 @@
 
 #include <qt_windows.h>
 
+#include <cstddef>
 #include <vector>
 
 namespace qbrowser_archive_detail
@@ -82,9 +83,11 @@ public:
     [[nodiscard]] bool openSource(
         const QString &path,
         const WindowsStableDirectoryTree &tree);
-    [[nodiscard]] bool openOwnedOutput(
+    [[nodiscard]] bool createOwnedOutput(
         const QString &path,
         const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] bool writeAll(const char *bytes, size_t size);
+    [[nodiscard]] bool flush();
     [[nodiscard]] bool readExact(
         quint64 expected,
         quint64 maximum,

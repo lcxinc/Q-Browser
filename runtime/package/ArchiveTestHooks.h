@@ -4,6 +4,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <QtTypes>
 
 #include <functional>
 
@@ -15,8 +16,12 @@ struct ArchiveTestHooks final
     std::function<void(const QString &, const QByteArray &)> beforeSourceRead;
     std::function<void(const QString &)> afterStagingGuardOpened;
     std::function<void(const QString &, const QByteArray &)> afterParentGuardOpened;
+    std::function<void(const QString &, const QByteArray &)> afterTemporaryReady;
     std::function<void(const QString &, const QByteArray &)> beforePublish;
     std::function<void(const QString &)> beforeFailureCleanup;
+    std::function<void(const QString &, quint32, bool)> afterWindowsHandleOpened;
+    std::function<quint32(quint32)> limitWindowsWriteRequest;
+    std::function<bool()> allowWindowsFlush;
 };
 
 void setArchiveTestHooks(ArchiveTestHooks hooks);
