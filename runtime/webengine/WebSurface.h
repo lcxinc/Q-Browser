@@ -40,6 +40,7 @@ signals:
     void popupDenied();
     void downloadDenied(const QUrl &url);
     void permissionDenied(const QUrl &origin);
+    void fileSelectionDenied(bool directorySelection);
 
 private:
     void loadTrustedError();

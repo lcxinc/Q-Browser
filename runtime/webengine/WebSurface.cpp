@@ -51,14 +51,17 @@ class PilotWebPage final : public QWebEnginePage
 {
 public:
     using DeniedCallback = std::function<void()>;
+    using FileSelectionDeniedCallback = std::function<void(bool)>;
 
     PilotWebPage(QWebEngineProfile *profile,
                  const PilotRequestInterceptor *interceptor,
                  DeniedCallback popupDenied,
+                 FileSelectionDeniedCallback fileSelectionDenied,
                  QObject *parent)
         : QWebEnginePage(profile, parent)
         , interceptor_(interceptor)
         , popupDenied_(std::move(popupDenied))
+        , fileSelectionDenied_(std::move(fileSelectionDenied))
     {
     }
 
@@ -79,9 +82,18 @@ protected:
         return QWebEnginePage::acceptNavigationRequest(url, type, isMainFrame);
     }
 
+    QStringList chooseFiles(FileSelectionMode mode,
+                            const QStringList &,
+                            const QStringList &) override
+    {
+        fileSelectionDenied_(mode == FileSelectUploadFolder);
+        return {};
+    }
+
 private:
     const PilotRequestInterceptor *interceptor_ = nullptr;
     DeniedCallback popupDenied_;
+    FileSelectionDeniedCallback fileSelectionDenied_;
 };
 
 } // namespace
@@ -108,7 +120,12 @@ WebSurface::WebSurface(const QUrl &mockOrigin, QWidget *parent)
     profile_->setUrlRequestInterceptor(interceptor_.get());
 
     page_ = std::make_unique<PilotWebPage>(
-        profile_.get(), interceptor_.get(), [this] { emit popupDenied(); }, nullptr);
+        profile_.get(), interceptor_.get(),
+        [this] { emit popupDenied(); },
+        [this](const bool directorySelection) {
+            emit fileSelectionDenied(directorySelection);
+        },
+        nullptr);
     QWebEngineSettings *settings = page_->settings();
     settings->setAttribute(QWebEngineSettings::JavascriptCanOpenWindows, false);
     settings->setAttribute(QWebEngineSettings::JavascriptCanAccessClipboard, false);
