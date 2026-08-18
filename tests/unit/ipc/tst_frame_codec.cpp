@@ -44,6 +44,11 @@ private slots:
     void rejectsInvalidPayload();
     void failsClosedAndBoundsQueuedBytes();
     void boundsDecodedFrameCount();
+    void consumesCompletedMaximumFrameBeforeAppendingCoalescedFrame();
+    void enforcesJsonNestingBeforeDom_data();
+    void enforcesJsonNestingBeforeDom();
+    void enforcesAggregateJsonEntriesBeforeDom_data();
+    void enforcesAggregateJsonEntriesBeforeDom();
 };
 
 void FrameCodecTest::encodesBigEndianLengthAndCompactUtf8Json()
@@ -157,11 +162,11 @@ void FrameCodecTest::failsClosedAndBoundsQueuedBytes()
              FrameStatus::NeedMoreData);
     QVERIFY(codec.queuedBytes() <= FrameCodec::maximumQueuedBytes());
     QCOMPARE(codec.feed(QByteArray(2, 'x')).status, FrameStatus::Failed);
-    QCOMPARE(codec.lastError(), FrameError::QueueLimitExceeded);
+    QCOMPARE(codec.lastError(), FrameError::InvalidJson);
     QCOMPARE(codec.queuedBytes(), qsizetype(0));
     QCOMPARE(codec.feed(frame(QJsonObject{{QStringLiteral("ok"), true}})).status,
              FrameStatus::Failed);
-    QCOMPARE(codec.lastErrorCode(), QStringLiteral("ipc.frame.queue_limit"));
+    QCOMPARE(codec.lastErrorCode(), QStringLiteral("ipc.frame.invalid_json"));
 }
 
 void FrameCodecTest::boundsDecodedFrameCount()
@@ -178,6 +183,90 @@ void FrameCodecTest::boundsDecodedFrameCount()
     QCOMPARE(result.status, FrameStatus::Failed);
     QCOMPARE(result.error, FrameError::QueueLimitExceeded);
     QCOMPARE(result.errorCode, QStringLiteral("ipc.frame.queue_limit"));
+}
+
+void FrameCodecTest::consumesCompletedMaximumFrameBeforeAppendingCoalescedFrame()
+{
+    const QByteArray maximumPayload = QByteArrayLiteral("{\"padding\":\"")
+        + QByteArray(static_cast<qsizetype>(FrameCodec::maximumPayloadBytes()) - 14, 'x')
+        + QByteArrayLiteral("\"}");
+    QCOMPARE(maximumPayload.size(),
+             static_cast<qsizetype>(FrameCodec::maximumPayloadBytes()));
+    const QByteArray maximumFrame = rawFrame(maximumPayload);
+    const QJsonObject next{{QStringLiteral("next"), true}};
+    FrameCodec codec;
+
+    QCOMPARE(codec.feed(maximumFrame.first(maximumFrame.size() - 1)).status,
+             FrameStatus::NeedMoreData);
+    const FrameFeedResult result = codec.feed(maximumFrame.last(1) + frame(next));
+
+    QCOMPARE(result.status, FrameStatus::FramesReady);
+    QCOMPARE(result.frames.size(), 2);
+    QCOMPARE(result.frames.at(1), next);
+    QCOMPARE(codec.queuedBytes(), qsizetype(0));
+}
+
+void FrameCodecTest::enforcesJsonNestingBeforeDom_data()
+{
+    QTest::addColumn<qsizetype>("arrayDepth");
+    QTest::addColumn<FrameStatus>("status");
+    QTest::addColumn<FrameError>("error");
+
+    QTest::newRow("exact-limit") << FrameCodec::maximumJsonNesting() - 1
+                                  << FrameStatus::FramesReady << FrameError::None;
+    QTest::newRow("limit-plus-one") << FrameCodec::maximumJsonNesting()
+                                     << FrameStatus::Failed
+                                     << FrameError::JsonResourceLimit;
+}
+
+void FrameCodecTest::enforcesJsonNestingBeforeDom()
+{
+    QFETCH(qsizetype, arrayDepth);
+    QFETCH(FrameStatus, status);
+    QFETCH(FrameError, error);
+    const QByteArray payload = QByteArrayLiteral("{\"value\":")
+        + QByteArray(arrayDepth, '[') + QByteArrayLiteral("0")
+        + QByteArray(arrayDepth, ']') + QByteArrayLiteral("}");
+    FrameCodec codec;
+
+    const FrameFeedResult result = codec.feed(rawFrame(payload));
+
+    QCOMPARE(result.status, status);
+    QCOMPARE(result.error, error);
+}
+
+void FrameCodecTest::enforcesAggregateJsonEntriesBeforeDom_data()
+{
+    QTest::addColumn<qsizetype>("elementCount");
+    QTest::addColumn<FrameStatus>("status");
+    QTest::addColumn<FrameError>("error");
+
+    QTest::newRow("exact-limit") << FrameCodec::maximumJsonAggregateEntries() - 1
+                                  << FrameStatus::FramesReady << FrameError::None;
+    QTest::newRow("limit-plus-one") << FrameCodec::maximumJsonAggregateEntries()
+                                     << FrameStatus::Failed
+                                     << FrameError::JsonResourceLimit;
+}
+
+void FrameCodecTest::enforcesAggregateJsonEntriesBeforeDom()
+{
+    QFETCH(qsizetype, elementCount);
+    QFETCH(FrameStatus, status);
+    QFETCH(FrameError, error);
+    QByteArray payload = QByteArrayLiteral("{\"items\":[");
+    for (qsizetype index = 0; index < elementCount; ++index) {
+        if (index != 0) {
+            payload.append(',');
+        }
+        payload.append('0');
+    }
+    payload.append(QByteArrayLiteral("]}"));
+    FrameCodec codec;
+
+    const FrameFeedResult result = codec.feed(rawFrame(payload));
+
+    QCOMPARE(result.status, status);
+    QCOMPARE(result.error, error);
 }
 
 QTEST_MAIN(FrameCodecTest)

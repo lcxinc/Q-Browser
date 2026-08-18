@@ -35,6 +35,19 @@ bool peerClosedError(const DWORD error)
            || error == ERROR_NO_DATA;
 }
 
+bool inheritedPipeHandleHasAccess(const HANDLE handle, const bool requiresRead)
+{
+    DWORD flags = 0;
+    if (!validHandle(handle) || !GetHandleInformation(handle, &flags)
+        || (flags & HANDLE_FLAG_INHERIT) == 0 || GetFileType(handle) != FILE_TYPE_PIPE) {
+        return false;
+    }
+    DWORD transferred = 0;
+    char ignored = 0;
+    return requiresRead ? PeekNamedPipe(handle, nullptr, 0, nullptr, &transferred, nullptr)
+                        : WriteFile(handle, &ignored, 0, &transferred, nullptr);
+}
+
 struct WriteContext {
     HANDLE pipe = nullptr;
     QByteArray bytes;
@@ -213,6 +226,50 @@ WinPipeTransport WinPipeTransport::adoptWorkerEnds(WorkerPipeEnds &&ends)
     }
 #endif
     return transport;
+}
+
+std::optional<WinPipeTransport> WinPipeTransport::adoptInheritedHandles(
+    const HANDLE readHandle,
+    const HANDLE writeHandle)
+{
+#ifdef Q_OS_WIN
+    if (readHandle == writeHandle
+        || !inheritedPipeHandleHasAccess(readHandle, true)
+        || !inheritedPipeHandleHasAccess(writeHandle, false)) {
+        return std::nullopt;
+    }
+
+    HANDLE adoptedRead = nullptr;
+    HANDLE adoptedWrite = nullptr;
+    const HANDLE process = GetCurrentProcess();
+    if (!DuplicateHandle(process,
+                         readHandle,
+                         process,
+                         &adoptedRead,
+                         0,
+                         FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        return std::nullopt;
+    }
+    if (!DuplicateHandle(process,
+                         writeHandle,
+                         process,
+                         &adoptedWrite,
+                         0,
+                         FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        closeHandle(adoptedRead);
+        return std::nullopt;
+    }
+
+    CloseHandle(readHandle);
+    CloseHandle(writeHandle);
+    return WinPipeTransport(adoptedRead, adoptedWrite);
+#else
+    Q_UNUSED(readHandle)
+    Q_UNUSED(writeHandle)
+    return std::nullopt;
+#endif
 }
 
 bool WinPipeTransport::isValid() const noexcept

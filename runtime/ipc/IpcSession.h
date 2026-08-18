@@ -65,9 +65,13 @@ private:
     SessionReceiveResult processFrame(const QJsonObject &object);
     SessionReceiveResult fail(SessionStatus status, const QString &code);
     bool pendingRequestExpired() const;
+    std::optional<qint64> nearestPendingDeadline() const;
     bool sendTracked(const QString &requestId,
                      const std::optional<ProtocolMessage> &message,
                      int timeoutMs);
+    bool sendInternal(const ProtocolMessage &message,
+                      int timeoutMs,
+                      bool allowTrackedMessage);
 
     WinPipeTransport transport_;
     IpcRole role_;

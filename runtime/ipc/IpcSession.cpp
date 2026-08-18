@@ -1,6 +1,7 @@
 #include "IpcSession.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace {
 
@@ -44,7 +45,20 @@ IpcSession::IpcSession(WinPipeTransport transport,
 
 bool IpcSession::send(const ProtocolMessage &message, const int timeoutMs)
 {
+    return sendInternal(message, timeoutMs, false);
+}
+
+bool IpcSession::sendInternal(const ProtocolMessage &message,
+                              const int timeoutMs,
+                              const bool allowTrackedMessage)
+{
     if (closed_) {
+        return false;
+    }
+    if (!allowTrackedMessage
+        && (message.type() == ProtocolType::Request
+            || message.type() == ProtocolType::RouteLoad)) {
+        lastErrorCode_ = QStringLiteral("ipc.session.tracking_required");
         return false;
     }
     if (!authenticated_) {
@@ -116,9 +130,27 @@ SessionReceiveResult IpcSession::receive(const int timeoutMs)
     QElapsedTimer receiveTimer;
     receiveTimer.start();
     for (;;) {
-        const int remaining = std::max(0, timeoutMs - static_cast<int>(receiveTimer.elapsed()));
+        const qint64 now = clock_.elapsed();
+        const int callerRemaining = std::max(
+            0, timeoutMs - static_cast<int>(receiveTimer.elapsed()));
+        int remaining = callerRemaining;
+        if (const auto requestDeadline = nearestPendingDeadline();
+            requestDeadline.has_value()) {
+            const qint64 requestRemaining = *requestDeadline - now;
+            if (requestRemaining <= 0) {
+                return fail(SessionStatus::TimedOut,
+                            QStringLiteral("ipc.session.request_timeout"));
+            }
+            remaining = std::min(remaining, static_cast<int>(std::min<qint64>(
+                                                requestRemaining,
+                                                std::numeric_limits<int>::max())));
+        }
         const PipeReadResult read = transport_.readSome(64 * 1024, remaining);
         if (read.status == PipeIoStatus::TimedOut) {
+            if (pendingRequestExpired()) {
+                return fail(SessionStatus::TimedOut,
+                            QStringLiteral("ipc.session.request_timeout"));
+            }
             return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
         }
         if (read.status == PipeIoStatus::PeerClosed) {
@@ -279,6 +311,19 @@ bool IpcSession::pendingRequestExpired() const
     return false;
 }
 
+std::optional<qint64> IpcSession::nearestPendingDeadline() const
+{
+    std::optional<qint64> nearest;
+    for (auto iterator = pendingRequests_.constBegin();
+         iterator != pendingRequests_.constEnd();
+         ++iterator) {
+        if (!nearest.has_value() || iterator.value() < *nearest) {
+            nearest = iterator.value();
+        }
+    }
+    return nearest;
+}
+
 bool IpcSession::sendTracked(const QString &requestId,
                              const std::optional<ProtocolMessage> &message,
                              const int timeoutMs)
@@ -299,7 +344,7 @@ bool IpcSession::sendTracked(const QString &requestId,
         lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
         return false;
     }
-    if (!send(*message, timeoutMs)) {
+    if (!sendInternal(*message, timeoutMs, true)) {
         return false;
     }
     pendingRequests_.insert(requestId, clock_.elapsed() + timeoutMs);

@@ -20,6 +20,7 @@ enum class FrameError {
     InvalidJson,
     RootNotObject,
     DuplicateMember,
+    JsonResourceLimit,
 };
 
 struct FrameFeedResult {
@@ -34,6 +35,8 @@ class FrameCodec final
 public:
     static constexpr quint32 maximumPayloadBytes() noexcept { return 1024U * 1024U; }
     static constexpr qsizetype maximumFramesPerFeed() noexcept { return 256; }
+    static constexpr qsizetype maximumJsonNesting() noexcept { return 64; }
+    static constexpr qsizetype maximumJsonAggregateEntries() noexcept { return 4096; }
     static constexpr qsizetype maximumQueuedBytes() noexcept
     {
         return static_cast<qsizetype>(maximumPayloadBytes()) + 4;

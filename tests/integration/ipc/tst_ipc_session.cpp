@@ -1,14 +1,103 @@
 #include "IpcSession.h"
 
+#include <QCoreApplication>
 #include <QTest>
 
 #include <chrono>
 #include <future>
 #include <type_traits>
+#include <string>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
+
+namespace {
+
+#ifdef Q_OS_WIN
+class ChildProcess final
+{
+public:
+    ~ChildProcess()
+    {
+        if (process_.hProcess != nullptr) {
+            if (WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT) {
+                TerminateProcess(process_.hProcess, 99);
+                WaitForSingleObject(process_.hProcess, 5000);
+            }
+            CloseHandle(process_.hProcess);
+        }
+        if (process_.hThread != nullptr) {
+            CloseHandle(process_.hThread);
+        }
+    }
+
+    PROCESS_INFORMATION *address() noexcept { return &process_; }
+    HANDLE processHandle() const noexcept { return process_.hProcess; }
+
+private:
+    PROCESS_INFORMATION process_{};
+};
+
+int runIpcChild(const int argc, char **argv)
+{
+    if (argc != 4) {
+        return 10;
+    }
+    bool readOk = false;
+    bool writeOk = false;
+    const quintptr readValue = QString::fromLocal8Bit(argv[2]).toULongLong(&readOk);
+    const quintptr writeValue = QString::fromLocal8Bit(argv[3]).toULongLong(&writeOk);
+    if (!readOk || !writeOk) {
+        return 11;
+    }
+    const HANDLE inheritedRead = reinterpret_cast<HANDLE>(readValue);
+    const HANDLE inheritedWrite = reinterpret_cast<HANDLE>(writeValue);
+    DWORD readFlags = 0;
+    DWORD writeFlags = 0;
+    if (!GetHandleInformation(inheritedRead, &readFlags)) {
+        return 20;
+    }
+    if (!GetHandleInformation(inheritedWrite, &writeFlags)) {
+        return 21;
+    }
+    if ((readFlags & HANDLE_FLAG_INHERIT) == 0
+        || (writeFlags & HANDLE_FLAG_INHERIT) == 0) {
+        return 22;
+    }
+    if (GetFileType(inheritedRead) != FILE_TYPE_PIPE
+        || GetFileType(inheritedWrite) != FILE_TYPE_PIPE) {
+        return 23;
+    }
+    DWORD transferred = 0;
+    if (!PeekNamedPipe(inheritedRead, nullptr, 0, nullptr, &transferred, nullptr)) {
+        return 24;
+    }
+    char ignored = 0;
+    if (!WriteFile(inheritedWrite, &ignored, 0, &transferred, nullptr)) {
+        return 25;
+    }
+    auto transport = WinPipeTransport::adoptInheritedHandles(
+        inheritedRead, inheritedWrite);
+    if (!transport.has_value()) {
+        return 12;
+    }
+    IpcSession worker(std::move(*transport), IpcRole::Worker);
+    const auto handshake = ProtocolMessage::handshake(QStringLiteral("child-nonce"));
+    if (!handshake.has_value() || !worker.send(*handshake)) {
+        return 13;
+    }
+    const SessionReceiveResult acknowledgement = worker.receive(2000);
+    if (acknowledgement.status != SessionStatus::MessageReady
+        || !worker.isAuthenticated()
+        || worker.appIdentity() != QStringLiteral("com.qbrowser.child")) {
+        return 14;
+    }
+    return 0;
+}
+#endif
+
+} // namespace
 
 class IpcSessionTest final : public QObject
 {
@@ -16,6 +105,8 @@ class IpcSessionTest final : public QObject
 
 private slots:
     void anonymousPipeEndsHaveLeastInheritance();
+    void rejectsInvalidInheritedHandles();
+    void adoptsInheritedHandlesInRealChildProcess();
     void pipeWriteTimeoutIsBounded();
     void authenticatesNonceAndUsesHostAssignedIdentity();
     void rejectsWrongNonceAndMalformedPeer();
@@ -58,6 +149,78 @@ void IpcSessionTest::anonymousPipeEndsHaveLeastInheritance()
     QVERIFY(GetHandleInformation(worker.nativeWriteHandle(), &workerWriteFlags));
     QVERIFY(!(workerReadFlags & HANDLE_FLAG_INHERIT));
     QVERIFY(!(workerWriteFlags & HANDLE_FLAG_INHERIT));
+#endif
+}
+
+void IpcSessionTest::rejectsInvalidInheritedHandles()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    QVERIFY(!WinPipeTransport::adoptInheritedHandles(nullptr, nullptr).has_value());
+
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    QVERIFY(!WinPipeTransport::adoptInheritedHandles(
+                 pair.workerEnds().nativeWriteHandle(),
+                 pair.workerEnds().nativeReadHandle())
+                 .has_value());
+    QVERIFY(pair.workerEnds().isValid());
+
+    QVERIFY(SetHandleInformation(pair.workerEnds().nativeReadHandle(),
+                                 HANDLE_FLAG_INHERIT, 0));
+    QVERIFY(!WinPipeTransport::adoptInheritedHandles(
+                 pair.workerEnds().nativeReadHandle(),
+                 pair.workerEnds().nativeWriteHandle())
+                 .has_value());
+    QVERIFY(pair.workerEnds().isValid());
+#endif
+}
+
+void IpcSessionTest::adoptsInheritedHandlesInRealChildProcess()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    const QString executable = QCoreApplication::applicationFilePath();
+    const QString command = QStringLiteral("\"%1\" --ipc-child %2 %3")
+                                .arg(executable,
+                                     QString::number(reinterpret_cast<quintptr>(
+                                         pair.workerEnds().nativeReadHandle())),
+                                     QString::number(reinterpret_cast<quintptr>(
+                                         pair.workerEnds().nativeWriteHandle())));
+    std::wstring mutableCommand = command.toStdWString();
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    ChildProcess child;
+
+    QVERIFY(CreateProcessW(reinterpret_cast<LPCWSTR>(executable.utf16()),
+                           mutableCommand.data(),
+                           nullptr,
+                           nullptr,
+                           TRUE,
+                           CREATE_NO_WINDOW,
+                           nullptr,
+                           nullptr,
+                           &startup,
+                           child.address()));
+    WorkerPipeEnds parentCopies = pair.takeWorkerEnds();
+    parentCopies.close();
+    IpcSession host(pair.takeHost(), IpcRole::Host,
+                    HostLaunchContext{QStringLiteral("child-nonce"),
+                                      QStringLiteral("com.qbrowser.child")});
+
+    const SessionReceiveResult handshake = host.receive(2000);
+    const DWORD waitResult = WaitForSingleObject(child.processHandle(), 5000);
+    DWORD exitCode = 0;
+    QVERIFY(GetExitCodeProcess(child.processHandle(), &exitCode));
+    QCOMPARE(waitResult, DWORD(WAIT_OBJECT_0));
+    QCOMPARE(exitCode, DWORD(0));
+    QCOMPARE(handshake.status, SessionStatus::MessageReady);
+    QCOMPARE(handshake.message->type(), ProtocolType::Handshake);
 #endif
 }
 
@@ -173,6 +336,18 @@ void IpcSessionTest::correlatesResponsesAndRejectsDuplicateRequestIds()
     QVERIFY(worker.send(*ProtocolMessage::handshake(QStringLiteral("n"))));
     QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
     QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
+    const auto untrackedRequest = ProtocolMessage::request(QStringLiteral("untracked"),
+                                                           QStringLiteral("storage"),
+                                                           QStringLiteral("get"), {});
+    QVERIFY(!worker.send(*untrackedRequest));
+    QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.tracking_required"));
+    QCOMPARE(worker.pendingRequestCount(), qsizetype(0));
+    const auto untrackedRoute = ProtocolMessage::routeLoad(QStringLiteral("untracked-route"),
+                                                           QStringLiteral("/orders"));
+    QVERIFY(!host.send(*untrackedRoute));
+    QCOMPARE(host.lastErrorCode(), QStringLiteral("ipc.session.tracking_required"));
+    QCOMPARE(host.pendingRequestCount(), qsizetype(0));
+
     QVERIFY(worker.sendRequest(QStringLiteral("req-1"), QStringLiteral("storage"),
                                QStringLiteral("get"), QJsonObject{}, 1000));
     QVERIFY(!worker.sendRequest(QStringLiteral("req-1"), QStringLiteral("storage"),
@@ -242,17 +417,17 @@ void IpcSessionTest::rejectsUnknownProtocolAndDuplicateInboundRequests()
         WinPipePair pair = WinPipeTransport::createHostPair();
         IpcSession host(pair.takeHost(), IpcRole::Host,
                         HostLaunchContext{QStringLiteral("n"), QStringLiteral("trusted")});
-        IpcSession worker(WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
-                          IpcRole::Worker);
-        QVERIFY(worker.send(*ProtocolMessage::handshake(QStringLiteral("n"))));
+        WinPipeTransport worker = WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+        QVERIFY(worker.writeAll(FrameCodec::encode(
+                                    ProtocolMessage::handshake(QStringLiteral("n"))->toJson()),
+                                1000));
         QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
-        QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
         const auto request = ProtocolMessage::request(QStringLiteral("same"),
                                                       QStringLiteral("storage"),
                                                       QStringLiteral("get"), {});
-        QVERIFY(worker.send(*request));
+        QVERIFY(worker.writeAll(FrameCodec::encode(request->toJson()), 1000));
         QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
-        QVERIFY(worker.send(*request));
+        QVERIFY(worker.writeAll(FrameCodec::encode(request->toJson()), 1000));
         QCOMPARE(host.receive(1000).status, SessionStatus::Failed);
         QCOMPARE(host.lastErrorCode(), QStringLiteral("ipc.session.duplicate_request_id"));
     }
@@ -291,11 +466,13 @@ void IpcSessionTest::expiresPendingRequests()
     QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
     QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
     QVERIFY(worker.sendRequest(QStringLiteral("expires"), QStringLiteral("storage"),
-                               QStringLiteral("get"), {}, 10));
+                               QStringLiteral("get"), {}, 25));
     QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
-    QTest::qWait(20);
+    QElapsedTimer elapsed;
+    elapsed.start();
     QCOMPARE(worker.receive(1000).status, SessionStatus::TimedOut);
     QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.request_timeout"));
+    QVERIFY(elapsed.elapsed() < 250);
 #endif
 }
 
@@ -342,6 +519,16 @@ void IpcSessionTest::reportsTimeoutPeerCloseAndHeartbeat()
 #endif
 }
 
-QTEST_MAIN(IpcSessionTest)
+int main(int argc, char **argv)
+{
+#ifdef Q_OS_WIN
+    if (argc > 1 && QByteArray(argv[1]) == QByteArrayLiteral("--ipc-child")) {
+        return runIpcChild(argc, argv);
+    }
+#endif
+    QCoreApplication application(argc, argv);
+    IpcSessionTest test;
+    return QTest::qExec(&test, argc, argv);
+}
 
 #include "tst_ipc_session.moc"

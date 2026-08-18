@@ -2,6 +2,8 @@
 
 #include <QByteArray>
 
+#include <optional>
+
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #else
@@ -62,6 +64,8 @@ public:
 
     static WinPipePair createHostPair();
     static WinPipeTransport adoptWorkerEnds(WorkerPipeEnds &&ends);
+    static std::optional<WinPipeTransport> adoptInheritedHandles(HANDLE readHandle,
+                                                                HANDLE writeHandle);
 
     bool isValid() const noexcept;
     HANDLE nativeReadHandle() const noexcept;

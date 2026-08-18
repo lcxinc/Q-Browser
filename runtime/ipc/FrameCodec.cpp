@@ -6,6 +6,8 @@
 #include <QSet>
 #include <QStringDecoder>
 
+#include <algorithm>
+
 namespace {
 
 quint32 decodeLength(const QByteArray &bytes)
@@ -19,6 +21,7 @@ quint32 decodeLength(const QByteArray &bytes)
 enum class StrictScanResult {
     Valid,
     DuplicateMember,
+    ResourceLimit,
     Invalid,
 };
 
@@ -31,16 +34,13 @@ public:
     {
         skipWhitespace();
         if (!parseValue(0)) {
-            return result_ == StrictScanResult::DuplicateMember ? result_
-                                                                : StrictScanResult::Invalid;
+            return result_ == StrictScanResult::Valid ? StrictScanResult::Invalid : result_;
         }
         skipWhitespace();
         return position_ == text_.size() ? result_ : StrictScanResult::Invalid;
     }
 
 private:
-    static constexpr qsizetype maximumNesting = 64;
-
     bool parseValue(const qsizetype nesting)
     {
         if (position_ >= text_.size()) {
@@ -48,25 +48,29 @@ private:
         }
         const QChar value = text_.at(position_);
         if (value == u'{') {
-            return nesting < maximumNesting && parseObject(nesting + 1);
+            if (nesting >= FrameCodec::maximumJsonNesting()) {
+                result_ = StrictScanResult::ResourceLimit;
+                return false;
+            }
+            return parseObject(nesting + 1);
         }
         if (value == u'[') {
-            return nesting < maximumNesting && parseArray(nesting + 1);
+            if (nesting >= FrameCodec::maximumJsonNesting()) {
+                result_ = StrictScanResult::ResourceLimit;
+                return false;
+            }
+            return parseArray(nesting + 1);
         }
         if (value == u'"') {
             QString ignored;
             return parseString(ignored);
         }
-        const qsizetype start = position_;
-        while (position_ < text_.size()) {
-            const QChar character = text_.at(position_);
-            if (character == u',' || character == u'}' || character == u']'
-                || character.isSpace()) {
-                break;
-            }
-            ++position_;
+        if (value == u'-' || (value >= u'0' && value <= u'9')) {
+            return parseNumber();
         }
-        return position_ > start;
+        return consumeKeyword(QStringView(u"true"))
+            || consumeKeyword(QStringView(u"false"))
+            || consumeKeyword(QStringView(u"null"));
     }
 
     bool parseObject(const qsizetype nesting)
@@ -87,6 +91,9 @@ private:
                 return false;
             }
             members.insert(member);
+            if (!countAggregateEntry()) {
+                return false;
+            }
             skipWhitespace();
             if (!consume(u':')) {
                 return false;
@@ -114,6 +121,9 @@ private:
             return true;
         }
         for (;;) {
+            if (!countAggregateEntry()) {
+                return false;
+            }
             if (!parseValue(nesting)) {
                 return false;
             }
@@ -130,34 +140,180 @@ private:
 
     bool parseString(QString &decoded)
     {
-        if (position_ >= text_.size() || text_.at(position_) != u'"') {
+        if (!consume(u'"')) {
             return false;
         }
-        const qsizetype start = position_++;
-        bool escaped = false;
         while (position_ < text_.size()) {
             const QChar character = text_.at(position_++);
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (character == u'\\') {
-                escaped = true;
-                continue;
-            }
             if (character == u'"') {
-                const QString token = text_.mid(start, position_ - start);
-                const QJsonDocument wrapper = QJsonDocument::fromJson(
-                    (QByteArrayLiteral("[") + token.toUtf8() + QByteArrayLiteral("]")));
-                if (!wrapper.isArray() || wrapper.array().size() != 1
-                    || !wrapper.array().first().isString()) {
+                return true;
+            }
+            if (character.unicode() < 0x20) {
+                return false;
+            }
+            if (character != u'\\') {
+                if (character.isHighSurrogate()) {
+                    if (position_ >= text_.size()
+                        || !text_.at(position_).isLowSurrogate()) {
+                        return false;
+                    }
+                    decoded.append(character);
+                    decoded.append(text_.at(position_++));
+                } else if (character.isLowSurrogate()) {
+                    return false;
+                } else {
+                    decoded.append(character);
+                }
+                continue;
+            }
+            if (position_ >= text_.size()) {
+                return false;
+            }
+            const QChar escape = text_.at(position_++);
+            switch (escape.unicode()) {
+            case '"':
+            case '\\':
+            case '/':
+                decoded.append(escape);
+                break;
+            case 'b':
+                decoded.append(u'\b');
+                break;
+            case 'f':
+                decoded.append(u'\f');
+                break;
+            case 'n':
+                decoded.append(u'\n');
+                break;
+            case 'r':
+                decoded.append(u'\r');
+                break;
+            case 't':
+                decoded.append(u'\t');
+                break;
+            case 'u': {
+                ushort codeUnit = 0;
+                if (!parseHexCodeUnit(codeUnit)) {
                     return false;
                 }
-                decoded = wrapper.array().first().toString();
-                return true;
+                const QChar unicode(codeUnit);
+                if (unicode.isHighSurrogate()) {
+                    if (position_ + 2 > text_.size() || text_.at(position_) != u'\\'
+                        || text_.at(position_ + 1) != u'u') {
+                        return false;
+                    }
+                    position_ += 2;
+                    ushort lowCodeUnit = 0;
+                    if (!parseHexCodeUnit(lowCodeUnit)
+                        || !QChar(lowCodeUnit).isLowSurrogate()) {
+                        return false;
+                    }
+                    decoded.append(unicode);
+                    decoded.append(QChar(lowCodeUnit));
+                } else if (unicode.isLowSurrogate()) {
+                    return false;
+                } else {
+                    decoded.append(unicode);
+                }
+                break;
+            }
+            default:
+                return false;
             }
         }
         return false;
+    }
+
+    bool parseHexCodeUnit(ushort &value)
+    {
+        if (position_ + 4 > text_.size()) {
+            return false;
+        }
+        ushort decoded = 0;
+        for (qsizetype index = 0; index < 4; ++index) {
+            const QChar character = text_.at(position_ + index);
+            ushort digit = 0;
+            if (character >= u'0' && character <= u'9') {
+                digit = static_cast<ushort>(character.unicode() - u'0');
+            } else if (character >= u'a' && character <= u'f') {
+                digit = static_cast<ushort>(character.unicode() - u'a' + 10);
+            } else if (character >= u'A' && character <= u'F') {
+                digit = static_cast<ushort>(character.unicode() - u'A' + 10);
+            } else {
+                return false;
+            }
+            decoded = static_cast<ushort>((decoded << 4U) | digit);
+        }
+        position_ += 4;
+        value = decoded;
+        return true;
+    }
+
+    bool parseNumber()
+    {
+        consume(u'-');
+        if (position_ >= text_.size()) {
+            return false;
+        }
+        if (text_.at(position_) == u'0') {
+            ++position_;
+            if (position_ < text_.size() && text_.at(position_).isDigit()) {
+                return false;
+            }
+        } else if (text_.at(position_) >= u'1' && text_.at(position_) <= u'9') {
+            do {
+                ++position_;
+            } while (position_ < text_.size() && text_.at(position_) >= u'0'
+                     && text_.at(position_) <= u'9');
+        } else {
+            return false;
+        }
+        if (consume(u'.')) {
+            const qsizetype start = position_;
+            while (position_ < text_.size() && text_.at(position_) >= u'0'
+                   && text_.at(position_) <= u'9') {
+                ++position_;
+            }
+            if (position_ == start) {
+                return false;
+            }
+        }
+        if (position_ < text_.size()
+            && (text_.at(position_) == u'e' || text_.at(position_) == u'E')) {
+            ++position_;
+            if (position_ < text_.size()
+                && (text_.at(position_) == u'+' || text_.at(position_) == u'-')) {
+                ++position_;
+            }
+            const qsizetype start = position_;
+            while (position_ < text_.size() && text_.at(position_) >= u'0'
+                   && text_.at(position_) <= u'9') {
+                ++position_;
+            }
+            if (position_ == start) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool consumeKeyword(const QStringView keyword)
+    {
+        if (QStringView(text_).mid(position_, keyword.size()) != keyword) {
+            return false;
+        }
+        position_ += keyword.size();
+        return true;
+    }
+
+    bool countAggregateEntry()
+    {
+        if (aggregateEntries_ >= FrameCodec::maximumJsonAggregateEntries()) {
+            result_ = StrictScanResult::ResourceLimit;
+            return false;
+        }
+        ++aggregateEntries_;
+        return true;
     }
 
     void skipWhitespace()
@@ -183,6 +339,7 @@ private:
 
     QString text_;
     qsizetype position_ = 0;
+    qsizetype aggregateEntries_ = 0;
     StrictScanResult result_ = StrictScanResult::Valid;
 };
 
@@ -210,13 +367,20 @@ FrameFeedResult FrameCodec::feed(const QByteArrayView bytes)
     if (isFailed()) {
         return {FrameStatus::Failed, {}, error_, errorCode_};
     }
-    if (bytes.size() > maximumQueuedBytes() - queued_.size()) {
-        return fail(FrameError::QueueLimitExceeded, QStringLiteral("ipc.frame.queue_limit"));
-    }
-    queued_.append(bytes.data(), bytes.size());
 
     QList<QJsonObject> frames;
-    while (queued_.size() >= 4) {
+    qsizetype inputPosition = 0;
+    for (;;) {
+        if (queued_.size() < 4 && inputPosition < bytes.size()) {
+            const qsizetype appended = std::min(4 - queued_.size(),
+                                                bytes.size() - inputPosition);
+            queued_.append(bytes.data() + inputPosition, appended);
+            inputPosition += appended;
+        }
+        if (queued_.size() < 4) {
+            break;
+        }
+
         const quint32 payloadSize = decodeLength(queued_);
         if (payloadSize == 0U) {
             return fail(FrameError::ZeroLength, QStringLiteral("ipc.frame.zero_length"));
@@ -226,8 +390,19 @@ FrameFeedResult FrameCodec::feed(const QByteArrayView bytes)
         }
 
         const qsizetype frameSize = 4 + static_cast<qsizetype>(payloadSize);
+        if (queued_.size() < frameSize && inputPosition < bytes.size()) {
+            const qsizetype appended = std::min(frameSize - queued_.size(),
+                                                bytes.size() - inputPosition);
+            queued_.append(bytes.data() + inputPosition, appended);
+            inputPosition += appended;
+        }
         if (queued_.size() < frameSize) {
             break;
+        }
+
+        if (frames.size() >= maximumFramesPerFeed()) {
+            return fail(FrameError::QueueLimitExceeded,
+                        QStringLiteral("ipc.frame.queue_limit"));
         }
 
         const QByteArray payload = queued_.sliced(4, payloadSize);
@@ -235,6 +410,19 @@ FrameFeedResult FrameCodec::feed(const QByteArrayView bytes)
         const QString decoded = decoder.decode(payload);
         if (decoder.hasError()) {
             return fail(FrameError::InvalidUtf8, QStringLiteral("ipc.frame.invalid_utf8"));
+        }
+
+        const StrictScanResult strictScan = StrictJsonScanner(decoded).scan();
+        if (strictScan == StrictScanResult::DuplicateMember) {
+            return fail(FrameError::DuplicateMember,
+                        QStringLiteral("ipc.frame.duplicate_member"));
+        }
+        if (strictScan == StrictScanResult::ResourceLimit) {
+            return fail(FrameError::JsonResourceLimit,
+                        QStringLiteral("ipc.frame.json_resource_limit"));
+        }
+        if (strictScan != StrictScanResult::Valid) {
+            return fail(FrameError::InvalidJson, QStringLiteral("ipc.frame.invalid_json"));
         }
 
         QJsonParseError parseError;
@@ -245,21 +433,13 @@ FrameFeedResult FrameCodec::feed(const QByteArrayView bytes)
         if (!document.isObject()) {
             return fail(FrameError::RootNotObject, QStringLiteral("ipc.frame.root_not_object"));
         }
-        const StrictScanResult strictScan = StrictJsonScanner(decoded).scan();
-        if (strictScan == StrictScanResult::DuplicateMember) {
-            return fail(FrameError::DuplicateMember,
-                        QStringLiteral("ipc.frame.duplicate_member"));
-        }
-        if (strictScan != StrictScanResult::Valid) {
-            return fail(FrameError::InvalidJson, QStringLiteral("ipc.frame.invalid_json"));
-        }
 
-        if (frames.size() >= maximumFramesPerFeed()) {
-            return fail(FrameError::QueueLimitExceeded,
-                        QStringLiteral("ipc.frame.queue_limit"));
-        }
         frames.append(document.object());
         queued_.remove(0, frameSize);
+
+        if (inputPosition >= bytes.size() && queued_.isEmpty()) {
+            break;
+        }
     }
 
     return {frames.isEmpty() ? FrameStatus::NeedMoreData : FrameStatus::FramesReady,
