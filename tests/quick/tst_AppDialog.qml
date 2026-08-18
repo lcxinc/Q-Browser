@@ -81,4 +81,18 @@ TestCase {
         dialog.close()
         Theme.dark = originalDark
     }
+
+    function test_textSelectionContrastsWithBaseInBothThemes() {
+        const originalDark = Theme.dark
+        for (const dark of [false, true]) {
+            Theme.dark = dark
+            const dialog = createTemporaryObject(dialogComponent, this)
+            verify(dialog)
+            verify(contrast(dialog.selectionField.selectionColor,
+                            dialog.selectionField.background.color) >= 3.0)
+            verify(contrast(dialog.selectionField.selectedTextColor,
+                            dialog.selectionField.selectionColor) >= 4.5)
+        }
+        Theme.dark = originalDark
+    }
 }

@@ -60,8 +60,8 @@ Control {
             width: parent.width
             implicitHeight: Math.max(Spacing.controlHeight, contentHeight + topPadding + bottomPadding)
             activeFocusOnTab: true
-            color: Theme.textPrimary
-            placeholderTextColor: Theme.textSecondary
+            color: root.enabled ? Theme.textPrimary : Theme.disabledText
+            placeholderTextColor: root.enabled ? Theme.textSecondary : Theme.disabledText
             selectByMouse: true
             font.family: Typography.family
             font.pixelSize: Typography.body
@@ -74,10 +74,12 @@ Control {
 
             background: Rectangle {
                 radius: Spacing.radius
-                color: Theme.surface
+                color: root.enabled ? Theme.surface : Theme.surfaceRaised
                 border.width: editor.activeFocus ? Spacing.focusRing : Spacing.border
-                border.color: root.hasError ? Theme.error
-                                                : editor.activeFocus ? Theme.focus : Theme.border
+                border.color: !root.enabled ? Theme.borderStrong
+                                             : root.hasError ? Theme.error
+                                             : editor.activeFocus ? Theme.focus
+                                                                  : Theme.borderStrong
             }
         }
 

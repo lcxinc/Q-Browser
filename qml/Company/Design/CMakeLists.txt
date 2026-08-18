@@ -15,6 +15,7 @@ qt_add_qml_module(q_browser_design
     AppCard.qml
     AppDialog.qml
     AppNavigation.qml
+    AppStatusBadge.qml
     AppTable.qml
     AppTextField.qml
     AppToast.qml

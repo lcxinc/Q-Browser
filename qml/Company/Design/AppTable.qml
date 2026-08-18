@@ -120,7 +120,8 @@ Control {
 
             background: Rectangle {
                 color: row.highlighted ? Theme.surfaceRaised : Theme.surface
-                border.width: row.visualFocus ? Spacing.focusRing : 0
+                border.width: row.highlighted || row.visualFocus
+                              ? Spacing.focusRing : 0
                 border.color: Theme.focus
             }
         }

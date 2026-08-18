@@ -100,7 +100,8 @@ Control {
 
             background: Rectangle {
                 color: destination.highlighted ? Theme.surfaceRaised : Theme.surface
-                border.width: destination.visualFocus ? Spacing.focusRing : 0
+                border.width: destination.highlighted || destination.visualFocus
+                              ? Spacing.focusRing : 0
                 border.color: Theme.focus
             }
         }

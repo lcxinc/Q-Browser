@@ -4,10 +4,13 @@ qt_add_executable(qbrowser_quick_tests
 target_sources(qbrowser_quick_tests
   PRIVATE
     tst_AppButton.qml
+    tst_AppCard.qml
     tst_AppDialog.qml
     tst_AppNavigation.qml
     tst_AppTable.qml
     tst_AppTextField.qml
+    tst_AppToast.qml
+    tst_AppStatusBadge.qml
     tst_StateView.qml)
 
 target_link_libraries(qbrowser_quick_tests
