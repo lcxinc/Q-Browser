@@ -7,8 +7,15 @@
 
 struct HostRequestContext {
     QString appIdentity;
-    bool userGesture = false;
+    QString requestId;
 };
+
+[[nodiscard]] constexpr qint64 maximumIpcBinaryResultBytes() noexcept
+{
+    // Base64 expands by 4/3; the remaining budget covers a maximum request ID,
+    // response envelope, metadata, and worst-case JSON escaping.
+    return 760LL * 1024LL;
+}
 
 struct BrokerResult {
     bool ok = false;

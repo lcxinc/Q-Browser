@@ -8,7 +8,9 @@ add_library(q_browser_broker STATIC
   NetworkBroker.cpp
   NetworkBroker.h
   StorageBroker.cpp
-  StorageBroker.h)
+  StorageBroker.h
+  UserGestureGrantStore.cpp
+  UserGestureGrantStore.h)
 
 target_include_directories(q_browser_broker
   PUBLIC
@@ -17,6 +19,7 @@ target_include_directories(q_browser_broker
 target_link_libraries(q_browser_broker
   PUBLIC
     q_browser_policy
+    q_browser_ipc
     Qt6::Core
   PRIVATE
     Qt6::Gui

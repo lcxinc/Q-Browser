@@ -53,13 +53,28 @@ public:
     QByteArray responseBody = "ok";
 };
 
+class FixedResolver final : public NetworkAddressResolver
+{
+public:
+    QList<QHostAddress> resolve(const QString &, int, bool &timedOut) override
+    {
+        timedOut = false;
+        return addresses;
+    }
+
+    QList<QHostAddress> addresses;
+};
+
 namespace {
 
-EffectiveNetworkPolicy policyFor(const LocalHttpServer &)
+EffectiveNetworkPolicy policyFor(const LocalHttpServer &server)
 {
-    return EffectiveNetworkPolicy{{NetworkAllowRule{QStringLiteral("127.0.0.1"),
+    return EffectiveNetworkPolicy{{NetworkAllowRule{NetworkScheme::Http,
+                                                     QStringLiteral("127.0.0.1"),
+                                                     server.serverPort(),
                                                      QStringLiteral("/api"),
-                                                     {HttpMethod::Get, HttpMethod::Post}}},
+                                                     {HttpMethod::Get, HttpMethod::Post},
+                                                     {NetworkAddressClass::Loopback}}},
                                   8,
                                   32,
                                   1000};
@@ -84,6 +99,7 @@ private slots:
     void deniedPathAndMethodNeverReachServer();
     void boundsRequestAndResponsePayloads();
     void returnsStableTimeout();
+    void rejectsWrongSchemePortAndResolvedAddressClass();
 };
 
 void NetworkBrokerTest::performsAllowedRequestAgainstRealServer()
@@ -95,7 +111,7 @@ void NetworkBrokerTest::performsAllowedRequestAgainstRealServer()
     const BrokerResult result = broker.invoke(QStringLiteral("request"),
                                               requestPayload(QStringLiteral("GET"),
                                                              server.url(QStringLiteral("/api/orders"))),
-                                              {QStringLiteral("host.identity"), false});
+                                              {QStringLiteral("host.identity"), QStringLiteral("request")});
 
     QVERIFY2(result.ok, qPrintable(result.errorCode));
     QCOMPARE(result.value.value(QStringLiteral("status")).toInt(), 200);
@@ -114,14 +130,14 @@ void NetworkBrokerTest::deniedPathAndMethodNeverReachServer()
     BrokerResult result = broker.invoke(QStringLiteral("request"),
                                         requestPayload(QStringLiteral("GET"),
                                                        server.url(QStringLiteral("/private"))),
-                                        {QStringLiteral("host.identity"), false});
+                                        {QStringLiteral("host.identity"), QStringLiteral("request")});
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
 
     result = broker.invoke(QStringLiteral("request"),
                            requestPayload(QStringLiteral("PUT"),
                                           server.url(QStringLiteral("/api"))),
-                           {QStringLiteral("host.identity"), false});
+                           {QStringLiteral("host.identity"), QStringLiteral("request")});
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
     QCOMPARE(server.requestCount, 0);
@@ -137,7 +153,7 @@ void NetworkBrokerTest::boundsRequestAndResponsePayloads()
                                         requestPayload(QStringLiteral("POST"),
                                                        server.url(QStringLiteral("/api")),
                                                        QByteArray(9, 'x')),
-                                        {QStringLiteral("host.identity"), false});
+                                        {QStringLiteral("host.identity"), QStringLiteral("request")});
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("network.payload_too_large"));
     QCOMPARE(server.requestCount, 0);
@@ -146,7 +162,7 @@ void NetworkBrokerTest::boundsRequestAndResponsePayloads()
     result = broker.invoke(QStringLiteral("request"),
                            requestPayload(QStringLiteral("GET"),
                                           server.url(QStringLiteral("/api"))),
-                           {QStringLiteral("host.identity"), false});
+                           {QStringLiteral("host.identity"), QStringLiteral("request")});
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("network.response_too_large"));
     QCOMPARE(server.requestCount, 1);
@@ -164,11 +180,48 @@ void NetworkBrokerTest::returnsStableTimeout()
     const BrokerResult result = broker.invoke(QStringLiteral("request"),
                                               requestPayload(QStringLiteral("GET"),
                                                              server.url(QStringLiteral("/api"))),
-                                              {QStringLiteral("host.identity"), false});
+                                              {QStringLiteral("host.identity"), QStringLiteral("request")});
 
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("network.timeout"));
     QCOMPARE(server.requestCount, 1);
+}
+
+void NetworkBrokerTest::rejectsWrongSchemePortAndResolvedAddressClass()
+{
+    LocalHttpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    NetworkBroker broker(policyFor(server));
+    const HostRequestContext context{QStringLiteral("host.identity"),
+                                     QStringLiteral("request")};
+
+    QUrl wrongScheme = server.url(QStringLiteral("/api"));
+    wrongScheme.setScheme(QStringLiteral("https"));
+    BrokerResult result = broker.invoke(QStringLiteral("request"),
+                                        requestPayload(QStringLiteral("GET"), wrongScheme),
+                                        context);
+    QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
+
+    QUrl wrongPort = server.url(QStringLiteral("/api"));
+    wrongPort.setPort(static_cast<int>(server.serverPort()) + 1);
+    result = broker.invoke(QStringLiteral("request"),
+                           requestPayload(QStringLiteral("GET"), wrongPort),
+                           context);
+    QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
+    QCOMPARE(server.requestCount, 0);
+
+    EffectiveNetworkPolicy rebound = policyFor(server);
+    rebound.rules[0].host = QStringLiteral("api.example.com");
+    rebound.rules[0].addressClasses = {NetworkAddressClass::Public};
+    FixedResolver resolver;
+    resolver.addresses = {QHostAddress::LocalHost};
+    NetworkBroker reboundBroker(rebound, resolver);
+    QUrl reboundUrl(QStringLiteral("http://api.example.com:%1/api").arg(server.serverPort()));
+    result = reboundBroker.invoke(QStringLiteral("request"),
+                                  requestPayload(QStringLiteral("GET"), reboundUrl),
+                                  context);
+    QCOMPARE(result.errorCode, QStringLiteral("network.host_denied"));
+    QCOMPARE(server.requestCount, 0);
 }
 
 QTEST_GUILESS_MAIN(NetworkBrokerTest)

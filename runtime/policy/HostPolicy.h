@@ -12,10 +12,25 @@ enum class HttpMethod {
     Put,
 };
 
+enum class NetworkScheme {
+    Http,
+    Https,
+};
+
+enum class NetworkAddressClass {
+    Public,
+    Loopback,
+    Private,
+    LinkLocal,
+};
+
 struct NetworkAllowRule {
+    NetworkScheme scheme = NetworkScheme::Https;
     QString host;
+    quint16 port = 0;
     QString pathPrefix;
     QSet<HttpMethod> methods;
+    QSet<NetworkAddressClass> addressClasses;
 };
 
 struct HostNetworkPolicy {
@@ -57,3 +72,4 @@ public:
 
 [[nodiscard]] QString httpMethodName(HttpMethod method);
 [[nodiscard]] std::optional<HttpMethod> parseHttpMethod(const QString &method);
+[[nodiscard]] QString networkSchemeName(NetworkScheme scheme);

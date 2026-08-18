@@ -2,6 +2,8 @@
 
 #include "CapabilityBroker.h"
 
+class UserGestureGrantStore;
+
 class ClipboardBackend
 {
 public:
@@ -20,7 +22,9 @@ public:
 class ClipboardBroker final : public CapabilityService
 {
 public:
-    ClipboardBroker(EffectiveClipboardPolicy policy, ClipboardBackend &backend);
+    ClipboardBroker(EffectiveClipboardPolicy policy,
+                    ClipboardBackend &backend,
+                    UserGestureGrantStore &grants);
 
     [[nodiscard]] BrokerResult invoke(const QString &operation,
                                       const QJsonObject &payload,
@@ -29,4 +33,5 @@ public:
 private:
     EffectiveClipboardPolicy policy_;
     ClipboardBackend &backend_;
+    UserGestureGrantStore &grants_;
 };

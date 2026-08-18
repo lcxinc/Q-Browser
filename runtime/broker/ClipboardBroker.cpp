@@ -1,5 +1,7 @@
 #include "ClipboardBroker.h"
 
+#include "UserGestureGrantStore.h"
+
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QSet>
@@ -20,8 +22,10 @@ bool QtClipboardBackend::writeText(const QString &text)
     return true;
 }
 
-ClipboardBroker::ClipboardBroker(EffectiveClipboardPolicy policy, ClipboardBackend &backend)
-    : policy_(policy), backend_(backend)
+ClipboardBroker::ClipboardBroker(EffectiveClipboardPolicy policy,
+                                 ClipboardBackend &backend,
+                                 UserGestureGrantStore &grants)
+    : policy_(policy), backend_(backend), grants_(grants)
 {
 }
 
@@ -38,7 +42,7 @@ BrokerResult ClipboardBroker::invoke(const QString &operation,
             return BrokerResult::failure(QStringLiteral("capability.denied"),
                                          QStringLiteral("Capability is not permitted."));
         }
-        if (!context.userGesture) {
+        if (!grants_.consume(context.appIdentity, context.requestId)) {
             return BrokerResult::failure(QStringLiteral("clipboard.gesture_required"),
                                          QStringLiteral("A user gesture is required."));
         }

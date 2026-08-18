@@ -1,5 +1,8 @@
 #include "CapabilityBroker.h"
 
+#include "FrameCodec.h"
+#include "ProtocolMessage.h"
+
 #include <utility>
 
 namespace {
@@ -21,6 +24,23 @@ bool validHostIdentity(const QString &identity)
         }
     }
     return true;
+}
+
+bool requestFitsIpc(const QString &requestId,
+                    const QString &capability,
+                    const QString &operation,
+                    const QJsonObject &payload)
+{
+    const auto message = ProtocolMessage::request(requestId, capability, operation, payload);
+    return message.has_value() && !FrameCodec::encode(message->toJson()).isEmpty();
+}
+
+bool responseFitsIpc(const QString &requestId, const BrokerResult &result)
+{
+    const auto message = result.ok
+        ? ProtocolMessage::successResponse(requestId, result.value)
+        : ProtocolMessage::errorResponse(requestId, result.errorCode, result.errorMessage);
+    return message.has_value() && !FrameCodec::encode(message->toJson()).isEmpty();
 }
 
 bool operationAllowed(const QString &capability, const QString &operation)
@@ -63,7 +83,7 @@ BrokerResult CapabilityBroker::dispatch(const QString &capability,
                                         const QJsonObject &payload,
                                         const HostRequestContext &context)
 {
-    if (!validHostIdentity(context.appIdentity)) {
+    if (!validHostIdentity(context.appIdentity) || context.requestId.isEmpty()) {
         return denied();
     }
 
@@ -80,5 +100,14 @@ BrokerResult CapabilityBroker::dispatch(const QString &capability,
     if (service == nullptr || !operationAllowed(capability, operation)) {
         return denied();
     }
-    return service->invoke(operation, payload, context);
+    if (!requestFitsIpc(context.requestId, capability, operation, payload)) {
+        return BrokerResult::failure(QStringLiteral("capability.payload_too_large"),
+                                     QStringLiteral("Capability request is too large."));
+    }
+    BrokerResult result = service->invoke(operation, payload, context);
+    if (!responseFitsIpc(context.requestId, result)) {
+        result = BrokerResult::failure(QStringLiteral("capability.response_too_large"),
+                                       QStringLiteral("Capability response is too large."));
+    }
+    return result;
 }

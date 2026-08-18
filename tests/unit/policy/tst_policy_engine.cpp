@@ -25,12 +25,18 @@ HostPolicy restrictiveHostPolicy()
     HostPolicy policy;
     HostNetworkPolicy network;
     network.rules = {
-        NetworkAllowRule{QStringLiteral("api.example.com"),
+        NetworkAllowRule{NetworkScheme::Https,
+                         QStringLiteral("api.example.com"),
+                         443,
                          QStringLiteral("/v1/orders"),
-                         {HttpMethod::Get}},
-        NetworkAllowRule{QStringLiteral("unrequested.example.com"),
+                         {HttpMethod::Get},
+                         {NetworkAddressClass::Public}},
+        NetworkAllowRule{NetworkScheme::Https,
+                         QStringLiteral("unrequested.example.com"),
+                         443,
                          QStringLiteral("/"),
-                         {HttpMethod::Post}},
+                         {HttpMethod::Post},
+                         {NetworkAddressClass::Public}},
     };
     network.maximumRequestBytes = 1024;
     network.maximumResponseBytes = 4096;
@@ -62,6 +68,8 @@ void PolicyEngineTest::intersectsEveryDeclaredCapability()
     QVERIFY(effective.network.has_value());
     QCOMPARE(effective.network->rules.size(), 1);
     QCOMPARE(effective.network->rules.first().host, QStringLiteral("api.example.com"));
+    QCOMPARE(effective.network->rules.first().scheme, NetworkScheme::Https);
+    QCOMPARE(effective.network->rules.first().port, 443);
     QCOMPARE(effective.network->rules.first().pathPrefix, QStringLiteral("/v1/orders"));
     QCOMPARE(effective.network->rules.first().methods, QSet<HttpMethod>{HttpMethod::Get});
     QCOMPARE(effective.network->maximumRequestBytes, 1024);
@@ -99,9 +107,12 @@ void PolicyEngineTest::absentOnEitherSideMeansDeny()
 void PolicyEngineTest::hostPolicyRejectsRegexLikeAndInvalidValues()
 {
     HostNetworkPolicy invalidNetwork;
-    invalidNetwork.rules = {NetworkAllowRule{QStringLiteral(".*\\.example\\.com"),
+    invalidNetwork.rules = {NetworkAllowRule{NetworkScheme::Https,
+                                             QStringLiteral(".*\\.example\\.com"),
+                                             443,
                                              QStringLiteral("/v1"),
-                                             {HttpMethod::Get}}};
+                                             {HttpMethod::Get},
+                                             {NetworkAddressClass::Public}}};
     invalidNetwork.maximumRequestBytes = 1;
     invalidNetwork.maximumResponseBytes = 1;
     invalidNetwork.timeoutMs = 1;

@@ -90,11 +90,12 @@ HostPolicy::validatedNetwork(const HostNetworkPolicy &candidate)
 
     QSet<QString> uniqueRules;
     for (const NetworkAllowRule &rule : candidate.rules) {
-        if (!validHost(rule.host) || !validPathPrefix(rule.pathPrefix)
-            || rule.methods.isEmpty()) {
+        if (!validHost(rule.host) || rule.port == 0 || !validPathPrefix(rule.pathPrefix)
+            || rule.methods.isEmpty() || rule.addressClasses.isEmpty()) {
             return std::nullopt;
         }
-        const QString key = rule.host + u'\n' + rule.pathPrefix;
+        const QString key = networkSchemeName(rule.scheme) + u'\n' + rule.host + u'\n'
+            + QString::number(rule.port) + u'\n' + rule.pathPrefix;
         if (uniqueRules.contains(key)) {
             return std::nullopt;
         }
@@ -146,4 +147,15 @@ std::optional<HttpMethod> parseHttpMethod(const QString &method)
         return HttpMethod::Put;
     }
     return std::nullopt;
+}
+
+QString networkSchemeName(const NetworkScheme scheme)
+{
+    switch (scheme) {
+    case NetworkScheme::Http:
+        return QStringLiteral("http");
+    case NetworkScheme::Https:
+        return QStringLiteral("https");
+    }
+    return {};
 }
