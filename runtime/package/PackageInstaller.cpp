@@ -6,6 +6,7 @@
 #include "ContentDigest.h"
 #include "PackageStore.h"
 #include "PackageInstallerTestHooks.h"
+#include "QmlSourcePolicy.h"
 #include "SignatureVerifier.h"
 #include "WindowsStableIo.h"
 
@@ -224,6 +225,19 @@ bool importsAreAllowed(const QStringList &imports, const QSet<QString> &allowed)
         return allowed.contains(name);
     });
 }
+
+bool sourcesPassPolicy(const QVector<ArchiveFile> &files)
+{
+    return std::ranges::all_of(files, [](const ArchiveFile &file) {
+        const QByteArray lower = file.path.toLower();
+        if (!lower.endsWith(QByteArrayLiteral(".qml"))
+            && !lower.endsWith(QByteArrayLiteral(".js"))
+            && !lower.endsWith(QByteArrayLiteral(".mjs"))) {
+            return true;
+        }
+        return QmlSourcePolicy::violations(file.contents).isEmpty();
+    });
+}
 }
 
 PackageInstaller::PackageInstaller(PackageStore &store,
@@ -339,6 +353,11 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
         return failure(InstallPhase::Verify,
                        InstallError::ImportDenied,
                        QStringLiteral("import_denied"));
+    }
+    if (!sourcesPassPolicy(files)) {
+        return failure(InstallPhase::Preflight,
+                       InstallError::PreflightRejected,
+                       QStringLiteral("source_policy_rejected"));
     }
 
     const QString preflightRoot = staging.filePath(QStringLiteral("preflight"));

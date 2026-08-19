@@ -9,6 +9,8 @@ class QmlSourcePolicyTest final : public QObject
 private slots:
     void rejectsDynamicConstructionLoadingAndImports();
     void ignoresCommentsStringsAndStaticComponents();
+    void distinguishesRegexAndTemplateExpressions();
+    void rejectsComputedLoaderMembersAndUnsafeUrls();
 };
 
 void QmlSourcePolicyTest::rejectsDynamicConstructionLoadingAndImports()
@@ -54,6 +56,64 @@ Item {
 }
 )QML";
     QCOMPARE(QmlSourcePolicy::violations(source), QStringList{});
+}
+
+void QmlSourcePolicyTest::distinguishesRegexAndTemplateExpressions()
+{
+    const QByteArray safe = R"QML(
+import QtQuick
+Item {
+  property var detector: /Qt\.createComponent\("remote.qml"\)/gi
+  property string documentation: `Qt.createQmlObject and loader.setSource`
+  function divide(a, b) { return a / b / 2 }
+}
+)QML";
+    QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});
+
+    const QByteArray attack = R"QML(
+import QtQuick
+Item {
+  property var q: Qt
+  property string computed: `${q["create" + "Component"]("remote.qml")}`
+}
+)QML";
+    const QStringList violations = QmlSourcePolicy::violations(attack);
+    QVERIFY(violations.contains(QStringLiteral("qt-dynamic-member")));
+    QVERIFY(violations.contains(QStringLiteral("qml-create-component")));
+}
+
+void QmlSourcePolicyTest::rejectsComputedLoaderMembersAndUnsafeUrls()
+{
+    const QByteArray source = R"QML(
+import QtQuick
+Item {
+  property var loaderAlias
+  Image { source: "file:///C:/secret.txt" }
+  Image { source: "https://attacker.invalid/pixel.png" }
+  Image { source: model.dynamicPath }
+  function attack(loader, member) {
+    const alias = loader
+    loader["set" + "Source"]("remote.qml")
+    loader[member]("remote.qml")
+    alias[member]
+  }
+}
+)QML";
+    const QStringList violations = QmlSourcePolicy::violations(source);
+    QVERIFY(violations.contains(QStringLiteral("loader-set-source")));
+    QVERIFY(violations.contains(QStringLiteral("loader-dynamic-member")));
+    QVERIFY(violations.contains(QStringLiteral("unsafe-url-source")));
+    QVERIFY(violations.contains(QStringLiteral("dynamic-url-source")));
+
+    const QByteArray safe = R"QML(
+import QtQuick
+Item {
+  Image { source: "assets/logo.png" }
+  Image { source: "qrc:/icons/logo.png" }
+  Loader { sourceComponent: Component { Image { source: "assets/nested.png" } } }
+}
+)QML";
+    QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});
 }
 
 QTEST_MAIN(QmlSourcePolicyTest)

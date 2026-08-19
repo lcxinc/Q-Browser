@@ -56,6 +56,20 @@ TestCase {
     }
     Component { id: customersComponent; Pages.CustomersPage { width: 800; height: 600 } }
     Component {
+        id: customersWindowComponent
+        Window {
+            id: customersWindow
+            property var runtime: null
+            readonly property alias page: visibleCustomersPage
+            width: 800; height: 600; visible: true
+            Pages.CustomersPage {
+                id: visibleCustomersPage
+                anchors.fill: parent
+                runtime: customersWindow.runtime
+            }
+        }
+    }
+    Component {
         id: customerDetailWindowComponent
         Window {
             id: detailWindow
@@ -132,7 +146,8 @@ TestCase {
         verify(runtime.lastPayload.url.indexOf("page=2") >= 0)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({ items: [{ id: "ORD-0001", customerName: "Acme" }],
-                                                       page: 2, pageSize: 20, total: 21, totalPages: 2 })) } })
+                                                       page: 2, pageSize: 20, total: 21, totalPages: 2,
+                                                       query: "acme", status: "pending" })) } })
         tryCompare(page.model, "ordersState", Models.RuntimeModels.Content)
         compare(page.model.orders.length, 1)
         compare(page.model.orders[0].display, "ORD-0001 — Acme")
@@ -150,7 +165,9 @@ TestCase {
         verify(page)
         page.search("acme north", "all", 3)
         runtime.finish({ ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 3, totalPages: 3 })) } })
+            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 3,
+                pageSize: 20, total: 41, totalPages: 3,
+                query: "acme north", status: "all" })) } })
 
         tryVerify(function() { return page.statusControl.itemAtIndex(1) !== null })
         const pending = page.statusControl.itemAtIndex(1)
@@ -166,7 +183,9 @@ TestCase {
         keyClick(Qt.Key_Right)
         compare(runtime.calls, callsWhileBusy)
         runtime.finish({ ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 1, totalPages: 1 })) } })
+            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 1,
+                pageSize: 20, total: 0, totalPages: 0,
+                query: "acme north", status: "pending" })) } })
         tryVerify(function() { return page.statusControl.enabled })
 
         window.requestActivate()
@@ -188,7 +207,8 @@ TestCase {
         verify(runtime.lastPayload.url.indexOf("/api/customers") >= 0)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({ items: [{ id: "CUS-001", name: "Acme" }],
-                                                       page: 1, pageSize: 20, total: 1, totalPages: 1 })) } })
+                                                       page: 1, pageSize: 20, total: 1, totalPages: 1,
+                                                       query: "lin" })) } })
         tryCompare(list.model, "customersState", Models.RuntimeModels.Content)
         compare(list.model.customers.length, 1)
         compare(list.model.customers[0].display, "CUS-001 — Acme")
@@ -226,7 +246,8 @@ TestCase {
         page.search("Acme", 1)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-001", name: "Acme" }], page: 1, totalPages: 3
+                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                pageSize: 20, total: 41, totalPages: 3, query: "acme"
             })) } })
         tryCompare(page.model, "customersState", Models.RuntimeModels.Content)
         compare(page.model.customersPage, 1)
@@ -237,7 +258,8 @@ TestCase {
         verify(runtime.lastPayload.url.indexOf("query=Acme") >= 0)
         verify(runtime.lastPayload.url.indexOf("page=2") >= 0)
         runtime.finish({ ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 2, totalPages: 3 })) } })
+            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 2,
+                pageSize: 20, total: 41, totalPages: 3, query: "acme" })) } })
         tryCompare(page.model, "customersState", Models.RuntimeModels.Empty)
         compare(page.model.customersPage, 2)
         verify(page.previousEnabled)
@@ -252,7 +274,8 @@ TestCase {
         page.search("Acme", 3)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-003", name: "Acme West" }], page: 3, totalPages: 3
+                items: [{ id: "CUS-003", name: "Acme West" }], page: 3,
+                pageSize: 20, total: 41, totalPages: 3, query: "acme"
             })) } })
         tryCompare(page.model, "customersPage", 3)
         verify(page.previousEnabled)
@@ -278,5 +301,84 @@ TestCase {
         tryCompare(page.model, "fileState", Models.RuntimeModels.Content)
         compare(page.model.fileMetadata.name, "report.txt")
         compare(page.model.fileMetadata.size, 4)
+    }
+
+    function test_emptyMockPaginationAndQueryIdentity() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const page = createTemporaryObject(ordersComponent, this, { runtime: runtime })
+        verify(runtime && page)
+        page.search("Missing", "all", 1)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [], page: 1, pageSize: 20, total: 0, totalPages: 0,
+                query: "missing", status: "all"
+            })) } })
+        tryCompare(page.model, "ordersState", Models.RuntimeModels.Empty)
+        compare(page.model.ordersTotalPages, 0)
+
+        page.search("Expected", "pending", 1)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [], page: 1, pageSize: 20, total: 0, totalPages: 0,
+                query: "wrong", status: "pending"
+            })) } })
+        tryCompare(page.model, "ordersState", Models.RuntimeModels.Error)
+    }
+
+    function test_pendingSearchClearsAndDisablesSelectedRows() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const ordersWindow = createTemporaryObject(ordersWindowComponent, this,
+                                                    { runtime: runtime })
+        verify(runtime && ordersWindow)
+        const ordersPage = ordersWindow.page
+        navigationSpy.target = ordersPage
+        navigationSpy.clear()
+        ordersPage.search("", "all", 1)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [{ id: "ORD-0001", customerName: "Acme" }],
+                page: 1, pageSize: 20, total: 1, totalPages: 1,
+                query: "", status: "all"
+            })) } })
+        tryCompare(ordersPage.model, "ordersState", Models.RuntimeModels.Content)
+        verify(ordersPage.tableControl.select(0))
+        ordersPage.openControl.forceActiveFocus(Qt.TabFocusReason)
+        ordersPage.search("pending", "all", 1)
+        compare(ordersPage.tableControl.currentIndex, -1)
+        verify(!ordersPage.openControl.enabled)
+        verify(!ordersPage.openSelectedOrder(0))
+        keyClick(Qt.Key_Return)
+        mouseClick(ordersPage.openControl, ordersPage.openControl.width / 2,
+                   ordersPage.openControl.height / 2)
+        compare(navigationSpy.count, 0)
+
+        const customersWindow = createTemporaryObject(customersWindowComponent, this,
+                                                       { runtime: runtime })
+        verify(customersWindow)
+        const customersPage = customersWindow.page
+        navigationSpy.target = customersPage
+        navigationSpy.clear()
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                pageSize: 20, total: 1, totalPages: 1, query: ""
+            })) } })
+        customersPage.search("", 1)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                pageSize: 20, total: 1, totalPages: 1, query: ""
+            })) } })
+        tryCompare(customersPage.model, "customersState", Models.RuntimeModels.Content)
+        verify(customersPage.tableControl.select(0))
+        customersPage.openControl.forceActiveFocus(Qt.TabFocusReason)
+        customersPage.search("pending", 1)
+        compare(customersPage.tableControl.currentIndex, -1)
+        verify(!customersPage.openControl.enabled)
+        verify(!customersPage.openSelectedCustomer(0))
+        keyClick(Qt.Key_Return)
+        mouseClick(customersPage.openControl, customersPage.openControl.width / 2,
+                   customersPage.openControl.height / 2)
+        compare(navigationSpy.count, 0)
     }
 }

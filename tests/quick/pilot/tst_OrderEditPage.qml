@@ -68,8 +68,15 @@ TestCase {
     }
 
     function orderResponse(order) {
+        const completeOrder = Object.assign({
+            id: "ORD-0001", customerId: "CUS-001", customerName: "Acme",
+            createdAt: "2026-08-18T09:30:00.000Z",
+            updatedAt: "2026-08-18T09:30:00.000Z",
+            status: "pending", totalCents: 125000, currency: "USD",
+            priority: "normal", shippingAddress: "1 Pilot Way", notes: ""
+        }, order)
         return { ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify(order)) } }
+            bodyBase64: Base64.encode(JSON.stringify(completeOrder)) } }
     }
 
     function errorResponse(message) {
@@ -242,5 +249,22 @@ TestCase {
         tryCompare(page.model, "orderDetailState", Models.RuntimeModels.Content)
         compare(page.model.order.status, "shipped")
         compare(page.model.orderStatusMutationState, Models.RuntimeModels.MutationIdle)
+    }
+
+    function test_saveRejectsSameIdWithMismatchedSubmittedFields() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const window = createTemporaryObject(editWindowComponent, this, { runtime: runtime })
+        verify(runtime && window)
+        const page = window.page
+        verify(page.refresh())
+        runtime.finish(orderResponse({}))
+        tryVerify(function() { return page.formVisible })
+        page.addressControl.text = "2 Correct Street"
+        mouseClick(page.saveControl, page.saveControl.width / 2, page.saveControl.height / 2)
+        runtime.finish(orderResponse({ shippingAddress: "tampered" }))
+        tryCompare(page.model, "orderEditMutationState",
+                   Models.RuntimeModels.MutationFailure)
+        verify(page.formVisible)
+        verify(page.saveControl.enabled)
     }
 }

@@ -57,7 +57,15 @@ TestCase {
 
         verify(page.submitCredentials("pilot@example.com", "pilot-pass"))
         runtime.finish({ ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify({ token: "session", user: { name: "Lin Chen" } })) } })
+            bodyBase64: Base64.encode(JSON.stringify({ token: "session", user: {
+                name: "Lin Chen", email: "attacker@example.com" } })) } })
+        tryVerify(function() { return page.model.serverError.length > 0 })
+        compare(page.model.authenticated, false)
+
+        verify(page.submitCredentials("pilot@example.com", "pilot-pass"))
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({ token: "session", user: {
+                name: "Lin Chen", email: "pilot@example.com" } })) } })
         tryCompare(page.model, "authenticated", true)
         compare(page.model.user.name, "Lin Chen")
     }

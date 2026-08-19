@@ -136,18 +136,34 @@ QtObject {
     }
 
     function validPage(body, context, secondaryKey) {
-        return isPlainObject(body) && validRows(body.items, secondaryKey)
-                && isInteger(body.page, 1, 100000)
-                && isInteger(body.totalPages, 1, 100000)
-                && body.page <= body.totalPages && body.page === context.expectedPage
+        if (!isPlainObject(body) || !validRows(body.items, secondaryKey)
+                || !isInteger(body.page, 1, 100000)
+                || !isInteger(body.pageSize, 1, 100)
+                || !isInteger(body.total, 0, Number.MAX_SAFE_INTEGER)
+                || !isInteger(body.totalPages, 0, 100000)
+                || body.page !== context.expectedPage
+                || typeof body.query !== "string" || body.query !== context.expectedQuery
+                || (typeof context.expectedStatus === "string"
+                    && body.status !== context.expectedStatus))
+            return false
+        if (body.total === 0)
+            return body.items.length === 0 && body.page === 1 && body.totalPages === 0
+        return body.total >= body.items.length && body.totalPages >= 1
+                && body.page <= body.totalPages
+                && body.totalPages === Math.ceil(body.total / body.pageSize)
     }
 
     function validOrder(body, expectedId) {
+        const statuses = ["pending", "processing", "shipped", "delivered", "cancelled"]
         return isPlainObject(body) && isText(body.id, 128) && body.id === expectedId
-                && (body.status === undefined || isText(body.status, 32))
-                && (body.priority === undefined || isText(body.priority, 32))
-                && (body.shippingAddress === undefined
-                    || typeof body.shippingAddress === "string")
+                && isText(body.customerId, 128) && isText(body.customerName, 500)
+                && isText(body.createdAt, 64) && isText(body.updatedAt, 64)
+                && statuses.indexOf(body.status) >= 0
+                && (body.priority === "normal" || body.priority === "high")
+                && isText(body.shippingAddress, 500)
+                && typeof body.notes === "string" && body.notes.length <= 500
+                && isInteger(body.totalCents, 0, Number.MAX_SAFE_INTEGER)
+                && body.currency === "USD"
     }
 
     function validDashboard(body) {
@@ -219,7 +235,7 @@ QtObject {
     }
 
     function login(email, password) {
-        const normalizedEmail = email.trim()
+        const normalizedEmail = email.trim().toLowerCase()
         emailError = normalizedEmail.length === 0 ? "Email is required"
                    : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
                      ? "Enter a valid email address" : ""
@@ -253,7 +269,7 @@ QtObject {
         const path = "/api/orders?page=" + ordersPage + "&pageSize=20&status="
                    + encodeURIComponent(ordersStatus) + "&query=" + encodeURIComponent(ordersQuery)
         if (network("orders", "GET", path, null, "orders",
-                    { expectedPage: ordersPage, expectedQuery: ordersQuery,
+                    { expectedPage: ordersPage, expectedQuery: ordersQuery.toLowerCase(),
                       expectedStatus: ordersStatus }).length === 0) {
             ordersState = RuntimeModels.Error
             ordersError = "Runtime is unavailable"
@@ -326,7 +342,10 @@ QtObject {
         const body = { status: status, priority: priority,
                        shippingAddress: shippingAddress.trim(), notes: notes }
         if (network("orderEditSave", "PATCH", "/api/orders/" + encodeURIComponent(id), body,
-                    "orderEditFlow", { expectedId: id }).length === 0) {
+                    "orderEditFlow", { expectedId: id, expectedStatus: body.status,
+                        expectedPriority: body.priority,
+                        expectedShippingAddress: body.shippingAddress,
+                        expectedNotes: body.notes }).length === 0) {
             orderEditMutationState = RuntimeModels.MutationFailure
             orderEditServerError = "Runtime is unavailable"
             return false
@@ -342,7 +361,8 @@ QtObject {
         const path = "/api/customers?page=" + customersPage
                    + "&pageSize=20&query=" + encodeURIComponent(customersQuery)
         if (network("customers", "GET", path, null, "customers",
-                    { expectedPage: customersPage, expectedQuery: customersQuery }).length === 0) {
+                    { expectedPage: customersPage,
+                      expectedQuery: customersQuery.toLowerCase() }).length === 0) {
             customersState = RuntimeModels.Error
             customersError = "Runtime is unavailable"
         }
@@ -423,7 +443,9 @@ QtObject {
         if (kind === "login") {
             if (response && response.ok === true && status >= 200 && status < 300
                     && isPlainObject(body) && isText(body.token, 4096)
-                    && isPlainObject(body.user) && isText(body.user.name, 256)) {
+                    && isPlainObject(body.user) && isText(body.user.name, 256)
+                    && isText(body.user.email, 320)
+                    && body.user.email === context.expectedEmail) {
                 authenticated = true; user = body.user; serverError = ""
             } else serverError = response && response.ok === true ? httpError
                                                                    : safeError(response, "Sign in failed")
@@ -454,7 +476,7 @@ QtObject {
             if (response && response.ok === true && status >= 200 && status < 300
                     && validPage(body, context, "customerName")) {
                 orders = displayRows(body.items || [], "customerName"); ordersPage = body.page || 1
-                ordersTotalPages = body.totalPages || 1
+                ordersTotalPages = body.totalPages
                 ordersState = orders.length === 0 ? RuntimeModels.Empty : RuntimeModels.Content
             } else { ordersError = response && response.ok === true ? httpError
                                                                      : safeError(response, "Orders failed")
@@ -491,7 +513,11 @@ QtObject {
                      orderEditState = RuntimeModels.Error }
         } else if (kind === "orderEditSave") {
             if (response && response.ok === true && status >= 200 && status < 300
-                    && validOrder(body, context.expectedId)) {
+                    && validOrder(body, context.expectedId)
+                    && body.status === context.expectedStatus
+                    && body.priority === context.expectedPriority
+                    && body.shippingAddress === context.expectedShippingAddress
+                    && body.notes === context.expectedNotes) {
                 order = body; orderEditMutationState = RuntimeModels.MutationSuccess
                 orderEditServerError = ""
                 orderEditMessage = "Order saved"; orderSaved(String(body.id || ""))
@@ -503,7 +529,7 @@ QtObject {
                     && validPage(body, context, "name")) {
                 customers = displayRows(body.items || [], "name")
                 customersPage = body.page || 1
-                customersTotalPages = body.totalPages || 1
+                customersTotalPages = body.totalPages
                 customersState = customers.length === 0 ? RuntimeModels.Empty : RuntimeModels.Content
             } else { customersError = response && response.ok === true ? httpError
                                                                         : safeError(response, "Customers failed")

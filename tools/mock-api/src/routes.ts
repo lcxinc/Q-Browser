@@ -556,7 +556,11 @@ export function createRouteHandler({
             normalizeSearch(`${order.id} ${order.customerName}`).includes(query);
           return statusMatches && queryMatches;
         });
-        sendJson(response, 200, paginated(filtered, page, pageSize));
+        sendJson(response, 200, {
+          ...paginated(filtered, page, pageSize),
+          query,
+          status: status ?? "all",
+        });
         return;
       }
 
@@ -594,7 +598,7 @@ export function createRouteHandler({
             query.length === 0 ||
             normalizeSearch(`${customer.id} ${customer.name} ${customer.email}`).includes(query),
         );
-        sendJson(response, 200, paginated(filtered, page, pageSize));
+        sendJson(response, 200, { ...paginated(filtered, page, pageSize), query });
         return;
       }
 

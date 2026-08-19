@@ -126,11 +126,12 @@ QString signedPackage(QTemporaryDir &temporary,
                       const QString &name,
                       const QByteArray &privatePem,
                       QByteArray manifestBytes,
-                      const bool corruptSignature = false)
+                      const bool corruptSignature = false,
+                      QByteArray mainQml = QByteArrayLiteral("import QtQuick\nItem {}"))
 {
     QVector<ArchiveFile> files{
         {QByteArrayLiteral("manifest.json"), std::move(manifestBytes)},
-        {QByteArrayLiteral("qml/Main.qml"), QByteArrayLiteral("import QtQuick\nItem {}")}};
+        {QByteArrayLiteral("qml/Main.qml"), std::move(mainQml)}};
     const ContentDigestResult payload = ContentDigest::payload(files);
     if (!payload.hasValue()) {
         return {};
@@ -174,6 +175,7 @@ private slots:
     void rejectsIncompatibleRuntimeWithoutChangingCurrent();
     void rejectsDeniedImportWithoutChangingCurrent();
     void rejectsFailedPreflightWithoutChangingCurrent();
+    void rejectsSignedUnsafeQmlWithoutChangingCurrent();
     void preflightMutationCannotEnterCommittedVersion();
     void changedCandidateFailsBeforeActivation();
     void changedSignatureFailsBeforeActivation();
@@ -217,6 +219,33 @@ void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
     QVERIFY(store.rollback(QStringLiteral("company.pilot")).succeeded());
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
              installedFirst.path);
+}
+
+void PackageInstallerTest::rejectsSignedUnsafeQmlWithoutChangingCurrent()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("safe"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    const QString originalCurrent = store.resolveCurrent(
+        QStringLiteral("company.pilot")).path;
+
+    const InstallResult rejected = installer.install(signedPackage(
+        temporary, QStringLiteral("malicious"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.1.0")), false,
+        QByteArrayLiteral("import QtQuick\nImage { source: \"file:///C:/secret.txt\" }")));
+    QCOMPARE(rejected.phase, InstallPhase::Preflight);
+    QCOMPARE(rejected.error, InstallError::PreflightRejected);
+    QCOMPARE(rejected.stableError, QStringLiteral("source_policy_rejected"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
+             originalCurrent);
 }
 
 void PackageInstallerTest::rejectsInvalidSignatureWithoutChangingCurrent()

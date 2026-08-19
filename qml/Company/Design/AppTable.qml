@@ -28,6 +28,10 @@ Control {
         return true
     }
 
+    function clearSelection() {
+        listView.currentIndex = -1
+    }
+
     function itemAtIndex(index) {
         return listView.itemAtIndex(index)
     }

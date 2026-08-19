@@ -9,8 +9,13 @@ Item {
     readonly property alias model: dataModel
     readonly property alias previousEnabled: previousButton.enabled
     readonly property alias nextEnabled: nextButton.enabled
+    readonly property alias tableControl: customerTable
+    readonly property alias openControl: openButton
     signal navigateRequested(string route)
-    function search(query, page) { dataModel.loadCustomers(query, page) }
+    function search(query, page) {
+        customerTable.clearSelection()
+        dataModel.loadCustomers(query, page)
+    }
     function previousPage() {
         if (dataModel.customersPage <= 1) return false
         search(dataModel.customersQuery, dataModel.customersPage - 1); return true
@@ -21,7 +26,8 @@ Item {
     }
     function openCustomer(id) { if (typeof id !== "string" || id.length === 0) return false; navigateRequested("/customers/" + encodeURIComponent(id)); return true }
     function openSelectedCustomer(index) {
-        if (!Number.isInteger(index) || index < 0 || index >= dataModel.customers.length)
+        if (dataModel.laneBusy("customers") || !Number.isInteger(index)
+                || index < 0 || index >= dataModel.customers.length)
             return false
         return openCustomer(dataModel.customers[index].id)
     }
@@ -36,7 +42,7 @@ Item {
             Layout.fillWidth: true
             AppButton { id: previousButton; text: "Previous"; enabled: !dataModel.laneBusy("customers") && dataModel.customersPage > 1; onClicked: root.previousPage() }
             Text { Layout.fillWidth: true; text: "Page " + dataModel.customersPage + " of " + dataModel.customersTotalPages; color: Theme.textSecondary; font.family: Typography.family; font.pixelSize: Typography.body; horizontalAlignment: Text.AlignHCenter; Accessible.name: text; Accessible.role: Accessible.StaticText }
-            AppButton { text: "Open selected"; enabled: customerTable.currentIndex >= 0; onClicked: root.openSelectedCustomer(customerTable.currentIndex) }
+            AppButton { id: openButton; text: "Open selected"; enabled: !dataModel.laneBusy("customers") && customerTable.currentIndex >= 0; onClicked: root.openSelectedCustomer(customerTable.currentIndex) }
             AppButton { id: nextButton; text: "Next"; enabled: !dataModel.laneBusy("customers") && dataModel.customersPage < dataModel.customersTotalPages; onClicked: root.nextPage() }
         }
     }

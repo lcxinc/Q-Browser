@@ -120,12 +120,16 @@ describe("mock-api", () => {
       pageSize: number;
       total: number;
       totalPages: number;
+      query: string;
+      status: string;
     }>(response);
     expect(body).toMatchObject({
       page: 2,
       pageSize: 2,
       total: 6,
       totalPages: 3,
+      query: "",
+      status: "all",
     });
     expect(body.items.map(({ id }) => id)).toEqual(["ORD-1003", "ORD-1004"]);
   });
@@ -139,12 +143,32 @@ describe("mock-api", () => {
     const body = await readJson<{
       items: Array<{ id: string; status: string }>;
       total: number;
+      query: string;
+      status: string;
     }>(response);
     expect(body.total).toBe(2);
+    expect(body).toMatchObject({ query: "acme", status: "pending" });
     expect(body.items).toEqual([
       expect.objectContaining({ id: "ORD-1001", status: "pending" }),
       expect.objectContaining({ id: "ORD-1006", status: "pending" }),
     ]);
+  });
+
+  test("returns canonical empty order pagination metadata", async () => {
+    const response = await fetch(
+      `${api.origin}/api/orders?status=all&query=missing&page=1&pageSize=20`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      items: [],
+      page: 1,
+      pageSize: 20,
+      total: 0,
+      totalPages: 0,
+      query: "missing",
+      status: "all",
+    });
   });
 
   test("returns an order detail with its customer", async () => {
@@ -194,8 +218,10 @@ describe("mock-api", () => {
       pageSize: number;
       total: number;
       totalPages: number;
+      query: string;
     }>(response);
-    expect(body).toMatchObject({ page: 2, pageSize: 2, total: 4, totalPages: 2 });
+    expect(body).toMatchObject({ page: 2, pageSize: 2, total: 4, totalPages: 2,
+      query: "" });
     expect(body.items.map(({ id }) => id)).toEqual(["CUS-003", "CUS-004"]);
   });
 

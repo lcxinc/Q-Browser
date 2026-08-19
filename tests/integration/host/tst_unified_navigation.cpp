@@ -1,5 +1,7 @@
+#include "HostApplication.h"
 #include "MainWindow.h"
 #include "NavigationBar.h"
+#include "HostWorkerSessionController.h"
 #include "ProtocolMessage.h"
 #include "RouteRegistry.h"
 #include "WebSurface.h"
@@ -101,6 +103,10 @@ bool waitForWebNavigation(WebSurface *surface,
                           const QUrl &expected,
                           QSignalSpy &spy)
 {
+    if (spy.count() > 0 && surface->currentUrl() == expected
+        && !surface->page()->isLoading()) {
+        return true;
+    }
     QElapsedTimer elapsed;
     elapsed.start();
     while (elapsed.elapsed() < 10000) {
@@ -114,6 +120,30 @@ bool waitForWebNavigation(WebSurface *surface,
     return false;
 }
 
+struct AuthenticatedSessions final {
+    std::unique_ptr<IpcSession> host;
+    std::unique_ptr<IpcSession> worker;
+};
+
+std::optional<AuthenticatedSessions> authenticatedSessions(const QString &appIdentity)
+{
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    if (!pair.isValid()) return std::nullopt;
+    auto host = std::make_unique<IpcSession>(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("host-controller-nonce"), appIdentity});
+    auto worker = std::make_unique<IpcSession>(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()), IpcRole::Worker);
+    const auto handshake = ProtocolMessage::handshake(
+        QStringLiteral("host-controller-nonce"));
+    if (!handshake.has_value() || !worker->send(*handshake, 1000)
+        || host->receive(1000).status != SessionStatus::MessageReady
+        || worker->receive(1000).status != SessionStatus::MessageReady) {
+        return std::nullopt;
+    }
+    return AuthenticatedSessions{std::move(host), std::move(worker)};
+}
+
 } // namespace
 
 class UnifiedNavigationTest final : public QObject
@@ -123,6 +153,7 @@ class UnifiedNavigationTest final : public QObject
 private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
     void workerNavigationIsSameAppAndHistoryAware();
+    void hostApplicationOwnsAttachableWorkerSessionController();
     void navigationTransactionsRejectReentrantCommands();
 };
 
@@ -277,7 +308,8 @@ void UnifiedNavigationTest::workerNavigationIsSameAppAndHistoryAware()
     const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
 Rectangle {
     width: 320; height: 200
-    Timer { interval: 1000; running: true; onTriggered: Runtime.navigate("/orders") }
+    Timer { interval: 100; running: true; onTriggered: Runtime.navigate("/worker-shaped-web") }
+    Timer { interval: 5000; running: true; onTriggered: Runtime.navigate("/orders") }
 })QML");
     WorkerTestEnvironment workerEnvironment(qml);
     QVERIFY2(workerEnvironment.isValid(), qPrintable(workerEnvironment.error()));
@@ -301,20 +333,17 @@ Rectangle {
     const QString initial = QStringLiteral("app://pilot/web-shaped-worker/42");
     QVERIFY(window.navigate(initial));
 
-    const SessionReceiveResult navigation = receiveUntil(
-        launch->hostSession, ProtocolType::NavigationRequest, 5000);
-    QCOMPARE(navigation.status, SessionStatus::MessageReady);
-    const QString requestedRoute = navigation.message->payload()
-                                       .value(QStringLiteral("route")).toString();
-    QVERIFY(window.navigateFromWorker(launch->hostSession.appIdentity(), requestedRoute));
-    QVERIFY(launch->hostSession.send(*ProtocolMessage::successResponse(
-        navigation.message->requestId(), QJsonObject{}), 5000));
-    QVERIFY(launch->hostSession.sendRouteLoad(QStringLiteral("host-route-load"),
-                                              requestedRoute, 5000));
-    const SessionReceiveResult routeAck = receiveUntil(
-        launch->hostSession, ProtocolType::Response, 5000);
-    QCOMPARE(routeAck.status, SessionStatus::MessageReady);
-    QCOMPARE(routeAck.message->requestId(), QStringLiteral("host-route-load"));
+    HostWorkerSessionController controller(&window);
+    QVERIFY(controller.attach(std::make_unique<IpcSession>(
+        std::move(launch->hostSession))));
+    QTest::qWait(250);
+    QCOMPARE(window.currentAppUrl(), initial);
+    QCOMPARE(window.historyCount(), 1);
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+    QTRY_COMPARE_WITH_TIMEOUT(window.currentAppUrl(), QStringLiteral("app://pilot/orders"),
+                              5000);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.pendingRouteLoadCount(), qsizetype(0), 5000);
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
     QCOMPARE(window.historyCount(), 2);
     QCOMPARE(window.historyIndex(), 1);
@@ -331,11 +360,35 @@ Rectangle {
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
 
     window.close();
-    launch->hostSession.close();
+    QVERIFY(controller.shutdown(QStringLiteral("navigation.complete")));
     launch->process.terminate(ERROR_PROCESS_ABORTED);
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    HostApplication application(server.origin());
+    QVERIFY(application.start());
+    QVERIFY(application.mainWindow() != nullptr);
+    QVERIFY(application.workerSessionController() != nullptr);
+
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+    QVERIFY(application.attachWorkerSession(std::move(sessions->host)));
+    QCOMPARE(application.workerSessionController()->state(),
+             HostWorkerSessionState::Running);
+    sessions->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(application.workerSessionController()->state(),
+                              HostWorkerSessionState::Failed, 2000);
+    QCOMPARE(application.workerSessionController()->lastErrorCode(),
+             QStringLiteral("ipc.session.peer_closed"));
+    QCOMPARE(application.workerSessionController()->state(),
+             HostWorkerSessionState::Failed);
+    application.mainWindow()->close();
 }
 
 void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()

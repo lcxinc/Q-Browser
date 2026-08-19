@@ -1,6 +1,7 @@
 #include "HostApplication.h"
 
 #include "MainWindow.h"
+#include "HostWorkerSessionController.h"
 
 #include "PilotRoutes.h"
 #include "RouteRegistry.h"
@@ -34,10 +35,23 @@ bool HostApplication::start()
     window->resize(1100, 720);
     window->show();
     mainWindow_ = std::move(window);
+    workerSessionController_ = std::make_unique<HostWorkerSessionController>(
+        mainWindow_.get());
     return true;
+}
+
+bool HostApplication::attachWorkerSession(std::unique_ptr<IpcSession> session)
+{
+    return workerSessionController_ != nullptr
+        && workerSessionController_->attach(std::move(session));
 }
 
 MainWindow *HostApplication::mainWindow() const noexcept
 {
     return mainWindow_.get();
+}
+
+HostWorkerSessionController *HostApplication::workerSessionController() const noexcept
+{
+    return workerSessionController_.get();
 }
