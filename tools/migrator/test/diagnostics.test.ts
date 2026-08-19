@@ -104,4 +104,58 @@ describe("migrator diagnostics", () => {
     const html = `<!doctype html>${`<div style="${declarations}"></div>`.repeat(201)}`;
     expect(() => scanDocument({ sourceFile: "inline-budget.html", html })).toThrow("CSS_DECLARATION_LIMIT_EXCEEDED");
   });
+
+  test("preflights declaration budgets before selector and at-rule early returns", () => {
+    const declarations = "unknown:0;".repeat(20_001);
+    for (const css of [`.a .b { ${declarations} }`, `@media all { .x { ${declarations} } }`]) {
+      expect(() => scanDocument({
+        sourceFile: "css-preflight.html",
+        html: "<main class='x'>Safe</main>",
+        stylesheets: [{ sourceFile: "oversize.css", css }],
+      })).toThrow("CSS_DECLARATION_LIMIT_EXCEEDED");
+    }
+  });
+
+  test("preflights declaration values before unsupported selector diagnostics", () => {
+    expect(() => scanDocument({
+      sourceFile: "css-value.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "value.css", css: `.a > .b { gap:${"x".repeat(4_097)} }` }],
+    })).toThrow("CSS_VALUE_LIMIT_EXCEEDED");
+  });
+
+  test("preflights per-declaration token and string limits independently", () => {
+    expect(() => scanDocument({
+      sourceFile: "css-token.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "token.css", css: `.a > .b { --x:${"x,".repeat(1_024)}x }` }],
+    })).toThrow("CSS_TOKEN_LIMIT_EXCEEDED");
+    expect(() => scanDocument({
+      sourceFile: "css-string.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "string.css", css: `.a > .b { content:"${"x".repeat(2_049)}" }` }],
+    })).toThrow("CSS_STRING_LIMIT_EXCEEDED");
+  });
+
+  test("uses CSS tokenization and decoded string values for declaration limits", () => {
+    const escapedQuote = `${"a".repeat(1_100)}\\\"${"b".repeat(1_100)}`;
+    expect(() => scanDocument({
+      sourceFile: "escaped-string.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "escaped-string.css", css: `.a > .b { content:"${escapedQuote}" }` }],
+    })).toThrow("CSS_STRING_LIMIT_EXCEEDED");
+
+    const escapedNewline = `${"a".repeat(2_048)}\\\nvalue`;
+    expect(() => scanDocument({
+      sourceFile: "continued-string.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "continued-string.css", css: `.a > .b { content:"${escapedNewline}" }` }],
+    })).toThrow("CSS_STRING_LIMIT_EXCEEDED");
+
+    expect(() => scanDocument({
+      sourceFile: "punctuation-string.html",
+      html: "<main>Safe</main>",
+      stylesheets: [{ sourceFile: "punctuation-string.css", css: `.a > .b { content:"${",".repeat(2_048)}" }` }],
+    })).not.toThrow();
+  });
 });

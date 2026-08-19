@@ -10,7 +10,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "npm run clean --workspace @q-browser/migrator && tsc -b --clean && tsc -b && npm rebuild --workspace @q-browser/migrator --ignore-scripts",
+    "build": "npm run clean --workspace @q-browser/migrator && tsc -b --force && npm rebuild --workspace @q-browser/migrator --ignore-scripts",
     "test": "npm run build && vitest run --pool=threads --maxWorkers=1",
     "lint": "tsc -b --pretty false && tsc -p migrator/tsconfig.test.json --pretty false"
   },

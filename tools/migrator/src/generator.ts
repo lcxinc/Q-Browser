@@ -14,7 +14,6 @@ import {
   prepareStableParent,
   requireStableParent,
   rollbackOwnedDirectories,
-  runStableIoHook,
   stableParentUnchanged,
   type OwnedDirectoryMap,
   type PathIdentity,
@@ -513,21 +512,6 @@ async function requireParentLock(lock: StablePathLock, parent: StableParentSnaps
   await requireStableParent(parent);
 }
 
-async function runParentRaceHook(
-  name: "afterGenerationStaged" | "beforeOutputCommit" | "beforeReportPublish",
-  output: string,
-  report: string,
-  parent: StableParentSnapshot,
-): Promise<void> {
-  try { await runStableIoHook(name, output, report); }
-  catch (error) {
-    if (error instanceof Error && "code" in error && ["EPERM", "EACCES", "EBUSY"].includes(String(error.code))) {
-      throw new Error(`OUTPUT_PARENT_CHANGED: ${parent.path}`);
-    }
-    throw error;
-  }
-}
-
 /** Publish one durable file with an exclusive hard-link operation. */
 export async function publishNewFile(filePath: string, contents: string): Promise<void> {
   const target = path.resolve(filePath);
@@ -607,12 +591,6 @@ export async function publishGenerationTransaction(
     // child. Windows helper cwd handles deny delete; POSIX holds directory fds
     // and retains the repeated identity barriers without claiming deny-delete.
     outputParentLock = await acquireStableDirectoryLock(outputParent.path);
-    await runStableIoHook(
-      "afterFirstDirectoryLockReady",
-      outputParent.path,
-      reportParent.path,
-      outputParentLock.helperProcessId,
-    );
     await requireParentLock(outputParentLock, outputParent);
     await requireStableParent(reportParent);
     reportParentLock = await acquireStableDirectoryLock(reportParent.path);
@@ -625,7 +603,6 @@ export async function publishGenerationTransaction(
       stagedFiles.push({ path: filePath, identity: await writeDurableNewFile(filePath, contents) });
     }
     reportStageIdentity = await writeDurableNewFile(reportStage, reportContents);
-    await runParentRaceHook("afterGenerationStaged", output, report, outputParent);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
     await requireParentLock(outputParentLock, outputParent);
@@ -635,7 +612,6 @@ export async function publishGenerationTransaction(
     await assertTargetMissing(output);
     await assertTargetMissing(report);
 
-    await runParentRaceHook("beforeOutputCommit", output, report, outputParent);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
     await requireParentLock(outputParentLock, outputParent);
@@ -650,7 +626,6 @@ export async function publishGenerationTransaction(
     }
     outputPublished = true;
 
-    await runStableIoHook("afterOutputPublish", output, report);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
     await requireParentLock(outputParentLock, outputParent);
@@ -660,7 +635,6 @@ export async function publishGenerationTransaction(
     await requireOwnedFile(reportStage, reportStageIdentity);
     await assertTargetMissing(report);
 
-    await runParentRaceHook("beforeReportPublish", output, report, reportParent);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
     await requireParentLock(outputParentLock, outputParent);
@@ -677,7 +651,6 @@ export async function publishGenerationTransaction(
     succeeded = true;
   } catch (error) {
     if (outputPublished && !reportPublished && outputParent && outputStageIdentity) {
-      await runStableIoHook("beforeOutputRollback", output, report);
       const publishedFiles = stagedFiles.map((file) => ({ ...file, path: path.join(output, path.basename(file.path)) }));
       if (await stableParentUnchanged(outputParent) && await pathHasIdentity(output, outputStageIdentity)) {
         await removeOwnedDirectory(output, outputParent, outputStageIdentity, publishedFiles);

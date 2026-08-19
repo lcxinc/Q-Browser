@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { generateProject, publishGenerationTransaction, publishNewFile } from "../src/generator.ts";
 import { scanDocument, scanFile } from "../src/scanner.ts";
-import { setStableIoTestHooks } from "../src/stable-io.ts";
+import { setStableIoTestCallbacks as setStableIoTestHooks } from "./support/stable-io-test-control.ts";
 
 afterEach(() => setStableIoTestHooks());
 

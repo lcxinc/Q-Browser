@@ -10,7 +10,8 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "clean": "node scripts/clean.mjs",
-    "build": "npm run clean && tsc -b",
+    "build": "npm run clean && tsc -b --force",
+    "prepack": "npm run build",
     "test": "vitest run",
     "lint": "tsc -p tsconfig.test.json --pretty false"
   },

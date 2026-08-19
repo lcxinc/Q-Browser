@@ -271,6 +271,25 @@ describe("migrator scanner and IR", () => {
     ]));
   });
 
+  test("uses important tombstones for supported properties and root variables", () => {
+    const ir = scanDocument({
+      sourceFile: "important.html",
+      html: "<style>:root { --Brand:4px; --Brand:8px !important; --Brand:10px } .x { display:flex; flex-direction:var(--Brand); gap:4px } #target { gap:6px } .x { gap:1em !important }</style><main id='target' class='x'>Safe</main>",
+    });
+    const main = flatten(ir.root).find((node) => node.kind === "main")!;
+    expect(main.style).toEqual({ display: "flex" });
+    expect(ir.styles.variables).toEqual({});
+    expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_CASCADE")).toHaveLength(2);
+    expect(ir.diagnostics.map((item) => item.code)).toContain("UNDEFINED_CSS_VARIABLE");
+
+    const inline = scanDocument({
+      sourceFile: "inline-important.html",
+      html: "<main class='x' style='gap:2em !important'>Safe</main>",
+      stylesheets: [{ sourceFile: "base.css", css: ".x { display:flex; gap:4px }" }],
+    });
+    expect(flatten(inline.root).find((node) => node.kind === "main")?.style).toEqual({ display: "flex" });
+  });
+
   test("locates unsupported custom properties declared in an inline style", () => {
     const ir = scanDocument({
       sourceFile: "inline-variable.html",
@@ -300,7 +319,7 @@ describe("migrator scanner and IR", () => {
       html: "<main id='target' class='x'>Safe</main>",
       stylesheets: [{ sourceFile: "cascade.css", css: ".x { display:flex; gap:calc(1px + 2%); } #target { gap:4px } .x { gap:8px !important }" }],
     });
-    expect(flatten(ir.root).find((node) => node.kind === "main")?.style.gap).toBe("4px");
+    expect(flatten(ir.root).find((node) => node.kind === "main")?.style.gap).toBeUndefined();
     expect(ir.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
       "UNSUPPORTED_LAYOUT", "UNSUPPORTED_CSS_CASCADE",
     ]));

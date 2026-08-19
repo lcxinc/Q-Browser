@@ -1,4 +1,5 @@
 import * as csstree from "css-tree";
+import { tokenize, tokenTypes } from "css-tree/tokenizer";
 
 import { addDiagnostic, createDiagnostic } from "./diagnostics.js";
 import type { Diagnostic, MigrationNodeKind, MigrationStyle, SourceRange } from "./types.js";
@@ -6,6 +7,8 @@ import type { Diagnostic, MigrationNodeKind, MigrationStyle, SourceRange } from 
 export const MAX_CSS_BYTES = 1_048_576;
 export const MAX_CSS_DECLARATIONS = 20_000;
 export const MAX_CSS_VALUE_LENGTH = 4_096;
+export const MAX_CSS_TOKENS_PER_DECLARATION = 2_048;
+export const MAX_CSS_STRING_LENGTH = 2_048;
 
 export interface CssBudget {
   declarations: number;
@@ -18,7 +21,7 @@ interface CssRule {
   declarations: ReadonlyArray<CssDeclaration>;
 }
 
-interface CssDeclaration { property: string; value: string; location: SourceRange; supported: boolean }
+interface CssDeclaration { property: string; value: string; location: SourceRange; supported: boolean; important: boolean }
 
 export interface ParsedStylesheets {
   variables: Record<string, string>;
@@ -174,25 +177,23 @@ function classifyDeclaration(
   declaration: CssAstNode,
   sheet: StylesheetSource,
   diagnostics: Diagnostic[],
-  budget: CssBudget,
 ): CssDeclaration | undefined {
-  budget.declarations += 1;
-  if (budget.declarations > MAX_CSS_DECLARATIONS) throw new Error("CSS_DECLARATION_LIMIT_EXCEEDED");
   const rawProperty = String(declaration.property ?? "");
   const property = rawProperty.startsWith("--") ? rawProperty : rawProperty.toLowerCase();
   const value = generate(declaration.value);
-  if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("CSS_VALUE_LIMIT_EXCEEDED");
   if (declaration.important) {
     const declarationLocation = location(sheet, declaration);
     addDiagnostic(diagnostics, createDiagnostic(
       "UNSUPPORTED_CSS_CASCADE", "warning", `Unsupported !important declaration: ${property}`, declarationLocation,
     ));
-    return undefined;
+    return property.startsWith("--") || SUPPORTED_PROPERTIES.has(property)
+      ? { property, value, location: declarationLocation, supported: false, important: true }
+      : undefined;
   }
   // Custom declarations are consumed only as :root values and never emit a
   // source-located diagnostic. Avoid repeatedly mapping their offsets across
   // a large HTML source when enforcing the shared inline declaration budget.
-  if (property.startsWith("--")) return { property, value, location: location(sheet, declaration), supported: true };
+  if (property.startsWith("--")) return { property, value, location: location(sheet, declaration), supported: true, important: false };
   const declarationLocation = location(sheet, declaration);
   if (DIAGNOSTIC_PROPERTIES.has(property) || property.startsWith("animation") || property.startsWith("transition")) {
     const code = property.startsWith("animation") || property.startsWith("transition") ? "UNSUPPORTED_ANIMATION" : "UNSUPPORTED_LAYOUT";
@@ -209,9 +210,47 @@ function classifyDeclaration(
     addDiagnostic(diagnostics, createDiagnostic(
       "UNSUPPORTED_LAYOUT", "warning", `Unsupported CSS value for ${property}: ${value}`, declarationLocation,
     ));
-    return { property, value, location: declarationLocation, supported: false };
+    return { property, value, location: declarationLocation, supported: false, important: false };
   }
-  return { property, value, location: declarationLocation, supported: true };
+  return { property, value, location: declarationLocation, supported: true, important: false };
+}
+
+function preflightDeclarations(ast: csstree.CssNode, budget: CssBudget): void {
+  csstree.walk(ast, {
+    visit: "Declaration",
+    enter(rawDeclaration) {
+      budget.declarations += 1;
+      if (budget.declarations > MAX_CSS_DECLARATIONS) throw new Error("CSS_DECLARATION_LIMIT_EXCEEDED");
+      const declaration = rawDeclaration as unknown as CssAstNode;
+      const value = generate(declaration.value);
+      if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("CSS_VALUE_LIMIT_EXCEEDED");
+      let tokens = 0;
+      tokenize(value, (type) => {
+        if (type !== tokenTypes.WhiteSpace && type !== tokenTypes.Comment) tokens += 1;
+        if (tokens > MAX_CSS_TOKENS_PER_DECLARATION) throw new Error("CSS_TOKEN_LIMIT_EXCEEDED");
+      });
+      csstree.walk(declaration.value as csstree.CssNode, {
+        visit: "String",
+        enter(rawString) {
+          const stringValue = String((rawString as CssAstNode).value ?? "");
+          if ([...stringValue].length > MAX_CSS_STRING_LENGTH) throw new Error("CSS_STRING_LIMIT_EXCEEDED");
+        },
+      });
+    },
+  });
+}
+
+interface CascadeCandidate {
+  declaration: CssDeclaration;
+  specificity: number;
+  order: number;
+}
+
+function candidateWins(candidate: CascadeCandidate, previous: CascadeCandidate | undefined): boolean {
+  if (!previous) return true;
+  if (candidate.declaration.important !== previous.declaration.important) return candidate.declaration.important;
+  return candidate.specificity > previous.specificity
+    || (candidate.specificity === previous.specificity && candidate.order >= previous.order);
 }
 
 function resolvedValue(
@@ -273,6 +312,7 @@ export function parseStylesheets(
   budget: CssBudget = createCssBudget(),
 ): ParsedStylesheets {
   const variables: Record<string, string> = {};
+  const variableWinners = new Map<string, CascadeCandidate>();
   const rules: CssRule[] = [];
   let order = 0;
 
@@ -290,6 +330,7 @@ export function parseStylesheets(
       }));
       continue;
     }
+    preflightDeclarations(ast as csstree.CssNode, budget);
 
     csstree.walk(ast as csstree.CssNode, {
       visit: "Atrule",
@@ -309,6 +350,7 @@ export function parseStylesheets(
         const rule = rawRule as unknown as CssAstNode;
         const selectorText = generate(rule.prelude).trim();
         const selectors = selectorText.split(",").map((item) => item.trim());
+        const ruleOrder = order++;
         if (selectors.some((selector) => !isSimpleSelector(selector))) {
           addDiagnostic(diagnostics, createDiagnostic(
             "UNSUPPORTED_COMPLEX_SELECTOR", "warning", `Unsupported CSS selector: ${selectorText}`, location(sheet, rule),
@@ -320,7 +362,7 @@ export function parseStylesheets(
           visit: "Declaration",
           enter(rawDeclaration) {
             const declaration = rawDeclaration as unknown as CssAstNode;
-            const classified = classifyDeclaration(declaration, sheet, diagnostics, budget);
+            const classified = classifyDeclaration(declaration, sheet, diagnostics);
             if (!classified) return;
             const { property, value } = classified;
             if (property.startsWith("--")) {
@@ -329,17 +371,23 @@ export function parseStylesheets(
                   "UNSUPPORTED_CSS_VARIABLE_SCOPE", "warning", `Unsupported scoped CSS variable: ${property}`, classified.location,
                 ));
               }
-              if (selectors.includes(":root")) variables[property] = value;
+              if (selectors.includes(":root")) {
+                const candidate = { declaration: classified, specificity: selectorSpecificity(":root"), order: ruleOrder };
+                if (candidateWins(candidate, variableWinners.get(property))) variableWinners.set(property, candidate);
+              }
               return;
             }
             declarations.push(classified);
           },
         });
         for (const selector of selectors) {
-          if (selector !== ":root") rules.push({ selector, specificity: selectorSpecificity(selector), order: order++, declarations });
+          if (selector !== ":root") rules.push({ selector, specificity: selectorSpecificity(selector), order: ruleOrder, declarations });
         }
       },
     });
+  }
+  for (const [property, winner] of variableWinners) {
+    if (winner.declaration.supported) variables[property] = winner.declaration.value;
   }
   return { variables, rules: rules.map((rule) => ({
       ...rule,
@@ -361,24 +409,25 @@ export function resolveStyle(
   kind: MigrationNodeKind,
   diagnostics: Diagnostic[],
 ): MigrationStyle {
-  const winners = new Map<keyof MigrationStyle, { specificity: number; order: number; value: string; location: SourceRange; supported: boolean }>();
+  const winners = new Map<keyof MigrationStyle, CascadeCandidate>();
   for (const rule of parsed.rules) {
     if (!selectorMatches(rule.selector, tag, attributes)) continue;
     for (const declaration of rule.declarations) {
       const key = SUPPORTED_PROPERTIES.get(declaration.property);
       if (!key) continue;
-      const previous = winners.get(key);
-      if (!previous || rule.specificity > previous.specificity || (rule.specificity === previous.specificity && rule.order >= previous.order)) {
-        winners.set(key, { specificity: rule.specificity, order: rule.order, value: declaration.value, location: declaration.location, supported: declaration.supported });
-      }
+      const candidate = { declaration, specificity: rule.specificity, order: rule.order };
+      if (candidateWins(candidate, winners.get(key))) winners.set(key, candidate);
     }
   }
   for (const declaration of inlineDeclarations) {
     const key = SUPPORTED_PROPERTIES.get(declaration.property);
-    if (key) winners.set(key, { specificity: 1_000, order: Number.MAX_SAFE_INTEGER, value: declaration.value, location: declaration.location, supported: declaration.supported });
+    if (key) {
+      const candidate = { declaration, specificity: 1_000, order: Number.MAX_SAFE_INTEGER };
+      if (candidateWins(candidate, winners.get(key))) winners.set(key, candidate);
+    }
   }
   const style: MigrationStyle = {};
-  for (const [key, winner] of [...winners].sort(([left], [right]) => left.localeCompare(right, "en"))) {
+  for (const [key, { declaration: winner }] of [...winners].sort(([left], [right]) => left.localeCompare(right, "en"))) {
     if (!winner.supported) continue;
     const value = winner.value;
     if (key === "display" && value !== "flex" && value !== "grid") continue;
@@ -386,7 +435,7 @@ export function resolveStyle(
     Object.assign(style, { [key]: value });
   }
   const supported: MigrationStyle = {};
-  for (const [key, winner] of [...winners].sort(([left], [right]) => left.localeCompare(right, "en"))) {
+  for (const [key, { declaration: winner }] of [...winners].sort(([left], [right]) => left.localeCompare(right, "en"))) {
     if (!winner.supported) continue;
     if (isGeneratedStyleSupported(kind, tag, style, key)) Object.assign(supported, { [key]: style[key] });
     else addDiagnostic(diagnostics, createDiagnostic(
@@ -405,12 +454,13 @@ export function parseInlineStyle(
 ): CssDeclaration[] {
   if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("INLINE_STYLE_LIMIT_EXCEEDED");
   const ast = csstree.parse(value, { context: "declarationList", positions: true, filename: sheet.sourceFile });
+  preflightDeclarations(ast, budget);
   const declarations: CssDeclaration[] = [];
   csstree.walk(ast, {
     visit: "Declaration",
     enter(rawDeclaration) {
       const declaration = rawDeclaration as unknown as CssAstNode;
-      const classified = classifyDeclaration(declaration, sheet, diagnostics, budget);
+      const classified = classifyDeclaration(declaration, sheet, diagnostics);
       if (classified?.property.startsWith("--")) {
         addDiagnostic(diagnostics, createDiagnostic(
           "UNSUPPORTED_CSS_VARIABLE_SCOPE", "warning", `Unsupported scoped CSS variable: ${classified.property}`, classified.location,

@@ -5,38 +5,6 @@ import { lstat, mkdir, open, realpath, rmdir, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-export interface StableIoTestHooks {
-  afterInputOpen?(filePath: string): void | Promise<void>;
-  afterInputInitialStat?(filePath: string): void | Promise<void>;
-  betweenInputSnapshots?(filePath: string): void | Promise<void>;
-  afterInputLockReady?(filePath: string, processId: number): void | Promise<void>;
-  beforeInputLockReadyAcceptance?(filePath: string): void | Promise<void>;
-  beforeDirectoryLockReadyAcceptance?(directoryPath: string): void | Promise<void>;
-  lockHelperReadyTimeoutMs?: number;
-  afterLockHelperSpawn?(targetPath: string, attempt: number, processId: number): void | Promise<void>;
-  afterFirstDirectoryLockReady?(outputParent: string, reportParent: string, processId?: number): void | Promise<void>;
-  beforeLockRelease?(targetPath: string): void | Promise<void>;
-  afterGenerationStaged?(outputPath: string, reportPath: string): void | Promise<void>;
-  beforeOutputCommit?(outputPath: string, reportPath: string): void | Promise<void>;
-  afterOutputPublish?(outputPath: string, reportPath: string): void | Promise<void>;
-  beforeOutputRollback?(outputPath: string, reportPath: string): void | Promise<void>;
-  beforeReportPublish?(outputPath: string, reportPath: string): void | Promise<void>;
-}
-
-let testHooks: StableIoTestHooks = {};
-
-export function setStableIoTestHooks(hooks: StableIoTestHooks = {}): void {
-  testHooks = { ...hooks };
-}
-
-export async function runStableIoHook(
-  name: Exclude<keyof StableIoTestHooks, "lockHelperReadyTimeoutMs">,
-  ...values: unknown[]
-): Promise<void> {
-  const hook = testHooks[name] as ((...args: unknown[]) => void | Promise<void>) | undefined;
-  await hook?.(...values);
-}
-
 type BigStats = BigIntStats;
 
 export interface PathIdentity {
@@ -113,20 +81,17 @@ class WindowsHelperLock implements StablePathLock {
   private readonly closePromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly donePromise: Promise<void>;
   private readonly protocolError: () => Error | undefined;
-  private readonly targetPath: string;
 
   constructor(
     child: ChildProcessWithoutNullStreams,
     closePromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
     donePromise: Promise<void>,
     protocolError: () => Error | undefined,
-    targetPath: string,
   ) {
     this.child = child;
     this.closePromise = closePromise;
     this.donePromise = donePromise;
     this.protocolError = protocolError;
-    this.targetPath = targetPath;
   }
 
   processId(): number {
@@ -145,9 +110,6 @@ class WindowsHelperLock implements StablePathLock {
   async release(): Promise<void> {
     if (this.released) return;
     this.released = true;
-    let hookError: unknown;
-    try { await runStableIoHook("beforeLockRelease", this.targetPath); }
-    catch (error) { hookError = error; }
     try {
       if (this.child.exitCode === null && this.child.signalCode === null) {
         const inputError = new Promise<never>((_resolve, reject) => {
@@ -167,9 +129,8 @@ class WindowsHelperLock implements StablePathLock {
       }
     } catch (error) {
       await terminateHelper(this.child, this.closePromise);
-      throw hookError ?? error;
+      throw error;
     }
-    if (hookError) throw hookError;
   }
 }
 
@@ -204,7 +165,7 @@ async function acquireWindowsHelperLock(
 ): Promise<WindowsHelperLock> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    try { return await acquireWindowsHelperLockOnce(targetPath, mode, attempt); }
+    try { return await acquireWindowsHelperLockOnce(targetPath, mode); }
     catch (error) {
       lastError = error;
       if (!(error instanceof Error) || !error.message.startsWith("LOCK_HELPER_EXITED") || attempt === 2) throw error;
@@ -217,7 +178,6 @@ async function acquireWindowsHelperLock(
 async function acquireWindowsHelperLockOnce(
   targetPath: string,
   mode: "file" | "directory",
-  attempt: number,
 ): Promise<WindowsHelperLock> {
   const system = await windowsSystemPaths();
   const child = spawn(system.powershell, [
@@ -250,7 +210,7 @@ async function acquireWindowsHelperLockOnce(
     rejectReady(error);
     rejectDone(error);
   };
-  const lock = new WindowsHelperLock(child, closePromise, done, () => protocolFailure, targetPath);
+  const lock = new WindowsHelperLock(child, closePromise, done, () => protocolFailure);
   let stdoutBuffer = "";
   let stdoutBytes = 0;
   let stderrBytes = 0;
@@ -289,12 +249,9 @@ async function acquireWindowsHelperLockOnce(
     });
   try {
     if (child.pid === undefined) throw new Error("LOCK_HELPER_EXITED");
-    await runStableIoHook("afterLockHelperSpawn", targetPath, attempt, child.pid);
-    const timeout = testHooks.lockHelperReadyTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    const timeout = DEFAULT_LOCK_TIMEOUT_MS;
     await raceTimeout((async () => {
       await ready;
-      if (mode === "file") await runStableIoHook("beforeInputLockReadyAcceptance", targetPath);
-      else await runStableIoHook("beforeDirectoryLockReadyAcceptance", targetPath);
     })(), timeout);
     await lock.assertAlive();
     return lock;
@@ -343,11 +300,9 @@ export async function readStableRegularFile(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     if (windowsLock) {
-      await runStableIoHook("afterInputLockReady", resolved, windowsLock.processId());
       await windowsLock.assertAlive();
     }
     handle = await open(resolved, constants.O_RDONLY | noFollow);
-    await runStableIoHook("afterInputOpen", resolved);
     await windowsLock?.assertAlive();
     const opened = await handle.stat({ bigint: true });
     if (!opened.isFile()) throw new Error(`UNSAFE_INPUT_PATH: ${resolved}`);
@@ -362,15 +317,13 @@ export async function readStableRegularFile(
     if (!sameIdentity(opened, named)) throw new Error(`INPUT_IDENTITY_CHANGED: ${resolved}`);
     if (!sameSnapshotMetadata(opened, named)) throw new Error(`INPUT_CHANGED: ${resolved}`);
 
-    await runStableIoHook("afterInputInitialStat", resolved);
     await windowsLock?.assertAlive();
     const first = await readCompleteSnapshot(handle, maximumBytes, resolved, opened);
-    await runStableIoHook("betweenInputSnapshots", resolved);
     await windowsLock?.assertAlive();
 
     // POSIX uses two full content/metadata snapshots. This detects inconsistency
     // but does not claim to defeat a coordinated writer that restores state.
-    // Windows additionally holds a FileShare.Read helper before every hook/read.
+    // Windows additionally holds a FileShare.Read helper throughout both reads.
     await assertNoReparseAncestors(resolved, "UNSAFE_INPUT_PATH");
     const secondCanonical = await realpath(resolved);
     if (!insideBoundary(comparable(canonicalBoundary), comparable(secondCanonical))) {
