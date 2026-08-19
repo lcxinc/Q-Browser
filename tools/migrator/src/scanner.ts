@@ -1,0 +1,287 @@
+import { lstat, readFile, realpath } from "node:fs/promises";
+import path from "node:path";
+import { parse, type DefaultTreeAdapterMap, type ParserError } from "parse5";
+
+import { parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.ts";
+import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.ts";
+import { IrBuilder } from "./ir.ts";
+import type { ControlValidation, MigrationIR, MigrationNode, MigrationNodeKind, ScanDocumentInput, SourceRange } from "./types.ts";
+
+export const SCANNER_LIMITS = Object.freeze({
+  inputBytes: 2_097_152,
+  files: 32,
+  domDepth: 64,
+  nodes: 10_000,
+  attributesPerNode: 64,
+  attributeLength: 8_192,
+  textLength: 65_536,
+});
+
+type P5Node = DefaultTreeAdapterMap["node"];
+type P5Element = DefaultTreeAdapterMap["element"];
+type P5TextNode = DefaultTreeAdapterMap["textNode"];
+
+const ALLOWED_ATTRIBUTES = new Set([
+  "id", "class", "name", "type", "for", "placeholder", "aria-label", "role", "value",
+  "checked", "disabled", "required", "minlength", "maxlength", "pattern", "width", "height", "alt", "src", "style",
+]);
+const BOOLEAN_ATTRIBUTES = new Set(["checked", "disabled", "required"]);
+const UNSUPPORTED_TAGS = new Map([
+  ["script", "UNSUPPORTED_SCRIPT"], ["canvas", "UNSUPPORTED_CANVAS"], ["iframe", "UNSUPPORTED_IFRAME"],
+]);
+
+function normalizeSource(source: string): string {
+  return source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").normalize("NFC");
+}
+
+function safeDisplayName(sourceFile: string): string {
+  const normalized = sourceFile.replaceAll("\\", "/");
+  return normalized.slice(normalized.lastIndexOf("/") + 1).normalize("NFC") || "input.html";
+}
+
+function rangeFor(node: P5Node, file: string): SourceRange {
+  const loc = "sourceCodeLocation" in node ? node.sourceCodeLocation : undefined;
+  const startLine = loc?.startLine ?? 1;
+  const startCol = loc?.startCol ?? 1;
+  const startOffset = loc?.startOffset ?? 0;
+  return {
+    file,
+    start: { line: startLine, column: startCol, offset: startOffset },
+    end: { line: loc?.endLine ?? startLine, column: loc?.endCol ?? startCol, offset: loc?.endOffset ?? startOffset },
+  };
+}
+
+function rangeForParseError(error: ParserError, file: string): SourceRange {
+  return {
+    file,
+    start: { line: error.startLine, column: error.startCol, offset: error.startOffset },
+    end: { line: error.endLine, column: error.endCol, offset: error.endOffset },
+  };
+}
+
+function isElement(node: P5Node): node is P5Element {
+  return "tagName" in node;
+}
+
+function isText(node: P5Node): node is P5TextNode {
+  return node.nodeName === "#text";
+}
+
+function nodeKind(tag: string): MigrationNodeKind {
+  if (/^h[1-6]$/u.test(tag)) return "heading";
+  const kinds: Partial<Record<string, MigrationNodeKind>> = {
+    nav: "navigation", main: "main", section: "section", article: "article", form: "form", label: "label",
+    input: "control", select: "control", textarea: "control", button: "control", table: "table", tr: "tableRow",
+    th: "tableCell", td: "tableCell", ul: "list", ol: "list", li: "listItem", img: "image",
+  };
+  return kinds[tag] ?? "container";
+}
+
+function boundedInteger(value: string | undefined): number | undefined {
+  if (!value || !/^\d{1,7}$/u.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed <= 1_000_000 ? parsed : undefined;
+}
+
+function isLocalAssetReference(value: string): boolean {
+  const normalized = value.trim().replaceAll("\\", "/");
+  return normalized.length > 0
+    && !normalized.startsWith("/")
+    && !normalized.startsWith("//")
+    && !/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(normalized)
+    && !normalized.split("/").includes("..");
+}
+
+function collectAttributes(element: P5Element): Record<string, string | boolean> {
+  if (element.attrs.length > SCANNER_LIMITS.attributesPerNode) throw new Error("ATTRIBUTE_LIMIT_EXCEEDED");
+  const attributes: Record<string, string | boolean> = {};
+  for (const attribute of element.attrs) {
+    const name = attribute.name.toLowerCase();
+    if (attribute.value.length > SCANNER_LIMITS.attributeLength) throw new Error("ATTRIBUTE_LENGTH_LIMIT_EXCEEDED");
+    if (name.startsWith("on") || !ALLOWED_ATTRIBUTES.has(name)) continue;
+    attributes[name] = BOOLEAN_ATTRIBUTES.has(name) ? true : attribute.value.normalize("NFC");
+  }
+  return attributes;
+}
+
+function validationFor(attributes: Readonly<Record<string, string | boolean>>): ControlValidation | undefined {
+  const validation: ControlValidation = {};
+  if (attributes.required === true) validation.required = true;
+  if (typeof attributes.minlength === "string") validation.minLength = boundedInteger(attributes.minlength);
+  if (typeof attributes.maxlength === "string") validation.maxLength = boundedInteger(attributes.maxlength);
+  if (typeof attributes.pattern === "string") validation.pattern = attributes.pattern;
+  return Object.keys(validation).length > 0 ? validation : undefined;
+}
+
+function childNodes(node: P5Node): P5Node[] {
+  return "childNodes" in node ? [...node.childNodes] : [];
+}
+
+function inlineStylesheets(document: DefaultTreeAdapterMap["document"], sourceFile: string): StylesheetSource[] {
+  const sheets: StylesheetSource[] = [];
+  function visit(node: P5Node): void {
+    if (isElement(node) && node.tagName.toLowerCase() === "style") {
+      const css = childNodes(node).filter(isText).map((child) => child.value).join("");
+      const start = node.sourceCodeLocation?.startTag;
+      sheets.push({
+        sourceFile,
+        css,
+        origin: start ? { line: start.endLine, column: start.endCol, offset: start.endOffset } : undefined,
+      });
+      return;
+    }
+    for (const child of childNodes(node)) visit(child);
+  }
+  for (const node of document.childNodes) visit(node);
+  return sheets;
+}
+
+export function scanDocument(input: ScanDocumentInput): MigrationIR {
+  if (Buffer.byteLength(input.html, "utf8") > SCANNER_LIMITS.inputBytes) throw new Error("INPUT_LIMIT_EXCEEDED");
+  const html = normalizeSource(input.html);
+  const sourceFile = safeDisplayName(input.sourceFile);
+  const builder = new IrBuilder();
+  const document = parse(html, {
+    sourceCodeLocationInfo: true,
+    onParseError(error) {
+      addDiagnostic(builder.diagnostics, createDiagnostic(
+        error.code === "duplicate-attribute" ? "DUPLICATE_ATTRIBUTE" : "HTML_PARSE_ERROR",
+        "warning", `HTML parse issue: ${error.code}`, rangeForParseError(error, sourceFile),
+      ));
+    },
+  });
+  const parsedCss = parseStylesheets([...inlineStylesheets(document, sourceFile), ...(input.stylesheets ?? [])], builder.diagnostics);
+  const rootLocation: SourceRange = {
+    file: sourceFile,
+    start: { line: 1, column: 1, offset: 0 },
+    end: {
+      line: html.split("\n").length,
+      column: html.length - html.lastIndexOf("\n"),
+      offset: html.length,
+    },
+  };
+  const root = builder.createNode("document", rootLocation, { tag: "#document" });
+  let count = 1;
+
+  function visit(node: P5Node, parent: MigrationNode, depth: number): void {
+    if (depth > SCANNER_LIMITS.domDepth) throw new Error("DOM_DEPTH_LIMIT_EXCEEDED");
+    if (++count > SCANNER_LIMITS.nodes) throw new Error("NODE_LIMIT_EXCEEDED");
+
+    if (isText(node)) {
+      const text = node.value.replace(/[ \t\n\r\f]+/gu, " ").trim().normalize("NFC");
+      if (text.length === 0) return;
+      if (text.length > SCANNER_LIMITS.textLength) throw new Error("TEXT_LIMIT_EXCEEDED");
+      parent.children.push(builder.createNode("text", rangeFor(node, sourceFile), { text }));
+      return;
+    }
+    if (!isElement(node)) {
+      for (const child of childNodes(node)) visit(child, parent, depth);
+      return;
+    }
+
+    const tag = node.tagName.toLowerCase();
+    const location = rangeFor(node, sourceFile);
+    if (tag === "style") return;
+    const rawAttributes = Object.fromEntries(node.attrs.map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
+    if (tag === "link" && rawAttributes.rel?.toLowerCase() === "stylesheet" && rawAttributes.href
+        && !isLocalAssetReference(rawAttributes.href)) {
+      addDiagnostic(builder.diagnostics, createDiagnostic(
+        "UNSUPPORTED_EXTERNAL_STYLESHEET", "warning", "External stylesheet is not loaded", location,
+      ));
+    }
+    const unsupportedCode = UNSUPPORTED_TAGS.get(tag);
+    if (unsupportedCode) {
+      addDiagnostic(builder.diagnostics, createDiagnostic(unsupportedCode, "warning", `Unsupported HTML element: ${tag}`, location));
+      return;
+    }
+    if (node.attrs.some((attribute) => attribute.name.toLowerCase() === "contenteditable")) {
+      addDiagnostic(builder.diagnostics, createDiagnostic("UNSUPPORTED_CONTENTEDITABLE", "warning", "contenteditable is not migrated", location));
+    }
+
+    const attributes = collectAttributes(node);
+    let inlineDeclarations: Array<{ property: string; value: string }> = [];
+    if (typeof attributes.style === "string") {
+      try { inlineDeclarations = parseInlineStyle(attributes.style); }
+      catch { addDiagnostic(builder.diagnostics, createDiagnostic("CSS_PARSE_ERROR", "warning", "Malformed inline style", location)); }
+      delete attributes.style;
+    }
+    const kind = nodeKind(tag);
+    const imageSource = kind === "image" && typeof attributes.src === "string" ? attributes.src : "";
+    const imageIsLocal = isLocalAssetReference(imageSource);
+    if (kind === "image" && imageSource.length > 0 && !imageIsLocal) {
+      addDiagnostic(builder.diagnostics, createDiagnostic(
+        "UNSUPPORTED_REMOTE_IMAGE", "warning", "Remote image source is not retained or loaded", location,
+      ));
+    }
+    const migrationNode = builder.createNode(kind, location, {
+      tag,
+      level: kind === "heading" ? Number(tag.slice(1)) : undefined,
+      attributes,
+      validation: kind === "control" ? validationFor(attributes) : undefined,
+      image: kind === "image" ? {
+        source: imageIsLocal ? imageSource : "",
+        alt: typeof attributes.alt === "string" ? attributes.alt : "",
+        width: boundedInteger(typeof attributes.width === "string" ? attributes.width : undefined),
+        height: boundedInteger(typeof attributes.height === "string" ? attributes.height : undefined),
+        local: imageIsLocal,
+      } : undefined,
+      style: resolveStyle(parsedCss, tag, attributes, inlineDeclarations),
+    });
+    if (kind === "image") delete migrationNode.attributes.src;
+    parent.children.push(migrationNode);
+    for (const child of childNodes(node)) visit(child, migrationNode, depth + 1);
+  }
+
+  for (const node of document.childNodes) visit(node, root, 1);
+  const result = builder.finish(sourceFile, root, parsedCss.variables);
+  result.diagnostics = sortDiagnostics(result.diagnostics);
+  return result;
+}
+
+function decodeUtf8(bytes: Uint8Array, label: string): string {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new Error(`INVALID_UTF8: ${label}`); }
+}
+
+async function readBoundedRegularFile(filePath: string, maxBytes: number): Promise<string> {
+  const resolved = path.resolve(filePath);
+  const stat = await lstat(resolved);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`UNSAFE_INPUT_PATH: ${resolved}`);
+  const canonical = await realpath(resolved);
+  if (path.normalize(canonical).toLocaleLowerCase("en-US") !== path.normalize(resolved).toLocaleLowerCase("en-US")) {
+    throw new Error(`UNSAFE_INPUT_PATH: ${resolved}`);
+  }
+  if (stat.size > maxBytes) throw new Error(`INPUT_LIMIT_EXCEEDED: ${resolved}`);
+  return decodeUtf8(await readFile(resolved), path.basename(resolved));
+}
+
+function localStylesheetReferences(html: string): string[] {
+  const document = parse(normalizeSource(html));
+  const references: string[] = [];
+  function visit(node: P5Node): void {
+    if (isElement(node) && node.tagName.toLowerCase() === "link") {
+      const values = Object.fromEntries(node.attrs.map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
+      if (values.rel?.toLowerCase() === "stylesheet" && values.href && isLocalAssetReference(values.href)) references.push(values.href);
+    }
+    for (const child of childNodes(node)) visit(child);
+  }
+  for (const node of document.childNodes) visit(node);
+  return [...new Set(references)].toSorted((left, right) => left.localeCompare(right, "en"));
+}
+
+export async function scanFile(inputPath: string): Promise<MigrationIR> {
+  const resolvedInput = path.resolve(inputPath);
+  if (!/\.html?$/iu.test(resolvedInput)) throw new Error("INPUT_EXTENSION_NOT_SUPPORTED");
+  const html = await readBoundedRegularFile(resolvedInput, SCANNER_LIMITS.inputBytes);
+  const inputDirectory = path.dirname(resolvedInput);
+  const sheets: Array<{ sourceFile: string; css: string }> = [];
+  const references = localStylesheetReferences(html);
+  if (references.length + 1 > SCANNER_LIMITS.files) throw new Error("FILE_LIMIT_EXCEEDED");
+  for (const reference of references) {
+    const candidate = path.resolve(inputDirectory, reference);
+    const relative = path.relative(inputDirectory, candidate);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("SOURCE_BOUNDARY_VIOLATION");
+    sheets.push({ sourceFile: safeDisplayName(reference), css: await readBoundedRegularFile(candidate, 1_048_576) });
+  }
+  return scanDocument({ html, sourceFile: safeDisplayName(resolvedInput), stylesheets: sheets });
+}

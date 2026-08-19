@@ -15,6 +15,7 @@
   },
   "files": ["package.json"],
   "references": [
-    { "path": "./mock-api" }
+    { "path": "./mock-api" },
+    { "path": "./migrator" }
   ]
 }

@@ -1,0 +1,2 @@
+form { display: grid; grid-template-columns: 1fr 2fr; gap: 8px 16px; padding: 16px; }
+label { font-weight: 600; }

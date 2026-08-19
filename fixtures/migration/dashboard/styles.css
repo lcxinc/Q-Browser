@@ -1,0 +1,3 @@
+:root { --brand: #315efb; --space: 16px; }
+body { font-family: "Segoe UI", sans-serif; color: #202124; }
+.metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space); padding: 24px; }

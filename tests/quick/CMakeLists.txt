@@ -11,7 +11,8 @@ target_sources(qbrowser_quick_tests
     tst_AppTextField.qml
     tst_AppToast.qml
     tst_AppStatusBadge.qml
-    tst_StateView.qml)
+    tst_StateView.qml
+    tst_MigratorGenerated.qml)
 
 target_sources(qbrowser_quick_tests PRIVATE
   pilot/tst_LoginPage.qml

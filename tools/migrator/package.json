@@ -1,0 +1,14 @@
+{
+  "name": "@q-browser/migrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "qbrowser-migrate": "src/cli.ts"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "lint": "tsc -b --pretty false"
+  }
+}
