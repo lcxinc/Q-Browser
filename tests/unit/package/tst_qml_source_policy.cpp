@@ -10,6 +10,7 @@ private slots:
     void rejectsDynamicConstructionLoadingAndImports();
     void ignoresCommentsStringsAndStaticComponents();
     void distinguishesRegexAndTemplateExpressions();
+    void distinguishesNumericDivisionAssignmentAndRegex();
     void rejectsComputedLoaderMembersAndUnsafeUrls();
     void classifiesEveryQmlAndScriptExtensionCaseInsensitively();
     void requiresSourceBindingsToBeOneStaticSafeLiteral();
@@ -129,6 +130,7 @@ Item {
     if (ready) /Qt\.createComponent/.test(text)
   }
 }
+
 )QML";
     QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});
 
@@ -141,6 +143,42 @@ Item {
 )QML";
     const QStringList violations = QmlSourcePolicy::violations(attack);
     QVERIFY(violations.contains(QStringLiteral("qt-dynamic-member")));
+    QVERIFY(violations.contains(QStringLiteral("qml-create-component")));
+}
+
+void QmlSourcePolicyTest::distinguishesNumericDivisionAssignmentAndRegex()
+{
+    const QByteArray safe = R"QML(
+import QtQuick
+Item {
+  property real decimalRatio: 12.5 / 2
+  property real leadingFraction: .5 / 2
+  property real exponentRatio: 1.2e+3 / 4
+  property int hexRatio: 0xFF / 2
+  property int binaryRatio: 0b1010 / 2
+  property int octalRatio: 0o77 / 7
+  function operators(value) {
+    const integer = 10n
+    value /= 2
+    value++ / 2
+    return /Qt\.createComponent/.test("documentation") && integer / 2n
+  }
+  property var flags: /source\s*:\s*test/giu
+  property string templateResult: `${1 / 2}`
+}
+)QML";
+    QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});
+
+    const QByteArray attack = R"QML(
+import QtQuick
+Item {
+  function attack() {
+    const ratio = 1 / 2 / 0x2
+    Qt.createComponent("remote.qml")
+  }
+}
+)QML";
+    const QStringList violations = QmlSourcePolicy::violations(attack);
     QVERIFY(violations.contains(QStringLiteral("qml-create-component")));
 }
 

@@ -36,20 +36,35 @@ HostWorkerSessionController::HostWorkerSessionController(MainWindow *window,
     }
 }
 
-HostWorkerSessionController::~HostWorkerSessionController() { stopIoThread(); }
+HostWorkerSessionController::~HostWorkerSessionController()
+{
+    stopIoThreadForDestruction();
+}
 
 bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
 {
-    if (state_ == HostWorkerSessionState::Failed) {
-        stopIoThread();
-        state_ = HostWorkerSessionState::Detached;
-    }
-    if (state_ != HostWorkerSessionState::Detached || window_ == nullptr
-        || session == nullptr || !session->isAuthenticated() || session->isClosed()
+    if (window_ == nullptr || session == nullptr || !session->isAuthenticated()
+        || session->isClosed()
         || session->appIdentity().isEmpty()) {
         lastErrorCode_ = QStringLiteral("host.worker_session.invalid_attachment");
         return false;
     }
+    if (io_ != nullptr || ioThread_ != nullptr) {
+        pendingSession_ = std::move(session);
+        cleanupFinalState_ = HostWorkerSessionState::Detached;
+        state_ = HostWorkerSessionState::ShuttingDown;
+        pendingRouteLoads_.clear();
+        outbound_.clear();
+        activeCommand_.reset();
+        requestIoStop();
+        return true;
+    }
+    return startSession(std::move(session));
+}
+
+bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> session)
+{
+    if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
     ++generation_;
     appIdentity_ = session->appIdentity();
     pendingRouteLoads_.clear();
@@ -59,10 +74,24 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
     ioThread_ = new QThread;
     ioThread_->setObjectName(QStringLiteral("host-worker-session-io"));
     io_ = new HostWorkerSessionIo(std::move(session), generation_);
+    ioIdentity_ = io_;
+    HostWorkerSessionIo *const attachedIo = io_;
+    QThread *const attachedThread = ioThread_;
+    const quint64 attachedGeneration = generation_;
     io_->moveToThread(ioThread_);
     connect(ioThread_, &QThread::started, io_, &HostWorkerSessionIo::start);
     connect(ioThread_, &QThread::finished, io_, &QObject::deleteLater);
-    connect(io_, &QObject::destroyed, this, [this] { io_ = nullptr; });
+    connect(io_, &QObject::destroyed, this,
+            [this, attachedIo, attachedThread, attachedGeneration] {
+                if (generation_ == attachedGeneration && io_ == attachedIo
+                    && ioIdentity_ == attachedIo && ioThread_ == attachedThread)
+                    io_ = nullptr;
+            }, Qt::QueuedConnection);
+    connect(ioThread_, &QThread::finished, this,
+            [this, attachedIo, attachedThread, attachedGeneration] {
+                handleIoThreadFinished(attachedIo, attachedThread,
+                                       attachedGeneration);
+            }, Qt::QueuedConnection);
     connect(io_, &HostWorkerSessionIo::navigationRequested, this,
             &HostWorkerSessionController::handleNavigationRequest, Qt::QueuedConnection);
     connect(io_, &HostWorkerSessionIo::routeLoadResponse, this,
@@ -81,8 +110,10 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
                 outbound_.clear();
                 activeCommand_.reset();
                 appIdentity_.clear();
-                state_ = HostWorkerSessionState::Detached;
+                cleanupFinalState_ = HostWorkerSessionState::Detached;
+                requestIoStop();
             }, Qt::QueuedConnection);
+    cleanupFinalState_ = HostWorkerSessionState::Failed;
     state_ = HostWorkerSessionState::Running;
     ioThread_->start();
     return true;
@@ -93,6 +124,7 @@ bool HostWorkerSessionController::shutdown(const QString &reason)
     if (state_ != HostWorkerSessionState::Running || io_ == nullptr || reason.isEmpty())
         return false;
     state_ = HostWorkerSessionState::ShuttingDown;
+    cleanupFinalState_ = HostWorkerSessionState::Detached;
     outbound_.clear();
     activeCommand_.reset();
     pendingRouteLoads_.clear();
@@ -109,6 +141,11 @@ QString HostWorkerSessionController::lastErrorCode() const { return lastErrorCod
 qsizetype HostWorkerSessionController::pendingRouteLoadCount() const noexcept
 {
     return pendingRouteLoads_.size();
+}
+
+bool HostWorkerSessionController::hasIoThread() const noexcept
+{
+    return ioThread_ != nullptr;
 }
 
 void HostWorkerSessionController::handleHostWorkerRoute(
@@ -267,31 +304,79 @@ void HostWorkerSessionController::failClosed(const QString &errorCode)
     pendingRouteLoads_.clear();
     outbound_.clear();
     activeCommand_.reset();
-    if (io_ != nullptr) {
-        const quint64 generation = generation_;
-        HostWorkerSessionIo *const io = io_;
-        QMetaObject::invokeMethod(io, [io, generation] { io->abort(generation); },
-                                  Qt::QueuedConnection);
-    }
+    appIdentity_.clear();
+    cleanupFinalState_ = HostWorkerSessionState::Failed;
+    requestIoStop();
     emit failed(lastErrorCode_);
 }
 
-void HostWorkerSessionController::stopIoThread()
+void HostWorkerSessionController::requestIoStop()
 {
-    if (ioThread_ == nullptr) return;
-    if (io_ != nullptr && ioThread_->isRunning()) {
-        const quint64 generation = generation_;
-        HostWorkerSessionIo *const io = io_;
-        QMetaObject::invokeMethod(io, [io, generation] { io->abort(generation); },
-                                  Qt::QueuedConnection);
+    if (ioIdentity_ == nullptr || ioThread_ == nullptr) return;
+    const quint64 generation = generation_;
+    HostWorkerSessionIo *const io = ioIdentity_;
+    (void)QMetaObject::invokeMethod(
+        io, [io, generation] { io->abort(generation); }, Qt::QueuedConnection);
+}
+
+void HostWorkerSessionController::handleIoThreadFinished(
+    HostWorkerSessionIo *const oldIo, QThread *const oldThread,
+    const quint64 generation)
+{
+    if (generation_ != generation || ioIdentity_ != oldIo
+        || ioThread_ != oldThread) {
+        oldThread->deleteLater();
+        return;
     }
-    ioThread_->quit();
-    if (!ioThread_->wait(6000)) {
-        ioThread_->requestInterruption();
-        ioThread_->quit();
-        (void)ioThread_->wait();
+
+    io_ = nullptr;
+    ioIdentity_ = nullptr;
+    ioThread_ = nullptr;
+    delete oldThread;
+    pendingRouteLoads_.clear();
+    outbound_.clear();
+    activeCommand_.reset();
+    appIdentity_.clear();
+
+    if (pendingSession_ != nullptr) {
+        std::unique_ptr<IpcSession> replacement = std::move(pendingSession_);
+        state_ = HostWorkerSessionState::Detached;
+        if (!startSession(std::move(replacement))) {
+            state_ = HostWorkerSessionState::Failed;
+            lastErrorCode_ = QStringLiteral("host.worker_session.reattach_failed");
+            emit failed(lastErrorCode_);
+        }
+        return;
     }
-    delete ioThread_;
+
+    state_ = cleanupFinalState_;
+}
+
+void HostWorkerSessionController::stopIoThreadForDestruction()
+{
+    pendingSession_.reset();
+    HostWorkerSessionIo *const oldIo = ioIdentity_;
+    QThread *const oldThread = ioThread_;
+    const quint64 oldGeneration = generation_;
+    if (oldThread == nullptr) return;
+
+    disconnect(oldThread, nullptr, this, nullptr);
+    if (oldIo != nullptr) {
+        disconnect(oldIo, nullptr, this, nullptr);
+        (void)QMetaObject::invokeMethod(
+            oldIo, [oldIo, oldGeneration] { oldIo->abort(oldGeneration); },
+            Qt::QueuedConnection);
+    } else {
+        oldThread->quit();
+    }
+
+    if (oldThread->wait(50)) {
+        delete oldThread;
+    } else {
+        connect(oldThread, &QThread::finished, oldThread,
+                &QObject::deleteLater, Qt::QueuedConnection);
+    }
     ioThread_ = nullptr;
     io_ = nullptr;
+    ioIdentity_ = nullptr;
 }

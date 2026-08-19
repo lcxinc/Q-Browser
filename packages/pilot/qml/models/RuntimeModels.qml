@@ -94,10 +94,30 @@ QtObject {
         }
     }
 
+    // QString/QML string lengths are UTF-16 code units. Bound untrusted IPC text
+    // before assigning it to any visible string property.
+    function boundedErrorText(value) {
+        return typeof value === "string" && value.length > 0 && value.length <= 512
+                ? value : ""
+    }
+
     function safeError(response, fallback) {
-        if (response && response.error && typeof response.error.message === "string")
-            return response.error.message
-        return fallback
+        const fallbackText = boundedErrorText(fallback)
+        if (isPlainObject(response) && isPlainObject(response.error)) {
+            const message = boundedErrorText(response.error.message)
+            if (message.length > 0)
+                return message
+        }
+        return fallbackText.length > 0 ? fallbackText : "Request failed"
+    }
+
+    function safeHttpError(body) {
+        if (isPlainObject(body) && isPlainObject(body.error)) {
+            const message = boundedErrorText(body.error.message)
+            if (message.length > 0)
+                return message
+        }
+        return "Request failed"
     }
 
     function responseBody(response) {
@@ -518,8 +538,7 @@ QtObject {
         const kind = context.kind
         const body = responseBody(response)
         const status = response && response.result ? response.result.status : 0
-        const httpError = body && body.error && body.error.message ? body.error.message
-                                                                     : "Request failed"
+        const httpError = safeHttpError(body)
         if (kind === "login") {
             if (response && response.ok === true && status >= 200 && status < 300
                     && isPlainObject(body) && isText(body.token, 4096)
@@ -633,7 +652,7 @@ QtObject {
                 fileMessage = response.result.name + " (" + response.result.size + " bytes)"
                 fileState = RuntimeModels.Content
             } else if (response && response.error && response.error.code === "file.cancelled") {
-                fileMetadata = ({}); fileMessage = response.error.message || "No file selected"
+                fileMetadata = ({}); fileMessage = safeError(response, "No file selected")
                 fileState = RuntimeModels.Empty
             } else { fileMessage = safeError(response, "File open failed"); fileState = RuntimeModels.Error }
         } else if (kind === "settingsLoad") {

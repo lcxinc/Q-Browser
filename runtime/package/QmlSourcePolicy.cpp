@@ -6,7 +6,7 @@
 
 namespace {
 
-enum class TokenKind { Identifier, String, Regex, Punctuation };
+enum class TokenKind { Identifier, Numeric, String, Template, Regex, Punctuation };
 struct Token final { TokenKind kind; QString text; int line; bool regexMayFollow = false; };
 
 bool identifierStart(const QChar value)
@@ -21,13 +21,16 @@ bool identifierPart(const QChar value)
 
 bool tokenCanEndExpression(const Token &token)
 {
-    if (token.kind == TokenKind::Identifier || token.kind == TokenKind::String
+    if (token.kind == TokenKind::Identifier || token.kind == TokenKind::Numeric
+        || token.kind == TokenKind::String || token.kind == TokenKind::Template
         || token.kind == TokenKind::Regex) {
         return token.text != QStringLiteral("return")
             && token.text != QStringLiteral("case")
             && token.text != QStringLiteral("throw");
     }
-    return (token.text == QStringLiteral(")") && !token.regexMayFollow)
+    return token.text == QStringLiteral("++")
+        || token.text == QStringLiteral("--")
+        || (token.text == QStringLiteral(")") && !token.regexMayFollow)
         || token.text == QStringLiteral("]")
         || token.text == QStringLiteral("}");
 }
@@ -87,6 +90,16 @@ private:
                 scanTemplate();
                 continue;
             }
+            if (value.isDigit() || (value == u'.' && peek(1).isDigit())) {
+                scanNumber();
+                continue;
+            }
+            if (value == u'/' && peek(1) == u'=') {
+                tokens_.push_back({TokenKind::Punctuation,
+                                   QStringLiteral("/="), line_});
+                index_ += 2;
+                continue;
+            }
             if (value == u'/' && beginsRegex()) {
                 scanRegex();
                 continue;
@@ -96,6 +109,13 @@ private:
                 while (index_ < source_.size() && identifierPart(source_.at(index_))) ++index_;
                 tokens_.push_back({TokenKind::Identifier,
                                    source_.sliced(start, index_ - start), line_});
+                continue;
+            }
+            if ((value == u'+' && peek(1) == u'+')
+                || (value == u'-' && peek(1) == u'-')) {
+                tokens_.push_back({TokenKind::Punctuation,
+                                   source_.sliced(index_, 2), line_});
+                index_ += 2;
                 continue;
             }
             bool regexMayFollow = false;
@@ -128,6 +148,79 @@ private:
     bool beginsRegex() const
     {
         return tokens_.isEmpty() || !tokenCanEndExpression(tokens_.back());
+    }
+
+    bool scanDigits(const int base)
+    {
+        bool sawDigit = false;
+        bool lastWasSeparator = false;
+        while (index_ < source_.size()) {
+            const QChar value = source_.at(index_);
+            int digit = -1;
+            if (value.isDigit()) digit = value.digitValue();
+            else if (value >= u'a' && value <= u'f') digit = 10 + value.unicode() - u'a';
+            else if (value >= u'A' && value <= u'F') digit = 10 + value.unicode() - u'A';
+            if (digit >= 0 && digit < base) {
+                sawDigit = true;
+                lastWasSeparator = false;
+                ++index_;
+                continue;
+            }
+            if (value == u'_') {
+                if (!sawDigit || lastWasSeparator) malformed_ = true;
+                lastWasSeparator = true;
+                ++index_;
+                continue;
+            }
+            break;
+        }
+        if (lastWasSeparator) malformed_ = true;
+        return sawDigit;
+    }
+
+    void scanNumber()
+    {
+        const qsizetype start = index_;
+        const int startLine = line_;
+        bool fractional = false;
+        bool exponent = false;
+        if (source_.at(index_) == u'.') {
+            fractional = true;
+            ++index_;
+            if (!scanDigits(10)) malformed_ = true;
+        } else if (source_.at(index_) == u'0'
+                   && (peek(1) == u'x' || peek(1) == u'X'
+                       || peek(1) == u'b' || peek(1) == u'B'
+                       || peek(1) == u'o' || peek(1) == u'O')) {
+            const QChar prefix = peek(1).toLower();
+            const int base = prefix == u'x' ? 16 : (prefix == u'b' ? 2 : 8);
+            index_ += 2;
+            if (!scanDigits(base)) malformed_ = true;
+        } else {
+            (void)scanDigits(10);
+            if (index_ < source_.size() && source_.at(index_) == u'.') {
+                fractional = true;
+                ++index_;
+                (void)scanDigits(10);
+            }
+            if (index_ < source_.size()
+                && (source_.at(index_) == u'e' || source_.at(index_) == u'E')) {
+                exponent = true;
+                ++index_;
+                if (index_ < source_.size()
+                    && (source_.at(index_) == u'+' || source_.at(index_) == u'-'))
+                    ++index_;
+                if (!scanDigits(10)) malformed_ = true;
+            }
+        }
+        if (index_ < source_.size() && source_.at(index_) == u'n') {
+            if (fractional || exponent) malformed_ = true;
+            ++index_;
+        }
+        if (index_ < source_.size() && identifierStart(source_.at(index_)))
+            malformed_ = true;
+        tokens_.push_back({TokenKind::Numeric,
+                           source_.sliced(start, index_ - start), startLine});
     }
 
     void scanString(const QChar quote)
@@ -190,6 +283,7 @@ private:
 
     void scanTemplate()
     {
+        const int startLine = line_;
         ++index_;
         while (index_ < source_.size()) {
             const QChar value = source_.at(index_++);
@@ -197,7 +291,11 @@ private:
                 ++index_;
                 continue;
             }
-            if (value == u'`') return;
+            if (value == u'`') {
+                tokens_.push_back({TokenKind::Template,
+                                   QStringLiteral("template"), startLine});
+                return;
+            }
             if (value == u'\n') ++line_;
             if (value == u'$' && index_ < source_.size() && source_.at(index_) == u'{') {
                 ++index_;

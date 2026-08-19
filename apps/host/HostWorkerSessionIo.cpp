@@ -1,6 +1,7 @@
 #include "HostWorkerSessionIo.h"
 
 #include <QJsonObject>
+#include <QThread>
 #include <QTimer>
 
 #include <utility>
@@ -81,14 +82,13 @@ void HostWorkerSessionIo::beginShutdown(const quint64 generation,
 
 void HostWorkerSessionIo::abort(const quint64 generation)
 {
-    if (generation != generation_ || terminal_) {
-        return;
+    if (generation != generation_) return;
+    if (!terminal_) {
+        terminal_ = true;
+        pollTimer_->stop();
+        if (session_ != nullptr) session_->close();
     }
-    terminal_ = true;
-    pollTimer_->stop();
-    if (session_ != nullptr) {
-        session_->close();
-    }
+    QThread::currentThread()->quit();
 }
 
 void HostWorkerSessionIo::pollSession()

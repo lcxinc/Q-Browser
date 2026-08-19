@@ -160,4 +160,39 @@ TestCase {
             })) } })
         tryCompare(model, "ordersState", Models.RuntimeModels.Error)
     }
+
+    function test_errorMessagesAreStringsBoundedTo512Utf16CodeUnits() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const model = createTemporaryObject(modelComponent, this, { runtime: runtime })
+        verify(runtime && model)
+        const invalidMessages = [{ injected: true }, ["injected"], "x".repeat(513),
+                                 "😀".repeat(257)]
+        for (let index = 0; index < invalidMessages.length; ++index) {
+            verify(model.loadDashboard())
+            runtime.finish({ ok: false, error: {
+                code: "transport.failed", message: invalidMessages[index] } })
+            tryCompare(model, "dashboardError", "Dashboard failed")
+            compare(typeof model.dashboardError, "string")
+        }
+
+        verify(model.loadDashboard())
+        runtime.finish({ ok: true, result: { status: 500,
+            bodyBase64: Base64.encode(JSON.stringify({
+                error: { message: { injected: true } }
+            })) } })
+        tryCompare(model, "dashboardError", "Request failed")
+
+        verify(model.openFile())
+        runtime.finish({ ok: false, error: {
+            code: "file.cancelled", message: ["injected"] } })
+        tryCompare(model, "fileMessage", "No file selected")
+        compare(typeof model.fileMessage, "string")
+
+        const exactlyBounded = "😀".repeat(256)
+        verify(model.loadSettings())
+        runtime.finish({ ok: false, error: {
+            code: "storage.failed", message: exactlyBounded } })
+        tryCompare(model, "settingsError", exactlyBounded)
+        compare(model.settingsError.length, 512)
+    }
 }

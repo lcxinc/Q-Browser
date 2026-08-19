@@ -21,11 +21,23 @@
 #include <QToolButton>
 #include <QWebEnginePage>
 
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <thread>
 
 namespace {
+
+#ifdef Q_OS_WIN
+DWORD processHandleCount()
+{
+    DWORD count = 0;
+    return GetProcessHandleCount(GetCurrentProcess(), &count) ? count : 0;
+}
+#endif
 
 class HelpServer final : public QObject
 {
@@ -162,6 +174,8 @@ private slots:
     void hostApplicationBindsWorkerContextLifecycle();
     void hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation();
     void stalledWorkerReaderNeverBlocksTheGuiThread();
+    void gracefulShutdownCleansIoBeforeReattach();
+    void failedSessionCanReattachBeforeOldCallbacksDrain();
     void navigationTransactionsRejectReentrantCommands();
 };
 
@@ -507,6 +521,119 @@ void UnifiedNavigationTest::stalledWorkerReaderNeverBlocksTheGuiThread()
              qPrintable(QStringLiteral("GUI heartbeat stalled for %1 ms")
                             .arg(maximumGap)));
     QVERIFY(writerFinished.load());
+}
+
+void UnifiedNavigationTest::gracefulShutdownCleansIoBeforeReattach()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    QElapsedTimer responsiveness;
+    responsiveness.start();
+    qint64 previousHeartbeat = responsiveness.elapsed();
+    qint64 maximumHeartbeatGap = 0;
+    int heartbeatCount = 0;
+    QTimer heartbeat;
+    heartbeat.setInterval(5);
+    connect(&heartbeat, &QTimer::timeout, &window, [&] {
+        const qint64 now = responsiveness.elapsed();
+        maximumHeartbeatGap = std::max(maximumHeartbeatGap, now - previousHeartbeat);
+        previousHeartbeat = now;
+        ++heartbeatCount;
+    });
+    heartbeat.start();
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(controller.attach(std::move(first->host)));
+    QVERIFY(controller.hasIoThread());
+
+    std::thread firstPeer([worker = std::move(first->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+    QVERIFY(controller.shutdown(QStringLiteral("lifecycle.first")));
+    QCOMPARE(controller.state(), HostWorkerSessionState::ShuttingDown);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Detached, 6000);
+    QVERIFY(!controller.hasIoThread());
+    firstPeer.join();
+#ifdef Q_OS_WIN
+    QTest::qWait(500);
+    const DWORD handlesAfterFirstCycle = processHandleCount();
+    QVERIFY(handlesAfterFirstCycle > 0);
+#endif
+
+    auto second = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(second.has_value());
+    QVERIFY(controller.attach(std::move(second->host)));
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+    QVERIFY(controller.hasIoThread());
+    std::thread secondPeer([worker = std::move(second->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+    QVERIFY(controller.shutdown(QStringLiteral("lifecycle.second")));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Detached, 6000);
+    QVERIFY(!controller.hasIoThread());
+    secondPeer.join();
+    heartbeat.stop();
+    QVERIFY(heartbeatCount > 0);
+    QVERIFY2(maximumHeartbeatGap < 100,
+             qPrintable(QStringLiteral("GUI lifecycle heartbeat stalled for %1 ms")
+                            .arg(maximumHeartbeatGap)));
+#ifdef Q_OS_WIN
+    QTest::qWait(500);
+    const DWORD handlesAfter = processHandleCount();
+    QVERIFY2(handlesAfter <= handlesAfterFirstCycle + 2,
+             qPrintable(QStringLiteral("reattached worker session leaked process handles: %1 -> %2")
+                            .arg(handlesAfterFirstCycle).arg(handlesAfter)));
+#endif
+}
+
+void UnifiedNavigationTest::failedSessionCanReattachBeforeOldCallbacksDrain()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    auto replacement = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(replacement.has_value());
+    std::unique_ptr<IpcSession> replacementHost = std::move(replacement->host);
+    bool replacementAccepted = false;
+    connect(&controller, &HostWorkerSessionController::failed, &window,
+            [&](const QString &) {
+                if (!replacementAccepted && replacementHost != nullptr)
+                    replacementAccepted = controller.attach(std::move(replacementHost));
+            }, Qt::DirectConnection);
+
+    QVERIFY(controller.attach(std::move(first->host)));
+    first->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(replacementAccepted, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Running, 6000);
+    QVERIFY(controller.hasIoThread());
+    QTest::qWait(100);
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+    QVERIFY(controller.hasIoThread());
+
+    replacement->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Failed, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
 }
 
 void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController()

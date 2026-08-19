@@ -31,6 +31,7 @@ public:
     [[nodiscard]] HostWorkerSessionState state() const noexcept;
     [[nodiscard]] QString lastErrorCode() const;
     [[nodiscard]] qsizetype pendingRouteLoadCount() const noexcept;
+    [[nodiscard]] bool hasIoThread() const noexcept;
 
 signals:
     void failed(const QString &errorCode);
@@ -65,17 +66,25 @@ private:
     void pumpOutbound();
     void resumeIoPolling();
     void failClosed(const QString &errorCode);
-    void stopIoThread();
+    bool startSession(std::unique_ptr<IpcSession> session);
+    void requestIoStop();
+    void handleIoThreadFinished(HostWorkerSessionIo *oldIo,
+                                QThread *oldThread,
+                                quint64 generation);
+    void stopIoThreadForDestruction();
 
     static constexpr qsizetype maximumQueuedCommands = 64;
 
     MainWindow *window_ = nullptr;
     HostWorkerSessionIo *io_ = nullptr;
+    HostWorkerSessionIo *ioIdentity_ = nullptr;
     QThread *ioThread_ = nullptr;
+    std::unique_ptr<IpcSession> pendingSession_;
     QQueue<OutboundCommand> outbound_;
     std::optional<OutboundCommand> activeCommand_;
     QHash<QString, QString> pendingRouteLoads_;
     HostWorkerSessionState state_ = HostWorkerSessionState::Detached;
+    HostWorkerSessionState cleanupFinalState_ = HostWorkerSessionState::Detached;
     QString lastErrorCode_;
     QString appIdentity_;
     quint64 generation_ = 0;
