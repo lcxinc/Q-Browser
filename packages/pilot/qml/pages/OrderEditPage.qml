@@ -10,11 +10,17 @@ Item {
     property string selectedStatus: ""
     property string selectedPriority: ""
     readonly property alias model: dataModel
-    readonly property alias addressText: address.text
-    readonly property alias notesText: notes.text
+    readonly property alias statusControl: statusNavigation
+    readonly property alias priorityControl: priorityNavigation
+    readonly property alias addressControl: address
+    readonly property alias notesControl: notes
+    readonly property alias saveControl: saveButton
+    readonly property alias mutationErrorControl: mutationError
+    readonly property bool formVisible: dataModel.orderEditState === Models.RuntimeModels.Content
+    readonly property bool mutationSaving: dataModel.orderEditMutationState
+                                           === Models.RuntimeModels.MutationSaving
     signal navigateRequested(string route)
     function refresh() { return dataModel.loadOrderForEdit(orderId) }
-    function save(status, priority, address, notes) { return dataModel.saveOrder(orderId, status, priority, address, notes) }
     Accessible.name: "Edit order " + orderId
     Accessible.role: Accessible.Pane
     Models.RuntimeModels { id: dataModel; runtime: root.runtime }
@@ -39,14 +45,32 @@ Item {
             viewState: dataModel.orderEditState
             loadingMessage: "Loading order"
             emptyMessage: "Load order before editing"
-            errorMessage: dataModel.orderEditServerError
+            errorMessage: dataModel.orderEditLoadError
             ColumnLayout {
+                id: editForm
                 anchors.fill: parent; spacing: Spacing.md
-                AppNavigation { Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget; orientation: Qt.Horizontal; model: ["pending", "processing", "shipped", "delivered", "cancelled"]; currentIndex: model.indexOf(root.selectedStatus); accessibleName: "Order status"; accessibleDescription: dataModel.orderEditErrors.status; onActivated: (index, value) => root.selectedStatus = String(value) }
-                AppNavigation { Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget; orientation: Qt.Horizontal; model: ["normal", "high"]; currentIndex: model.indexOf(root.selectedPriority); accessibleName: "Order priority"; accessibleDescription: dataModel.orderEditErrors.priority; onActivated: (index, value) => root.selectedPriority = String(value) }
-                AppTextField { id: address; Layout.fillWidth: true; label: "Shipping address"; required: true; maximumLength: 500; externalError: dataModel.orderEditErrors.shippingAddress }
-                AppTextField { id: notes; Layout.fillWidth: true; label: "Notes"; maximumLength: 500 }
-                AppButton { text: "Save"; onClicked: root.save(root.selectedStatus, root.selectedPriority, address.text, notes.text) }
+                AppNavigation { id: statusNavigation; Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget; orientation: Qt.Horizontal; model: ["pending", "processing", "shipped", "delivered", "cancelled"]; currentIndex: model.indexOf(root.selectedStatus); enabled: !root.mutationSaving; accessibleName: "Order status"; accessibleDescription: dataModel.orderEditErrors.status; onActivated: (index, value) => root.selectedStatus = String(value) }
+                AppNavigation { id: priorityNavigation; Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget; orientation: Qt.Horizontal; model: ["normal", "high"]; currentIndex: model.indexOf(root.selectedPriority); enabled: !root.mutationSaving; accessibleName: "Order priority"; accessibleDescription: dataModel.orderEditErrors.priority; onActivated: (index, value) => root.selectedPriority = String(value) }
+                AppTextField { id: address; Layout.fillWidth: true; enabled: !root.mutationSaving; label: "Shipping address"; required: true; maximumLength: 500; externalError: dataModel.orderEditErrors.shippingAddress }
+                AppTextField { id: notes; Layout.fillWidth: true; enabled: !root.mutationSaving; label: "Notes"; maximumLength: 500 }
+                Text {
+                    id: mutationError
+                    Layout.fillWidth: true
+                    visible: dataModel.orderEditMutationState === Models.RuntimeModels.MutationFailure
+                             && text.length > 0
+                    text: dataModel.orderEditServerError
+                    color: Theme.error
+                    font.family: Typography.family; font.pixelSize: Typography.body
+                    wrapMode: Text.Wrap
+                    Accessible.name: text; Accessible.role: Accessible.AlertMessage
+                }
+                AppButton {
+                    id: saveButton
+                    text: root.mutationSaving ? "Saving" : "Save"
+                    enabled: !root.mutationSaving
+                    onClicked: dataModel.saveOrder(root.orderId, root.selectedStatus,
+                                                   root.selectedPriority, address.text, notes.text)
+                }
             }
         }
         AppToast { id: savedToast; Layout.alignment: Qt.AlignHCenter; accessibleName: dataModel.orderEditMessage }

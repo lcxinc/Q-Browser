@@ -5,6 +5,7 @@ QtObject {
     id: root
 
     enum LoadState { Content, Loading, Empty, Error }
+    enum MutationState { MutationIdle, MutationSaving, MutationFailure, MutationSuccess }
 
     property var runtime: null
     property string apiOrigin: runtime && typeof runtime.apiOrigin === "string"
@@ -34,8 +35,12 @@ QtObject {
 
     property int orderDetailState: RuntimeModels.Empty
     property string orderDetailError: ""
+    property int orderStatusMutationState: RuntimeModels.MutationIdle
+    property string orderStatusError: ""
     property var order: ({})
     property int orderEditState: RuntimeModels.Empty
+    property string orderEditLoadError: ""
+    property int orderEditMutationState: RuntimeModels.MutationIdle
     property var orderEditErrors: ({ status: "", priority: "", shippingAddress: "" })
     property string orderEditServerError: ""
     property string orderEditMessage: ""
@@ -166,6 +171,8 @@ QtObject {
     function loadOrder(id) {
         orderDetailState = RuntimeModels.Loading
         orderDetailError = ""
+        orderStatusMutationState = RuntimeModels.MutationIdle
+        orderStatusError = ""
         orderDetailMessage = ""
         if (network("orderDetail", "GET", "/api/orders/" + encodeURIComponent(id), null,
                     "orderDetailFlow").length === 0) {
@@ -178,12 +185,14 @@ QtObject {
         if (typeof id !== "string" || id.length === 0)
             return false
         orderEditState = RuntimeModels.Loading
+        orderEditLoadError = ""
+        orderEditMutationState = RuntimeModels.MutationIdle
         orderEditServerError = ""
         orderEditMessage = ""
         if (network("orderEditLoad", "GET", "/api/orders/" + encodeURIComponent(id), null,
                     "orderEditFlow").length === 0) {
             orderEditState = RuntimeModels.Error
-            orderEditServerError = "Runtime is unavailable"
+            orderEditLoadError = "Runtime is unavailable"
             return false
         }
         return true
@@ -193,13 +202,13 @@ QtObject {
         const validStatuses = ["pending", "processing", "shipped", "delivered", "cancelled"]
         if (typeof id !== "string" || id.length === 0 || validStatuses.indexOf(status) < 0)
             return false
-        orderDetailState = RuntimeModels.Loading
-        orderDetailError = ""
+        orderStatusMutationState = RuntimeModels.MutationSaving
+        orderStatusError = ""
         orderDetailMessage = ""
         if (network("orderStatus", "PATCH", "/api/orders/" + encodeURIComponent(id),
                     { status: status }, "orderDetailFlow").length === 0) {
-            orderDetailState = RuntimeModels.Error
-            orderDetailError = "Runtime is unavailable"
+            orderStatusMutationState = RuntimeModels.MutationFailure
+            orderStatusError = "Runtime is unavailable"
             return false
         }
         return true
@@ -216,14 +225,16 @@ QtObject {
         orderEditServerError = ""
         orderEditMessage = ""
         if (orderEditErrors.status.length > 0 || orderEditErrors.priority.length > 0
-                || orderEditErrors.shippingAddress.length > 0)
+                || orderEditErrors.shippingAddress.length > 0) {
+            orderEditMutationState = RuntimeModels.MutationIdle
             return false
-        orderEditState = RuntimeModels.Loading
+        }
+        orderEditMutationState = RuntimeModels.MutationSaving
         const body = { status: status, priority: priority,
                        shippingAddress: shippingAddress.trim(), notes: notes }
         if (network("orderEditSave", "PATCH", "/api/orders/" + encodeURIComponent(id), body,
                     "orderEditFlow").length === 0) {
-            orderEditState = RuntimeModels.Error
+            orderEditMutationState = RuntimeModels.MutationFailure
             orderEditServerError = "Runtime is unavailable"
             return false
         }
@@ -331,11 +342,11 @@ QtObject {
                      orderDetailState = RuntimeModels.Error }
         } else if (kind === "orderStatus") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
-                order = body; orderDetailState = RuntimeModels.Content
-                orderDetailError = ""; orderDetailMessage = "Order status updated"
-            } else { orderDetailError = response && response.ok === true ? httpError
+                order = body; orderStatusMutationState = RuntimeModels.MutationSuccess
+                orderStatusError = ""; orderDetailMessage = "Order status updated"
+            } else { orderStatusError = response && response.ok === true ? httpError
                                                                            : safeError(response, "Update failed")
-                     orderDetailState = RuntimeModels.Error }
+                     orderStatusMutationState = RuntimeModels.MutationFailure }
         } else if (kind === "orderEditLoad") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
                 order = body
@@ -344,18 +355,19 @@ QtObject {
                 editShippingAddress = typeof body.shippingAddress === "string"
                         ? body.shippingAddress : ""
                 editNotes = typeof body.notes === "string" ? body.notes : ""
-                orderEditState = RuntimeModels.Content; orderEditServerError = ""
+                orderEditState = RuntimeModels.Content; orderEditLoadError = ""
                 orderEditLoaded()
-            } else { orderEditServerError = response && response.ok === true ? httpError
-                                                                              : safeError(response, "Order failed")
+            } else { orderEditLoadError = response && response.ok === true ? httpError
+                                                                            : safeError(response, "Order failed")
                      orderEditState = RuntimeModels.Error }
         } else if (kind === "orderEditSave") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
-                order = body; orderEditState = RuntimeModels.Content; orderEditServerError = ""
+                order = body; orderEditMutationState = RuntimeModels.MutationSuccess
+                orderEditServerError = ""
                 orderEditMessage = "Order saved"; orderSaved(String(body.id || ""))
             } else { orderEditServerError = response && response.ok === true ? httpError
                                                                               : safeError(response, "Update failed")
-                     orderEditState = RuntimeModels.Error }
+                     orderEditMutationState = RuntimeModels.MutationFailure }
         } else if (kind === "customers") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
                 customers = displayRows(body.items || [], "name")

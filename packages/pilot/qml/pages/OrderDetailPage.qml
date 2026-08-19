@@ -9,6 +9,10 @@ Item {
     property string orderId: ""
     readonly property alias model: dataModel
     readonly property alias statusControl: statusNavigation
+    readonly property alias mutationErrorControl: mutationError
+    readonly property bool detailVisible: dataModel.orderDetailState === Models.RuntimeModels.Content
+    readonly property bool mutationSaving: dataModel.orderStatusMutationState
+                                           === Models.RuntimeModels.MutationSaving
     signal navigateRequested(string route)
     function refresh() {
         if (orderId.length === 0) return false
@@ -32,10 +36,22 @@ Item {
             model: ["pending", "processing", "shipped", "delivered", "cancelled"]
             currentIndex: model.indexOf(String(dataModel.order.status || ""))
             enabled: dataModel.orderDetailState === Models.RuntimeModels.Content
+                     && !root.mutationSaving
             accessibleName: "Change order status"
-            accessibleDescription: dataModel.orderDetailError.length > 0
-                                   ? dataModel.orderDetailError : "Select the new order status"
+            accessibleDescription: dataModel.orderStatusError.length > 0
+                                   ? dataModel.orderStatusError : "Select the new order status"
             onActivated: (index, value) => root.changeStatus(String(value))
+        }
+        Text {
+            id: mutationError
+            Layout.fillWidth: true
+            visible: dataModel.orderStatusMutationState === Models.RuntimeModels.MutationFailure
+                     && text.length > 0
+            text: dataModel.orderStatusError
+            color: Theme.error
+            font.family: Typography.family; font.pixelSize: Typography.body
+            wrapMode: Text.Wrap
+            Accessible.name: text; Accessible.role: Accessible.AlertMessage
         }
         AppToast {
             Layout.alignment: Qt.AlignHCenter
