@@ -10,5 +10,8 @@
     "build": "tsc -b",
     "test": "vitest run",
     "lint": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "entities": "8.0.0"
   }
 }

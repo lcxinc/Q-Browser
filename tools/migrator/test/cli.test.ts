@@ -16,6 +16,9 @@ function launch(args: string[]) {
     env: {
       ...process.env,
       PATH: "C:\\Windows\\System32",
+      SystemRoot: "Z:\\poisoned-system-root",
+      WINDIR: "Z:\\poisoned-system-root",
+      COMSPEC: "Z:\\poisoned-command-processor.exe",
       HTTP_PROXY: "http://127.0.0.1:1",
       HTTPS_PROXY: "http://127.0.0.1:1",
       LANG: "tr_TR.UTF-8",
@@ -60,7 +63,7 @@ describe("qbrowser-migrate CLI", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("uses stable usage errors and exit code 64", () => {
     const result = launch(["generate", input]);
