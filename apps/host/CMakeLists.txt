@@ -9,6 +9,8 @@ add_library(q_browser_host STATIC
   HostWorkerSessionController.h
   HostWorkerSessionIo.cpp
   HostWorkerSessionIo.h
+  HostWorkerSessionTestHooks.cpp
+  HostWorkerSessionTestHooks.h
   MainWindow.cpp
   MainWindow.h
   NavigationBar.cpp
@@ -28,6 +30,10 @@ target_link_libraries(q_browser_host
     Qt6::Widgets)
 
 q_browser_enable_strict_warnings(q_browser_host)
+
+if(BUILD_TESTING)
+  target_compile_definitions(q_browser_host PUBLIC Q_BROWSER_HOST_TESTING)
+endif()
 
 add_executable(qbrowser-host WIN32 main.cpp)
 target_link_libraries(qbrowser-host PRIVATE q_browser_host)

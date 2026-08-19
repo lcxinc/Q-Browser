@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QObject>
 #include <QQueue>
+#include <QPointer>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -32,6 +33,7 @@ public:
     [[nodiscard]] QString lastErrorCode() const;
     [[nodiscard]] qsizetype pendingRouteLoadCount() const noexcept;
     [[nodiscard]] bool hasIoThread() const noexcept;
+    [[nodiscard]] bool ioThreadRunning() const noexcept;
 
 signals:
     void failed(const QString &errorCode);
@@ -68,7 +70,7 @@ private:
     void failClosed(const QString &errorCode);
     bool startSession(std::unique_ptr<IpcSession> session);
     void requestIoStop();
-    void handleIoThreadFinished(HostWorkerSessionIo *oldIo,
+    void handleIoThreadFinished(QPointer<HostWorkerSessionIo> oldIo,
                                 QThread *oldThread,
                                 quint64 generation);
     void stopIoThreadForDestruction();
@@ -76,8 +78,7 @@ private:
     static constexpr qsizetype maximumQueuedCommands = 64;
 
     MainWindow *window_ = nullptr;
-    HostWorkerSessionIo *io_ = nullptr;
-    HostWorkerSessionIo *ioIdentity_ = nullptr;
+    QPointer<HostWorkerSessionIo> io_;
     QThread *ioThread_ = nullptr;
     std::unique_ptr<IpcSession> pendingSession_;
     QQueue<OutboundCommand> outbound_;
@@ -91,4 +92,5 @@ private:
     quint64 nextCommandId_ = 0;
     quint64 nextRouteLoadId_ = 0;
     bool suppressHostRoute_ = false;
+    bool stopRequested_ = false;
 };

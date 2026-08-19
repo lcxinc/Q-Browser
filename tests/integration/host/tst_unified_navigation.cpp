@@ -2,6 +2,7 @@
 #include "MainWindow.h"
 #include "NavigationBar.h"
 #include "HostWorkerSessionController.h"
+#include "HostWorkerSessionTestHooks.h"
 #include "ProtocolMessage.h"
 #include "RouteRegistry.h"
 #include "WebSurface.h"
@@ -13,10 +14,12 @@
 #include <QHostAddress>
 #include <QLineEdit>
 #include <QSignalSpy>
+#include <QScopeGuard>
 #include <QStackedWidget>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
+#include <QThread>
 #include <QTimer>
 #include <QToolButton>
 #include <QWebEnginePage>
@@ -27,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <semaphore>
 #include <thread>
 
 namespace {
@@ -176,6 +180,8 @@ private slots:
     void stalledWorkerReaderNeverBlocksTheGuiThread();
     void gracefulShutdownCleansIoBeforeReattach();
     void failedSessionCanReattachBeforeOldCallbacksDrain();
+    void reattachAfterIoThreadFinishedBeforeGuiCleanup();
+    void destroyAfterIoThreadFinishedBeforeGuiCleanup();
     void navigationTransactionsRejectReentrantCommands();
 };
 
@@ -634,6 +640,124 @@ void UnifiedNavigationTest::failedSessionCanReattachBeforeOldCallbacksDrain()
     replacement->worker->close();
     QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Failed, 3000);
     QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::reattachAfterIoThreadFinishedBeforeGuiCleanup()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    std::atomic_bool stoppingEntered = false;
+    std::binary_semaphore allowThreadQuit(0);
+    bool threadQuitAllowed = false;
+    [[maybe_unused]] const auto resetHooks = qScopeGuard([&] {
+        qbrowser_host_testing::resetHostWorkerSessionTestHooks();
+        if (!threadQuitAllowed) allowThreadQuit.release();
+    });
+    qbrowser_host_testing::HostWorkerSessionTestHooks hooks;
+    hooks.beforeIoThreadQuit = [&](quint64) {
+        stoppingEntered.store(true);
+        allowThreadQuit.acquire();
+    };
+    qbrowser_host_testing::setHostWorkerSessionTestHooks(std::move(hooks));
+
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    auto replacement = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(replacement.has_value());
+    QVERIFY(controller.attach(std::move(first->host)));
+    std::thread firstPeer([worker = std::move(first->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+    QVERIFY(controller.shutdown(QStringLiteral("barrier.reattach")));
+    QTRY_VERIFY_WITH_TIMEOUT(stoppingEntered.load(), 5000);
+    allowThreadQuit.release();
+    threadQuitAllowed = true;
+    QThread::msleep(100);
+    QVERIFY(controller.hasIoThread());
+    QVERIFY(!controller.ioThreadRunning());
+    qbrowser_host_testing::resetHostWorkerSessionTestHooks();
+
+    QVERIFY(controller.attach(std::move(replacement->host)));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Running, 5000);
+    QVERIFY(controller.ioThreadRunning());
+    firstPeer.join();
+
+    std::thread replacementPeer([worker = std::move(replacement->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+    QVERIFY(controller.shutdown(QStringLiteral("barrier.replacement")));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Detached, 5000);
+    replacementPeer.join();
+}
+
+void UnifiedNavigationTest::destroyAfterIoThreadFinishedBeforeGuiCleanup()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    auto controller = std::make_unique<HostWorkerSessionController>(&window);
+    std::atomic_bool stoppingEntered = false;
+    std::binary_semaphore allowThreadQuit(0);
+    bool threadQuitAllowed = false;
+    [[maybe_unused]] const auto resetHooks = qScopeGuard([&] {
+        qbrowser_host_testing::resetHostWorkerSessionTestHooks();
+        if (!threadQuitAllowed) allowThreadQuit.release();
+    });
+    qbrowser_host_testing::HostWorkerSessionTestHooks hooks;
+    hooks.beforeIoThreadQuit = [&](quint64) {
+        stoppingEntered.store(true);
+        allowThreadQuit.acquire();
+    };
+    qbrowser_host_testing::setHostWorkerSessionTestHooks(std::move(hooks));
+
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+    QVERIFY(controller->attach(std::move(sessions->host)));
+    std::thread peer([worker = std::move(sessions->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+    QVERIFY(controller->shutdown(QStringLiteral("barrier.destroy")));
+    QTRY_VERIFY_WITH_TIMEOUT(stoppingEntered.load(), 5000);
+    allowThreadQuit.release();
+    threadQuitAllowed = true;
+    QThread::msleep(100);
+    QVERIFY(controller->hasIoThread());
+    QVERIFY(!controller->ioThreadRunning());
+    qbrowser_host_testing::resetHostWorkerSessionTestHooks();
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    controller.reset();
+    QVERIFY2(elapsed.elapsed() < 100,
+             qPrintable(QStringLiteral("controller destruction blocked GUI for %1 ms")
+                            .arg(elapsed.elapsed())));
+    peer.join();
 }
 
 void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController()

@@ -1,4 +1,5 @@
 #include "HostWorkerSessionIo.h"
+#include "HostWorkerSessionTestHooks.h"
 
 #include <QJsonObject>
 #include <QThread>
@@ -7,10 +8,12 @@
 #include <utility>
 
 HostWorkerSessionIo::HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
-                                         const quint64 generation)
+                                         const quint64 generation,
+                                         QThread *const ownerThread)
     : session_(std::move(session))
     , pollTimer_(new QTimer(this))
     , generation_(generation)
+    , ownerThread_(ownerThread)
 {
     pollTimer_->setInterval(2);
     connect(pollTimer_, &QTimer::timeout, this,
@@ -88,7 +91,20 @@ void HostWorkerSessionIo::abort(const quint64 generation)
         pollTimer_->stop();
         if (session_ != nullptr) session_->close();
     }
-    QThread::currentThread()->quit();
+    QThread *const ioThread = QThread::currentThread();
+    if (!transferToOwnerThread())
+        qFatal("Host worker IO ownership transfer failed");
+#ifdef Q_BROWSER_HOST_TESTING
+    qbrowser_host_testing::runBeforeIoThreadQuitHook(generation_);
+#endif
+    ioThread->quit();
+}
+
+bool HostWorkerSessionIo::transferToOwnerThread()
+{
+    QThread *const current = QThread::currentThread();
+    return ownerThread_ != nullptr && thread() == current
+        && moveToThread(ownerThread_);
 }
 
 void HostWorkerSessionIo::pollSession()

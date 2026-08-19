@@ -6,6 +6,7 @@
 #include <memory>
 
 class QTimer;
+class QThread;
 
 class HostWorkerSessionIo final : public QObject
 {
@@ -13,7 +14,8 @@ class HostWorkerSessionIo final : public QObject
 
 public:
     HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
-                        quint64 generation);
+                        quint64 generation,
+                        QThread *ownerThread);
 
     void start();
     void sendMessage(quint64 generation,
@@ -24,6 +26,7 @@ public:
     void resumePolling(quint64 generation);
     void beginShutdown(quint64 generation, const QString &reason);
     void abort(quint64 generation);
+    [[nodiscard]] bool transferToOwnerThread();
 
 signals:
     void commandFinished(quint64 generation,
@@ -50,6 +53,7 @@ private:
     std::unique_ptr<IpcSession> session_;
     QTimer *pollTimer_ = nullptr;
     quint64 generation_ = 0;
+    QThread *ownerThread_ = nullptr;
     bool awaitingGui_ = false;
     bool stopping_ = false;
     bool terminal_ = false;
