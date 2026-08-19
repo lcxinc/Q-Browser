@@ -4,5 +4,24 @@
   "generatedFiles": [
     "Main.qml"
   ],
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "code": "UNSUPPORTED_CONTROL",
+      "severity": "warning",
+      "message": "Unsupported form control: checkbox",
+      "location": {
+        "file": "index.html",
+        "start": {
+          "line": 1,
+          "column": 212,
+          "offset": 211
+        },
+        "end": {
+          "line": 1,
+          "column": 243,
+          "offset": 242
+        }
+      }
+    }
+  ]
 }

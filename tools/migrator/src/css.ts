@@ -7,6 +7,10 @@ export const MAX_CSS_BYTES = 1_048_576;
 export const MAX_CSS_DECLARATIONS = 20_000;
 export const MAX_CSS_VALUE_LENGTH = 4_096;
 
+export interface CssBudget {
+  declarations: number;
+}
+
 interface CssRule {
   selector: string;
   specificity: number;
@@ -30,6 +34,7 @@ interface CssAstNode {
   name?: string;
   property?: string;
   value?: unknown;
+  important?: boolean;
   prelude?: unknown;
   block?: unknown;
   loc?: { start?: { line?: number; column?: number; offset?: number }; end?: { line?: number; column?: number; offset?: number } };
@@ -47,6 +52,10 @@ const SUPPORTED_PROPERTIES = new Map<string, keyof MigrationStyle>([
 ]);
 
 const DIAGNOSTIC_PROPERTIES = new Set(["animation", "animation-name", "transition", "float", "position", "columns", "column-count"]);
+
+export function createCssBudget(): CssBudget {
+  return { declarations: 0 };
+}
 
 function location(sheet: StylesheetSource, node: CssAstNode): SourceRange {
   const start = node.loc?.start;
@@ -79,6 +88,57 @@ function isSimpleSelector(selector: string): boolean {
   return selector === ":root" || /^#[A-Za-z_][\w-]*$/u.test(selector) || /^\.[A-Za-z_][\w-]*$/u.test(selector) || /^[A-Za-z][\w-]*$/u.test(selector);
 }
 
+function supportedValue(property: string, value: string): boolean {
+  if (property === "display") return value === "flex" || value === "grid";
+  if (property === "flex-direction") return value === "row" || value === "column";
+  if (property === "justify-content") return ["start", "center", "end", "space-between", "space-around", "space-evenly"].includes(value);
+  if (property === "align-items") return ["start", "center", "end", "stretch"].includes(value);
+  if (property === "text-align") return ["left", "center", "right"].includes(value);
+  if (property === "grid-template-columns") {
+    return /^repeat\([1-9]\d{0,2},(?:[1-9]\d*(?:\.\d+)?(?:px|fr)|auto|minmax\([^()]+\))\)$/u.test(value)
+      || /^(?:[1-9]\d*(?:\.\d+)?(?:px|fr)|auto|minmax\([^()]+\))(?: (?:[1-9]\d*(?:\.\d+)?(?:px|fr)|auto|minmax\([^()]+\))){0,31}$/u.test(value);
+  }
+  return true;
+}
+
+function classifyDeclaration(
+  declaration: CssAstNode,
+  sheet: StylesheetSource,
+  diagnostics: Diagnostic[],
+  budget: CssBudget,
+): { property: string; value: string } | undefined {
+  budget.declarations += 1;
+  if (budget.declarations > MAX_CSS_DECLARATIONS) throw new Error("CSS_DECLARATION_LIMIT_EXCEEDED");
+  const property = String(declaration.property ?? "").toLowerCase();
+  const value = generate(declaration.value);
+  if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("CSS_VALUE_LIMIT_EXCEEDED");
+  if (property.startsWith("--")) return { property, value };
+  if (declaration.important) {
+    addDiagnostic(diagnostics, createDiagnostic(
+      "UNSUPPORTED_CSS_CASCADE", "warning", `Unsupported !important declaration: ${property}`, location(sheet, declaration),
+    ));
+    return undefined;
+  }
+  if (DIAGNOSTIC_PROPERTIES.has(property) || property.startsWith("animation") || property.startsWith("transition")) {
+    const code = property.startsWith("animation") || property.startsWith("transition") ? "UNSUPPORTED_ANIMATION" : "UNSUPPORTED_LAYOUT";
+    addDiagnostic(diagnostics, createDiagnostic(code, "warning", `Unsupported CSS property: ${property}`, location(sheet, declaration)));
+    return undefined;
+  }
+  if (!SUPPORTED_PROPERTIES.has(property)) {
+    addDiagnostic(diagnostics, createDiagnostic(
+      "UNSUPPORTED_CSS_PROPERTY", "warning", `Unsupported CSS property: ${property}`, location(sheet, declaration),
+    ));
+    return undefined;
+  }
+  if (!supportedValue(property, value)) {
+    addDiagnostic(diagnostics, createDiagnostic(
+      "UNSUPPORTED_LAYOUT", "warning", `Unsupported CSS value for ${property}: ${value}`, location(sheet, declaration),
+    ));
+    return undefined;
+  }
+  return { property, value };
+}
+
 function generate(node: unknown): string {
   return csstree.generate(node as csstree.CssNode, { compact: true }).trim();
 }
@@ -86,10 +146,10 @@ function generate(node: unknown): string {
 export function parseStylesheets(
   sheets: ReadonlyArray<StylesheetSource>,
   diagnostics: Diagnostic[],
+  budget: CssBudget = createCssBudget(),
 ): ParsedStylesheets {
   const variables: Record<string, string> = {};
   const rules: CssRule[] = [];
-  let declarationCount = 0;
   let order = 0;
 
   for (const sheet of sheets) {
@@ -135,25 +195,15 @@ export function parseStylesheets(
         csstree.walk(rule.block as csstree.CssNode, {
           visit: "Declaration",
           enter(rawDeclaration) {
-            declarationCount += 1;
-            if (declarationCount > MAX_CSS_DECLARATIONS) throw new Error("CSS_DECLARATION_LIMIT_EXCEEDED");
             const declaration = rawDeclaration as unknown as CssAstNode;
-            const property = String(declaration.property ?? "").toLowerCase();
-            const value = generate(declaration.value);
-            if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("CSS_VALUE_LIMIT_EXCEEDED");
+            const classified = classifyDeclaration(declaration, sheet, diagnostics, budget);
+            if (!classified) return;
+            const { property, value } = classified;
             if (property.startsWith("--")) {
               if (selectors.includes(":root")) variables[property] = value;
               return;
             }
-            if (DIAGNOSTIC_PROPERTIES.has(property)) {
-              const code = property.startsWith("animation") || property === "transition" ? "UNSUPPORTED_ANIMATION" : "UNSUPPORTED_LAYOUT";
-              addDiagnostic(diagnostics, createDiagnostic(code, "warning", `Unsupported CSS property: ${property}`, location(sheet, declaration)));
-              return;
-            }
-            if (SUPPORTED_PROPERTIES.has(property)) declarations.push({ property, value });
-            else addDiagnostic(diagnostics, createDiagnostic(
-              "UNSUPPORTED_CSS_PROPERTY", "warning", `Unsupported CSS property: ${property}`, location(sheet, declaration),
-            ));
+            declarations.push({ property, value });
           },
         });
         for (const selector of selectors) {
@@ -195,25 +245,33 @@ export function resolveStyle(
   }
   const style: MigrationStyle = {};
   for (const [key, winner] of [...winners].sort(([left], [right]) => left.localeCompare(right, "en"))) {
-    if (key === "display" && winner.value !== "flex" && winner.value !== "grid") continue;
-    if (key === "flexDirection" && winner.value !== "row" && winner.value !== "column") continue;
-    if (key === "justifyContent" && !["start", "center", "end", "space-between", "space-around", "space-evenly"].includes(winner.value)) continue;
-    if (key === "alignItems" && !["start", "center", "end", "stretch"].includes(winner.value)) continue;
-    if (key === "textAlign" && winner.value !== "left" && winner.value !== "center" && winner.value !== "right") continue;
-    Object.assign(style, { [key]: winner.value });
+    const variable = /^var\((--[A-Za-z_][\w-]*)\)$/u.exec(winner.value);
+    const value = variable ? (parsed.variables[variable[1]!] ?? winner.value) : winner.value;
+    if (key === "display" && value !== "flex" && value !== "grid") continue;
+    if (key === "flexDirection" && value !== "row" && value !== "column") continue;
+    if (key === "justifyContent" && !["start", "center", "end", "space-between", "space-around", "space-evenly"].includes(value)) continue;
+    if (key === "alignItems" && !["start", "center", "end", "stretch"].includes(value)) continue;
+    if (key === "textAlign" && value !== "left" && value !== "center" && value !== "right") continue;
+    Object.assign(style, { [key]: value });
   }
   return style;
 }
 
-export function parseInlineStyle(value: string): Array<{ property: string; value: string }> {
+export function parseInlineStyle(
+  value: string,
+  diagnostics: Diagnostic[],
+  sheet: StylesheetSource,
+  budget: CssBudget,
+): Array<{ property: string; value: string }> {
   if (value.length > MAX_CSS_VALUE_LENGTH) throw new Error("INLINE_STYLE_LIMIT_EXCEEDED");
-  const ast = csstree.parse(value, { context: "declarationList" });
+  const ast = csstree.parse(value, { context: "declarationList", positions: true, filename: sheet.sourceFile });
   const declarations: Array<{ property: string; value: string }> = [];
   csstree.walk(ast, {
     visit: "Declaration",
     enter(rawDeclaration) {
       const declaration = rawDeclaration as unknown as CssAstNode;
-      declarations.push({ property: String(declaration.property ?? "").toLowerCase(), value: generate(declaration.value) });
+      const classified = classifyDeclaration(declaration, sheet, diagnostics, budget);
+      if (classified && !classified.property.startsWith("--")) declarations.push(classified);
     },
   });
   return declarations;

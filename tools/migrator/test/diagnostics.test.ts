@@ -78,6 +78,15 @@ describe("migrator diagnostics", () => {
     ]));
   });
 
+  test("diagnoses unsupported cascade priority instead of applying it incorrectly", () => {
+    const ir = scanDocument({
+      sourceFile: "cascade.html",
+      html: "<main class='card'>Safe</main>",
+      stylesheets: [{ sourceFile: "cascade.css", css: ".card { display:grid !important }" }],
+    });
+    expect(ir.diagnostics.map((item) => item.code)).toContain("UNSUPPORTED_CSS_CASCADE");
+  });
+
   test("maps inline CSS diagnostics back to HTML line and column", () => {
     const ir = scanDocument({
       sourceFile: "inline.html",
@@ -88,5 +97,11 @@ describe("migrator diagnostics", () => {
       file: "inline.html",
       start: { line: 3, column: 1 },
     });
+  });
+
+  test("enforces one declaration budget across all inline style attributes", () => {
+    const declarations = Array.from({ length: 100 }, (_, index) => `--x${index}:0`).join(";");
+    const html = `<!doctype html>${`<div style="${declarations}"></div>`.repeat(201)}`;
+    expect(() => scanDocument({ sourceFile: "inline-budget.html", html })).toThrow("CSS_DECLARATION_LIMIT_EXCEEDED");
   });
 });

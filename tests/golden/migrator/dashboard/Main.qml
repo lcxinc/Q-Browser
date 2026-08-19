@@ -38,9 +38,11 @@ Item {
             AppCard {
                 Layout.fillWidth: true
                 accessibleName: "Revenue $42,000 Orders 128"
-                ColumnLayout {
+                GridLayout {
                     anchors.fill: parent
-                    spacing: Spacing.md
+                    columns: 2
+                    rowSpacing: 16
+                    columnSpacing: 16
                     AppCard {
                         Layout.fillWidth: true
                         accessibleName: "Revenue $42,000"

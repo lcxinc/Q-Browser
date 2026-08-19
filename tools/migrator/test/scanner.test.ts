@@ -29,7 +29,7 @@ describe("migrator scanner and IR", () => {
     expect(nodes.every((node) => node.location.start.line > 0 && node.location.start.column > 0)).toBe(true);
     expect(first.styles.variables).toEqual({ "--brand": "#315efb", "--space": "16px" });
     expect(nodes.find((node) => node.kind === "section")?.style).toMatchObject({
-      display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: "var(--space)", padding: "24px",
+      display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: "16px", padding: "24px",
     });
   });
 
@@ -123,5 +123,35 @@ describe("migrator scanner and IR", () => {
     expect(ir.root.location.end).toEqual({ line: 3, column: 18, offset: 94 });
     expect(ir.diagnostics.find((item) => item.code === "UNSUPPORTED_EXTERNAL_STYLESHEET")?.location.start)
       .toMatchObject({ line: 2, column: 1 });
+  });
+
+  test("classifies every inline declaration with source-located diagnostics", () => {
+    const ir = scanDocument({
+      sourceFile: "inline-unsafe.html",
+      html: "<!doctype html>\n<main style=\"display:block; position:absolute; animation:pulse 1s; transition-duration:2s; background-image:url(https://invalid/x)\">Safe</main>",
+    });
+    const diagnostics = ir.diagnostics.filter((item) => item.location.file === "inline-unsafe.html");
+    expect(diagnostics.map((item) => item.code)).toEqual([
+      "UNSUPPORTED_LAYOUT", "UNSUPPORTED_LAYOUT", "UNSUPPORTED_ANIMATION", "UNSUPPORTED_ANIMATION", "UNSUPPORTED_CSS_PROPERTY",
+    ]);
+    expect(diagnostics.map((item) => item.location.start.line)).toEqual([2, 2, 2, 2, 2]);
+    expect(new Set(diagnostics.map((item) => item.location.start.column)).size).toBe(5);
+  });
+
+  test("preserves canonical root-relative CSS paths and document cascade order", async () => {
+    const temporaryRoot = path.join(os.tmpdir(), `qbrowser-css-paths-${process.pid}-${Date.now()}`);
+    try {
+      await mkdir(path.join(temporaryRoot, "a"), { recursive: true });
+      await mkdir(path.join(temporaryRoot, "b"), { recursive: true });
+      await writeFile(path.join(temporaryRoot, "index.html"), "<!doctype html><link rel='stylesheet' href='b/styles.css'><link rel='stylesheet' href='a/styles.css'><main class='x'>Safe</main>", "utf8");
+      await writeFile(path.join(temporaryRoot, "a/styles.css"), ".x { color: red; unknown-a: 1 }", "utf8");
+      await writeFile(path.join(temporaryRoot, "b/styles.css"), ".x { color: blue; unknown-b: 1 }", "utf8");
+      const ir = await scanFile(path.join(temporaryRoot, "index.html"));
+      expect(flatten(ir.root).find((node) => node.kind === "main")?.style.color).toBe("red");
+      expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_PROPERTY").map((item) => item.location.file))
+        .toEqual(["a/styles.css", "b/styles.css"]);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 });

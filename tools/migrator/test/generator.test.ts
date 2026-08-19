@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 
-import { generateProject, generateToDirectory, qmlIdentifier } from "../src/generator.ts";
+import { generateProject, generateToDirectory, qmlIdentifier, qmlString } from "../src/generator.ts";
 import { scanDocument, scanFile } from "../src/scanner.ts";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
@@ -55,6 +55,39 @@ describe("migrator QML generator", () => {
     expect(qml).not.toContain("\u2028");
     expect(qml).not.toContain("\nQt.openUrlExternally");
     expect(qml).toContain("// Source: evil.invalid___Item__.html:1:7");
+  });
+
+  test("emits RowLayout and GridLayout only for recognized IR layouts", () => {
+    const row = generateProject(scanDocument({
+      sourceFile: "row.html",
+      html: "<!doctype html><main class='row'><section class='grid'><p>A</p><p>B</p></section></main>",
+      stylesheets: [{ sourceFile: "layout.css", css: ".row { display:flex; gap:8px } .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:4px }" }],
+    })).files["Main.qml"];
+    expect(row).toContain("RowLayout {");
+    expect(row).toContain("GridLayout {");
+    expect(row).toContain("columns: 2");
+    expect(row).toContain("rowSpacing: 4");
+    expect(row).toContain("columnSpacing: 4");
+  });
+
+  test("maps only supported controls and preserves labels for unsupported controls", () => {
+    const generated = generateProject(scanDocument({
+      sourceFile: "controls.html",
+      html: "<!doctype html><form><label for='email'>Email address</label><input id='email' type='email'><label><input type='checkbox'>Accept terms</label><label for='choice'>Choice</label><select id='choice'><option>A</option></select><input type='radio' name='pick'></form>",
+    }));
+    const qml = generated.files["Main.qml"];
+    expect(qml).toContain('label: "Email address"');
+    expect(qml).toContain('text: "Accept terms"');
+    expect(qml).toContain('text: "Unsupported checkbox control"');
+    expect(qml).toContain('text: "Unsupported select control"');
+    expect(qml).toContain('text: "Unsupported radio control"');
+    expect(qml.match(/AppTextField \{/gu)).toHaveLength(1);
+    expect(generated.report.diagnostics.filter((item) => item.code === "UNSUPPORTED_CONTROL")).toHaveLength(3);
+  });
+
+  test("escapes NUL, C0, C1, separators, format controls, and lone surrogates", () => {
+    const encoded = qmlString("A\0\u0001\t\n\u0085\u200B\u2028\u2029\uD800😀Z");
+    expect(encoded).toBe('"A\\u0000\\u0001\\t\\n\\u0085\\u200B\\u2028\\u2029\\uD800😀Z"');
   });
 
   test("writes atomically and refuses to overwrite or traverse an existing output", async () => {

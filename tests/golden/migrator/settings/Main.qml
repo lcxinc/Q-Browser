@@ -71,6 +71,16 @@ Item {
                         Accessible.role: Accessible.StaticText
                         // Source: index.html:1:205
                     }
+                    AppCard {
+                        Layout.fillWidth: true
+                        accessibleName: "Use dark theme"
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: Spacing.xs
+                            Text { text: "Use dark theme"; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.body }
+                            Text { text: "Unsupported checkbox control"; color: Theme.textSecondary; font.family: Typography.family; font.pixelSize: Typography.label }
+                        }
+                    }
                 }
             }
         }

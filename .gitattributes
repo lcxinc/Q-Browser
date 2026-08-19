@@ -1,0 +1,5 @@
+/.gitattributes text eol=lf
+/tools/migrator/** text eol=lf
+/fixtures/migration/** text eol=lf
+/tests/golden/migrator/** text eol=lf
+/tests/quick/tst_MigratorGenerated.qml text eol=lf

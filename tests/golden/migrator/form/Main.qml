@@ -30,41 +30,19 @@ Item {
                 Accessible.role: Accessible.StaticText
                 // Source: index.html:1:88
             }
-            ColumnLayout {
+            GridLayout {
                 Layout.fillWidth: true
-                spacing: Spacing.md
-                Text {
-                    Layout.fillWidth: true
-                    text: "Customer"
-                    color: Theme.textPrimary
-                    font.family: Typography.family
-                    font.pixelSize: Typography.body
-                    font.weight: Typography.normalWeight
-                    wrapMode: Text.Wrap
-                    Accessible.name: text
-                    Accessible.role: Accessible.StaticText
-                    // Source: index.html:1:113
-                }
+                columns: 2
+                rowSpacing: 8
+                columnSpacing: 16
                 AppTextField {
                     Layout.fillWidth: true
-                    label: "customer"
+                    label: "Customer"
                     required: true
                 }
-                Text {
-                    Layout.fillWidth: true
-                    text: "Notes"
-                    color: Theme.textPrimary
-                    font.family: Typography.family
-                    font.pixelSize: Typography.body
-                    font.weight: Typography.normalWeight
-                    wrapMode: Text.Wrap
-                    Accessible.name: text
-                    Accessible.role: Accessible.StaticText
-                    // Source: index.html:1:211
-                }
                 AppTextField {
                     Layout.fillWidth: true
-                    label: ""
+                    label: "Notes"
                     maximumLength: 200
                 }
                 AppButton {

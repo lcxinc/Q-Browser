@@ -1,10 +1,10 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parse, type DefaultTreeAdapterMap, type ParserError } from "parse5";
 
-import { parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.ts";
+import { createCssBudget, parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.ts";
 import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.ts";
 import { IrBuilder } from "./ir.ts";
+import { readStableRegularFile } from "./stable-io.ts";
 import type { ControlValidation, MigrationIR, MigrationNode, MigrationNodeKind, ScanDocumentInput, SourceRange } from "./types.ts";
 
 export const SCANNER_LIMITS = Object.freeze({
@@ -117,6 +117,24 @@ function childNodes(node: P5Node): P5Node[] {
   return "childNodes" in node ? [...node.childNodes] : [];
 }
 
+function positionAt(source: string, offset: number): { line: number; column: number; offset: number } {
+  const prefix = source.slice(0, offset);
+  const lastLine = prefix.lastIndexOf("\n");
+  return { line: prefix.split("\n").length, column: offset - lastLine, offset };
+}
+
+function inlineStyleOrigin(element: P5Element, source: string): { line: number; column: number; offset: number } | undefined {
+  const attribute = element.sourceCodeLocation?.attrs?.style;
+  if (!attribute) return undefined;
+  const raw = source.slice(attribute.startOffset, attribute.endOffset);
+  const equals = raw.indexOf("=");
+  if (equals < 0) return positionAt(source, attribute.startOffset);
+  let relative = equals + 1;
+  while (relative < raw.length && /[ \t\n\r\f]/u.test(raw[relative]!)) relative += 1;
+  if (raw[relative] === "\"" || raw[relative] === "'") relative += 1;
+  return positionAt(source, attribute.startOffset + relative);
+}
+
 function inlineStylesheets(document: DefaultTreeAdapterMap["document"], sourceFile: string): StylesheetSource[] {
   const sheets: StylesheetSource[] = [];
   function visit(node: P5Node): void {
@@ -150,7 +168,8 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
       ));
     },
   });
-  const parsedCss = parseStylesheets([...inlineStylesheets(document, sourceFile), ...(input.stylesheets ?? [])], builder.diagnostics);
+  const cssBudget = createCssBudget();
+  const parsedCss = parseStylesheets([...inlineStylesheets(document, sourceFile), ...(input.stylesheets ?? [])], builder.diagnostics, cssBudget);
   const rootLocation: SourceRange = {
     file: sourceFile,
     start: { line: 1, column: 1, offset: 0 },
@@ -201,8 +220,18 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
     const attributes = collectAttributes(node);
     let inlineDeclarations: Array<{ property: string; value: string }> = [];
     if (typeof attributes.style === "string") {
-      try { inlineDeclarations = parseInlineStyle(attributes.style); }
-      catch { addDiagnostic(builder.diagnostics, createDiagnostic("CSS_PARSE_ERROR", "warning", "Malformed inline style", location)); }
+      try {
+        inlineDeclarations = parseInlineStyle(
+          attributes.style,
+          builder.diagnostics,
+          { sourceFile, css: attributes.style, origin: inlineStyleOrigin(node, html) },
+          cssBudget,
+        );
+      }
+      catch (error) {
+        if (error instanceof Error && error.message.endsWith("_LIMIT_EXCEEDED")) throw error;
+        addDiagnostic(builder.diagnostics, createDiagnostic("CSS_PARSE_ERROR", "warning", "Malformed inline style", location));
+      }
       delete attributes.style;
     }
     const kind = nodeKind(tag);
@@ -243,18 +272,6 @@ function decodeUtf8(bytes: Uint8Array, label: string): string {
   catch { throw new Error(`INVALID_UTF8: ${label}`); }
 }
 
-async function readBoundedRegularFile(filePath: string, maxBytes: number): Promise<string> {
-  const resolved = path.resolve(filePath);
-  const stat = await lstat(resolved);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`UNSAFE_INPUT_PATH: ${resolved}`);
-  const canonical = await realpath(resolved);
-  if (path.normalize(canonical).toLocaleLowerCase("en-US") !== path.normalize(resolved).toLocaleLowerCase("en-US")) {
-    throw new Error(`UNSAFE_INPUT_PATH: ${resolved}`);
-  }
-  if (stat.size > maxBytes) throw new Error(`INPUT_LIMIT_EXCEEDED: ${resolved}`);
-  return decodeUtf8(await readFile(resolved), path.basename(resolved));
-}
-
 function localStylesheetReferences(html: string): string[] {
   const document = parse(normalizeSource(html));
   const references: string[] = [];
@@ -266,14 +283,17 @@ function localStylesheetReferences(html: string): string[] {
     for (const child of childNodes(node)) visit(child);
   }
   for (const node of document.childNodes) visit(node);
-  return [...new Set(references)].toSorted((left, right) => left.localeCompare(right, "en"));
+  return references.filter((reference, index) => references.indexOf(reference) === index);
 }
 
 export async function scanFile(inputPath: string): Promise<MigrationIR> {
   const resolvedInput = path.resolve(inputPath);
   if (!/\.html?$/iu.test(resolvedInput)) throw new Error("INPUT_EXTENSION_NOT_SUPPORTED");
-  const html = await readBoundedRegularFile(resolvedInput, SCANNER_LIMITS.inputBytes);
   const inputDirectory = path.dirname(resolvedInput);
+  const html = decodeUtf8(
+    await readStableRegularFile(resolvedInput, SCANNER_LIMITS.inputBytes, inputDirectory),
+    path.basename(resolvedInput),
+  );
   const sheets: Array<{ sourceFile: string; css: string }> = [];
   const references = localStylesheetReferences(html);
   if (references.length + 1 > SCANNER_LIMITS.files) throw new Error("FILE_LIMIT_EXCEEDED");
@@ -281,7 +301,10 @@ export async function scanFile(inputPath: string): Promise<MigrationIR> {
     const candidate = path.resolve(inputDirectory, reference);
     const relative = path.relative(inputDirectory, candidate);
     if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("SOURCE_BOUNDARY_VIOLATION");
-    sheets.push({ sourceFile: safeDisplayName(reference), css: await readBoundedRegularFile(candidate, 1_048_576) });
+    sheets.push({
+      sourceFile: path.relative(inputDirectory, candidate).replaceAll("\\", "/").normalize("NFC"),
+      css: decodeUtf8(await readStableRegularFile(candidate, 1_048_576, inputDirectory), reference),
+    });
   }
   return scanDocument({ html, sourceFile: safeDisplayName(resolvedInput), stylesheets: sheets });
 }

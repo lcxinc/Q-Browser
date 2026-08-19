@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
-import { lstat, mkdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { assertSafeOutputParent, generateProject, generateToDirectory } from "./generator.ts";
+import { generateProject, publishGenerationTransaction, publishNewFile } from "./generator.ts";
 import { scanFile } from "./scanner.ts";
 
 export interface CliIo {
@@ -26,29 +25,6 @@ function parseFlag(args: string[], name: string): string {
   return args[index + 1]!;
 }
 
-async function writeNewAtomic(filePath: string, contents: string): Promise<void> {
-  const output = path.resolve(filePath);
-  await assertNewPath(output);
-  await assertSafeOutputParent(output);
-  const parent = path.dirname(output);
-  await mkdir(parent, { recursive: true });
-  const parentStat = await lstat(parent);
-  if (parentStat.isSymbolicLink()) throw new Error(`OUTPUT_REPARSE_POINT: ${parent}`);
-  const temporary = path.join(parent, `.${path.basename(output)}.qbrowser-${process.pid}-${Date.now()}`);
-  await writeFile(temporary, contents, { encoding: "utf8", flag: "wx" });
-  try { await rename(temporary, output); }
-  catch (error) { throw error; }
-}
-
-async function assertNewPath(filePath: string): Promise<void> {
-  const output = path.resolve(filePath);
-  try { await stat(output); throw new Error(`OUTPUT_ALREADY_EXISTS: ${output}`); }
-  catch (error) {
-    if (error instanceof Error && error.message.startsWith("OUTPUT_ALREADY_EXISTS")) throw error;
-    if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
-  }
-}
-
 export async function runCli(args: string[], io: CliIo = {
   stdout: (message) => process.stdout.write(message),
   stderr: (message) => process.stderr.write(message),
@@ -61,7 +37,7 @@ export async function runCli(args: string[], io: CliIo = {
       if (args.length !== 4 || args[2] !== "--json") throw new Error("INVALID_ARGUMENTS");
       const ir = await scanFile(input);
       const destination = parseFlag(args, "--json");
-      await writeNewAtomic(destination, `${JSON.stringify(ir, null, 2)}\n`);
+      await publishNewFile(destination, `${JSON.stringify(ir, null, 2)}\n`);
       io.stdout(`Scanned ${ir.sourceFile}: ${ir.diagnostics.length} diagnostic(s)\n`);
       return ir.diagnostics.some((item) => item.severity === "fatal") ? 2 : 0;
     }
@@ -76,13 +52,13 @@ export async function runCli(args: string[], io: CliIo = {
           || (!reportRelativeToOutput.startsWith("..") && !path.isAbsolute(reportRelativeToOutput))) {
         throw new Error("REPORT_INSIDE_OUTPUT");
       }
-      await assertNewPath(resolvedOutput);
-      await assertNewPath(resolvedReport);
-      await assertSafeOutputParent(resolvedOutput);
-      await assertSafeOutputParent(resolvedReport);
-      const generated = generateProject(await scanFile(input));
-      await generateToDirectory(output, generated);
-      await writeNewAtomic(report, `${JSON.stringify(generated.report, null, 2)}\n`);
+      const ir = await scanFile(input);
+      if (ir.diagnostics.some((item) => item.severity === "fatal")) {
+        io.stdout(`Generation blocked: ${ir.diagnostics.length} diagnostic(s)\n`);
+        return 2;
+      }
+      const generated = generateProject(ir);
+      await publishGenerationTransaction(output, report, generated);
       io.stdout(`Generated ${generated.report.generatedFiles.length} file(s): ${generated.report.diagnostics.length} diagnostic(s)\n`);
       return generated.report.diagnostics.some((item) => item.severity === "fatal") ? 2 : 0;
     }

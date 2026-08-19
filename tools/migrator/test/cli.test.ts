@@ -114,4 +114,45 @@ describe("qbrowser-migrate CLI", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("returns exit 2 and publishes nothing for fatal diagnostics", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-fatal-${process.pid}-${Date.now()}`);
+    const fatalInput = path.join(root, "fatal.html");
+    const output = path.join(root, "output");
+    const report = path.join(root, "report.json");
+    try {
+      await mkdir(root, { recursive: true });
+      await writeFile(fatalInput, `<!doctype html>${"<script></script>".repeat(510)}`, "utf8");
+      const result = launch(["generate", fatalInput, "--output", output, "--report", report]);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toBe("");
+      await expect(access(output)).rejects.toThrow();
+      await expect(access(report)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fatal diagnostics take precedence and leave pre-existing targets unchanged", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-fatal-existing-${process.pid}-${Date.now()}`);
+    const fatalInput = path.join(root, "fatal.html");
+    const output = path.join(root, "output");
+    const report = path.join(root, "report.json");
+    try {
+      await mkdir(output, { recursive: true });
+      await writeFile(path.join(output, "sentinel.txt"), "output-sentinel", "utf8");
+      await writeFile(report, "report-sentinel", "utf8");
+      await writeFile(fatalInput, `<!doctype html>${"<script></script>".repeat(510)}`, "utf8");
+      const result = launch(["generate", fatalInput, "--output", output, "--report", report]);
+      expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+        status: 2,
+        stdout: "Generation blocked: 500 diagnostic(s)\n",
+        stderr: "",
+      });
+      expect(await readFile(path.join(output, "sentinel.txt"), "utf8")).toBe("output-sentinel");
+      expect(await readFile(report, "utf8")).toBe("report-sentinel");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
