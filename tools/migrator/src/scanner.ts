@@ -1,4 +1,6 @@
 import path from "node:path";
+import { DecodingMode, EntityDecoder } from "entities";
+import { htmlDecodeTree } from "entities/decode";
 import { parse, type DefaultTreeAdapterMap, type ParserError } from "parse5";
 
 import { createCssBudget, parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.ts";
@@ -29,10 +31,6 @@ const BOOLEAN_ATTRIBUTES = new Set(["checked", "disabled", "required"]);
 const UNSUPPORTED_TAGS = new Map([
   ["script", "UNSUPPORTED_SCRIPT"], ["canvas", "UNSUPPORTED_CANVAS"], ["iframe", "UNSUPPORTED_IFRAME"],
 ]);
-
-function normalizeSource(source: string): string {
-  return source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").normalize("NFC");
-}
 
 function safeDisplayName(sourceFile: string): string {
   const normalized = sourceFile.replaceAll("\\", "/");
@@ -118,21 +116,96 @@ function childNodes(node: P5Node): P5Node[] {
 }
 
 function positionAt(source: string, offset: number): { line: number; column: number; offset: number } {
-  const prefix = source.slice(0, offset);
-  const lastLine = prefix.lastIndexOf("\n");
-  return { line: prefix.split("\n").length, column: offset - lastLine, offset };
+  let line = 1;
+  let column = 1;
+  for (let index = 0; index < offset;) {
+    if (source[index] === "\r") {
+      index += source[index + 1] === "\n" ? 2 : 1;
+      line += 1;
+      column = 1;
+    } else if (source[index] === "\n") {
+      index += 1;
+      line += 1;
+      column = 1;
+    } else {
+      index += 1;
+      column += 1;
+    }
+  }
+  return { line, column, offset };
 }
 
-function inlineStyleOrigin(element: P5Element, source: string): { line: number; column: number; offset: number } | undefined {
+function inlineStyleSource(
+  element: P5Element,
+  source: string,
+  sourceFile: string,
+  decodedValue: string,
+): StylesheetSource {
   const attribute = element.sourceCodeLocation?.attrs?.style;
-  if (!attribute) return undefined;
+  if (!attribute) return { sourceFile, css: decodedValue };
   const raw = source.slice(attribute.startOffset, attribute.endOffset);
   const equals = raw.indexOf("=");
-  if (equals < 0) return positionAt(source, attribute.startOffset);
+  if (equals < 0) return { sourceFile, css: decodedValue };
   let relative = equals + 1;
   while (relative < raw.length && /[ \t\n\r\f]/u.test(raw[relative]!)) relative += 1;
-  if (raw[relative] === "\"" || raw[relative] === "'") relative += 1;
-  return positionAt(source, attribute.startOffset + relative);
+  const quote = raw[relative] === "\"" || raw[relative] === "'" ? raw[relative] : undefined;
+  if (quote) relative += 1;
+  const rawStart = attribute.startOffset + relative;
+  const rawEnd = quote && raw.endsWith(quote) ? attribute.endOffset - 1 : attribute.endOffset;
+  const decodedToRaw = decodedOffsetMap(source.slice(rawStart, rawEnd), decodedValue, rawStart);
+  const fallback: SourceRange = {
+    file: sourceFile,
+    start: positionAt(source, rawStart),
+    end: positionAt(source, rawEnd),
+  };
+  return {
+    sourceFile,
+    css: decodedValue,
+    rawMapping: { source, decodedToRaw: decodedToRaw ?? [], fallback },
+  };
+}
+
+function decodedOffsetMap(raw: string, decoded: string, absoluteStart: number): Array<number | undefined> | undefined {
+  const offsets: Array<number | undefined> = new Array(decoded.length + 1);
+  let rawIndex = 0;
+  let decodedIndex = 0;
+  offsets[0] = absoluteStart;
+
+  function append(consumed: number, value: string, exactInternal: boolean): boolean {
+    if (decoded.slice(decodedIndex, decodedIndex + value.length) !== value) return false;
+    offsets[decodedIndex] = absoluteStart + rawIndex;
+    for (let index = 1; index < value.length; index += 1) {
+      offsets[decodedIndex + index] = exactInternal ? absoluteStart + rawIndex + index : undefined;
+    }
+    rawIndex += consumed;
+    decodedIndex += value.length;
+    offsets[decodedIndex] = absoluteStart + rawIndex;
+    return true;
+  }
+
+  while (rawIndex < raw.length) {
+    if (raw[rawIndex] === "\r") {
+      const consumed = raw[rawIndex + 1] === "\n" ? 2 : 1;
+      if (!append(consumed, "\n", false)) return undefined;
+      continue;
+    }
+    if (raw[rawIndex] === "&") {
+      let decodedEntity = "";
+      const decoder = new EntityDecoder(htmlDecodeTree, (codePoint) => { decodedEntity += String.fromCodePoint(codePoint); });
+      decoder.startEntity(DecodingMode.Attribute);
+      let consumed = decoder.write(raw, rawIndex + 1);
+      if (consumed < 0) consumed = decoder.end();
+      if (consumed > 0) {
+        if (!append(consumed, decodedEntity, false)) return undefined;
+        continue;
+      }
+    }
+    const codePoint = raw.codePointAt(rawIndex);
+    if (codePoint === undefined) return undefined;
+    const value = codePoint === 0 ? "\uFFFD" : String.fromCodePoint(codePoint);
+    if (!append(codePoint > 0xffff ? 2 : 1, value, true)) return undefined;
+  }
+  return decodedIndex === decoded.length ? offsets : undefined;
 }
 
 function inlineStylesheets(document: DefaultTreeAdapterMap["document"], sourceFile: string): StylesheetSource[] {
@@ -156,7 +229,7 @@ function inlineStylesheets(document: DefaultTreeAdapterMap["document"], sourceFi
 
 export function scanDocument(input: ScanDocumentInput): MigrationIR {
   if (Buffer.byteLength(input.html, "utf8") > SCANNER_LIMITS.inputBytes) throw new Error("INPUT_LIMIT_EXCEEDED");
-  const html = normalizeSource(input.html);
+  const html = input.html;
   const sourceFile = safeDisplayName(input.sourceFile);
   const builder = new IrBuilder();
   const document = parse(html, {
@@ -224,7 +297,7 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
         inlineDeclarations = parseInlineStyle(
           attributes.style,
           builder.diagnostics,
-          { sourceFile, css: attributes.style, origin: inlineStyleOrigin(node, html) },
+          inlineStyleSource(node, html, sourceFile, attributes.style),
           cssBudget,
         );
       }
@@ -273,7 +346,7 @@ function decodeUtf8(bytes: Uint8Array, label: string): string {
 }
 
 function localStylesheetReferences(html: string): string[] {
-  const document = parse(normalizeSource(html));
+  const document = parse(html);
   const references: string[] = [];
   function visit(node: P5Node): void {
     if (isElement(node) && node.tagName.toLowerCase() === "link") {

@@ -6,12 +6,15 @@ import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.
 import {
   capturePathIdentity,
   identityFromStats,
+  materializeStableParent,
   pathHasIdentity,
+  planStableParent,
   prepareStableParent,
   requireStableParent,
+  rollbackOwnedDirectories,
   runStableIoHook,
-  samePathIdentity,
   stableParentUnchanged,
+  type OwnedDirectoryMap,
   type PathIdentity,
   type StableParentSnapshot,
 } from "./stable-io.ts";
@@ -29,6 +32,27 @@ export interface GenerationReport {
 export interface GeneratedProject {
   files: Record<string, string>;
   report: GenerationReport;
+}
+
+export function assertDisjointGenerationPaths(outputPath: string, reportPath: string): void {
+  const lexicalKey = (value: string): string => {
+    let normalized = path.resolve(value).normalize("NFC");
+    if (process.platform !== "win32") return path.normalize(normalized);
+    if (normalized.startsWith("\\\\?\\UNC\\")) normalized = `\\\\${normalized.slice(8)}`;
+    else if (normalized.startsWith("\\\\?\\")) normalized = normalized.slice(4);
+    const parsed = path.win32.parse(normalized);
+    const segments = normalized.slice(parsed.root.length).split(/[\\/]/u)
+      .map((segment) => segment.replace(/[ .]+$/u, ""));
+    return path.win32.join(parsed.root, ...segments).toLocaleLowerCase("en-US");
+  };
+  const output = lexicalKey(outputPath);
+  const report = lexicalKey(reportPath);
+  const contains = (ancestor: string, candidate: string): boolean => {
+    if (ancestor === candidate) return true;
+    const separator = process.platform === "win32" ? "\\" : path.sep;
+    return candidate.startsWith(ancestor.endsWith(separator) ? ancestor : `${ancestor}${separator}`);
+  };
+  if (contains(output, report) || contains(report, output)) throw new Error("OUTPUT_REPORT_OVERLAP");
 }
 
 const QML_RESERVED = new Set([
@@ -482,6 +506,52 @@ async function requireOwnedDirectory(
   for (const file of files) await requireOwnedFile(file.path, file.identity);
 }
 
+interface ParentLease {
+  path: string;
+  identity: PathIdentity;
+  handle: Awaited<ReturnType<typeof open>>;
+  parent: StableParentSnapshot;
+}
+
+async function acquireParentLease(parent: StableParentSnapshot, label: string): Promise<ParentLease> {
+  const leasePath = path.join(parent.path, `.${label}.qbrowser-${randomUUID()}.lock`);
+  const handle = await open(leasePath, "wx", 0o600);
+  try {
+    await handle.writeFile("qbrowser-migrator-parent-lease\n", { encoding: "utf8" });
+    await handle.sync();
+    return { path: leasePath, identity: identityFromStats(await handle.stat({ bigint: true })), handle, parent };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function releaseParentLease(lease: ParentLease | undefined): Promise<void> {
+  if (!lease) return;
+  await lease.handle.close();
+  await removeOwnedFile(lease.path, lease.parent, lease.identity);
+}
+
+async function requireParentLease(lease: ParentLease): Promise<void> {
+  await requireStableParent(lease.parent);
+  await requireOwnedFile(lease.path, lease.identity);
+}
+
+async function runParentRaceHook(
+  name: "afterGenerationStaged" | "beforeOutputCommit" | "beforeReportPublish",
+  output: string,
+  report: string,
+  parent: StableParentSnapshot,
+): Promise<void> {
+  try { await runStableIoHook(name, output, report); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && ["EPERM", "EACCES"].includes(String(error.code))) {
+      throw new Error(`OUTPUT_PARENT_CHANGED: ${parent.path}`);
+    }
+    throw error;
+  }
+}
+
 /** Publish one durable file with an exclusive hard-link operation. */
 export async function publishNewFile(filePath: string, contents: string): Promise<void> {
   const target = path.resolve(filePath);
@@ -500,11 +570,7 @@ export async function publishNewFile(filePath: string, contents: string): Promis
   }
 }
 
-/**
- * Stage and validate both artifacts before publication. The report is published
- * by an exclusive hard link. If directory publication loses a race, only the
- * report inode owned by this transaction is eligible for rollback.
- */
+/** Stage both artifacts, publish the directory without replacement, then link the report exclusively. */
 export async function publishGenerationTransaction(
   outputDirectory: string,
   reportPath: string,
@@ -512,69 +578,114 @@ export async function publishGenerationTransaction(
 ): Promise<void> {
   const output = path.resolve(outputDirectory);
   const report = path.resolve(reportPath);
+  assertDisjointGenerationPaths(output, report);
   const entries = validateOutputFiles(generated.files);
   const reportContents = `${JSON.stringify(generated.report, null, 2)}\n`;
   if (Buffer.byteLength(reportContents, "utf8") > GENERATOR_LIMITS.outputBytes) throw new Error("OUTPUT_LIMIT_EXCEEDED");
 
-  const outputParent = await prepareStableParent(output);
-  const reportParent = await prepareStableParent(report);
+  const outputPlan = await planStableParent(output);
+  const reportPlan = await planStableParent(report);
   await assertTargetMissing(output);
   await assertTargetMissing(report);
-  const outputStage = ownedStagePath(outputParent, output, "directory");
-  const reportStage = ownedStagePath(reportParent, report, "file");
-  await mkdir(outputStage, { recursive: false });
-  const outputStageIdentity = await capturePathIdentity(outputStage);
+  const outputStage = path.join(outputPlan.path, `.${path.basename(output)}.qbrowser-${randomUUID()}.stage`);
+  const reportStage = path.join(reportPlan.path, `.${path.basename(report)}.qbrowser-${randomUUID()}.tmp`);
+  const ownedParents: OwnedDirectoryMap = new Map();
+  let outputParent: StableParentSnapshot | undefined;
+  let reportParent: StableParentSnapshot | undefined;
+  let outputStageIdentity: PathIdentity | undefined;
+  let outputLease: ParentLease | undefined;
+  let reportLease: ParentLease | undefined;
   const stagedFiles: Array<{ path: string; identity: PathIdentity }> = [];
   let reportStageIdentity: PathIdentity | undefined;
   let reportPublished = false;
   let outputPublished = false;
+  let succeeded = false;
   try {
+    outputParent = await materializeStableParent(outputPlan, ownedParents);
+    reportParent = await materializeStableParent(reportPlan, ownedParents);
+    await requireStableParent(outputParent);
+    await requireStableParent(reportParent);
+    await assertTargetMissing(output);
+    await assertTargetMissing(report);
+    // On Windows an open child file denies ancestor rename/delete. POSIX permits
+    // renames, so the portable fallback relies on repeated identity barriers and
+    // does not claim protection from an active attacker that restores state.
+    outputLease = await acquireParentLease(outputParent, path.basename(output));
+    reportLease = await acquireParentLease(reportParent, path.basename(report));
+    await mkdir(outputStage, { recursive: false });
+    outputStageIdentity = await capturePathIdentity(outputStage);
     for (const [name, contents] of entries) {
       const filePath = path.join(outputStage, name);
       stagedFiles.push({ path: filePath, identity: await writeDurableNewFile(filePath, contents) });
     }
     reportStageIdentity = await writeDurableNewFile(reportStage, reportContents);
-    await runStableIoHook("afterGenerationStaged", output, report);
+    await runParentRaceHook("afterGenerationStaged", output, report, outputParent);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
+    await requireParentLease(outputLease);
+    await requireParentLease(reportLease);
     await requireOwnedDirectory(outputStage, outputStageIdentity, stagedFiles);
     await requireOwnedFile(reportStage, reportStageIdentity);
+    await assertTargetMissing(output);
+    await assertTargetMissing(report);
 
-    await runStableIoHook("beforeReportPublish", output, report);
+    await runParentRaceHook("beforeOutputCommit", output, report, outputParent);
     await requireStableParent(outputParent);
     await requireStableParent(reportParent);
+    await requireParentLease(outputLease);
+    await requireParentLease(reportLease);
     await assertTargetMissing(output);
+    await assertTargetMissing(report);
+    await requireOwnedDirectory(outputStage, outputStageIdentity, stagedFiles);
+    try {
+      await rename(outputStage, output);
+    } catch (error) {
+      throw await normalizePublishError(error, output);
+    }
+    outputPublished = true;
+
+    await runStableIoHook("afterOutputPublish", output, report);
+    await requireStableParent(outputParent);
+    await requireStableParent(reportParent);
+    await requireParentLease(outputLease);
+    await requireParentLease(reportLease);
+    const publishedFiles = stagedFiles.map((file) => ({ ...file, path: path.join(output, path.basename(file.path)) }));
+    await requireOwnedDirectory(output, outputStageIdentity, publishedFiles);
     await requireOwnedFile(reportStage, reportStageIdentity);
+    await assertTargetMissing(report);
+
+    await runParentRaceHook("beforeReportPublish", output, report, reportParent);
+    await requireStableParent(outputParent);
+    await requireStableParent(reportParent);
+    await requireParentLease(outputLease);
+    await requireParentLease(reportLease);
+    await requireOwnedDirectory(output, outputStageIdentity, publishedFiles);
+    await requireOwnedFile(reportStage, reportStageIdentity);
+    await assertTargetMissing(report);
     try {
       await link(reportStage, report);
     } catch (error) {
       throw await normalizePublishError(error, report);
     }
     reportPublished = true;
-
-    await runStableIoHook("afterReportPublish", output, report);
-    await requireStableParent(outputParent);
-    await requireStableParent(reportParent);
-    await assertTargetMissing(output);
-    await requireOwnedDirectory(outputStage, outputStageIdentity, stagedFiles);
-    try {
-      await rename(outputStage, output);
-      outputPublished = true;
-    } catch (error) {
-      throw await normalizePublishError(error, output);
-    }
+    succeeded = true;
   } catch (error) {
-    if (reportPublished && !outputPublished) {
-      await runStableIoHook("beforeReportRollback", output, report);
-      if (reportStageIdentity && await stableParentUnchanged(reportParent) && await samePathIdentity(report, reportStage)) {
-        await unlink(report);
+    if (outputPublished && !reportPublished && outputParent && outputStageIdentity) {
+      await runStableIoHook("beforeOutputRollback", output, report);
+      const publishedFiles = stagedFiles.map((file) => ({ ...file, path: path.join(output, path.basename(file.path)) }));
+      if (await stableParentUnchanged(outputParent) && await pathHasIdentity(output, outputStageIdentity)) {
+        await removeOwnedDirectory(output, outputParent, outputStageIdentity, publishedFiles);
+        outputPublished = false;
       }
     }
     throw error;
   } finally {
-    if (!outputPublished && await stableParentUnchanged(outputParent)) {
+    if (!outputPublished && outputParent && outputStageIdentity && await stableParentUnchanged(outputParent)) {
       await removeOwnedDirectory(outputStage, outputParent, outputStageIdentity, stagedFiles);
     }
-    if (reportStageIdentity) await removeOwnedFile(reportStage, reportParent, reportStageIdentity);
+    if (reportStageIdentity && reportParent) await removeOwnedFile(reportStage, reportParent, reportStageIdentity);
+    await releaseParentLease(reportLease);
+    await releaseParentLease(outputLease);
+    if (!succeeded) await rollbackOwnedDirectories(ownedParents);
   }
 }

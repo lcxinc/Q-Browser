@@ -27,6 +27,11 @@ export interface StylesheetSource {
   sourceFile: string;
   css: string;
   origin?: { line: number; column: number; offset: number };
+  rawMapping?: {
+    source: string;
+    decodedToRaw: ReadonlyArray<number | undefined>;
+    fallback: SourceRange;
+  };
 }
 
 interface CssAstNode {
@@ -60,6 +65,16 @@ export function createCssBudget(): CssBudget {
 function location(sheet: StylesheetSource, node: CssAstNode): SourceRange {
   const start = node.loc?.start;
   const end = node.loc?.end;
+  if (sheet.rawMapping) {
+    const rawStart = sheet.rawMapping.decodedToRaw[start?.offset ?? -1];
+    const rawEnd = sheet.rawMapping.decodedToRaw[end?.offset ?? -1];
+    if (rawStart === undefined || rawEnd === undefined) return sheet.rawMapping.fallback;
+    return {
+      file: sheet.sourceFile,
+      start: rawPosition(sheet.rawMapping.source, rawStart),
+      end: rawPosition(sheet.rawMapping.source, rawEnd),
+    };
+  }
   const origin = sheet.origin ?? { line: 1, column: 1, offset: 0 };
   const startLocalLine = start?.line ?? 1;
   const endLocalLine = end?.line ?? startLocalLine;
@@ -76,6 +91,26 @@ function location(sheet: StylesheetSource, node: CssAstNode): SourceRange {
       offset: origin.offset + (end?.offset ?? start?.offset ?? 0),
     },
   };
+}
+
+function rawPosition(source: string, offset: number): { line: number; column: number; offset: number } {
+  let line = 1;
+  let column = 1;
+  for (let index = 0; index < offset;) {
+    if (source[index] === "\r") {
+      index += source[index + 1] === "\n" ? 2 : 1;
+      line += 1;
+      column = 1;
+    } else if (source[index] === "\n") {
+      index += 1;
+      line += 1;
+      column = 1;
+    } else {
+      index += 1;
+      column += 1;
+    }
+  }
+  return { line, column, offset };
 }
 
 function selectorSpecificity(selector: string): number {

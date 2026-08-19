@@ -10,6 +10,70 @@ import { setStableIoTestHooks } from "../src/stable-io.ts";
 afterEach(() => setStableIoTestHooks());
 
 describe("migrator stable IO", () => {
+  test("rejects direct bidirectional output/report overlap before creating parents", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-direct-overlap-${process.pid}-${Date.now()}`);
+    const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
+    try {
+      await expect(publishGenerationTransaction(
+        path.join(root, "report-root", "output"),
+        path.join(root, "report-root"),
+        generated,
+      )).rejects.toThrow("OUTPUT_REPORT_OVERLAP");
+      await expect(access(root)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects repeated same-size input overwrites after the initial metadata snapshot", async () => {
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      const root = path.join(os.tmpdir(), `qbrowser-input-same-size-${process.pid}-${Date.now()}-${iteration}`);
+      const input = path.join(root, "index.html");
+      const original = "<!doctype html><main>AAAAAAAA</main>";
+      const replacement = "<!doctype html><main>BBBBBBBB</main>";
+      try {
+        await mkdir(root, { recursive: true });
+        await writeFile(input, original, "utf8");
+        setStableIoTestHooks({
+          afterInputInitialStat: async (opened: string) => {
+            if (opened === input) await writeFile(input, replacement, "utf8");
+          },
+        });
+        await expect(scanFile(input)).rejects.toThrow("INPUT_CHANGED");
+      } finally {
+        setStableIoTestHooks();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("rejects same-size A/B changes across two complete snapshots for HTML and CSS", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-input-two-pass-${process.pid}-${Date.now()}`);
+    const input = path.join(root, "index.html");
+    const css = path.join(root, "site.css");
+    try {
+      await mkdir(root, { recursive: true });
+      await writeFile(input, "<!doctype html><link rel='stylesheet' href='site.css'><main>AAAAAAAA</main>", "utf8");
+      await writeFile(css, "main { color: #111111; }", "utf8");
+      setStableIoTestHooks({
+        betweenInputSnapshots: async (opened: string) => {
+          if (opened === input) await writeFile(input, "<!doctype html><link rel='stylesheet' href='site.css'><main>BBBBBBBB</main>", "utf8");
+        },
+      });
+      await expect(scanFile(input)).rejects.toThrow("INPUT_CHANGED");
+
+      setStableIoTestHooks({
+        betweenInputSnapshots: async (opened: string) => {
+          if (opened === css) await writeFile(css, "main { color: #222222; }", "utf8");
+        },
+      });
+      await expect(scanFile(input)).rejects.toThrow("INPUT_CHANGED");
+    } finally {
+      setStableIoTestHooks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects an input name swapped after its native handle opens", async () => {
     const root = path.join(os.tmpdir(), `qbrowser-input-swap-${process.pid}-${Date.now()}`);
     const input = path.join(root, "index.html");
@@ -38,6 +102,22 @@ describe("migrator stable IO", () => {
       await writeFile(input, "<!doctype html><main>Small</main>", "utf8");
       setStableIoTestHooks({ afterInputOpen: async () => appendFile(input, "x".repeat(2_097_152), "utf8") });
       await expect(scanFile(input)).rejects.toThrow("INPUT_LIMIT_EXCEEDED");
+    } finally {
+      setStableIoTestHooks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects truncation after the initial metadata snapshot", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-input-truncate-${process.pid}-${Date.now()}`);
+    const input = path.join(root, "index.html");
+    try {
+      await mkdir(root, { recursive: true });
+      await writeFile(input, "<!doctype html><main>Original content</main>", "utf8");
+      setStableIoTestHooks({
+        afterInputInitialStat: async () => writeFile(input, "<!doctype html><main>x</main>", "utf8"),
+      });
+      await expect(scanFile(input)).rejects.toThrow("INPUT_CHANGED");
     } finally {
       setStableIoTestHooks();
       await rm(root, { recursive: true, force: true });
@@ -81,20 +161,20 @@ describe("migrator stable IO", () => {
     }
   });
 
-  test("rolls back only its owned report after an output race", async () => {
+  test("rolls back only its owned output after a report race", async () => {
     const root = path.join(os.tmpdir(), `qbrowser-output-race-${process.pid}-${Date.now()}`);
     const output = path.join(root, "output");
     const report = path.join(root, "report.json");
     const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
     try {
       setStableIoTestHooks({
-        afterReportPublish: async () => {
+        beforeReportPublish: async () => {
+          await writeFile(report, "replacement", { encoding: "utf8", flag: "wx" });
+        },
+        beforeOutputRollback: async () => {
+          await rename(output, path.join(root, "owned-displaced"));
           await mkdir(output);
           await writeFile(path.join(output, "competitor.txt"), "competitor", "utf8");
-        },
-        beforeReportRollback: async () => {
-          await rm(report, { force: true });
-          await writeFile(report, "replacement", { encoding: "utf8", flag: "wx" });
         },
       });
       await expect(publishGenerationTransaction(output, report, generated)).rejects.toThrow("OUTPUT_ALREADY_EXISTS");
@@ -112,7 +192,7 @@ describe("migrator stable IO", () => {
     const report = path.join(root, "report.json");
     const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
     try {
-      setStableIoTestHooks({ afterReportPublish: async () => mkdir(output) });
+      setStableIoTestHooks({ beforeOutputCommit: async () => mkdir(output) });
       await expect(publishGenerationTransaction(output, report, generated)).rejects.toThrow("OUTPUT_ALREADY_EXISTS");
       expect(await readdir(output)).toEqual([]);
       await expect(access(report)).rejects.toThrow();
@@ -172,6 +252,93 @@ describe("migrator stable IO", () => {
       expect(await readFile(path.join(competitorStage, "competitor.txt"), "utf8")).toBe("competitor");
       await expect(access(output)).rejects.toThrow();
       await expect(access(report)).rejects.toThrow();
+    } finally {
+      setStableIoTestHooks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes owned missing parent chains when staging fails before publication", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-parent-cleanup-${process.pid}-${Date.now()}`);
+    const output = path.join(root, "nested", "output-parent", "output");
+    const report = path.join(root, "nested", "report-parent", "report.json");
+    const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
+    try {
+      setStableIoTestHooks({ afterGenerationStaged: async () => { throw new Error("INJECTED_STAGE_FAILURE"); } });
+      await expect(publishGenerationTransaction(output, report, generated)).rejects.toThrow("INJECTED_STAGE_FAILURE");
+      await expect(access(path.join(root, "nested"))).rejects.toThrow();
+    } finally {
+      setStableIoTestHooks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when a parent is swapped after the final checks and before publish", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-final-publish-race-${process.pid}-${Date.now()}`);
+    const outputParent = path.join(root, "output-parent");
+    const reportParent = path.join(root, "report-parent");
+    const displaced = path.join(root, "output-displaced");
+    const attacker = path.join(root, "attacker");
+    const output = path.join(outputParent, "output");
+    const report = path.join(reportParent, "report.json");
+    const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
+    try {
+      await mkdir(outputParent, { recursive: true });
+      await mkdir(reportParent, { recursive: true });
+      await mkdir(attacker, { recursive: true });
+      await writeFile(path.join(attacker, "sentinel.txt"), "competitor", "utf8");
+      setStableIoTestHooks({
+        beforeOutputCommit: async () => {
+          await rename(outputParent, displaced);
+          await symlink(attacker, outputParent, process.platform === "win32" ? "junction" : "dir");
+        },
+      });
+      await expect(publishGenerationTransaction(output, report, generated)).rejects.toThrow("OUTPUT_PARENT_CHANGED");
+      expect(await readFile(path.join(attacker, "sentinel.txt"), "utf8")).toBe("competitor");
+      await expect(access(path.join(attacker, "output"))).rejects.toThrow();
+      await expect(access(report)).rejects.toThrow();
+    } finally {
+      setStableIoTestHooks();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(process.platform === "win32")("holds native child handles that deny parent rename through both publish operations", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-parent-lease-${process.pid}-${Date.now()}`);
+    const outputParent = path.join(root, "output-parent");
+    const reportParent = path.join(root, "report-parent");
+    const output = path.join(outputParent, "output");
+    const report = path.join(reportParent, "report.json");
+    const generated = generateProject(scanDocument({ sourceFile: "safe.html", html: "<!doctype html><main>Safe</main>" }));
+    let outputRenameBlocked = false;
+    let reportRenameBlocked = false;
+    try {
+      await mkdir(outputParent, { recursive: true });
+      await mkdir(reportParent, { recursive: true });
+      setStableIoTestHooks({
+        beforeOutputCommit: async () => {
+          try {
+            const displaced = path.join(root, "output-displaced");
+            await rename(outputParent, displaced);
+            await rename(displaced, outputParent);
+          } catch (error) {
+            outputRenameBlocked = error instanceof Error && "code" in error && ["EPERM", "EACCES"].includes(String(error.code));
+          }
+        },
+        beforeReportPublish: async () => {
+          try {
+            const displaced = path.join(root, "report-displaced");
+            await rename(reportParent, displaced);
+            await rename(displaced, reportParent);
+          } catch (error) {
+            reportRenameBlocked = error instanceof Error && "code" in error && ["EPERM", "EACCES"].includes(String(error.code));
+          }
+        },
+      });
+      await publishGenerationTransaction(output, report, generated);
+      expect({ outputRenameBlocked, reportRenameBlocked }).toEqual({ outputRenameBlocked: true, reportRenameBlocked: true });
+      expect(await readdir(outputParent)).toEqual(["output"]);
+      expect(await readdir(reportParent)).toEqual(["report.json"]);
     } finally {
       setStableIoTestHooks();
       await rm(root, { recursive: true, force: true });

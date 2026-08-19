@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { generateProject, publishGenerationTransaction, publishNewFile } from "./generator.ts";
+import { assertDisjointGenerationPaths, generateProject, publishGenerationTransaction, publishNewFile } from "./generator.ts";
 import { scanFile } from "./scanner.ts";
 
 export interface CliIo {
@@ -47,11 +47,7 @@ export async function runCli(args: string[], io: CliIo = {
       const report = parseFlag(args, "--report");
       const resolvedOutput = path.resolve(output);
       const resolvedReport = path.resolve(report);
-      const reportRelativeToOutput = path.relative(resolvedOutput, resolvedReport);
-      if (reportRelativeToOutput.length === 0
-          || (!reportRelativeToOutput.startsWith("..") && !path.isAbsolute(reportRelativeToOutput))) {
-        throw new Error("REPORT_INSIDE_OUTPUT");
-      }
+      assertDisjointGenerationPaths(resolvedOutput, resolvedReport);
       const ir = await scanFile(input);
       if (ir.diagnostics.some((item) => item.severity === "fatal")) {
         io.stdout(`Generation blocked: ${ir.diagnostics.length} diagnostic(s)\n`);

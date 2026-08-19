@@ -69,6 +69,38 @@ describe("qbrowser-migrate CLI", () => {
     expect(result.stderr).toContain("qbrowser-migrate: INVALID_ARGUMENTS\nUsage:\n");
   });
 
+  test("rejects equal or bidirectionally overlapping output and report paths before input IO", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-overlap-${process.pid}-${Date.now()}`);
+    const missingInput = path.join(root, "missing.html");
+    try {
+      const cases = [
+        [path.join(root, "tree"), path.join(root, "tree", "report.json")],
+        [path.join(root, "report", "output"), path.join(root, "report")],
+        [path.join(root, "same"), path.join(root, "same")],
+      ];
+      for (const [output, report] of cases) {
+        const result = launch(["generate", missingInput, "--output", output!, "--report", report!]);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("OUTPUT_REPORT_OVERLAP");
+      }
+      await expect(access(root)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(process.platform === "win32")("rejects Windows case and trailing-dot aliases before input IO", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-win-alias-${process.pid}-${Date.now()}`);
+    const result = launch([
+      "generate", path.join(root, "missing.html"),
+      "--output", path.join(root, "Tree"),
+      "--report", path.join(root, "tree.", "report.json"),
+    ]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("OUTPUT_REPORT_OVERLAP");
+    await expect(access(root)).rejects.toThrow();
+  });
+
   test("preflights report collisions before publishing an output directory", async () => {
     const root = path.join(os.tmpdir(), `qbrowser-cli-collision-${process.pid}-${Date.now()}`);
     const output = path.join(root, "output");

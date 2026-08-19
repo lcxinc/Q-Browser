@@ -72,7 +72,13 @@ describe("migrator scanner and IR", () => {
     const lf = scanDocument({ sourceFile: "list.html", html: html.replaceAll("\r\n", "\n") });
     const crlf = scanDocument({ sourceFile: "list.html", html: html.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n") });
 
-    expect(lf.root).toEqual(crlf.root);
+    const semantics = (node: MigrationNode): unknown => ({
+      ...node,
+      location: undefined,
+      children: node.children.map(semantics),
+    });
+    expect(semantics(lf.root)).toEqual(semantics(crlf.root));
+    expect(crlf.root.location.end.offset).toBe(lf.root.location.end.offset + 1);
   });
 
   test("parses bounded inline style elements without executing or exposing them as content", () => {
@@ -136,6 +142,41 @@ describe("migrator scanner and IR", () => {
     ]);
     expect(diagnostics.map((item) => item.location.start.line)).toEqual([2, 2, 2, 2, 2]);
     expect(new Set(diagnostics.map((item) => item.location.start.column)).size).toBe(5);
+  });
+
+  test("maps inline diagnostics through named, decimal, and hexadecimal HTML entities", () => {
+    const html = "<!doctype html>\n<main style=\"/*😀&amp;&#x1F600;*/ &Tab;&#112;osition:absolute; transition-duration:2s\">Safe</main>";
+    const ir = scanDocument({ sourceFile: "entity-style.html", html });
+    const layout = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_LAYOUT")!;
+    const animation = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_ANIMATION")!;
+    expect(layout.location.start).toEqual({
+      line: 2,
+      column: html.indexOf("&#112;") - html.lastIndexOf("\n", html.indexOf("&#112;")),
+      offset: html.indexOf("&#112;"),
+    });
+    expect(animation.location.start.offset).toBe(html.indexOf("transition-duration"));
+  });
+
+  test("maps multiline entity-decoded inline CSS back to raw CRLF and astral offsets", () => {
+    const html = "<!doctype html>\r\n<main style=\"/*😀&amp;*/\r\n  &#x70;osition:absolute;\r\n  transition-duration:2s\">Safe</main>";
+    const ir = scanDocument({ sourceFile: "entity-lines.html", html });
+    const layout = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_LAYOUT")!;
+    const animation = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_ANIMATION")!;
+    expect(layout.location.start).toMatchObject({ line: 3, column: 3, offset: html.indexOf("&#x70;") });
+    expect(animation.location.start).toMatchObject({ line: 4, column: 3, offset: html.indexOf("transition-duration") });
+  });
+
+  test("uses the complete raw style value range when decoded offsets cannot be mapped exactly", () => {
+    const html = "<main style=\"/*e\u0301*/ position:absolute\">Safe</main>";
+    const ir = scanDocument({ sourceFile: "fallback-style.html", html });
+    const diagnostic = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_LAYOUT")!;
+    const rawStart = html.indexOf("\"") + 1;
+    const rawEnd = html.lastIndexOf("\"");
+    expect(diagnostic.location).toEqual({
+      file: "fallback-style.html",
+      start: { line: 1, column: rawStart + 1, offset: rawStart },
+      end: { line: 1, column: rawEnd + 1, offset: rawEnd },
+    });
   });
 
   test("preserves canonical root-relative CSS paths and document cascade order", async () => {
