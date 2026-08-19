@@ -1827,7 +1827,8 @@ void ManifestTest::schemaMatchesRuntimeContract()
     QCOMPARE(schemaMethods,
              QStringList({QStringLiteral("GET"),
                           QStringLiteral("POST"),
-                          QStringLiteral("PUT")}));
+                          QStringLiteral("PUT"),
+                          QStringLiteral("PATCH")}));
     QCOMPARE(networkSchema.value(QStringLiteral("properties"))
                  .toObject()
                  .value(QStringLiteral("hosts"))

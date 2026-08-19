@@ -151,6 +151,8 @@ QString httpMethodName(const HttpMethod method)
         return QStringLiteral("POST");
     case HttpMethod::Put:
         return QStringLiteral("PUT");
+    case HttpMethod::Patch:
+        return QStringLiteral("PATCH");
     }
     return {};
 }
@@ -165,6 +167,9 @@ std::optional<HttpMethod> parseHttpMethod(const QString &method)
     }
     if (method == QStringLiteral("PUT")) {
         return HttpMethod::Put;
+    }
+    if (method == QStringLiteral("PATCH")) {
+        return HttpMethod::Patch;
     }
     return std::nullopt;
 }

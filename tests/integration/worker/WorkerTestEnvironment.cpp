@@ -3,6 +3,7 @@
 #include "AppContainerProfile.h"
 
 #include <QDir>
+#include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -84,6 +85,33 @@ bool writeNewFile(const QString &path, const QByteArray &contents)
         && file.write(contents) == contents.size();
 }
 
+bool copyPackageTree(const QString &source, const QString &destination)
+{
+    const QFileInfo sourceInfo(source);
+    const QString canonicalSource = sourceInfo.canonicalFilePath();
+    if (!sourceInfo.isDir() || sourceInfo.isSymLink() || canonicalSource.isEmpty()) {
+        return false;
+    }
+    QDirIterator entries(canonicalSource,
+                         QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot
+                             | QDir::NoSymLinks,
+                         QDirIterator::Subdirectories);
+    const QDir sourceDirectory(canonicalSource);
+    while (entries.hasNext()) {
+        const QString path = entries.next();
+        const QFileInfo information(path);
+        const QString relative = sourceDirectory.relativeFilePath(path);
+        const QString target = QDir(destination).filePath(relative);
+        if (information.isDir()) {
+            if (!QDir().mkpath(target)) return false;
+        } else if (!information.isFile() || !QDir().mkpath(QFileInfo(target).dir().path())
+                   || !QFile::copy(path, target)) {
+            return false;
+        }
+    }
+    return QFileInfo(QDir(destination).filePath(QStringLiteral("qml/Main.qml"))).isFile();
+}
+
 } // namespace
 
 SessionReceiveResult receiveUntilWithClock(
@@ -138,10 +166,10 @@ WorkerTestEnvironment::Launch::Launch(IpcSession host, SandboxProcess child)
 {
 }
 
-WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml)
+WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml, QString packageSource)
     : appId_(QStringLiteral("com.qbrowser.workertest.%1")
                  .arg(QUuid::createUuid().toString(QUuid::Id128).toLower())),
-      mainQml_(std::move(mainQml))
+      mainQml_(std::move(mainQml)), packageSource_(std::move(packageSource))
 {
     if (!prepare() && error_.isEmpty()) {
         error_ = QStringLiteral("worker test environment preparation failed");
@@ -200,13 +228,20 @@ bool WorkerTestEnvironment::prepare()
         error_ = QStringLiteral("worker descendants could not be created");
         return false;
     }
-    if (mainQml_.isEmpty()) {
-        mainQml_ = QByteArrayLiteral(
-            "import QtQuick\nRectangle { width: 320; height: 200; color: \"#123456\" }\n");
-    }
-    if (!writeNewFile(QDir(qmlDirectory).filePath(QStringLiteral("Main.qml")), mainQml_)) {
-        error_ = QStringLiteral("test QML could not be written");
-        return false;
+    if (!packageSource_.isEmpty()) {
+        if (!copyPackageTree(packageSource_, packageDirectory_)) {
+            error_ = QStringLiteral("test package could not be copied");
+            return false;
+        }
+    } else {
+        if (mainQml_.isEmpty()) {
+            mainQml_ = QByteArrayLiteral(
+                "import QtQuick\nRectangle { width: 320; height: 200; color: \"#123456\" }\n");
+        }
+        if (!writeNewFile(QDir(qmlDirectory).filePath(QStringLiteral("Main.qml")), mainQml_)) {
+            error_ = QStringLiteral("test QML could not be written");
+            return false;
+        }
     }
 
     const QString sourceWorker = QString::fromUtf8(Q_BROWSER_WORKER_PATH);
@@ -246,7 +281,8 @@ bool WorkerTestEnvironment::prepare()
 std::optional<WorkerTestEnvironment::Launch> WorkerTestEnvironment::launch(
     const QString &workerNonce,
     const QString &hostNonce,
-    const int heartbeatMs)
+    const int heartbeatMs,
+    const QString &apiOrigin)
 {
     if (!boundary_.has_value()) {
         return std::nullopt;
@@ -258,6 +294,7 @@ std::optional<WorkerTestEnvironment::Launch> WorkerTestEnvironment::launch(
     request.tempDirectory = workerTemp_;
     request.arguments = {QStringLiteral("--qbrowser-package"), packageDirectory_,
                          QStringLiteral("--qbrowser-entry"), QStringLiteral("qml/Main.qml"),
+                         QStringLiteral("--qbrowser-api-origin"), apiOrigin,
                          QStringLiteral("--qbrowser-nonce"), workerNonce,
                          QStringLiteral("--qbrowser-heartbeat-ms"), QString::number(heartbeatMs)};
     request.resourceLimits = {1, 512ULL * 1024ULL * 1024ULL};

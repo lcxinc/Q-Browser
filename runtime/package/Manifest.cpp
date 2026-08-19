@@ -562,7 +562,8 @@ QVector<ManifestError> validateNetworkMethods(const QJsonObject &permissions)
     }
 
     static const QSet<QString> allowed = {
-        QStringLiteral("GET"), QStringLiteral("POST"), QStringLiteral("PUT")};
+        QStringLiteral("GET"), QStringLiteral("POST"), QStringLiteral("PUT"),
+        QStringLiteral("PATCH")};
     QSet<QString> seen;
     QVector<ManifestError> errors;
     const QJsonArray methods = methodsValue.toArray();

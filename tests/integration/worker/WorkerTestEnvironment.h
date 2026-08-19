@@ -25,7 +25,7 @@ SessionReceiveResult receiveUntil(IpcSession &session,
 class WorkerTestEnvironment final
 {
 public:
-    explicit WorkerTestEnvironment(QByteArray mainQml = {});
+    explicit WorkerTestEnvironment(QByteArray mainQml = {}, QString packageSource = {});
     ~WorkerTestEnvironment();
 
     WorkerTestEnvironment(const WorkerTestEnvironment &) = delete;
@@ -48,7 +48,8 @@ public:
 
     std::optional<Launch> launch(const QString &workerNonce,
                                  const QString &hostNonce,
-                                 int heartbeatMs = 50);
+                                 int heartbeatMs = 50,
+                                 const QString &apiOrigin = QStringLiteral("http://127.0.0.1:4173/"));
 
 private:
     bool prepare();
@@ -64,4 +65,5 @@ private:
     QString error_;
     std::optional<SandboxTrustBoundary> boundary_;
     QByteArray mainQml_;
+    QString packageSource_;
 };

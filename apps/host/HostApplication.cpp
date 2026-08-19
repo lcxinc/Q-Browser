@@ -2,6 +2,7 @@
 
 #include "MainWindow.h"
 
+#include "PilotRoutes.h"
 #include "RouteRegistry.h"
 #include "WebSurface.h"
 
@@ -21,22 +22,12 @@ bool HostApplication::start()
         return true;
     }
 
-    RouteRegistry routes;
-    const RouteRecord worker{QStringLiteral("/dashboard"),
-                             Engine::QmlWorker,
-                             QStringLiteral("com.qbrowser.pilot"),
-                             QStringLiteral("qml/Main.qml")};
-    const RouteRecord web{QStringLiteral("/web/help"),
-                          Engine::WebEngine,
-                          QStringLiteral("com.qbrowser.web"),
-                          mockOrigin_.resolved(QUrl(QStringLiteral("help")))
-                              .toString(QUrl::FullyEncoded)};
-    if (routes.add(worker) != RouteAddResult::Added
-        || routes.add(web) != RouteAddResult::Added) {
+    auto routes = createPilotRouteRegistry(mockOrigin_);
+    if (!routes.has_value()) {
         return false;
     }
 
-    auto window = std::make_unique<MainWindow>(std::move(routes), mockOrigin_);
+    auto window = std::make_unique<MainWindow>(std::move(*routes), mockOrigin_);
     if (!window->webSurface()->isConfigurationValid()) {
         return false;
     }

@@ -44,6 +44,7 @@ private:
         QString nonce;
         QString packageDirectory;
         QString entryPoint;
+        QString apiOrigin;
         int heartbeatMs = 0;
     };
 

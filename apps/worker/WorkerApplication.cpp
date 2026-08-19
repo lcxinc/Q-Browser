@@ -5,6 +5,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QUrl>
 
 #include <limits>
 
@@ -77,8 +78,10 @@ std::optional<WorkerApplication::LaunchArguments> WorkerApplication::parseArgume
     const auto nonce = singleValue(arguments, QStringLiteral("--qbrowser-nonce"));
     const auto package = singleValue(arguments, QStringLiteral("--qbrowser-package"));
     const auto entry = singleValue(arguments, QStringLiteral("--qbrowser-entry"));
+    const auto apiOriginText = singleValue(arguments, QStringLiteral("--qbrowser-api-origin"));
     const auto heartbeat = singleValue(arguments, QStringLiteral("--qbrowser-heartbeat-ms"));
-    if (!readText || !writeText || !nonce || !package || !entry || !heartbeat) {
+    if (!readText || !writeText || !nonce || !package || !entry || !apiOriginText
+        || !heartbeat) {
         return std::nullopt;
     }
     const auto read = inheritedHandle(*readText);
@@ -86,9 +89,18 @@ std::optional<WorkerApplication::LaunchArguments> WorkerApplication::parseArgume
     bool heartbeatOk = false;
     const int heartbeatMs = heartbeat->toInt(&heartbeatOk);
     const QFileInfo packageInfo(*package);
+    const QUrl apiOrigin(*apiOriginText, QUrl::StrictMode);
+    const QString originPath = apiOrigin.path(QUrl::FullyDecoded);
     if (!read || !write || *read == *write || nonce->isEmpty()
         || nonce->size() > 256 || !packageInfo.isAbsolute() || !packageInfo.isDir()
         || packageInfo.isSymLink() || entry->isEmpty() || entry->size() > 2048
+        || !apiOrigin.isValid() || apiOrigin.isRelative()
+        || (apiOrigin.scheme() != QStringLiteral("http")
+            && apiOrigin.scheme() != QStringLiteral("https"))
+        || apiOrigin.host().isEmpty() || !apiOrigin.userInfo().isEmpty()
+        || apiOrigin.hasQuery() || apiOrigin.hasFragment()
+        || (!originPath.isEmpty() && originPath != QStringLiteral("/"))
+        || apiOrigin.port(apiOrigin.scheme() == QStringLiteral("https") ? 443 : 80) <= 0
         || !heartbeatOk || heartbeatMs < 20 || heartbeatMs > 60'000) {
         return std::nullopt;
     }
@@ -97,8 +109,14 @@ std::optional<WorkerApplication::LaunchArguments> WorkerApplication::parseArgume
             return std::nullopt;
         }
     }
+    QString canonicalOrigin = apiOrigin.adjusted(QUrl::RemovePath | QUrl::RemoveQuery
+                                                  | QUrl::RemoveFragment)
+                                  .toString(QUrl::FullyEncoded);
+    if (canonicalOrigin.endsWith(u'/')) canonicalOrigin.chop(1);
     return LaunchArguments{*read, *write, *nonce,
-                           packageInfo.canonicalFilePath(), *entry, heartbeatMs};
+                           packageInfo.canonicalFilePath(), *entry,
+                           canonicalOrigin,
+                           heartbeatMs};
 }
 
 void WorkerApplication::pollIpc()
@@ -116,6 +134,7 @@ void WorkerApplication::pollIpc()
 bool WorkerApplication::finishAuthentication()
 {
     runtimeFacade_.assignAppIdentity(session_->appIdentity());
+    runtimeFacade_.assignApiOrigin(launch_.apiOrigin);
     window_ = std::make_unique<WorkerWindow>();
     state_ = State::Loading;
     if (!window_->load(launch_.packageDirectory, launch_.entryPoint, &runtimeFacade_)) {

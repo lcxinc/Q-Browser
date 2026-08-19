@@ -10,6 +10,7 @@ enum class HttpMethod {
     Get,
     Post,
     Put,
+    Patch,
 };
 
 enum class NetworkScheme {

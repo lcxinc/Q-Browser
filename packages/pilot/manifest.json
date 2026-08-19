@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "appId": "com.qbrowser.pilot",
+  "version": "1.0.0",
+  "entryPoint": "qml/Main.qml",
+  "runtime": {
+    "minVersion": "1.0.0",
+    "maxVersion": "1.x"
+  },
+  "imports": [
+    "QtQuick",
+    "QtQuick.Controls",
+    "QtQuick.Layouts",
+    "Company.Design"
+  ],
+  "permissions": {
+    "network": {
+      "hosts": ["127.0.0.1"],
+      "methods": ["GET", "POST", "PATCH"]
+    },
+    "storage": "app-private",
+    "clipboardWrite": false,
+    "clipboardRead": "user-gesture",
+    "fileOpen": "user-brokered",
+    "process": false
+  },
+  "limits": {
+    "packageBytes": 5242880,
+    "memoryMiB": 256,
+    "processes": 1
+  },
+  "routes": [
+    "/login",
+    "/dashboard",
+    "/orders",
+    "/orders/:id",
+    "/orders/:id/edit",
+    "/customers",
+    "/customers/:id",
+    "/files",
+    "/settings"
+  ]
+}

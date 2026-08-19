@@ -100,6 +100,7 @@ class NetworkBrokerTest final : public QObject
 
 private slots:
     void performsAllowedRequestAgainstRealServer();
+    void performsAllowedPatchAgainstRealServer();
     void deniedPathAndMethodNeverReachServer();
     void boundsRequestAndResponsePayloads();
     void returnsStableTimeout();
@@ -108,6 +109,25 @@ private slots:
     void classifiesOnlyGloballyRoutableAddressesAsPublic();
     void canonicalizesUnicodeIdnForPolicyDnsAndHostHeader();
 };
+
+void NetworkBrokerTest::performsAllowedPatchAgainstRealServer()
+{
+    LocalHttpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+    EffectiveNetworkPolicy policy = policyFor(server);
+    policy.rules[0].methods.insert(HttpMethod::Patch);
+    NetworkBroker broker(policy);
+    const BrokerResult result = broker.invoke(
+        QStringLiteral("request"),
+        requestPayload(QStringLiteral("PATCH"),
+                       server.url(QStringLiteral("/api/orders/ORD-0001")),
+                       QByteArrayLiteral("{}")),
+        {QStringLiteral("host.identity"), QStringLiteral("patch-request")});
+    QVERIFY2(result.ok, qPrintable(result.errorCode));
+    QCOMPARE(server.requestCount, 1);
+    QVERIFY(server.lastRequest.startsWith(QByteArrayLiteral(
+        "PATCH /api/orders/ORD-0001 HTTP/1.1\r\n")));
+}
 
 void NetworkBrokerTest::performsAllowedRequestAgainstRealServer()
 {

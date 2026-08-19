@@ -101,7 +101,7 @@
               "uniqueItems": true,
               "items": {
                 "type": "string",
-                "enum": ["GET", "POST", "PUT"]
+                "enum": ["GET", "POST", "PUT", "PATCH"]
               }
             }
           }

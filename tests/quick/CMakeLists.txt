@@ -13,6 +13,12 @@ target_sources(qbrowser_quick_tests
     tst_AppStatusBadge.qml
     tst_StateView.qml)
 
+target_sources(qbrowser_quick_tests PRIVATE
+  pilot/tst_LoginPage.qml
+  pilot/tst_OrdersPage.qml
+  pilot/tst_OrderEditPage.qml
+  pilot/tst_SettingsPage.qml)
+
 target_link_libraries(qbrowser_quick_tests
   PRIVATE
     q_browser_design

@@ -5,6 +5,7 @@
 RuntimeFacade::RuntimeFacade(QObject *parent) : QObject(parent) {}
 
 QString RuntimeFacade::appIdentity() const { return appIdentity_; }
+QString RuntimeFacade::apiOrigin() const { return apiOrigin_; }
 QString RuntimeFacade::route() const { return route_; }
 
 void RuntimeFacade::assignAppIdentity(const QString &identity)
@@ -12,6 +13,13 @@ void RuntimeFacade::assignAppIdentity(const QString &identity)
     if (appIdentity_ == identity) return;
     appIdentity_ = identity;
     emit appIdentityChanged();
+}
+
+void RuntimeFacade::assignApiOrigin(const QString &origin)
+{
+    if (apiOrigin_ == origin) return;
+    apiOrigin_ = origin;
+    emit apiOriginChanged();
 }
 
 void RuntimeFacade::loadRoute(const QString &route)
