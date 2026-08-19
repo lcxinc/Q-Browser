@@ -7,7 +7,7 @@
 namespace {
 
 enum class TokenKind { Identifier, String, Regex, Punctuation };
-struct Token final { TokenKind kind; QString text; };
+struct Token final { TokenKind kind; QString text; int line; bool regexMayFollow = false; };
 
 bool identifierStart(const QChar value)
 {
@@ -27,7 +27,8 @@ bool tokenCanEndExpression(const Token &token)
             && token.text != QStringLiteral("case")
             && token.text != QStringLiteral("throw");
     }
-    return token.text == QStringLiteral(")") || token.text == QStringLiteral("]")
+    return (token.text == QStringLiteral(")") && !token.regexMayFollow)
+        || token.text == QStringLiteral("]")
         || token.text == QStringLiteral("}");
 }
 
@@ -55,6 +56,7 @@ private:
                 return;
             }
             if (value.isSpace()) {
+                if (value == u'\n') ++line_;
                 ++index_;
                 continue;
             }
@@ -66,7 +68,10 @@ private:
             if (value == u'/' && peek(1) == u'*') {
                 index_ += 2;
                 while (index_ + 1 < source_.size()
-                       && !(source_.at(index_) == u'*' && peek(1) == u'/')) ++index_;
+                       && !(source_.at(index_) == u'*' && peek(1) == u'/')) {
+                    if (source_.at(index_) == u'\n') ++line_;
+                    ++index_;
+                }
                 if (index_ + 1 >= source_.size()) {
                     malformed_ = true;
                     return;
@@ -90,12 +95,25 @@ private:
                 const qsizetype start = index_++;
                 while (index_ < source_.size() && identifierPart(source_.at(index_))) ++index_;
                 tokens_.push_back({TokenKind::Identifier,
-                                   source_.sliced(start, index_ - start)});
+                                   source_.sliced(start, index_ - start), line_});
                 continue;
+            }
+            bool regexMayFollow = false;
+            if (value == u'(') {
+                static const QSet<QString> controlKeywords{
+                    QStringLiteral("if"), QStringLiteral("while"),
+                    QStringLiteral("for"), QStringLiteral("with"),
+                    QStringLiteral("switch"), QStringLiteral("catch")};
+                controlParens_.push_back(!tokens_.isEmpty()
+                    && tokens_.back().kind == TokenKind::Identifier
+                    && controlKeywords.contains(tokens_.back().text));
+            } else if (value == u')' && !controlParens_.isEmpty()) {
+                regexMayFollow = controlParens_.back();
+                controlParens_.pop_back();
             }
             if (value == u'{') ++braceDepth;
             else if (value == u'}' && braceDepth > 0) --braceDepth;
-            tokens_.push_back({TokenKind::Punctuation, QString(value)});
+            tokens_.push_back({TokenKind::Punctuation, QString(value), line_, regexMayFollow});
             ++index_;
         }
         if (templateExpression) malformed_ = true;
@@ -115,14 +133,16 @@ private:
     void scanString(const QChar quote)
     {
         QString decoded;
+        const int startLine = line_;
         ++index_;
         while (index_ < source_.size()) {
             const QChar value = source_.at(index_++);
             if (value == quote) {
-                tokens_.push_back({TokenKind::String, std::move(decoded)});
+                tokens_.push_back({TokenKind::String, std::move(decoded), startLine});
                 return;
             }
             if (value != u'\\') {
+                if (value == u'\n') ++line_;
                 decoded += value;
                 continue;
             }
@@ -147,6 +167,7 @@ private:
 
     void scanRegex()
     {
+        const int startLine = line_;
         ++index_;
         bool inCharacterClass = false;
         while (index_ < source_.size()) {
@@ -159,7 +180,7 @@ private:
             else if (value == u']') inCharacterClass = false;
             else if (value == u'/' && !inCharacterClass) {
                 while (index_ < source_.size() && source_.at(index_).isLetter()) ++index_;
-                tokens_.push_back({TokenKind::Regex, QStringLiteral("regex")});
+                tokens_.push_back({TokenKind::Regex, QStringLiteral("regex"), startLine});
                 return;
             }
             if (value == u'\n' || value == u'\r') break;
@@ -177,6 +198,7 @@ private:
                 continue;
             }
             if (value == u'`') return;
+            if (value == u'\n') ++line_;
             if (value == u'$' && index_ < source_.size() && source_.at(index_) == u'{') {
                 ++index_;
                 scan(true);
@@ -190,6 +212,8 @@ private:
     qsizetype index_ = 0;
     QVector<Token> tokens_;
     bool malformed_ = false;
+    int line_ = 1;
+    QVector<bool> controlParens_;
 };
 
 void addUnique(QStringList &values, const QString &value)
@@ -226,7 +250,31 @@ bool safeSourceUrl(const QString &value)
     return url.isValid() && url.scheme().isEmpty();
 }
 
+bool staticSourceBinding(const QVector<Token> &tokens, const qsizetype valueIndex)
+{
+    if (valueIndex >= tokens.size()
+        || tokens.at(valueIndex).kind != TokenKind::String
+        || !safeSourceUrl(tokens.at(valueIndex).text)) return false;
+    const qsizetype next = valueIndex + 1;
+    if (next >= tokens.size()) return true;
+    if (tokens.at(next).text == QStringLiteral(";")
+        || tokens.at(next).text == QStringLiteral("}")) return true;
+    if (tokens.at(next).line <= tokens.at(valueIndex).line) return false;
+    if (next + 1 >= tokens.size()) return false;
+    return tokens.at(next).kind == TokenKind::Identifier
+        && (tokens.at(next + 1).text == QStringLiteral(":")
+            || tokens.at(next + 1).text == QStringLiteral("{"));
+}
+
 } // namespace
+
+bool QmlSourcePolicy::isQmlSourcePath(const QByteArrayView path)
+{
+    const QByteArray lower = path.toByteArray().toLower();
+    return lower.endsWith(QByteArrayLiteral(".qml"))
+        || lower.endsWith(QByteArrayLiteral(".js"))
+        || lower.endsWith(QByteArrayLiteral(".mjs"));
+}
 
 QStringList QmlSourcePolicy::violations(const QByteArray &source)
 {
@@ -237,6 +285,21 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
 
     QSet<QString> qtAliases{QStringLiteral("Qt")};
     QSet<QString> loaderAliases{QStringLiteral("Loader"), QStringLiteral("loader")};
+    for (qsizetype index = 0; index + 4 < tokens.size(); ++index) {
+        if (tokens.at(index).text != QStringLiteral("Loader")
+            || tokens.at(index + 1).text != QStringLiteral("{")) continue;
+        int depth = 1;
+        for (qsizetype cursor = index + 2; cursor < tokens.size() && depth > 0; ++cursor) {
+            if (tokens.at(cursor).text == QStringLiteral("{")) ++depth;
+            else if (tokens.at(cursor).text == QStringLiteral("}")) --depth;
+            else if (depth == 1 && tokens.at(cursor).text == QStringLiteral("id")
+                     && cursor + 2 < tokens.size()
+                     && tokens.at(cursor + 1).text == QStringLiteral(":")
+                     && tokens.at(cursor + 2).kind == TokenKind::Identifier) {
+                loaderAliases.insert(tokens.at(cursor + 2).text);
+            }
+        }
+    }
     for (qsizetype index = 0; index + 2 < tokens.size(); ++index) {
         if (tokens.at(index).kind == TokenKind::Identifier
             && (tokens.at(index + 1).text == QStringLiteral("=")
@@ -266,7 +329,8 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
             nextScopeIsLoader = true;
         }
         if (token.text == QStringLiteral("{")) {
-            loaderScopes.push_back(nextScopeIsLoader);
+            const bool inheritedLoader = !loaderScopes.isEmpty() && loaderScopes.back();
+            loaderScopes.push_back(inheritedLoader || nextScopeIsLoader);
             nextScopeIsLoader = false;
             continue;
         }
@@ -278,10 +342,16 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
 
         if (token.kind == TokenKind::Identifier && token.text == QStringLiteral("source")
             && index + 1 < tokens.size() && tokens.at(index + 1).text == QStringLiteral(":")) {
-            if (inLoader) addUnique(result, QStringLiteral("dynamic-loader-source"));
-            if (index + 2 >= tokens.size() || tokens.at(index + 2).kind != TokenKind::String)
+            const bool isStatic = staticSourceBinding(tokens, index + 2);
+            if (!isStatic && inLoader)
+                addUnique(result, QStringLiteral("dynamic-loader-source"));
+            if (!isStatic)
                 addUnique(result, QStringLiteral("dynamic-url-source"));
             else if (!safeSourceUrl(tokens.at(index + 2).text))
+                addUnique(result, QStringLiteral("unsafe-url-source"));
+            if (index + 2 < tokens.size()
+                && tokens.at(index + 2).kind == TokenKind::String
+                && !safeSourceUrl(tokens.at(index + 2).text))
                 addUnique(result, QStringLiteral("unsafe-url-source"));
         }
 
@@ -329,9 +399,8 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
             if (isAlias(loaderAliases, tokens.at(index - 1)))
                 addUnique(result, QStringLiteral("loader-dynamic-member"));
         }
-        if (token.text == QStringLiteral(".") && index + 2 < tokens.size()
-            && tokens.at(index + 1).text == QStringLiteral("setSource")
-            && tokens.at(index + 2).text == QStringLiteral("("))
+        if (token.text == QStringLiteral(".") && index + 1 < tokens.size()
+            && tokens.at(index + 1).text == QStringLiteral("setSource"))
             addUnique(result, QStringLiteral("loader-set-source"));
 
         if (token.kind != TokenKind::Identifier) continue;

@@ -14,7 +14,7 @@ Item {
     signal navigateRequested(string route)
     function search(query, page) {
         customerTable.clearSelection()
-        dataModel.loadCustomers(query, page)
+        return dataModel.loadCustomers(query, page)
     }
     function previousPage() {
         if (dataModel.customersPage <= 1) return false
@@ -24,7 +24,7 @@ Item {
         if (dataModel.customersPage >= dataModel.customersTotalPages) return false
         search(dataModel.customersQuery, dataModel.customersPage + 1); return true
     }
-    function openCustomer(id) { if (typeof id !== "string" || id.length === 0) return false; navigateRequested("/customers/" + encodeURIComponent(id)); return true }
+    function openCustomer(id) { if (typeof id !== "string" || id.trim().length === 0 || id.length > 128) return false; navigateRequested("/customers/" + encodeURIComponent(id)); return true }
     function openSelectedCustomer(index) {
         if (dataModel.laneBusy("customers") || !Number.isInteger(index)
                 || index < 0 || index >= dataModel.customers.length)

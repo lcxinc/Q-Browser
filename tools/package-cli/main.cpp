@@ -494,7 +494,7 @@ int pack(const QString &source, const QString &output)
     }
     QVector<ArchiveFile> files = snapshot.files();
     for (const ArchiveFile &file : std::as_const(files)) {
-        if ((file.path.endsWith(".qml") || file.path.endsWith(".js"))
+        if (QmlSourcePolicy::isQmlSourcePath(file.path)
             && !QmlSourcePolicy::violations(file.contents).isEmpty()) {
             return commandError(QStringLiteral("source_policy_failed"));
         }

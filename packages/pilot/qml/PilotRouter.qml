@@ -47,7 +47,9 @@ Item {
     }
 
     function navigate(target) {
-        const normalizedTarget = String(target).split("?")[0].split("#")[0]
+        if (typeof target !== "string" || target.length === 0)
+            return false
+        const normalizedTarget = target.split("?")[0].split("#")[0]
         if (normalizedTarget === normalizedRoute)
             return false
         if (!runtime || typeof runtime.navigate !== "function")
@@ -56,6 +58,7 @@ Item {
     }
 
     function pageKey(path) {
+        if (typeof path !== "string") return "notFound"
         if (path === "/login") return "login"
         if (path === "/dashboard") return "dashboard"
         if (path === "/orders") return "orders"

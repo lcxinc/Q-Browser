@@ -141,6 +141,7 @@ QtObject {
                 || !isInteger(body.pageSize, 1, 100)
                 || !isInteger(body.total, 0, Number.MAX_SAFE_INTEGER)
                 || !isInteger(body.totalPages, 0, 100000)
+                || body.items.length > body.pageSize
                 || body.page !== context.expectedPage
                 || typeof body.query !== "string" || body.query !== context.expectedQuery
                 || (typeof context.expectedStatus === "string"
@@ -180,6 +181,25 @@ QtObject {
             const item = body.revenueByMonth[row]
             if (!isPlainObject(item) || !isText(item.month, 32)
                     || !isInteger(item.amountCents, 0, Number.MAX_SAFE_INTEGER))
+                return false
+        }
+        return true
+    }
+
+    function validCustomerSummary(body) {
+        return isPlainObject(body) && isText(body.id, 128)
+                && isText(body.name, 500) && isText(body.email, 320)
+    }
+
+    function validCustomerDetail(body, expectedId) {
+        if (!validCustomerSummary(body) || body.id !== expectedId
+                || !Array.isArray(body.orders) || body.orders.length > 100)
+            return false
+        for (let index = 0; index < body.orders.length; ++index) {
+            const related = body.orders[index]
+            if (!isPlainObject(related) || !isText(related.id, 128)
+                    || !validOrder(related, related.id)
+                    || related.customerId !== expectedId)
                 return false
         }
         return true
@@ -235,6 +255,12 @@ QtObject {
     }
 
     function login(email, password) {
+        if (typeof email !== "string" || typeof password !== "string") {
+            emailError = "Email must be text"
+            passwordError = "Password must be text"
+            serverError = ""
+            return false
+        }
         const normalizedEmail = email.trim().toLowerCase()
         emailError = normalizedEmail.length === 0 ? "Email is required"
                    : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
@@ -251,16 +277,26 @@ QtObject {
     }
 
     function loadDashboard() {
+        if (laneBusy("dashboard")) return false
         dashboardState = RuntimeModels.Loading
         dashboardError = ""
-        if (laneBusy("dashboard")) return false
         if (network("dashboard", "GET", "/api/dashboard", null, "dashboard").length === 0) {
             dashboardState = RuntimeModels.Error
             dashboardError = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function loadOrders(query, status, page) {
+        const validStatuses = ["all", "pending", "processing", "shipped", "delivered", "cancelled"]
+        if (typeof query !== "string" || typeof status !== "string"
+                || validStatuses.indexOf(status) < 0
+                || !Number.isInteger(page) || page < 1 || page > 100000) {
+            ordersState = RuntimeModels.Error
+            ordersError = "Invalid order search"
+            return false
+        }
         ordersQuery = query.trim()
         ordersStatus = status.length === 0 ? "all" : status
         ordersPage = Math.max(1, page)
@@ -273,10 +309,17 @@ QtObject {
                       expectedStatus: ordersStatus }).length === 0) {
             ordersState = RuntimeModels.Error
             ordersError = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function loadOrder(id) {
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128) {
+            orderDetailState = RuntimeModels.Error
+            orderDetailError = "Invalid order id"
+            return false
+        }
         orderDetailState = RuntimeModels.Loading
         orderDetailError = ""
         orderStatusMutationState = RuntimeModels.MutationIdle
@@ -286,11 +329,13 @@ QtObject {
                     "orderDetailFlow", { expectedId: id }).length === 0) {
             orderDetailState = RuntimeModels.Error
             orderDetailError = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function loadOrderForEdit(id) {
-        if (typeof id !== "string" || id.length === 0)
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128)
             return false
         orderEditState = RuntimeModels.Loading
         orderEditLoadError = ""
@@ -308,7 +353,8 @@ QtObject {
 
     function changeOrderStatus(id, status) {
         const validStatuses = ["pending", "processing", "shipped", "delivered", "cancelled"]
-        if (typeof id !== "string" || id.length === 0 || validStatuses.indexOf(status) < 0)
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128
+                || typeof status !== "string" || validStatuses.indexOf(status) < 0)
             return false
         orderStatusMutationState = RuntimeModels.MutationSaving
         orderStatusError = ""
@@ -325,6 +371,15 @@ QtObject {
 
     function saveOrder(id, status, priority, shippingAddress, notes) {
         const validStatuses = ["pending", "processing", "shipped", "delivered", "cancelled"]
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128
+                || typeof status !== "string" || typeof priority !== "string"
+                || typeof shippingAddress !== "string" || typeof notes !== "string") {
+            orderEditErrors = { status: "Choose a valid status",
+                priority: "Choose a valid priority",
+                shippingAddress: "Shipping address must be text" }
+            orderEditMutationState = RuntimeModels.MutationIdle
+            return false
+        }
         orderEditErrors = {
             status: validStatuses.indexOf(status) < 0 ? "Choose a valid status" : "",
             priority: ["normal", "high"].indexOf(priority) < 0 ? "Choose a valid priority" : "",
@@ -333,8 +388,9 @@ QtObject {
         }
         orderEditServerError = ""
         orderEditMessage = ""
+        if (notes.length > 500) orderEditServerError = "Notes are too long"
         if (orderEditErrors.status.length > 0 || orderEditErrors.priority.length > 0
-                || orderEditErrors.shippingAddress.length > 0) {
+                || orderEditErrors.shippingAddress.length > 0 || notes.length > 500) {
             orderEditMutationState = RuntimeModels.MutationIdle
             return false
         }
@@ -354,6 +410,12 @@ QtObject {
     }
 
     function loadCustomers(query, page) {
+        if (typeof query !== "string" || !Number.isInteger(page)
+                || page < 1 || page > 100000) {
+            customersState = RuntimeModels.Error
+            customersError = "Invalid customer search"
+            return false
+        }
         customersQuery = query.trim()
         customersPage = Math.max(1, page)
         customersState = RuntimeModels.Loading
@@ -365,27 +427,38 @@ QtObject {
                       expectedQuery: customersQuery.toLowerCase() }).length === 0) {
             customersState = RuntimeModels.Error
             customersError = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function loadCustomer(id) {
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128) {
+            customerDetailState = RuntimeModels.Error
+            customerDetailError = "Invalid customer id"
+            return false
+        }
         customerDetailState = RuntimeModels.Loading
         customerDetailError = ""
         if (network("customerDetail", "GET", "/api/customers/" + encodeURIComponent(id), null,
                     "customerDetail", { expectedId: id }).length === 0) {
             customerDetailState = RuntimeModels.Error
             customerDetailError = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function openFile() {
+        if (laneBusy("file")) return false
         fileState = RuntimeModels.Loading
         fileMessage = "Opening file"
-        if (laneBusy("file")) return false
         if (begin("file", "file", "open", {}, "file", { expectedKind: "open" }).length === 0) {
             fileState = RuntimeModels.Error
             fileMessage = "Runtime is unavailable"
+            return false
         }
+        return true
     }
 
     function loadSettings() {
@@ -404,6 +477,11 @@ QtObject {
     }
 
     function persistTheme(name) {
+        if (typeof name !== "string" || (name !== "dark" && name !== "light")) {
+            settingsError = "Invalid theme"
+            settingsMessage = settingsError
+            return false
+        }
         themeName = name === "dark" ? "dark" : "light"
         settingsLoading = false
         settingsSaving = true
@@ -423,6 +501,8 @@ QtObject {
     }
 
     function complete(requestId, response) {
+        if (typeof requestId !== "string" || requestId.length === 0)
+            return
         const context = pending[requestId]
         if (!context || typeof context.kind !== "string")
             return
@@ -445,6 +525,7 @@ QtObject {
                     && isPlainObject(body) && isText(body.token, 4096)
                     && isPlainObject(body.user) && isText(body.user.name, 256)
                     && isText(body.user.email, 320)
+                    && isText(body.user.id, 128) && isText(body.user.role, 128)
                     && body.user.email === context.expectedEmail) {
                 authenticated = true; user = body.user; serverError = ""
             } else serverError = response && response.ok === true ? httpError
@@ -526,7 +607,8 @@ QtObject {
                      orderEditMutationState = RuntimeModels.MutationFailure }
         } else if (kind === "customers") {
             if (response && response.ok === true && status >= 200 && status < 300
-                    && validPage(body, context, "name")) {
+                    && validPage(body, context, "name")
+                    && body.items.every(function(item) { return validCustomerSummary(item) })) {
                 customers = displayRows(body.items || [], "name")
                 customersPage = body.page || 1
                 customersTotalPages = body.totalPages
@@ -536,10 +618,7 @@ QtObject {
                      customersState = RuntimeModels.Error }
         } else if (kind === "customerDetail") {
             if (response && response.ok === true && status >= 200 && status < 300
-                    && isPlainObject(body) && body.id === context.expectedId
-                    && isText(body.id, 128) && isText(body.name, 500)
-                    && (body.email === undefined || typeof body.email === "string")
-                    && validRows(body.orders || [], "")) {
+                    && validCustomerDetail(body, context.expectedId)) {
                 const detail = Object.assign({}, body)
                 detail.orders = displayRows(body.orders || [], "customerName")
                 customer = detail; customerDetailState = RuntimeModels.Content

@@ -127,11 +127,13 @@ QString signedPackage(QTemporaryDir &temporary,
                       const QByteArray &privatePem,
                       QByteArray manifestBytes,
                       const bool corruptSignature = false,
-                      QByteArray mainQml = QByteArrayLiteral("import QtQuick\nItem {}"))
+                      QByteArray mainQml = QByteArrayLiteral("import QtQuick\nItem {}"),
+                      QVector<ArchiveFile> extraFiles = {})
 {
     QVector<ArchiveFile> files{
         {QByteArrayLiteral("manifest.json"), std::move(manifestBytes)},
         {QByteArrayLiteral("qml/Main.qml"), std::move(mainQml)}};
+    files.append(std::move(extraFiles));
     const ContentDigestResult payload = ContentDigest::payload(files);
     if (!payload.hasValue()) {
         return {};
@@ -244,6 +246,19 @@ void PackageInstallerTest::rejectsSignedUnsafeQmlWithoutChangingCurrent()
     QCOMPARE(rejected.phase, InstallPhase::Preflight);
     QCOMPARE(rejected.error, InstallError::PreflightRejected);
     QCOMPARE(rejected.stableError, QStringLiteral("source_policy_rejected"));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
+             originalCurrent);
+
+    const InstallResult mixedCaseRejected = installer.install(signedPackage(
+        temporary, QStringLiteral("malicious-mixed-case"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.1.1")), false,
+        QByteArrayLiteral("import QtQuick\nItem {}"),
+        {{QByteArrayLiteral("qml/Evil.QML"),
+          QByteArrayLiteral("import QtQuick\nImage { source: base + name }")},
+         {QByteArrayLiteral("logic/Evil.MJS"),
+          QByteArrayLiteral("Qt.createComponent(target)")}}));
+    QCOMPARE(mixedCaseRejected.phase, InstallPhase::Preflight);
+    QCOMPARE(mixedCaseRejected.stableError, QStringLiteral("source_policy_rejected"));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
              originalCurrent);
 }

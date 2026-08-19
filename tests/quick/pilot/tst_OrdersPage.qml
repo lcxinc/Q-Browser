@@ -206,7 +206,7 @@ TestCase {
         list.search("Lin", 1)
         verify(runtime.lastPayload.url.indexOf("/api/customers") >= 0)
         runtime.finish({ ok: true, result: { status: 200,
-            bodyBase64: Base64.encode(JSON.stringify({ items: [{ id: "CUS-001", name: "Acme" }],
+            bodyBase64: Base64.encode(JSON.stringify({ items: [{ id: "CUS-001", name: "Acme", email: "ops@acme.test" }],
                                                        page: 1, pageSize: 20, total: 1, totalPages: 1,
                                                        query: "lin" })) } })
         tryCompare(list.model, "customersState", Models.RuntimeModels.Content)
@@ -234,9 +234,20 @@ TestCase {
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({ id: "CUS-001", name: "Acme",
                                                 orders: [{ id: "ORD-0001" }] })) } })
+        tryCompare(detail.model, "customerDetailState", Models.RuntimeModels.Error)
+        detail.refresh()
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                id: "CUS-001", name: "Acme", email: "ops@acme.test",
+                orders: [{ id: "ORD-0001", customerId: "CUS-001",
+                    customerName: "Acme", createdAt: "2026-08-01T00:00:00Z",
+                    updatedAt: "2026-08-01T00:00:00Z", status: "pending",
+                    totalCents: 100, currency: "USD", priority: "normal",
+                    shippingAddress: "1 Pilot Way", notes: "" }]
+            })) } })
         tryCompare(detail.model, "customerDetailState", Models.RuntimeModels.Content)
         compare(detail.model.customer.orders.length, 1)
-        compare(detail.model.customer.orders[0].display, "ORD-0001")
+        compare(detail.model.customer.orders[0].display, "ORD-0001 — Acme")
     }
 
     function test_customerPaginationEmptyAndErrorStates() {
@@ -246,7 +257,7 @@ TestCase {
         page.search("Acme", 1)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                items: [{ id: "CUS-001", name: "Acme", email: "ops@acme.test" }], page: 1,
                 pageSize: 20, total: 41, totalPages: 3, query: "acme"
             })) } })
         tryCompare(page.model, "customersState", Models.RuntimeModels.Content)
@@ -274,7 +285,7 @@ TestCase {
         page.search("Acme", 3)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-003", name: "Acme West" }], page: 3,
+                items: [{ id: "CUS-003", name: "Acme West", email: "west@acme.test" }], page: 3,
                 pageSize: 20, total: 41, totalPages: 3, query: "acme"
             })) } })
         tryCompare(page.model, "customersPage", 3)
@@ -360,13 +371,13 @@ TestCase {
         navigationSpy.clear()
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                items: [{ id: "CUS-001", name: "Acme", email: "ops@acme.test" }], page: 1,
                 pageSize: 20, total: 1, totalPages: 1, query: ""
             })) } })
         customersPage.search("", 1)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
-                items: [{ id: "CUS-001", name: "Acme" }], page: 1,
+                items: [{ id: "CUS-001", name: "Acme", email: "ops@acme.test" }], page: 1,
                 pageSize: 20, total: 1, totalPages: 1, query: ""
             })) } })
         tryCompare(customersPage.model, "customersState", Models.RuntimeModels.Content)

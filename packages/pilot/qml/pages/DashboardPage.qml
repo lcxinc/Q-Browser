@@ -13,12 +13,14 @@ Item {
     readonly property alias revenueText: revenueValue.text
     readonly property var revenueRows: dataModel.dashboard.revenueByMonth || []
     readonly property string revenueAccessibleName: revenueTable.accessibleName
-    function refresh() { dataModel.loadDashboard() }
+    function refresh() { return dataModel.loadDashboard() }
     function metric(name) {
+        if (typeof name !== "string") return 0
         const kpis = dataModel.dashboard.kpis || ({})
         return kpis[name] === undefined ? 0 : Number(kpis[name])
     }
     function money(cents) {
+        if (typeof cents !== "number" || !Number.isFinite(cents)) cents = 0
         return "$" + (Number(cents || 0) / 100).toLocaleString(Qt.locale("en_US"), "f", 2)
     }
     Accessible.name: "Dashboard"

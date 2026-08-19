@@ -229,10 +229,7 @@ bool importsAreAllowed(const QStringList &imports, const QSet<QString> &allowed)
 bool sourcesPassPolicy(const QVector<ArchiveFile> &files)
 {
     return std::ranges::all_of(files, [](const ArchiveFile &file) {
-        const QByteArray lower = file.path.toLower();
-        if (!lower.endsWith(QByteArrayLiteral(".qml"))
-            && !lower.endsWith(QByteArrayLiteral(".js"))
-            && !lower.endsWith(QByteArrayLiteral(".mjs"))) {
+        if (!QmlSourcePolicy::isQmlSourcePath(file.path)) {
             return true;
         }
         return QmlSourcePolicy::violations(file.contents).isEmpty();

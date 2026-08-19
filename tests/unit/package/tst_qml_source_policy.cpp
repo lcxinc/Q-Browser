@@ -11,6 +11,9 @@ private slots:
     void ignoresCommentsStringsAndStaticComponents();
     void distinguishesRegexAndTemplateExpressions();
     void rejectsComputedLoaderMembersAndUnsafeUrls();
+    void classifiesEveryQmlAndScriptExtensionCaseInsensitively();
+    void requiresSourceBindingsToBeOneStaticSafeLiteral();
+    void rejectsSetSourceAndComputedMembersForAnyLoaderId();
 };
 
 void QmlSourcePolicyTest::rejectsDynamicConstructionLoadingAndImports()
@@ -32,6 +35,7 @@ Item {
     import(target)
   }
 }
+
 )QML";
     const QStringList violations = QmlSourcePolicy::violations(source);
     QVERIFY(violations.contains(QStringLiteral("remote-import")));
@@ -42,6 +46,61 @@ Item {
     QVERIFY(violations.contains(QStringLiteral("dynamic-loader-source")));
     QVERIFY(violations.contains(QStringLiteral("loader-set-source")));
     QVERIFY(violations.contains(QStringLiteral("dynamic-import")));
+}
+
+void QmlSourcePolicyTest::classifiesEveryQmlAndScriptExtensionCaseInsensitively()
+{
+    QVERIFY(QmlSourcePolicy::isQmlSourcePath(QByteArrayLiteral("qml/Main.QML")));
+    QVERIFY(QmlSourcePolicy::isQmlSourcePath(QByteArrayLiteral("logic/route.Js")));
+    QVERIFY(QmlSourcePolicy::isQmlSourcePath(QByteArrayLiteral("logic/module.MJS")));
+    QVERIFY(!QmlSourcePolicy::isQmlSourcePath(QByteArrayLiteral("assets/qml.txt")));
+}
+
+void QmlSourcePolicyTest::requiresSourceBindingsToBeOneStaticSafeLiteral()
+{
+    const QByteArray safe = R"QML(
+import QtQuick
+Item {
+  Image { source: "assets/logo.png"; width: 10 }
+  Loader { id: arbitrary; source: "Page.qml" }
+  Image {
+    source:
+      "qrc:/icons/logo.png"
+  }
+  property var matcher: /source:\s*"https:\/\//
+  property string templateText: `source: "https://ignored.invalid"`
+}
+)QML";
+    QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});
+
+    const QList<QByteArray> attacks{
+        QByteArrayLiteral("import QtQuick\nImage { source: \"assets/\" + name }"),
+        QByteArrayLiteral("import QtQuick\nImage { source: chooseSource() }"),
+        QByteArrayLiteral("import QtQuick\nImage { source: \"data:image/png;base64,AA\" }"),
+        QByteArrayLiteral("import QtQuick\nImage { source: \"file:///C:/secret\" }"),
+        QByteArrayLiteral("import QtQuick\nImage { source: \"https://evil.invalid/x\" }"),
+    };
+    for (const QByteArray &attack : attacks)
+        QVERIFY2(!QmlSourcePolicy::violations(attack).isEmpty(), attack.constData());
+}
+
+void QmlSourcePolicyTest::rejectsSetSourceAndComputedMembersForAnyLoaderId()
+{
+    const QByteArray source = R"QML(
+import QtQuick
+Item {
+  Loader { id: arbitraryName; source: "Page.qml" }
+  function attack(member) {
+    const alias = arbitraryName
+    const setter = alias.setSource
+    arbitraryName[member]
+    alias["set" + "Source"]
+  }
+}
+)QML";
+    const QStringList violations = QmlSourcePolicy::violations(source);
+    QVERIFY(violations.contains(QStringLiteral("loader-set-source")));
+    QVERIFY(violations.contains(QStringLiteral("loader-dynamic-member")));
 }
 
 void QmlSourcePolicyTest::ignoresCommentsStringsAndStaticComponents()
@@ -66,6 +125,9 @@ Item {
   property var detector: /Qt\.createComponent\("remote.qml"\)/gi
   property string documentation: `Qt.createQmlObject and loader.setSource`
   function divide(a, b) { return a / b / 2 }
+  function conditional(text, ready) {
+    if (ready) /Qt\.createComponent/.test(text)
+  }
 }
 )QML";
     QCOMPARE(QmlSourcePolicy::violations(safe), QStringList{});

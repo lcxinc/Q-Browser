@@ -7,7 +7,7 @@ Item {
     id: root
     property var runtime: null
     readonly property alias model: dataModel
-    function openFile() { dataModel.openFile() }
+    function openFile() { return dataModel.openFile() }
     Accessible.name: "Files"; Accessible.role: Accessible.Pane
     Models.RuntimeModels { id: dataModel; runtime: root.runtime }
     ColumnLayout {

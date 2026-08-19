@@ -179,6 +179,28 @@ bool MainWindow::goForward()
     return true;
 }
 
+bool MainWindow::attachWorkerSurface(WorkerSurface *surface)
+{
+    if (workerSurface_ != nullptr || surface == nullptr || !surface->isValid()) {
+        return false;
+    }
+    workerSurface_ = surface;
+    workerSurface_->setParent(surfaceStack_);
+    workerSurface_->setObjectName(QStringLiteral("worker-surface"));
+    surfaceStack_->insertWidget(0, workerSurface_);
+    return true;
+}
+
+void MainWindow::detachWorkerSurface()
+{
+    if (workerSurface_ == nullptr) return;
+    if (surfaceStack_->currentWidget() == workerSurface_)
+        showTrustedError(QStringLiteral("The package worker is unavailable."));
+    surfaceStack_->removeWidget(workerSurface_);
+    delete workerSurface_;
+    workerSurface_ = nullptr;
+}
+
 HostSurfaceKind MainWindow::activeSurface() const noexcept { return activeSurface_; }
 
 int MainWindow::activeSurfaceCount() const
@@ -200,6 +222,7 @@ QString MainWindow::trustedErrorText() const { return trustedErrorLabel_->text()
 NavigationBar *MainWindow::navigationBar() const noexcept { return navigationBar_; }
 QStackedWidget *MainWindow::surfaceStack() const noexcept { return surfaceStack_; }
 WebSurface *MainWindow::webSurface() const noexcept { return webSurface_; }
+WorkerSurface *MainWindow::workerSurface() const noexcept { return workerSurface_; }
 
 bool MainWindow::activate(const QString &canonicalUrl)
 {

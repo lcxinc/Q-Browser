@@ -134,4 +134,30 @@ TestCase {
         verify(model.settingsError.length > 0)
         compare(model.pendingCount, 0)
     }
+
+    function test_pageSizeAndPublicArgumentBoundariesFailWithoutThrowing() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const model = createTemporaryObject(modelComponent, this, { runtime: runtime })
+        verify(runtime && model)
+
+        verify(!model.login(null, {}))
+        verify(model.emailError.length > 0)
+        verify(model.passwordError.length > 0)
+        verify(!model.loadOrders(null, {}, "one"))
+        verify(!model.loadCustomers([], "one"))
+        verify(!model.loadOrder({}))
+        verify(!model.loadCustomer(42))
+        verify(!model.saveOrder([], {}, [], null, {}))
+        compare(runtime.calls, 0)
+
+        verify(model.loadOrders("", "all", 1))
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                items: [{ id: "ORD-1", customerName: "One" },
+                        { id: "ORD-2", customerName: "Two" }],
+                page: 1, pageSize: 1, total: 2, totalPages: 2,
+                query: "", status: "all"
+            })) } })
+        tryCompare(model, "ordersState", Models.RuntimeModels.Error)
+    }
 }

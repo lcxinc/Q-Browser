@@ -7,6 +7,8 @@ add_library(q_browser_host STATIC
   HostApplication.h
   HostWorkerSessionController.cpp
   HostWorkerSessionController.h
+  HostWorkerSessionIo.cpp
+  HostWorkerSessionIo.h
   MainWindow.cpp
   MainWindow.h
   NavigationBar.cpp

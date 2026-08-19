@@ -9,8 +9,8 @@ Item {
     readonly property alias model: dataModel
     readonly property alias retryControl: retryButton
     function applyTheme() { Theme.dark = dataModel.themeName === "dark" }
-    function loadSettings() { dataModel.loadSettings() }
-    function setTheme(name) { dataModel.persistTheme(name); applyTheme() }
+    function loadSettings() { return dataModel.loadSettings() }
+    function setTheme(name) { const changed = dataModel.persistTheme(name); if (changed) applyTheme(); return changed }
     Accessible.name: "Settings"; Accessible.role: Accessible.Pane
     Models.RuntimeModels {
         id: dataModel; runtime: root.runtime

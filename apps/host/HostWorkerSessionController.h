@@ -1,31 +1,29 @@
 #pragma once
 
-#include "IpcSession.h"
+#include "ProtocolMessage.h"
 
 #include <QHash>
 #include <QObject>
+#include <QQueue>
+#include <QUrl>
+#include <QVariantMap>
 
 #include <memory>
+#include <optional>
 
+class HostWorkerSessionIo;
+class IpcSession;
 class MainWindow;
-class QTimer;
+class QThread;
 
-enum class HostWorkerSessionState
-{
-    Detached,
-    Running,
-    Failed,
-};
-
+enum class HostWorkerSessionState { Detached, Running, ShuttingDown, Failed };
 Q_DECLARE_METATYPE(HostWorkerSessionState)
 
 class HostWorkerSessionController final : public QObject
 {
     Q_OBJECT
-
 public:
-    explicit HostWorkerSessionController(MainWindow *window,
-                                         QObject *parent = nullptr);
+    explicit HostWorkerSessionController(MainWindow *window, QObject *parent = nullptr);
     ~HostWorkerSessionController() override;
 
     [[nodiscard]] bool attach(std::unique_ptr<IpcSession> session);
@@ -36,24 +34,52 @@ public:
 
 signals:
     void failed(const QString &errorCode);
-
-private slots:
-    void pollSession();
+    void routeLoadAcknowledged(const QString &route);
 
 private:
-    void handleMessage(const ProtocolMessage &message);
-    void handleNavigationRequest(const ProtocolMessage &message);
-    void handleRouteLoadResponse(const ProtocolMessage &message);
-    void failClosed(const QString &errorCode);
+    struct OutboundCommand final {
+        quint64 id = 0;
+        std::optional<ProtocolMessage> message;
+        QString route;
+        bool trackedRouteLoad = false;
+        bool resumePollingAfter = false;
+    };
 
-    static constexpr int sendTimeoutMs = 5000;
-    static constexpr int routeLoadTimeoutMs = 5000;
+    void handleHostWorkerRoute(const QString &packageId,
+                               const QString &entryPoint,
+                               const QVariantMap &parameters,
+                               const QUrl &appUrl);
+    void handleNavigationRequest(quint64 generation,
+                                 const QString &requestId,
+                                 const QString &route);
+    void handleRouteLoadResponse(quint64 generation,
+                                 const QString &requestId,
+                                 const QJsonObject &payload);
+    void handleCommandFinished(quint64 generation,
+                               quint64 commandId,
+                               bool success,
+                               const QString &errorCode);
+    bool enqueueMessage(const ProtocolMessage &message,
+                        bool resumePollingAfter = false);
+    bool enqueueRouteLoad(const QString &route);
+    void pumpOutbound();
+    void resumeIoPolling();
+    void failClosed(const QString &errorCode);
+    void stopIoThread();
+
+    static constexpr qsizetype maximumQueuedCommands = 64;
 
     MainWindow *window_ = nullptr;
-    std::unique_ptr<IpcSession> session_;
-    QTimer *pollTimer_ = nullptr;
+    HostWorkerSessionIo *io_ = nullptr;
+    QThread *ioThread_ = nullptr;
+    QQueue<OutboundCommand> outbound_;
+    std::optional<OutboundCommand> activeCommand_;
     QHash<QString, QString> pendingRouteLoads_;
     HostWorkerSessionState state_ = HostWorkerSessionState::Detached;
     QString lastErrorCode_;
+    QString appIdentity_;
+    quint64 generation_ = 0;
+    quint64 nextCommandId_ = 0;
     quint64 nextRouteLoadId_ = 0;
+    bool suppressHostRoute_ = false;
 };

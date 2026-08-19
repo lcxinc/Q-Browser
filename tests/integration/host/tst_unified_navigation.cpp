@@ -17,8 +17,13 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
+#include <QTimer>
 #include <QToolButton>
 #include <QWebEnginePage>
+
+#include <algorithm>
+#include <atomic>
+#include <thread>
 
 namespace {
 
@@ -154,6 +159,9 @@ private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
     void workerNavigationIsSameAppAndHistoryAware();
     void hostApplicationOwnsAttachableWorkerSessionController();
+    void hostApplicationBindsWorkerContextLifecycle();
+    void hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation();
+    void stalledWorkerReaderNeverBlocksTheGuiThread();
     void navigationTransactionsRejectReentrantCommands();
 };
 
@@ -336,6 +344,8 @@ Rectangle {
     HostWorkerSessionController controller(&window);
     QVERIFY(controller.attach(std::make_unique<IpcSession>(
         std::move(launch->hostSession))));
+    QSignalSpy routeLoadSpy(&controller,
+                            &HostWorkerSessionController::routeLoadAcknowledged);
     QTest::qWait(250);
     QCOMPARE(window.currentAppUrl(), initial);
     QCOMPARE(window.historyCount(), 1);
@@ -343,6 +353,8 @@ Rectangle {
     QTRY_COMPARE_WITH_TIMEOUT(window.currentAppUrl(), QStringLiteral("app://pilot/orders"),
                               5000);
     QTRY_COMPARE_WITH_TIMEOUT(controller.pendingRouteLoadCount(), qsizetype(0), 5000);
+    QCOMPARE(routeLoadSpy.count(), 1);
+    QCOMPARE(routeLoadSpy.at(0).at(0).toString(), QStringLiteral("/orders"));
     QCOMPARE(controller.state(), HostWorkerSessionState::Running);
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
     QCOMPARE(window.historyCount(), 2);
@@ -355,8 +367,13 @@ Rectangle {
                                        QStringLiteral("/worker-shaped-web")));
     QCOMPARE(window.historyCount(), 2);
     QVERIFY(window.goBack());
+    QTRY_COMPARE_WITH_TIMEOUT(routeLoadSpy.count(), 2, 5000);
+    QCOMPARE(routeLoadSpy.at(1).at(0).toString(),
+             QStringLiteral("/web-shaped-worker/42"));
     QCOMPARE(window.currentAppUrl(), initial);
     QVERIFY(window.goForward());
+    QTRY_COMPARE_WITH_TIMEOUT(routeLoadSpy.count(), 3, 5000);
+    QCOMPARE(routeLoadSpy.at(2).at(0).toString(), QStringLiteral("/orders"));
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
 
     window.close();
@@ -365,6 +382,131 @@ Rectangle {
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment workerEnvironment;
+    QVERIFY2(workerEnvironment.isValid(), qPrintable(workerEnvironment.error()));
+    auto launch = workerEnvironment.launch(QStringLiteral("host-route-sync"),
+                                           QStringLiteral("host-route-sync"), 100);
+    QVERIFY2(launch.has_value(), qPrintable(workerEnvironment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceReady = receiveUntil(launch->hostSession, ProtocolType::SurfaceReady);
+    QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    WorkerSurface *surface = WorkerSurface::create(
+        surfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        launch->process.nativeProcessHandle(), WorkerAttemptId{103});
+    QVERIFY(surface != nullptr);
+
+    MainWindow window(routes(server.helpUrl(), workerEnvironment.appId()),
+                      server.origin(), surface);
+    window.resize(900, 600);
+    window.show();
+    HostWorkerSessionController controller(&window);
+    QVERIFY(controller.attach(std::make_unique<IpcSession>(
+        std::move(launch->hostSession))));
+    QSignalSpy acknowledged(&controller,
+                            &HostWorkerSessionController::routeLoadAcknowledged);
+
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/7")));
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 1, 5000);
+    QCOMPARE(acknowledged.at(0).at(0).toString(),
+             QStringLiteral("/web-shaped-worker/7"));
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 2, 5000);
+    QCOMPARE(acknowledged.at(1).at(0).toString(), QStringLiteral("/orders"));
+    QVERIFY(window.goBack());
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 3, 5000);
+    QCOMPARE(acknowledged.at(2).at(0).toString(),
+             QStringLiteral("/web-shaped-worker/7"));
+    QVERIFY(window.goForward());
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 4, 5000);
+    QCOMPARE(acknowledged.at(3).at(0).toString(), QStringLiteral("/orders"));
+
+    bool reentered = false;
+    const QMetaObject::Connection reentry = connect(
+        &controller, &HostWorkerSessionController::routeLoadAcknowledged,
+        &window, [&](const QString &route) {
+            if (!reentered && route == QStringLiteral("/web-shaped-worker/9")) {
+                reentered = true;
+                QVERIFY(window.goBack());
+            }
+        }, Qt::DirectConnection);
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/9")));
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 6, 5000);
+    QVERIFY(reentered);
+    QCOMPARE(acknowledged.at(4).at(0).toString(),
+             QStringLiteral("/web-shaped-worker/9"));
+    QCOMPARE(acknowledged.at(5).at(0).toString(), QStringLiteral("/orders"));
+    QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
+    disconnect(reentry);
+
+    const int stableCount = acknowledged.count();
+    QVERIFY(!window.navigate(QStringLiteral("app://pilot/missing")));
+    QTest::qWait(100);
+    QCOMPARE(acknowledged.count(), stableCount);
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/worker-shaped-web")));
+    QTest::qWait(100);
+    QCOMPARE(acknowledged.count(), stableCount);
+
+    QVERIFY(controller.shutdown(QStringLiteral("route-sync.complete")));
+    window.close();
+    launch->process.terminate(ERROR_PROCESS_ABORTED);
+    QVERIFY(launch->process.waitForFinished(5000));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::stalledWorkerReaderNeverBlocksTheGuiThread()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+    QVERIFY(controller.attach(std::move(sessions->host)));
+
+    std::atomic_bool writerFinished = false;
+    std::thread writer([worker = std::move(sessions->worker), &writerFinished]() mutable {
+        for (int index = 0; index < 2000; ++index) {
+            const auto request = ProtocolMessage::request(
+                QStringLiteral("flood-%1").arg(index),
+                QStringLiteral("test"), QStringLiteral("stall"), QJsonObject{});
+            if (!request.has_value() || !worker->send(*request, 100)) {
+                break;
+            }
+        }
+        writerFinished = true;
+        worker->close();
+    });
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    qint64 previousTick = elapsed.elapsed();
+    qint64 maximumGap = 0;
+    QTimer heartbeat;
+    heartbeat.setInterval(5);
+    connect(&heartbeat, &QTimer::timeout, &window, [&] {
+        const qint64 now = elapsed.elapsed();
+        maximumGap = std::max(maximumGap, now - previousTick);
+        previousTick = now;
+    });
+    heartbeat.start();
+    QTest::qWait(1500);
+    heartbeat.stop();
+    writer.join();
+
+    QVERIFY2(maximumGap < 100,
+             qPrintable(QStringLiteral("GUI heartbeat stalled for %1 ms")
+                            .arg(maximumGap)));
+    QVERIFY(writerFinished.load());
 }
 
 void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController()
@@ -388,6 +530,49 @@ void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController
              QStringLiteral("ipc.session.peer_closed"));
     QCOMPARE(application.workerSessionController()->state(),
              HostWorkerSessionState::Failed);
+    application.mainWindow()->close();
+}
+
+void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto launch = environment.launch(QStringLiteral("host-context"),
+                                     QStringLiteral("host-context"), 100);
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceReady = receiveUntil(launch->hostSession, ProtocolType::SurfaceReady);
+    QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    auto process = std::make_shared<SandboxProcess>(std::move(launch->process));
+    WorkerSurface *surface = WorkerSurface::create(
+        surfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        process->nativeProcessHandle(), WorkerAttemptId{104});
+    QVERIFY(surface != nullptr);
+
+    HostApplication application(server.origin());
+    QVERIFY(application.start());
+    HostWorkerAttachContext context;
+    context.session = std::make_unique<IpcSession>(std::move(launch->hostSession));
+    context.surface = surface;
+    context.processLifetime = process;
+    context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
+    QVERIFY(application.attachWorkerContext(std::move(context)));
+    QVERIFY(application.hasWorkerContext());
+    QCOMPARE(application.mainWindow()->workerSurface(), surface);
+    QCOMPARE(application.workerSessionController()->state(),
+             HostWorkerSessionState::Running);
+
+    application.detachWorkerContext(QStringLiteral("context.test.complete"));
+    QVERIFY(!application.hasWorkerContext());
+    QCOMPARE(application.mainWindow()->workerSurface(), nullptr);
+    QVERIFY(process->waitForFinished(5000));
+    const auto closed = process->close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
     application.mainWindow()->close();
 }
 

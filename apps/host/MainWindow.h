@@ -35,6 +35,8 @@ public:
                                           const QString &route);
     [[nodiscard]] bool goBack();
     [[nodiscard]] bool goForward();
+    [[nodiscard]] bool attachWorkerSurface(WorkerSurface *surface);
+    void detachWorkerSurface();
 
     [[nodiscard]] HostSurfaceKind activeSurface() const noexcept;
     [[nodiscard]] int activeSurfaceCount() const;
@@ -45,6 +47,7 @@ public:
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
     [[nodiscard]] QStackedWidget *surfaceStack() const noexcept;
     [[nodiscard]] WebSurface *webSurface() const noexcept;
+    [[nodiscard]] WorkerSurface *workerSurface() const noexcept;
 
 signals:
     void currentUrlChanged(const QString &url);

@@ -14,10 +14,10 @@ Item {
     signal navigateRequested(string route)
     function search(query, status, page) {
         orderTable.clearSelection()
-        dataModel.loadOrders(query, status, page)
+        return dataModel.loadOrders(query, status, page)
     }
     function openOrder(id) {
-        if (typeof id !== "string" || id.length === 0) return false
+        if (typeof id !== "string" || id.trim().length === 0 || id.length > 128) return false
         navigateRequested("/orders/" + encodeURIComponent(id)); return true
     }
     function openSelectedOrder(index) {

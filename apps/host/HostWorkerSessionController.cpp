@@ -1,218 +1,297 @@
 #include "HostWorkerSessionController.h"
 
+#include "HostWorkerSessionIo.h"
+#include "IpcSession.h"
 #include "MainWindow.h"
 
 #include <QJsonObject>
-#include <QTimer>
+#include <QScopedValueRollback>
+#include <QThread>
 
 #include <utility>
 
+namespace {
+QString routeFromAppUrl(const QUrl &url)
+{
+    if (!url.isValid() || url.scheme() != QStringLiteral("app")
+        || url.host() != QStringLiteral("pilot") || !url.fragment().isEmpty()) {
+        return {};
+    }
+    QString route = url.path(QUrl::FullyEncoded);
+    const QString query = url.query(QUrl::FullyEncoded);
+    if (!query.isEmpty()) route += u'?' + query;
+    return route.startsWith(u'/') && !route.startsWith(QStringLiteral("//"))
+        ? route : QString{};
+}
+} // namespace
+
 HostWorkerSessionController::HostWorkerSessionController(MainWindow *window,
                                                          QObject *parent)
-    : QObject(parent), window_(window), pollTimer_(new QTimer(this))
+    : QObject(parent), window_(window)
 {
-    pollTimer_->setInterval(5);
-    connect(pollTimer_, &QTimer::timeout,
-            this, &HostWorkerSessionController::pollSession);
+    if (window_ != nullptr) {
+        connect(window_, &MainWindow::workerRouteRequested, this,
+                &HostWorkerSessionController::handleHostWorkerRoute,
+                Qt::DirectConnection);
+    }
 }
 
-HostWorkerSessionController::~HostWorkerSessionController() = default;
+HostWorkerSessionController::~HostWorkerSessionController() { stopIoThread(); }
 
 bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
 {
-    if (state_ == HostWorkerSessionState::Running || window_ == nullptr
+    if (state_ == HostWorkerSessionState::Failed) {
+        stopIoThread();
+        state_ = HostWorkerSessionState::Detached;
+    }
+    if (state_ != HostWorkerSessionState::Detached || window_ == nullptr
         || session == nullptr || !session->isAuthenticated() || session->isClosed()
         || session->appIdentity().isEmpty()) {
         lastErrorCode_ = QStringLiteral("host.worker_session.invalid_attachment");
         return false;
     }
-
+    ++generation_;
+    appIdentity_ = session->appIdentity();
     pendingRouteLoads_.clear();
+    outbound_.clear();
+    activeCommand_.reset();
     lastErrorCode_.clear();
-    session_ = std::move(session);
+    ioThread_ = new QThread;
+    ioThread_->setObjectName(QStringLiteral("host-worker-session-io"));
+    io_ = new HostWorkerSessionIo(std::move(session), generation_);
+    io_->moveToThread(ioThread_);
+    connect(ioThread_, &QThread::started, io_, &HostWorkerSessionIo::start);
+    connect(ioThread_, &QThread::finished, io_, &QObject::deleteLater);
+    connect(io_, &QObject::destroyed, this, [this] { io_ = nullptr; });
+    connect(io_, &HostWorkerSessionIo::navigationRequested, this,
+            &HostWorkerSessionController::handleNavigationRequest, Qt::QueuedConnection);
+    connect(io_, &HostWorkerSessionIo::routeLoadResponse, this,
+            &HostWorkerSessionController::handleRouteLoadResponse, Qt::QueuedConnection);
+    connect(io_, &HostWorkerSessionIo::commandFinished, this,
+            &HostWorkerSessionController::handleCommandFinished, Qt::QueuedConnection);
+    connect(io_, &HostWorkerSessionIo::sessionFailed, this,
+            [this](const quint64 generation, const QString &errorCode) {
+                if (generation == generation_) failClosed(errorCode);
+            }, Qt::QueuedConnection);
+    connect(io_, &HostWorkerSessionIo::shutdownFinished, this,
+            [this](const quint64 generation) {
+                if (generation != generation_
+                    || state_ != HostWorkerSessionState::ShuttingDown) return;
+                pendingRouteLoads_.clear();
+                outbound_.clear();
+                activeCommand_.reset();
+                appIdentity_.clear();
+                state_ = HostWorkerSessionState::Detached;
+            }, Qt::QueuedConnection);
     state_ = HostWorkerSessionState::Running;
-    pollTimer_->start();
-    QTimer::singleShot(0, this, &HostWorkerSessionController::pollSession);
+    ioThread_->start();
     return true;
 }
 
 bool HostWorkerSessionController::shutdown(const QString &reason)
 {
-    if (state_ != HostWorkerSessionState::Running || session_ == nullptr
-        || reason.isEmpty()) {
+    if (state_ != HostWorkerSessionState::Running || io_ == nullptr || reason.isEmpty())
         return false;
-    }
-    const auto message = ProtocolMessage::shutdown(reason);
-    if (!message.has_value() || !session_->send(*message, sendTimeoutMs)) {
-        failClosed(session_->lastErrorCode().isEmpty()
-                       ? QStringLiteral("host.worker_session.shutdown_send_failed")
-                       : session_->lastErrorCode());
-        return false;
-    }
-    pollTimer_->stop();
-    session_->close();
-    session_.reset();
+    state_ = HostWorkerSessionState::ShuttingDown;
+    outbound_.clear();
+    activeCommand_.reset();
     pendingRouteLoads_.clear();
-    state_ = HostWorkerSessionState::Detached;
+    const quint64 generation = generation_;
+    HostWorkerSessionIo *const io = io_;
+    QMetaObject::invokeMethod(io, [io, generation, reason] {
+        io->beginShutdown(generation, reason);
+    }, Qt::QueuedConnection);
     return true;
 }
 
-HostWorkerSessionState HostWorkerSessionController::state() const noexcept
-{
-    return state_;
-}
-
-QString HostWorkerSessionController::lastErrorCode() const
-{
-    return lastErrorCode_;
-}
-
+HostWorkerSessionState HostWorkerSessionController::state() const noexcept { return state_; }
+QString HostWorkerSessionController::lastErrorCode() const { return lastErrorCode_; }
 qsizetype HostWorkerSessionController::pendingRouteLoadCount() const noexcept
 {
     return pendingRouteLoads_.size();
 }
 
-void HostWorkerSessionController::pollSession()
+void HostWorkerSessionController::handleHostWorkerRoute(
+    const QString &packageId, const QString &entryPoint,
+    const QVariantMap &parameters, const QUrl &appUrl)
 {
-    if (state_ != HostWorkerSessionState::Running || session_ == nullptr) {
-        return;
-    }
-
-    constexpr int maximumMessagesPerTurn = 32;
-    for (int index = 0; index < maximumMessagesPerTurn; ++index) {
-        const SessionReceiveResult received = session_->poll(0);
-        if (received.status == SessionStatus::TimedOut && !session_->isClosed()) {
-            return;
-        }
-        if (received.status != SessionStatus::MessageReady
-            || !received.message.has_value()) {
-            failClosed(received.errorCode.isEmpty()
-                           ? QStringLiteral("host.worker_session.receive_failed")
-                           : received.errorCode);
-            return;
-        }
-        handleMessage(*received.message);
-        if (state_ != HostWorkerSessionState::Running) {
-            return;
-        }
-    }
-}
-
-void HostWorkerSessionController::handleMessage(const ProtocolMessage &message)
-{
-    switch (message.type()) {
-    case ProtocolType::NavigationRequest:
-        handleNavigationRequest(message);
-        break;
-    case ProtocolType::Response:
-        handleRouteLoadResponse(message);
-        break;
-    case ProtocolType::Heartbeat:
-    case ProtocolType::Ready:
-    case ProtocolType::SurfaceReady:
-    case ProtocolType::StructuredLog:
-        break;
-    case ProtocolType::Shutdown:
-        failClosed(QStringLiteral("host.worker_session.peer_shutdown"));
-        break;
-    case ProtocolType::Request: {
-        const auto response = ProtocolMessage::errorResponse(
-            message.requestId(), QStringLiteral("capability.unhandled"),
-            QStringLiteral("No capability handler is attached."));
-        if (!response.has_value() || !session_->send(*response, sendTimeoutMs)) {
-            failClosed(session_->lastErrorCode().isEmpty()
-                           ? QStringLiteral("host.worker_session.response_send_failed")
-                           : session_->lastErrorCode());
-        }
-        break;
-    }
-    case ProtocolType::Handshake:
-    case ProtocolType::HandshakeAck:
-    case ProtocolType::RouteLoad:
-        failClosed(QStringLiteral("host.worker_session.unexpected_message"));
-        break;
-    }
+    Q_UNUSED(entryPoint)
+    Q_UNUSED(parameters)
+    if (suppressHostRoute_ || state_ != HostWorkerSessionState::Running
+        || packageId != appIdentity_) return;
+    const QString route = routeFromAppUrl(appUrl);
+    if (!route.isEmpty() && !enqueueRouteLoad(route))
+        failClosed(QStringLiteral("host.worker_session.outbound_queue_full"));
 }
 
 void HostWorkerSessionController::handleNavigationRequest(
-    const ProtocolMessage &message)
+    const quint64 generation, const QString &requestId, const QString &route)
 {
-    const QString route = message.payload().value(QStringLiteral("route")).toString();
+    if (generation != generation_ || state_ != HostWorkerSessionState::Running) return;
     if (!pendingRouteLoads_.isEmpty()) {
         const auto response = ProtocolMessage::errorResponse(
-            message.requestId(), QStringLiteral("navigation.busy"),
+            requestId, QStringLiteral("navigation.busy"),
             QStringLiteral("A route load is already pending."));
-        if (!response.has_value() || !session_->send(*response, sendTimeoutMs)) {
-            failClosed(session_->lastErrorCode().isEmpty()
-                           ? QStringLiteral("host.worker_session.response_send_failed")
-                           : session_->lastErrorCode());
-        }
+        if (!response.has_value() || !enqueueMessage(*response, true))
+            failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
         return;
     }
-
-    if (!window_->navigateFromWorker(session_->appIdentity(), route)) {
+    bool navigated = false;
+    {
+        QScopedValueRollback suppression(suppressHostRoute_, true);
+        navigated = window_ != nullptr && window_->navigateFromWorker(appIdentity_, route);
+    }
+    if (generation != generation_ || state_ != HostWorkerSessionState::Running) return;
+    if (!navigated) {
         const auto response = ProtocolMessage::errorResponse(
-            message.requestId(), QStringLiteral("navigation.denied"),
+            requestId, QStringLiteral("navigation.denied"),
             QStringLiteral("The requested route is not assigned to this worker."));
-        if (!response.has_value() || !session_->send(*response, sendTimeoutMs)) {
-            failClosed(session_->lastErrorCode().isEmpty()
-                           ? QStringLiteral("host.worker_session.response_send_failed")
-                           : session_->lastErrorCode());
-        }
+        if (!response.has_value() || !enqueueMessage(*response, true))
+            failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
         return;
     }
-
     const auto response = ProtocolMessage::successResponse(
-        message.requestId(), QJsonObject{{QStringLiteral("route"), route}});
-    if (!response.has_value() || !session_->send(*response, sendTimeoutMs)) {
-        failClosed(session_->lastErrorCode().isEmpty()
-                       ? QStringLiteral("host.worker_session.response_send_failed")
-                       : session_->lastErrorCode());
+        requestId, QJsonObject{{QStringLiteral("route"), route}});
+    if (!response.has_value() || !enqueueMessage(*response) || !enqueueRouteLoad(route)) {
+        failClosed(QStringLiteral("host.worker_session.outbound_queue_full"));
         return;
     }
-
-    const QString routeLoadId = QStringLiteral("host-route-%1")
-                                    .arg(++nextRouteLoadId_);
-    if (!session_->sendRouteLoad(routeLoadId, route, routeLoadTimeoutMs)) {
-        failClosed(session_->lastErrorCode().isEmpty()
-                       ? QStringLiteral("host.worker_session.route_load_send_failed")
-                       : session_->lastErrorCode());
-        return;
-    }
-    pendingRouteLoads_.insert(routeLoadId, route);
+    if (!outbound_.isEmpty()) outbound_.back().resumePollingAfter = true;
+    else if (activeCommand_.has_value()) activeCommand_->resumePollingAfter = true;
 }
 
 void HostWorkerSessionController::handleRouteLoadResponse(
-    const ProtocolMessage &message)
+    const quint64 generation, const QString &requestId, const QJsonObject &payload)
 {
-    const auto iterator = pendingRouteLoads_.find(message.requestId());
+    if (generation != generation_ || state_ != HostWorkerSessionState::Running) return;
+    const auto iterator = pendingRouteLoads_.find(requestId);
     if (iterator == pendingRouteLoads_.end()) {
         failClosed(QStringLiteral("host.worker_session.unexpected_response"));
         return;
     }
-    const QJsonObject payload = message.payload();
+    const QString route = iterator.value();
     const QJsonObject result = payload.value(QStringLiteral("result")).toObject();
     if (!payload.value(QStringLiteral("ok")).toBool(false)
-        || result.value(QStringLiteral("route")).toString() != iterator.value()) {
+        || result.value(QStringLiteral("route")).toString() != route) {
         failClosed(QStringLiteral("host.worker_session.route_load_rejected"));
         return;
     }
     pendingRouteLoads_.erase(iterator);
+    emit routeLoadAcknowledged(route);
+    if (generation == generation_ && state_ == HostWorkerSessionState::Running)
+        resumeIoPolling();
+}
+
+void HostWorkerSessionController::handleCommandFinished(
+    const quint64 generation, const quint64 commandId, const bool success,
+    const QString &errorCode)
+{
+    if (generation != generation_ || state_ != HostWorkerSessionState::Running
+        || !activeCommand_.has_value() || activeCommand_->id != commandId) return;
+    const bool resume = activeCommand_->resumePollingAfter;
+    activeCommand_.reset();
+    if (!success) {
+        failClosed(errorCode.isEmpty() ? QStringLiteral("host.worker_session.send_failed")
+                                        : errorCode);
+        return;
+    }
+    pumpOutbound();
+    if (resume && generation == generation_ && state_ == HostWorkerSessionState::Running)
+        resumeIoPolling();
+}
+
+bool HostWorkerSessionController::enqueueMessage(const ProtocolMessage &message,
+                                                 const bool resumePollingAfter)
+{
+    if (outbound_.size() + (activeCommand_.has_value() ? 1 : 0)
+        >= maximumQueuedCommands) return false;
+    OutboundCommand command;
+    command.id = ++nextCommandId_;
+    command.message = message;
+    command.resumePollingAfter = resumePollingAfter;
+    outbound_.enqueue(std::move(command));
+    pumpOutbound();
+    return true;
+}
+
+bool HostWorkerSessionController::enqueueRouteLoad(const QString &route)
+{
+    if (route.isEmpty() || pendingRouteLoads_.size() >= maximumQueuedCommands
+        || outbound_.size() + (activeCommand_.has_value() ? 1 : 0)
+               >= maximumQueuedCommands) return false;
+    const QString requestId = QStringLiteral("host-route-%1").arg(++nextRouteLoadId_);
+    const auto message = ProtocolMessage::routeLoad(requestId, route);
+    if (!message.has_value()) return false;
+    pendingRouteLoads_.insert(requestId, route);
+    OutboundCommand command;
+    command.id = ++nextCommandId_;
+    command.message = *message;
+    command.route = route;
+    command.trackedRouteLoad = true;
+    outbound_.enqueue(std::move(command));
+    pumpOutbound();
+    return true;
+}
+
+void HostWorkerSessionController::pumpOutbound()
+{
+    if (state_ != HostWorkerSessionState::Running || io_ == nullptr
+        || activeCommand_.has_value() || outbound_.isEmpty()) return;
+    activeCommand_ = outbound_.dequeue();
+    const OutboundCommand command = *activeCommand_;
+    const quint64 generation = generation_;
+    HostWorkerSessionIo *const io = io_;
+    QMetaObject::invokeMethod(io, [io, generation, command] {
+        if (command.message.has_value())
+            io->sendMessage(generation, command.id, *command.message,
+                            command.trackedRouteLoad, command.route);
+    }, Qt::QueuedConnection);
+}
+
+void HostWorkerSessionController::resumeIoPolling()
+{
+    if (io_ == nullptr) return;
+    const quint64 generation = generation_;
+    HostWorkerSessionIo *const io = io_;
+    QMetaObject::invokeMethod(io, [io, generation] { io->resumePolling(generation); },
+                              Qt::QueuedConnection);
 }
 
 void HostWorkerSessionController::failClosed(const QString &errorCode)
 {
-    if (state_ == HostWorkerSessionState::Failed) {
-        return;
-    }
-    pollTimer_->stop();
-    if (session_ != nullptr) {
-        session_->close();
-    }
-    pendingRouteLoads_.clear();
+    if (state_ == HostWorkerSessionState::Failed
+        || state_ == HostWorkerSessionState::Detached) return;
     state_ = HostWorkerSessionState::Failed;
-    lastErrorCode_ = errorCode.isEmpty()
-                         ? QStringLiteral("host.worker_session.failed")
-                         : errorCode;
+    lastErrorCode_ = errorCode.isEmpty() ? QStringLiteral("host.worker_session.failed")
+                                         : errorCode;
+    pendingRouteLoads_.clear();
+    outbound_.clear();
+    activeCommand_.reset();
+    if (io_ != nullptr) {
+        const quint64 generation = generation_;
+        HostWorkerSessionIo *const io = io_;
+        QMetaObject::invokeMethod(io, [io, generation] { io->abort(generation); },
+                                  Qt::QueuedConnection);
+    }
     emit failed(lastErrorCode_);
+}
+
+void HostWorkerSessionController::stopIoThread()
+{
+    if (ioThread_ == nullptr) return;
+    if (io_ != nullptr && ioThread_->isRunning()) {
+        const quint64 generation = generation_;
+        HostWorkerSessionIo *const io = io_;
+        QMetaObject::invokeMethod(io, [io, generation] { io->abort(generation); },
+                                  Qt::QueuedConnection);
+    }
+    ioThread_->quit();
+    if (!ioThread_->wait(6000)) {
+        ioThread_->requestInterruption();
+        ioThread_->quit();
+        (void)ioThread_->wait();
+    }
+    delete ioThread_;
+    ioThread_ = nullptr;
+    io_ = nullptr;
 }
