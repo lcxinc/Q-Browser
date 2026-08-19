@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtTest
 import Company.Design
 
@@ -9,42 +10,80 @@ TestCase {
     Component {
         id: toastComponent
 
-        AppToast {
-            duration: 160
+        Window {
+            width: 360
+            height: 160
+            visible: true
+
+            property alias toast: toastControl
+            property alias toastMessage: toastControl.message
+            property alias toastVisible: toastControl.visible
+
+            AppToast {
+                id: toastControl
+                duration: 160
+            }
         }
     }
 
-    SignalSpy {
-        id: announcementSpy
-        signalName: "announcementRequested"
+    function init() {
+        AccessibilityRecorder.clear()
     }
 
-    function init() {
-        announcementSpy.clear()
+    function createToast(initialProperties) {
+        const host = createTemporaryObject(toastComponent, null,
+                                           initialProperties || {})
+        verify(host)
+        verify(host.visible)
+        return host.toast
     }
 
     function test_normalAndErrorAnnouncementsUseExpectedPriority() {
-        const toast = createTemporaryObject(toastComponent, this)
+        const toast = createToast()
         verify(toast)
-        announcementSpy.target = toast
-
         toast.show("Order saved", 500)
         verify(toast.shown)
         compare(toast.Accessible.name, "Order saved")
         compare(toast.Accessible.role, Accessible.StaticText)
-        compare(announcementSpy.count, 1)
-        compare(announcementSpy.signalArguments[0][0], "Order saved")
-        compare(announcementSpy.signalArguments[0][1], Accessible.Polite)
+        compare(AccessibilityRecorder.count, 1)
+        compare(AccessibilityRecorder.lastMessage, "Order saved")
+        compare(AccessibilityRecorder.lastPoliteness, Accessible.Polite)
 
         toast.error = true
         toast.show("Save failed", 500)
-        compare(announcementSpy.count, 2)
-        compare(announcementSpy.signalArguments[1][0], "Save failed")
-        compare(announcementSpy.signalArguments[1][1], Accessible.Assertive)
+        compare(AccessibilityRecorder.count, 2)
+        compare(AccessibilityRecorder.lastMessage, "Save failed")
+        compare(AccessibilityRecorder.lastPoliteness, Accessible.Assertive)
+    }
+
+    function test_shownTracksVisibilityAndMessage() {
+        const toast = createToast({
+                                      "toastMessage": "Declarative",
+                                      "toastVisible": true
+                                  })
+        verify(toast)
+        verify(toast.shown)
+
+        toast.visible = false
+        verify(!toast.shown)
+
+        toast.visible = true
+        toast.message = ""
+        verify(!toast.shown)
+    }
+
+    function test_emptyMessageIsNotShownOrAnnounced() {
+        const toast = createToast()
+        verify(toast)
+
+        toast.show("", 500)
+        verify(!toast.shown)
+        verify(!toast.visible)
+        compare(AccessibilityRecorder.count, 0)
     }
 
     function test_showRestartsTimeoutAndDismissStopsIt() {
-        const toast = createTemporaryObject(toastComponent, this)
+        const toast = createToast()
         verify(toast)
 
         toast.show("First", 160)
@@ -58,6 +97,7 @@ TestCase {
         verify(toast.shown)
         toast.dismiss()
         verify(!toast.shown)
+        verify(!toast.visible)
         wait(550)
         verify(!toast.shown)
     }

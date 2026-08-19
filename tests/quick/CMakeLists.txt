@@ -16,6 +16,8 @@ target_sources(qbrowser_quick_tests
 target_link_libraries(qbrowser_quick_tests
   PRIVATE
     q_browser_design
+    Qt6::Gui
+    Qt6::Qml
     Qt6::QuickTest)
 
 target_compile_definitions(qbrowser_quick_tests

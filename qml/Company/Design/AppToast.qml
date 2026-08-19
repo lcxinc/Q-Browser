@@ -8,23 +8,20 @@ Control {
     property int duration: 4000
     property bool error: false
     property string accessibleName: message
-    readonly property bool shown: message.length > 0 && dismissTimer.running
-
-    signal announcementRequested(string message, int politeness)
-
-    function announceMessage(text) {
-        const politeness = error ? Accessible.Assertive : Accessible.Polite
-        announcementRequested(text, politeness)
-        Accessible.announce(text, politeness)
-    }
+    readonly property bool shown: visible && message.length > 0
 
     function show(text, timeout) {
         message = text
+        if (message.length === 0) {
+            dismiss()
+            return
+        }
         if (typeof timeout === "number" && timeout > 0)
             duration = timeout
         visible = true
         dismissTimer.restart()
-        announceMessage(text)
+        Accessible.announce(message,
+                            error ? Accessible.Assertive : Accessible.Polite)
     }
 
     function dismiss() {
