@@ -11,6 +11,8 @@ QtObject {
                                && runtime.apiOrigin.length > 0
                                ? runtime.apiOrigin : "http://127.0.0.1:4173"
     property var pending: ({})
+    property var latestGeneration: ({})
+    property int requestGeneration: 0
 
     property string emailError: ""
     property string passwordError: ""
@@ -36,10 +38,19 @@ QtObject {
     property int orderEditState: RuntimeModels.Empty
     property var orderEditErrors: ({ status: "", priority: "", shippingAddress: "" })
     property string orderEditServerError: ""
+    property string orderEditMessage: ""
+    property string editStatus: ""
+    property string editPriority: ""
+    property string editShippingAddress: ""
+    property string editNotes: ""
+    property string orderDetailMessage: ""
 
     property int customersState: RuntimeModels.Empty
     property string customersError: ""
     property var customers: []
+    property int customersPage: 1
+    property int customersTotalPages: 1
+    property string customersQuery: ""
     property int customerDetailState: RuntimeModels.Empty
     property string customerDetailError: ""
     property var customer: ({})
@@ -50,6 +61,9 @@ QtObject {
 
     property string themeName: "light"
     property string settingsMessage: ""
+
+    signal orderEditLoaded()
+    signal orderSaved(string orderId)
 
     function encodedJson(value) {
         return Base64.encode(JSON.stringify(value))
@@ -87,24 +101,29 @@ QtObject {
         })
     }
 
-    function begin(kind, capability, operation, payload) {
+    function begin(kind, capability, operation, payload, lane) {
         if (!runtime || typeof runtime.invoke !== "function")
             return ""
         const requestId = runtime.invoke(capability, operation, payload)
         if (typeof requestId !== "string" || requestId.length === 0)
             return ""
+        const requestLane = typeof lane === "string" && lane.length > 0 ? lane : kind
+        const generation = ++requestGeneration
         const next = Object.assign({}, pending)
-        next[requestId] = kind
+        next[requestId] = { kind: kind, lane: requestLane, generation: generation }
         pending = next
+        const newest = Object.assign({}, latestGeneration)
+        newest[requestLane] = generation
+        latestGeneration = newest
         return requestId
     }
 
-    function network(kind, method, path, body) {
+    function network(kind, method, path, body, lane) {
         return begin(kind, "network", "request", {
             method: method,
             url: apiOrigin + path,
             bodyBase64: body === undefined || body === null ? "" : encodedJson(body)
-        })
+        }, lane)
     }
 
     function login(email, password) {
@@ -147,10 +166,43 @@ QtObject {
     function loadOrder(id) {
         orderDetailState = RuntimeModels.Loading
         orderDetailError = ""
-        if (network("orderDetail", "GET", "/api/orders/" + encodeURIComponent(id), null).length === 0) {
+        orderDetailMessage = ""
+        if (network("orderDetail", "GET", "/api/orders/" + encodeURIComponent(id), null,
+                    "orderDetailFlow").length === 0) {
             orderDetailState = RuntimeModels.Error
             orderDetailError = "Runtime is unavailable"
         }
+    }
+
+    function loadOrderForEdit(id) {
+        if (typeof id !== "string" || id.length === 0)
+            return false
+        orderEditState = RuntimeModels.Loading
+        orderEditServerError = ""
+        orderEditMessage = ""
+        if (network("orderEditLoad", "GET", "/api/orders/" + encodeURIComponent(id), null,
+                    "orderEditFlow").length === 0) {
+            orderEditState = RuntimeModels.Error
+            orderEditServerError = "Runtime is unavailable"
+            return false
+        }
+        return true
+    }
+
+    function changeOrderStatus(id, status) {
+        const validStatuses = ["pending", "processing", "shipped", "delivered", "cancelled"]
+        if (typeof id !== "string" || id.length === 0 || validStatuses.indexOf(status) < 0)
+            return false
+        orderDetailState = RuntimeModels.Loading
+        orderDetailError = ""
+        orderDetailMessage = ""
+        if (network("orderStatus", "PATCH", "/api/orders/" + encodeURIComponent(id),
+                    { status: status }, "orderDetailFlow").length === 0) {
+            orderDetailState = RuntimeModels.Error
+            orderDetailError = "Runtime is unavailable"
+            return false
+        }
+        return true
     }
 
     function saveOrder(id, status, priority, shippingAddress, notes) {
@@ -162,13 +214,15 @@ QtObject {
                                                                   : shippingAddress.length > 500 ? "Shipping address is too long" : ""
         }
         orderEditServerError = ""
+        orderEditMessage = ""
         if (orderEditErrors.status.length > 0 || orderEditErrors.priority.length > 0
                 || orderEditErrors.shippingAddress.length > 0)
             return false
         orderEditState = RuntimeModels.Loading
         const body = { status: status, priority: priority,
                        shippingAddress: shippingAddress.trim(), notes: notes }
-        if (network("orderEdit", "PATCH", "/api/orders/" + encodeURIComponent(id), body).length === 0) {
+        if (network("orderEditSave", "PATCH", "/api/orders/" + encodeURIComponent(id), body,
+                    "orderEditFlow").length === 0) {
             orderEditState = RuntimeModels.Error
             orderEditServerError = "Runtime is unavailable"
             return false
@@ -177,10 +231,12 @@ QtObject {
     }
 
     function loadCustomers(query, page) {
+        customersQuery = query.trim()
+        customersPage = Math.max(1, page)
         customersState = RuntimeModels.Loading
         customersError = ""
-        const path = "/api/customers?page=" + Math.max(1, page)
-                   + "&pageSize=20&query=" + encodeURIComponent(query.trim())
+        const path = "/api/customers?page=" + customersPage
+                   + "&pageSize=20&query=" + encodeURIComponent(customersQuery)
         if (network("customers", "GET", path, null).length === 0) {
             customersState = RuntimeModels.Error
             customersError = "Runtime is unavailable"
@@ -219,12 +275,15 @@ QtObject {
     }
 
     function complete(requestId, response) {
-        const kind = pending[requestId]
-        if (typeof kind !== "string")
+        const context = pending[requestId]
+        if (!context || typeof context.kind !== "string")
             return
         const next = Object.assign({}, pending)
         delete next[requestId]
         pending = next
+        if (latestGeneration[context.lane] !== context.generation)
+            return
+        const kind = context.kind
         const body = responseBody(response)
         const status = response && response.result ? response.result.status : 0
         const httpError = body && body.error && body.error.message ? body.error.message
@@ -238,7 +297,21 @@ QtObject {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
                 const dashboardValue = Object.assign({}, body)
                 dashboardValue.recentActivity = displayRows(body.recentActivity || [], "text")
-                dashboard = dashboardValue; dashboardState = RuntimeModels.Content
+                dashboardValue.revenueByMonth = (body.revenueByMonth || []).map(function(item) {
+                    const row = Object.assign({}, item)
+                    const cents = Number(item && item.amountCents) || 0
+                    row.display = String(item && item.month ? item.month : "") + " — $"
+                                + (cents / 100).toLocaleString(Qt.locale("en_US"), "f", 2)
+                    return row
+                })
+                dashboard = dashboardValue
+                const kpis = body.kpis || ({})
+                const hasMetrics = Number(kpis.orderCount) !== 0
+                        || Number(kpis.customerCount) !== 0 || Number(kpis.pendingCount) !== 0
+                        || Number(kpis.revenueCents) !== 0
+                dashboardState = hasMetrics || dashboardValue.revenueByMonth.length > 0
+                        || dashboardValue.recentActivity.length > 0
+                        ? RuntimeModels.Content : RuntimeModels.Empty
             } else { dashboardError = response && response.ok === true ? httpError
                                                                         : safeError(response, "Dashboard failed")
                      dashboardState = RuntimeModels.Error }
@@ -256,15 +329,38 @@ QtObject {
             } else { orderDetailError = response && response.ok === true ? httpError
                                                                           : safeError(response, "Order failed")
                      orderDetailState = RuntimeModels.Error }
-        } else if (kind === "orderEdit") {
+        } else if (kind === "orderStatus") {
+            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+                order = body; orderDetailState = RuntimeModels.Content
+                orderDetailError = ""; orderDetailMessage = "Order status updated"
+            } else { orderDetailError = response && response.ok === true ? httpError
+                                                                           : safeError(response, "Update failed")
+                     orderDetailState = RuntimeModels.Error }
+        } else if (kind === "orderEditLoad") {
+            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+                order = body
+                editStatus = typeof body.status === "string" ? body.status : ""
+                editPriority = typeof body.priority === "string" ? body.priority : ""
+                editShippingAddress = typeof body.shippingAddress === "string"
+                        ? body.shippingAddress : ""
+                editNotes = typeof body.notes === "string" ? body.notes : ""
+                orderEditState = RuntimeModels.Content; orderEditServerError = ""
+                orderEditLoaded()
+            } else { orderEditServerError = response && response.ok === true ? httpError
+                                                                              : safeError(response, "Order failed")
+                     orderEditState = RuntimeModels.Error }
+        } else if (kind === "orderEditSave") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
                 order = body; orderEditState = RuntimeModels.Content; orderEditServerError = ""
+                orderEditMessage = "Order saved"; orderSaved(String(body.id || ""))
             } else { orderEditServerError = response && response.ok === true ? httpError
                                                                               : safeError(response, "Update failed")
                      orderEditState = RuntimeModels.Error }
         } else if (kind === "customers") {
             if (response && response.ok === true && status >= 200 && status < 300 && body) {
                 customers = displayRows(body.items || [], "name")
+                customersPage = body.page || 1
+                customersTotalPages = body.totalPages || 1
                 customersState = customers.length === 0 ? RuntimeModels.Empty : RuntimeModels.Content
             } else { customersError = response && response.ok === true ? httpError
                                                                         : safeError(response, "Customers failed")

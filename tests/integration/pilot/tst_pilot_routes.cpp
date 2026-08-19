@@ -9,7 +9,50 @@
 #include <QFile>
 #include <QDirIterator>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QTest>
+
+namespace {
+QStringList sourcePolicyViolations(const QByteArray &source)
+{
+    const QString text = QString::fromUtf8(source);
+    QStringList violations;
+    const auto addRegex = [&text, &violations](const QString &name,
+                                               const QString &pattern,
+                                               QRegularExpression::PatternOptions options = {}) {
+        const QRegularExpression expression(pattern, options);
+        Q_ASSERT(expression.isValid());
+        if (expression.match(text).hasMatch())
+            violations.push_back(name);
+    };
+    const auto addLiteral = [&source, &violations](const QString &name,
+                                                   const QByteArray &literal) {
+        if (source.contains(literal))
+            violations.push_back(name);
+    };
+
+    addRegex(QStringLiteral("dynamic-import"), QStringLiteral("\\bimport\\s*\\("));
+    addRegex(QStringLiteral("dynamic-loader-source"), QStringLiteral("\\bsource\\s*:"));
+    addRegex(QStringLiteral("loader-set-source"), QStringLiteral("\\.\\s*setSource\\s*\\("));
+    addRegex(QStringLiteral("qml-create-component"),
+             QStringLiteral("\\bQt\\s*\\.\\s*createComponent\\s*\\("));
+    addRegex(QStringLiteral("qml-create-object"),
+             QStringLiteral("\\bQt\\s*\\.\\s*createQmlObject\\s*\\("));
+    addRegex(QStringLiteral("qt-include"),
+             QStringLiteral("\\bQt\\s*\\.\\s*include\\s*\\("));
+    addRegex(QStringLiteral("remote-import"),
+             QStringLiteral("^\\s*import\\s+[\\\"'](?:https?|file):"),
+             QRegularExpression::MultilineOption);
+    addLiteral(QStringLiteral("raw-network"), QByteArrayLiteral("XMLHttpRequest"));
+    addLiteral(QStringLiteral("worker-network"), QByteArrayLiteral("WorkerScript"));
+    addLiteral(QStringLiteral("file-url"), QByteArrayLiteral("file://"));
+    addLiteral(QStringLiteral("native-file"), QByteArrayLiteral("QFile"));
+    addLiteral(QStringLiteral("native-file-dialog"), QByteArrayLiteral("FileDialog"));
+    addLiteral(QStringLiteral("external-url"), QByteArrayLiteral("Qt.openUrlExternally"));
+    addLiteral(QStringLiteral("native-plugin"), QByteArrayLiteral("plugin "));
+    return violations;
+}
+} // namespace
 
 class PilotRoutesTest final : public QObject
 {
@@ -20,7 +63,29 @@ private slots:
     void hostInventoryResolvesPatternToPageAndEngine();
     void realWorkerLoadsPilotAndEmitsTypedCapability();
     void sourcePolicyForbidsRawNetworkFilesystemAndNativeCode();
+    void sourcePolicyRejectsDynamicQmlConstructionAndLoading();
 };
+
+void PilotRoutesTest::sourcePolicyRejectsDynamicQmlConstructionAndLoading()
+{
+    const QString path = QDir(QStringLiteral(Q_BROWSER_SOURCE_DIR))
+                             .filePath(QStringLiteral("tests/fixtures/pilot/source-policy-attack.qml"));
+    QFile fixture(path);
+    QVERIFY2(fixture.open(QIODevice::ReadOnly), qPrintable(path));
+    const QStringList violations = sourcePolicyViolations(fixture.readAll());
+    QCOMPARE(violations,
+             QStringList({QStringLiteral("dynamic-import"),
+                          QStringLiteral("dynamic-loader-source"),
+                          QStringLiteral("loader-set-source"),
+                          QStringLiteral("qml-create-component"),
+                          QStringLiteral("qml-create-object"),
+                          QStringLiteral("qt-include"),
+                          QStringLiteral("remote-import")}));
+
+    QCOMPARE(sourcePolicyViolations(
+                 QByteArrayLiteral("Loader { sourceComponent: safeStaticComponent }")),
+             QStringList());
+}
 
 void PilotRoutesTest::packageManifestDeclaresWorkerInventory()
 {
@@ -61,13 +126,6 @@ void PilotRoutesTest::sourcePolicyForbidsRawNetworkFilesystemAndNativeCode()
         QVERIFY2(QFileInfo(QDir(qmlRoot).filePath(QStringLiteral("pages/") + page)).isFile(),
                  qPrintable(page));
     }
-    const QList<QByteArray> forbidden{
-        QByteArrayLiteral("XMLHttpRequest"), QByteArrayLiteral("WorkerScript"),
-        QByteArrayLiteral("file://"), QByteArrayLiteral("QFile"),
-        QByteArrayLiteral("FileDialog"), QByteArrayLiteral("Qt.openUrlExternally"),
-        QByteArrayLiteral("import \"http"), QByteArrayLiteral("import 'http"),
-        QByteArrayLiteral("source: \"http"), QByteArrayLiteral("source: 'http"),
-        QByteArrayLiteral("plugin ")};
     int runtimeInvocations = 0;
     QDirIterator sources(qmlRoot, {QStringLiteral("*.qml"), QStringLiteral("*.js")},
                          QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
@@ -75,11 +133,10 @@ void PilotRoutesTest::sourcePolicyForbidsRawNetworkFilesystemAndNativeCode()
         QFile source(sources.next());
         QVERIFY(source.open(QIODevice::ReadOnly));
         const QByteArray contents = source.readAll();
-        for (const QByteArray &needle : forbidden) {
-            QVERIFY2(!contents.contains(needle),
-                     qPrintable(source.fileName() + QStringLiteral(": ")
-                                + QString::fromLatin1(needle)));
-        }
+        const QStringList violations = sourcePolicyViolations(contents);
+        QVERIFY2(violations.isEmpty(),
+                 qPrintable(source.fileName() + QStringLiteral(": ")
+                            + violations.join(QStringLiteral(", "))));
         qsizetype offset = 0;
         while ((offset = contents.indexOf("runtime.invoke", offset)) >= 0) {
             ++runtimeInvocations;

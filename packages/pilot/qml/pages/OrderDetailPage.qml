@@ -8,8 +8,13 @@ Item {
     property var runtime: null
     property string orderId: ""
     readonly property alias model: dataModel
+    readonly property alias statusControl: statusNavigation
     signal navigateRequested(string route)
-    function refresh() { dataModel.loadOrder(orderId) }
+    function refresh() {
+        if (orderId.length === 0) return false
+        dataModel.loadOrder(orderId); return true
+    }
+    function changeStatus(status) { return dataModel.changeOrderStatus(orderId, status) }
     Accessible.name: "Order " + orderId
     Accessible.role: Accessible.Pane
     Models.RuntimeModels { id: dataModel; runtime: root.runtime }
@@ -19,6 +24,24 @@ Item {
         StateView {
             Layout.fillWidth: true; Layout.fillHeight: true; viewState: dataModel.orderDetailState; errorMessage: dataModel.orderDetailError; emptyMessage: "Load order details"
             AppCard { anchors.fill: parent; accessibleName: "Order details"; ColumnLayout { anchors.fill: parent; spacing: Spacing.sm; Text { text: dataModel.order.customerName || ""; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.headingSmall } AppStatusBadge { text: dataModel.order.status || "unknown"; status: dataModel.order.status === "delivered" ? "success" : "neutral" } Text { text: dataModel.order.shippingAddress || ""; color: Theme.textSecondary; font.family: Typography.family; font.pixelSize: Typography.body; wrapMode: Text.Wrap } } }
+        }
+        AppNavigation {
+            id: statusNavigation
+            Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget
+            orientation: Qt.Horizontal
+            model: ["pending", "processing", "shipped", "delivered", "cancelled"]
+            currentIndex: model.indexOf(String(dataModel.order.status || ""))
+            enabled: dataModel.orderDetailState === Models.RuntimeModels.Content
+            accessibleName: "Change order status"
+            accessibleDescription: dataModel.orderDetailError.length > 0
+                                   ? dataModel.orderDetailError : "Select the new order status"
+            onActivated: (index, value) => root.changeStatus(String(value))
+        }
+        AppToast {
+            Layout.alignment: Qt.AlignHCenter
+            message: dataModel.orderDetailMessage
+            visible: message.length > 0
+            accessibleName: message
         }
     }
 }

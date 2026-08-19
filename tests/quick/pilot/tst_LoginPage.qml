@@ -75,10 +75,29 @@ TestCase {
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({
                 kpis: { orderCount: 12, pendingCount: 2, customerCount: 4, revenueCents: 477725 },
+                revenueByMonth: [
+                    { month: "2026-07", amountCents: 117275 },
+                    { month: "2026-08", amountCents: 120000 }
+                ],
                 recentActivity: [{ id: "act-001", text: "Order updated" }]
             })) } })
         tryCompare(page.model, "dashboardState", Models.RuntimeModels.Content)
-        compare(page.model.dashboard.kpis.pendingCount, 2)
+        compare(page.orderCountText, "12")
+        compare(page.customerCountText, "4")
+        compare(page.pendingCountText, "2")
+        compare(page.revenueText, "$4,777.25")
+        compare(page.revenueRows.length, 2)
+        compare(page.revenueRows[1].display, "2026-08 — $1,200.00")
+        compare(page.revenueAccessibleName, "Revenue by month")
         compare(page.model.dashboard.recentActivity[0].display, "act-001 — Order updated")
+
+        page.refresh()
+        compare(page.model.dashboardState, Models.RuntimeModels.Loading)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({
+                kpis: { orderCount: 0, pendingCount: 0, customerCount: 0, revenueCents: 0 },
+                revenueByMonth: [], recentActivity: []
+            })) } })
+        tryCompare(page.model, "dashboardState", Models.RuntimeModels.Empty)
     }
 }

@@ -7,6 +7,7 @@ Item {
     id: root
     property var runtime: null
     readonly property alias model: dataModel
+    readonly property alias statusControl: statusNavigation
     property string selectedStatus: "all"
     signal navigateRequested(string route)
     function search(query, status, page) { dataModel.loadOrders(query, status, page) }
@@ -31,7 +32,18 @@ Item {
             AppTextField { id: query; Layout.fillWidth: true; label: "Search"; accessibleName: "Search orders"; placeholderText: "Order or customer"; onAccepted: root.search(text, root.selectedStatus, 1) }
             AppButton { text: "Search"; onClicked: root.search(query.text, root.selectedStatus, 1) }
         }
-        AppNavigation { Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget; orientation: Qt.Horizontal; model: ["all", "pending", "processing", "shipped", "delivered", "cancelled"]; currentIndex: 0; accessibleName: "Order status filter"; onActivated: (index, value) => root.selectedStatus = String(value) }
+        AppNavigation {
+            id: statusNavigation
+            Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget
+            orientation: Qt.Horizontal
+            model: ["all", "pending", "processing", "shipped", "delivered", "cancelled"]
+            currentIndex: 0
+            accessibleName: "Order status filter"
+            onActivated: (index, value) => {
+                root.selectedStatus = String(value)
+                root.search(dataModel.ordersQuery, root.selectedStatus, 1)
+            }
+        }
         StateView {
             Layout.fillWidth: true; Layout.fillHeight: true
             viewState: dataModel.ordersState; emptyMessage: "No matching orders"; errorMessage: dataModel.ordersError

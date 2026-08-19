@@ -10,6 +10,19 @@ Item {
     property var runtime: null
     property string route: "/login"
     readonly property string normalizedRoute: route.split("?")[0].split("#")[0]
+    readonly property alias navigationControl: navigation
+    readonly property int navigationIndex: {
+        if (normalizedRoute === "/dashboard") return 0
+        if (normalizedRoute === "/orders" || /^\/orders\/[^/]+(?:\/edit)?$/.test(normalizedRoute)) return 1
+        if (normalizedRoute === "/customers" || /^\/customers\/[^/]+$/.test(normalizedRoute)) return 2
+        if (normalizedRoute === "/files") return 3
+        if (normalizedRoute === "/settings") return 4
+        return -1
+    }
+    onNavigationIndexChanged: {
+        if (navigation.currentIndex !== navigationIndex)
+            navigation.currentIndex = navigationIndex
+    }
     readonly property string orderId: {
         const match = /^\/orders\/([^/]+)(?:\/edit)?$/.exec(normalizedRoute)
         return match ? decodeURIComponent(match[1]) : ""
@@ -34,10 +47,14 @@ Item {
     }
 
     function navigate(target) {
+        const normalizedTarget = String(target).split("?")[0].split("#")[0]
+        if (normalizedTarget === normalizedRoute)
+            return false
         if (runtime && typeof runtime.loadRoute === "function")
             runtime.loadRoute(target)
         else
             route = target
+        return true
     }
 
     function pageKey(path) {
@@ -60,6 +77,7 @@ Item {
             id: navigation
             Layout.fillHeight: true
             visible: root.normalizedRoute !== "/login"
+            currentIndex: root.navigationIndex
             model: [
                 { label: "Dashboard", route: "/dashboard" },
                 { label: "Orders", route: "/orders" },
@@ -95,7 +113,7 @@ Item {
     Component { id: dashboardPage; Pages.DashboardPage { runtime: root.runtime; Component.onCompleted: refresh() } }
     Component { id: ordersPage; Pages.OrdersPage { runtime: root.runtime; onNavigateRequested: route => root.navigate(route); Component.onCompleted: search("", "all", 1) } }
     Component { id: orderDetailPage; Pages.OrderDetailPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
-    Component { id: orderEditPage; Pages.OrderEditPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route) } }
+    Component { id: orderEditPage; Pages.OrderEditPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
     Component { id: customersPage; Pages.CustomersPage { runtime: root.runtime; onNavigateRequested: route => root.navigate(route); Component.onCompleted: search("", 1) } }
     Component { id: customerDetailPage; Pages.CustomerDetailPage { runtime: root.runtime; customerId: root.customerId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
     Component { id: filesPage; Pages.FilesPage { runtime: root.runtime } }
