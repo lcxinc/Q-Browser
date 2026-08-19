@@ -3,56 +3,15 @@
 #include "HostPolicy.h"
 #include "RouteRegistry.h"
 #include "ProtocolMessage.h"
+#include "QmlSourcePolicy.h"
 #include "WorkerTestEnvironment.h"
 
 #include <QDir>
 #include <QFile>
 #include <QDirIterator>
 #include <QJsonDocument>
-#include <QRegularExpression>
+#include <QSet>
 #include <QTest>
-
-namespace {
-QStringList sourcePolicyViolations(const QByteArray &source)
-{
-    const QString text = QString::fromUtf8(source);
-    QStringList violations;
-    const auto addRegex = [&text, &violations](const QString &name,
-                                               const QString &pattern,
-                                               QRegularExpression::PatternOptions options = {}) {
-        const QRegularExpression expression(pattern, options);
-        Q_ASSERT(expression.isValid());
-        if (expression.match(text).hasMatch())
-            violations.push_back(name);
-    };
-    const auto addLiteral = [&source, &violations](const QString &name,
-                                                   const QByteArray &literal) {
-        if (source.contains(literal))
-            violations.push_back(name);
-    };
-
-    addRegex(QStringLiteral("dynamic-import"), QStringLiteral("\\bimport\\s*\\("));
-    addRegex(QStringLiteral("dynamic-loader-source"), QStringLiteral("\\bsource\\s*:"));
-    addRegex(QStringLiteral("loader-set-source"), QStringLiteral("\\.\\s*setSource\\s*\\("));
-    addRegex(QStringLiteral("qml-create-component"),
-             QStringLiteral("\\bQt\\s*\\.\\s*createComponent\\s*\\("));
-    addRegex(QStringLiteral("qml-create-object"),
-             QStringLiteral("\\bQt\\s*\\.\\s*createQmlObject\\s*\\("));
-    addRegex(QStringLiteral("qt-include"),
-             QStringLiteral("\\bQt\\s*\\.\\s*include\\s*\\("));
-    addRegex(QStringLiteral("remote-import"),
-             QStringLiteral("^\\s*import\\s+[\\\"'](?:https?|file):"),
-             QRegularExpression::MultilineOption);
-    addLiteral(QStringLiteral("raw-network"), QByteArrayLiteral("XMLHttpRequest"));
-    addLiteral(QStringLiteral("worker-network"), QByteArrayLiteral("WorkerScript"));
-    addLiteral(QStringLiteral("file-url"), QByteArrayLiteral("file://"));
-    addLiteral(QStringLiteral("native-file"), QByteArrayLiteral("QFile"));
-    addLiteral(QStringLiteral("native-file-dialog"), QByteArrayLiteral("FileDialog"));
-    addLiteral(QStringLiteral("external-url"), QByteArrayLiteral("Qt.openUrlExternally"));
-    addLiteral(QStringLiteral("native-plugin"), QByteArrayLiteral("plugin "));
-    return violations;
-}
-} // namespace
 
 class PilotRoutesTest final : public QObject
 {
@@ -60,11 +19,59 @@ class PilotRoutesTest final : public QObject
 
 private slots:
     void packageManifestDeclaresWorkerInventory();
+    void manifestDeclarationsMatchDirectSourceUsage();
     void hostInventoryResolvesPatternToPageAndEngine();
     void realWorkerLoadsPilotAndEmitsTypedCapability();
     void sourcePolicyForbidsRawNetworkFilesystemAndNativeCode();
     void sourcePolicyRejectsDynamicQmlConstructionAndLoading();
 };
+
+void PilotRoutesTest::manifestDeclarationsMatchDirectSourceUsage()
+{
+    const QDir sourceRoot(QDir(QStringLiteral(Q_BROWSER_SOURCE_DIR))
+                              .filePath(QStringLiteral("packages/pilot/qml")));
+    QSet<QString> directImports;
+    bool usesNetwork = false;
+    QSet<QString> networkMethods;
+    bool usesStorage = false;
+    bool usesFile = false;
+    QDirIterator sources(sourceRoot.path(), {QStringLiteral("*.qml"), QStringLiteral("*.js")},
+                         QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
+    while (sources.hasNext()) {
+        QFile source(sources.next());
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(source.readAll());
+        for (const QString &line : text.split(u'\n')) {
+            const QString trimmed = line.trimmed();
+            if (!trimmed.startsWith(QStringLiteral("import "))) continue;
+            const QString name = trimmed.sliced(7).section(u' ', 0, 0);
+            if (!name.startsWith(u'\"') && !name.startsWith(u'\'')) directImports.insert(name);
+        }
+        usesNetwork = usesNetwork || text.contains(QStringLiteral("network(\""));
+        for (const QString &method : {QStringLiteral("GET"), QStringLiteral("POST"),
+                                      QStringLiteral("PATCH")}) {
+            if (text.contains(u'"' + method + u'"')) networkMethods.insert(method);
+        }
+        usesStorage = usesStorage || text.contains(QStringLiteral("\"storage\""));
+        usesFile = usesFile || text.contains(QStringLiteral("\"file\", \"open\""));
+    }
+    const QString manifestPath = QDir(QStringLiteral(Q_BROWSER_SOURCE_DIR))
+                                     .filePath(QStringLiteral("packages/pilot/manifest.json"));
+    QFile manifestFile(manifestPath);
+    QVERIFY(manifestFile.open(QIODevice::ReadOnly));
+    const ManifestParseResult parsed = Manifest::parse(manifestFile.readAll());
+    QVERIFY(parsed.hasValue());
+    QCOMPARE(directImports, QSet<QString>(parsed.value().imports().cbegin(),
+                                          parsed.value().imports().cend()));
+    QCOMPARE(!parsed.value().permissions().network.hosts.isEmpty(), usesNetwork);
+    QCOMPARE(networkMethods,
+             QSet<QString>(parsed.value().permissions().network.methods.cbegin(),
+                           parsed.value().permissions().network.methods.cend()));
+    QCOMPARE(parsed.value().permissions().storage == StoragePermission::AppPrivate, usesStorage);
+    QCOMPARE(parsed.value().permissions().fileOpen == FileOpenPermission::UserBrokered, usesFile);
+    QVERIFY(!parsed.value().permissions().clipboardWrite);
+    QCOMPARE(parsed.value().permissions().clipboardRead, ClipboardReadPermission::Disabled);
+}
 
 void PilotRoutesTest::sourcePolicyRejectsDynamicQmlConstructionAndLoading()
 {
@@ -72,17 +79,18 @@ void PilotRoutesTest::sourcePolicyRejectsDynamicQmlConstructionAndLoading()
                              .filePath(QStringLiteral("tests/fixtures/pilot/source-policy-attack.qml"));
     QFile fixture(path);
     QVERIFY2(fixture.open(QIODevice::ReadOnly), qPrintable(path));
-    const QStringList violations = sourcePolicyViolations(fixture.readAll());
-    QCOMPARE(violations,
-             QStringList({QStringLiteral("dynamic-import"),
-                          QStringLiteral("dynamic-loader-source"),
-                          QStringLiteral("loader-set-source"),
-                          QStringLiteral("qml-create-component"),
-                          QStringLiteral("qml-create-object"),
-                          QStringLiteral("qt-include"),
-                          QStringLiteral("remote-import")}));
+    const QStringList violations = QmlSourcePolicy::violations(fixture.readAll());
+    for (const QString &expected : {QStringLiteral("dynamic-import"),
+                                    QStringLiteral("dynamic-loader-source"),
+                                    QStringLiteral("loader-set-source"),
+                                    QStringLiteral("qml-create-component"),
+                                    QStringLiteral("qml-create-object"),
+                                    QStringLiteral("qt-include"),
+                                    QStringLiteral("remote-import")}) {
+        QVERIFY2(violations.contains(expected), qPrintable(expected));
+    }
 
-    QCOMPARE(sourcePolicyViolations(
+    QCOMPARE(QmlSourcePolicy::violations(
                  QByteArrayLiteral("Loader { sourceComponent: safeStaticComponent }")),
              QStringList());
 }
@@ -105,6 +113,12 @@ void PilotRoutesTest::packageManifestDeclaresWorkerInventory()
                           QStringLiteral("/customers/:id"),
                           QStringLiteral("/files"),
                           QStringLiteral("/settings")}));
+    QCOMPARE(parsed.value().imports(),
+             QStringList({QStringLiteral("QtQuick"),
+                          QStringLiteral("QtQuick.Layouts"),
+                          QStringLiteral("Company.Design")}));
+    QCOMPARE(parsed.value().permissions().clipboardRead,
+             ClipboardReadPermission::Disabled);
     QCOMPARE(parsed.value().permissions().network.methods,
              QStringList({QStringLiteral("GET"), QStringLiteral("POST"), QStringLiteral("PATCH")}));
     const auto patch = parseHttpMethod(QStringLiteral("PATCH"));
@@ -133,7 +147,7 @@ void PilotRoutesTest::sourcePolicyForbidsRawNetworkFilesystemAndNativeCode()
         QFile source(sources.next());
         QVERIFY(source.open(QIODevice::ReadOnly));
         const QByteArray contents = source.readAll();
-        const QStringList violations = sourcePolicyViolations(contents);
+        const QStringList violations = QmlSourcePolicy::violations(contents);
         QVERIFY2(violations.isEmpty(),
                  qPrintable(source.fileName() + QStringLiteral(": ")
                             + violations.join(QStringLiteral(", "))));

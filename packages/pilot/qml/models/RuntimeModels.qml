@@ -12,6 +12,13 @@ QtObject {
                                && runtime.apiOrigin.length > 0
                                ? runtime.apiOrigin : "http://127.0.0.1:4173"
     property var pending: ({})
+    property var activeRequestByLane: ({})
+    readonly property int pendingCount: Object.keys(pending).length
+    readonly property var fixedLanes: ({
+        login: true, dashboard: true, orders: true, orderDetailFlow: true,
+        orderEditFlow: true, customers: true, customerDetail: true,
+        file: true, settings: true
+    })
     property var latestGeneration: ({})
     property int requestGeneration: 0
 
@@ -66,6 +73,11 @@ QtObject {
 
     property string themeName: "light"
     property string settingsMessage: ""
+    property bool settingsLoading: false
+    property bool settingsSaving: false
+    property bool settingsDirty: false
+    property bool settingsPersisted: false
+    property string settingsError: ""
 
     signal orderEditLoaded()
     signal orderSaved(string orderId)
@@ -90,9 +102,71 @@ QtObject {
 
     function responseBody(response) {
         if (!response || response.ok !== true || !response.result
+                || !isPlainObject(response.result)
+                || !isInteger(response.result.status, 100, 599)
                 || typeof response.result.bodyBase64 !== "string")
             return null
         return decodedJson(response.result.bodyBase64)
+    }
+
+    function isPlainObject(value) {
+        return value !== null && typeof value === "object" && !Array.isArray(value)
+                && Object.prototype.toString.call(value) === "[object Object]"
+    }
+
+    function isInteger(value, minimum, maximum) {
+        return typeof value === "number" && Number.isFinite(value)
+                && Math.floor(value) === value && value >= minimum && value <= maximum
+    }
+
+    function isText(value, maximum) {
+        return typeof value === "string" && value.length > 0 && value.length <= maximum
+    }
+
+    function validRows(items, secondaryKey) {
+        if (!Array.isArray(items) || items.length > 100)
+            return false
+        for (let index = 0; index < items.length; ++index) {
+            const item = items[index]
+            if (!isPlainObject(item) || !isText(item.id, 128)
+                    || (secondaryKey && !isText(item[secondaryKey], 500)))
+                return false
+        }
+        return true
+    }
+
+    function validPage(body, context, secondaryKey) {
+        return isPlainObject(body) && validRows(body.items, secondaryKey)
+                && isInteger(body.page, 1, 100000)
+                && isInteger(body.totalPages, 1, 100000)
+                && body.page <= body.totalPages && body.page === context.expectedPage
+    }
+
+    function validOrder(body, expectedId) {
+        return isPlainObject(body) && isText(body.id, 128) && body.id === expectedId
+                && (body.status === undefined || isText(body.status, 32))
+                && (body.priority === undefined || isText(body.priority, 32))
+                && (body.shippingAddress === undefined
+                    || typeof body.shippingAddress === "string")
+    }
+
+    function validDashboard(body) {
+        if (!isPlainObject(body) || !isPlainObject(body.kpis)
+                || !Array.isArray(body.revenueByMonth) || body.revenueByMonth.length > 120
+                || !validRows(body.recentActivity, "text"))
+            return false
+        const keys = ["orderCount", "customerCount", "pendingCount", "revenueCents"]
+        for (let index = 0; index < keys.length; ++index) {
+            if (!isInteger(body.kpis[keys[index]], 0, Number.MAX_SAFE_INTEGER))
+                return false
+        }
+        for (let row = 0; row < body.revenueByMonth.length; ++row) {
+            const item = body.revenueByMonth[row]
+            if (!isPlainObject(item) || !isText(item.month, 32)
+                    || !isInteger(item.amountCents, 0, Number.MAX_SAFE_INTEGER))
+                return false
+        }
+        return true
     }
 
     function displayRows(items, secondaryKey) {
@@ -106,29 +180,42 @@ QtObject {
         })
     }
 
-    function begin(kind, capability, operation, payload, lane) {
+    function laneBusy(lane) {
+        return typeof activeRequestByLane[lane] === "string"
+    }
+
+    function begin(kind, capability, operation, payload, lane, expected) {
         if (!runtime || typeof runtime.invoke !== "function")
+            return ""
+        const requestLane = typeof lane === "string" && lane.length > 0 ? lane : kind
+        if (!fixedLanes[requestLane])
             return ""
         const requestId = runtime.invoke(capability, operation, payload)
         if (typeof requestId !== "string" || requestId.length === 0)
             return ""
-        const requestLane = typeof lane === "string" && lane.length > 0 ? lane : kind
         const generation = ++requestGeneration
         const next = Object.assign({}, pending)
-        next[requestId] = { kind: kind, lane: requestLane, generation: generation }
+        const previousRequestId = activeRequestByLane[requestLane]
+        if (typeof previousRequestId === "string")
+            delete next[previousRequestId]
+        next[requestId] = Object.assign({ kind: kind, lane: requestLane,
+                                          generation: generation }, expected || ({}))
         pending = next
+        const active = Object.assign({}, activeRequestByLane)
+        active[requestLane] = requestId
+        activeRequestByLane = active
         const newest = Object.assign({}, latestGeneration)
         newest[requestLane] = generation
         latestGeneration = newest
         return requestId
     }
 
-    function network(kind, method, path, body, lane) {
+    function network(kind, method, path, body, lane, expected) {
         return begin(kind, "network", "request", {
             method: method,
             url: apiOrigin + path,
             bodyBase64: body === undefined || body === null ? "" : encodedJson(body)
-        }, lane)
+        }, lane, expected)
     }
 
     function login(email, password) {
@@ -142,13 +229,16 @@ QtObject {
         if (emailError.length > 0 || passwordError.length > 0)
             return false
         authenticated = false
-        return network("login", "POST", "/api/login", { email: normalizedEmail, password: password }).length > 0
+        if (laneBusy("login")) return false
+        return network("login", "POST", "/api/login", { email: normalizedEmail, password: password },
+                       "login", { expectedEmail: normalizedEmail }).length > 0
     }
 
     function loadDashboard() {
         dashboardState = RuntimeModels.Loading
         dashboardError = ""
-        if (network("dashboard", "GET", "/api/dashboard", null).length === 0) {
+        if (laneBusy("dashboard")) return false
+        if (network("dashboard", "GET", "/api/dashboard", null, "dashboard").length === 0) {
             dashboardState = RuntimeModels.Error
             dashboardError = "Runtime is unavailable"
         }
@@ -162,7 +252,9 @@ QtObject {
         ordersError = ""
         const path = "/api/orders?page=" + ordersPage + "&pageSize=20&status="
                    + encodeURIComponent(ordersStatus) + "&query=" + encodeURIComponent(ordersQuery)
-        if (network("orders", "GET", path, null).length === 0) {
+        if (network("orders", "GET", path, null, "orders",
+                    { expectedPage: ordersPage, expectedQuery: ordersQuery,
+                      expectedStatus: ordersStatus }).length === 0) {
             ordersState = RuntimeModels.Error
             ordersError = "Runtime is unavailable"
         }
@@ -175,7 +267,7 @@ QtObject {
         orderStatusError = ""
         orderDetailMessage = ""
         if (network("orderDetail", "GET", "/api/orders/" + encodeURIComponent(id), null,
-                    "orderDetailFlow").length === 0) {
+                    "orderDetailFlow", { expectedId: id }).length === 0) {
             orderDetailState = RuntimeModels.Error
             orderDetailError = "Runtime is unavailable"
         }
@@ -190,7 +282,7 @@ QtObject {
         orderEditServerError = ""
         orderEditMessage = ""
         if (network("orderEditLoad", "GET", "/api/orders/" + encodeURIComponent(id), null,
-                    "orderEditFlow").length === 0) {
+                    "orderEditFlow", { expectedId: id }).length === 0) {
             orderEditState = RuntimeModels.Error
             orderEditLoadError = "Runtime is unavailable"
             return false
@@ -206,7 +298,8 @@ QtObject {
         orderStatusError = ""
         orderDetailMessage = ""
         if (network("orderStatus", "PATCH", "/api/orders/" + encodeURIComponent(id),
-                    { status: status }, "orderDetailFlow").length === 0) {
+                    { status: status }, "orderDetailFlow",
+                    { expectedId: id, expectedStatus: status }).length === 0) {
             orderStatusMutationState = RuntimeModels.MutationFailure
             orderStatusError = "Runtime is unavailable"
             return false
@@ -233,7 +326,7 @@ QtObject {
         const body = { status: status, priority: priority,
                        shippingAddress: shippingAddress.trim(), notes: notes }
         if (network("orderEditSave", "PATCH", "/api/orders/" + encodeURIComponent(id), body,
-                    "orderEditFlow").length === 0) {
+                    "orderEditFlow", { expectedId: id }).length === 0) {
             orderEditMutationState = RuntimeModels.MutationFailure
             orderEditServerError = "Runtime is unavailable"
             return false
@@ -248,7 +341,8 @@ QtObject {
         customersError = ""
         const path = "/api/customers?page=" + customersPage
                    + "&pageSize=20&query=" + encodeURIComponent(customersQuery)
-        if (network("customers", "GET", path, null).length === 0) {
+        if (network("customers", "GET", path, null, "customers",
+                    { expectedPage: customersPage, expectedQuery: customersQuery }).length === 0) {
             customersState = RuntimeModels.Error
             customersError = "Runtime is unavailable"
         }
@@ -257,7 +351,8 @@ QtObject {
     function loadCustomer(id) {
         customerDetailState = RuntimeModels.Loading
         customerDetailError = ""
-        if (network("customerDetail", "GET", "/api/customers/" + encodeURIComponent(id), null).length === 0) {
+        if (network("customerDetail", "GET", "/api/customers/" + encodeURIComponent(id), null,
+                    "customerDetail", { expectedId: id }).length === 0) {
             customerDetailState = RuntimeModels.Error
             customerDetailError = "Runtime is unavailable"
         }
@@ -266,23 +361,45 @@ QtObject {
     function openFile() {
         fileState = RuntimeModels.Loading
         fileMessage = "Opening file"
-        if (begin("file", "file", "open", {}).length === 0) {
+        if (laneBusy("file")) return false
+        if (begin("file", "file", "open", {}, "file", { expectedKind: "open" }).length === 0) {
             fileState = RuntimeModels.Error
             fileMessage = "Runtime is unavailable"
         }
     }
 
     function loadSettings() {
+        if (laneBusy("settings")) return false
+        settingsLoading = true
+        settingsError = ""
         settingsMessage = "Loading settings"
-        if (begin("settingsLoad", "storage", "get", { key: "theme" }).length === 0)
+        if (begin("settingsLoad", "storage", "get", { key: "theme" }, "settings",
+                  { expectedVersion: requestGeneration + 1 }).length === 0) {
+            settingsLoading = false
+            settingsError = "Settings unavailable"
             settingsMessage = "Settings unavailable"
+            return false
+        }
+        return true
     }
 
     function persistTheme(name) {
         themeName = name === "dark" ? "dark" : "light"
+        settingsLoading = false
+        settingsSaving = true
+        settingsDirty = true
+        settingsPersisted = false
+        settingsError = ""
         settingsMessage = "Saving settings"
-        if (begin("settingsSave", "storage", "set", { key: "theme", value: themeName }).length === 0)
+        if (begin("settingsSave", "storage", "set", { key: "theme", value: themeName },
+                  "settings", { expectedValue: themeName,
+                                expectedVersion: requestGeneration + 1 }).length === 0) {
+            settingsSaving = false
+            settingsError = "Settings unavailable"
             settingsMessage = "Settings unavailable"
+            return false
+        }
+        return true
     }
 
     function complete(requestId, response) {
@@ -292,6 +409,10 @@ QtObject {
         const next = Object.assign({}, pending)
         delete next[requestId]
         pending = next
+        const active = Object.assign({}, activeRequestByLane)
+        if (active[context.lane] === requestId)
+            delete active[context.lane]
+        activeRequestByLane = active
         if (latestGeneration[context.lane] !== context.generation)
             return
         const kind = context.kind
@@ -300,12 +421,15 @@ QtObject {
         const httpError = body && body.error && body.error.message ? body.error.message
                                                                      : "Request failed"
         if (kind === "login") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
-                authenticated = true; user = body.user || ({}); serverError = ""
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && isPlainObject(body) && isText(body.token, 4096)
+                    && isPlainObject(body.user) && isText(body.user.name, 256)) {
+                authenticated = true; user = body.user; serverError = ""
             } else serverError = response && response.ok === true ? httpError
                                                                    : safeError(response, "Sign in failed")
         } else if (kind === "dashboard") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validDashboard(body)) {
                 const dashboardValue = Object.assign({}, body)
                 dashboardValue.recentActivity = displayRows(body.recentActivity || [], "text")
                 dashboardValue.revenueByMonth = (body.revenueByMonth || []).map(function(item) {
@@ -327,7 +451,8 @@ QtObject {
                                                                         : safeError(response, "Dashboard failed")
                      dashboardState = RuntimeModels.Error }
         } else if (kind === "orders") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validPage(body, context, "customerName")) {
                 orders = displayRows(body.items || [], "customerName"); ordersPage = body.page || 1
                 ordersTotalPages = body.totalPages || 1
                 ordersState = orders.length === 0 ? RuntimeModels.Empty : RuntimeModels.Content
@@ -335,20 +460,24 @@ QtObject {
                                                                      : safeError(response, "Orders failed")
                      ordersState = RuntimeModels.Error }
         } else if (kind === "orderDetail") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validOrder(body, context.expectedId)) {
                 order = body; orderDetailState = RuntimeModels.Content
             } else { orderDetailError = response && response.ok === true ? httpError
                                                                           : safeError(response, "Order failed")
                      orderDetailState = RuntimeModels.Error }
         } else if (kind === "orderStatus") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validOrder(body, context.expectedId)
+                    && body.status === context.expectedStatus) {
                 order = body; orderStatusMutationState = RuntimeModels.MutationSuccess
                 orderStatusError = ""; orderDetailMessage = "Order status updated"
             } else { orderStatusError = response && response.ok === true ? httpError
                                                                            : safeError(response, "Update failed")
                      orderStatusMutationState = RuntimeModels.MutationFailure }
         } else if (kind === "orderEditLoad") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validOrder(body, context.expectedId)) {
                 order = body
                 editStatus = typeof body.status === "string" ? body.status : ""
                 editPriority = typeof body.priority === "string" ? body.priority : ""
@@ -361,7 +490,8 @@ QtObject {
                                                                             : safeError(response, "Order failed")
                      orderEditState = RuntimeModels.Error }
         } else if (kind === "orderEditSave") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validOrder(body, context.expectedId)) {
                 order = body; orderEditMutationState = RuntimeModels.MutationSuccess
                 orderEditServerError = ""
                 orderEditMessage = "Order saved"; orderSaved(String(body.id || ""))
@@ -369,7 +499,8 @@ QtObject {
                                                                               : safeError(response, "Update failed")
                      orderEditMutationState = RuntimeModels.MutationFailure }
         } else if (kind === "customers") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && validPage(body, context, "name")) {
                 customers = displayRows(body.items || [], "name")
                 customersPage = body.page || 1
                 customersTotalPages = body.totalPages || 1
@@ -378,7 +509,11 @@ QtObject {
                                                                         : safeError(response, "Customers failed")
                      customersState = RuntimeModels.Error }
         } else if (kind === "customerDetail") {
-            if (response && response.ok === true && status >= 200 && status < 300 && body) {
+            if (response && response.ok === true && status >= 200 && status < 300
+                    && isPlainObject(body) && body.id === context.expectedId
+                    && isText(body.id, 128) && isText(body.name, 500)
+                    && (body.email === undefined || typeof body.email === "string")
+                    && validRows(body.orders || [], "")) {
                 const detail = Object.assign({}, body)
                 detail.orders = displayRows(body.orders || [], "customerName")
                 customer = detail; customerDetailState = RuntimeModels.Content
@@ -386,7 +521,9 @@ QtObject {
                                                                              : safeError(response, "Customer failed")
                      customerDetailState = RuntimeModels.Error }
         } else if (kind === "file") {
-            if (response && response.ok === true && response.result) {
+            if (response && response.ok === true && isPlainObject(response.result)
+                    && isText(response.result.name, 500)
+                    && isInteger(response.result.size, 0, Number.MAX_SAFE_INTEGER)) {
                 fileMetadata = { name: response.result.name, size: response.result.size }
                 fileMessage = response.result.name + " (" + response.result.size + " bytes)"
                 fileState = RuntimeModels.Content
@@ -395,15 +532,27 @@ QtObject {
                 fileState = RuntimeModels.Empty
             } else { fileMessage = safeError(response, "File open failed"); fileState = RuntimeModels.Error }
         } else if (kind === "settingsLoad") {
-            if (response && response.ok === true && response.result) {
-                themeName = response.result.value === "dark" ? "dark" : "light"
+            settingsLoading = false
+            if (response && response.ok === true && isPlainObject(response.result)
+                    && (response.result.value === "dark" || response.result.value === "light")) {
+                themeName = response.result.value
+                settingsPersisted = true; settingsDirty = false; settingsError = ""
                 settingsMessage = "Settings loaded"
             } else if (response && response.error && response.error.code === "storage.not_found") {
-                themeName = "light"; settingsMessage = "Using default settings"
-            } else settingsMessage = safeError(response, "Settings unavailable")
+                themeName = "light"; settingsPersisted = false; settingsDirty = false
+                settingsError = ""; settingsMessage = "Using default settings"
+            } else { settingsError = safeError(response, "Settings unavailable")
+                     settingsMessage = settingsError }
         } else if (kind === "settingsSave") {
-            settingsMessage = response && response.ok === true ? "Settings saved"
-                                                                : safeError(response, "Settings could not be saved")
+            settingsSaving = false
+            if (response && response.ok === true && isPlainObject(response.result)) {
+                settingsDirty = false; settingsPersisted = true; settingsError = ""
+                settingsMessage = "Settings saved"
+            } else {
+                settingsDirty = true; settingsPersisted = false
+                settingsError = safeError(response, "Settings could not be saved")
+                settingsMessage = settingsError
+            }
         }
     }
 

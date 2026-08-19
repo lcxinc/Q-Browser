@@ -98,7 +98,12 @@ TestCase {
         compare(page.model.orderEditLoadError, "Order missing")
         verify(!page.formVisible)
 
-        verify(page.refresh())
+        tryVerify(function() { return page.retryControl.visible })
+        compare(page.retryControl.Accessible.description, "Retry loading order for editing")
+        activate(window, page.retryControl)
+        keyClick(Qt.Key_Return)
+        compare(page.model.orderEditState, Models.RuntimeModels.Loading)
+        verify(!page.retryControl.enabled)
         runtime.finish(orderResponse({ id: "ORD-0001", status: "shipped",
             priority: "high", shippingAddress: "120 Market Street", notes: "Dock 3" }))
         tryCompare(page.model, "orderEditState", Models.RuntimeModels.Content)
@@ -176,7 +181,10 @@ TestCase {
         compare(page.model.orderDetailError, "Order missing")
         verify(!page.detailVisible)
         verify(!page.statusControl.enabled)
-        verify(page.refresh())
+        tryVerify(function() { return page.retryControl.visible })
+        compare(page.retryControl.Accessible.description, "Retry loading order details")
+        activate(window, page.retryControl)
+        keyClick(Qt.Key_Return)
         compare(page.model.orderDetailState, Models.RuntimeModels.Loading)
         runtime.finish(orderResponse({ id: "ORD-0001", status: "pending",
             customerName: "Acme", shippingAddress: "1 Pilot Way" }))

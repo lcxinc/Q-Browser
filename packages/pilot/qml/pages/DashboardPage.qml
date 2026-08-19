@@ -32,7 +32,7 @@ Item {
         RowLayout {
             Layout.fillWidth: true
             Text { Layout.fillWidth: true; text: "Dashboard"; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.heading; font.weight: Typography.boldWeight }
-            AppButton { text: "Refresh"; onClicked: root.refresh() }
+            AppButton { text: "Refresh"; enabled: !dataModel.laneBusy("dashboard"); onClicked: root.refresh() }
         }
         StateView {
             Layout.fillWidth: true; Layout.fillHeight: true

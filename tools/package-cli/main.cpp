@@ -4,6 +4,7 @@
 #endif
 #include "ContentDigest.h"
 #include "Manifest.h"
+#include "QmlSourcePolicy.h"
 #include "SignatureVerifier.h"
 
 #include <QCommandLineOption>
@@ -492,6 +493,12 @@ int pack(const QString &source, const QString &output)
         return commandError(QStringLiteral("snapshot_failed"));
     }
     QVector<ArchiveFile> files = snapshot.files();
+    for (const ArchiveFile &file : std::as_const(files)) {
+        if ((file.path.endsWith(".qml") || file.path.endsWith(".js"))
+            && !QmlSourcePolicy::violations(file.contents).isEmpty()) {
+            return commandError(QStringLiteral("source_policy_failed"));
+        }
+    }
     removeFile(files, QByteArrayLiteral("metadata/content.sha256"));
     removeFile(files, QByteArrayLiteral("metadata/signature.ed25519"));
     const ArchiveFile *manifestFile = findFile(files, QByteArrayLiteral("manifest.json"));

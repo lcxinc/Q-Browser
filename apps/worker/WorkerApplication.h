@@ -29,6 +29,7 @@ private slots:
                                const QString &capability,
                                const QString &operation,
                                const QJsonObject &payload);
+    void sendNavigationRequest(const QString &requestId, const QString &route);
 
 private:
     enum class State {

@@ -9,7 +9,6 @@
   },
   "imports": [
     "QtQuick",
-    "QtQuick.Controls",
     "QtQuick.Layouts",
     "Company.Design"
   ],
@@ -20,7 +19,6 @@
     },
     "storage": "app-private",
     "clipboardWrite": false,
-    "clipboardRead": "user-gesture",
     "fileOpen": "user-brokered",
     "process": false
   },

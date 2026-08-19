@@ -50,11 +50,9 @@ Item {
         const normalizedTarget = String(target).split("?")[0].split("#")[0]
         if (normalizedTarget === normalizedRoute)
             return false
-        if (runtime && typeof runtime.loadRoute === "function")
-            runtime.loadRoute(target)
-        else
-            route = target
-        return true
+        if (!runtime || typeof runtime.navigate !== "function")
+            return false
+        return runtime.navigate(target) !== ""
     }
 
     function pageKey(path) {

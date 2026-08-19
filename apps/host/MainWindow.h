@@ -31,6 +31,8 @@ public:
                QWidget *parent = nullptr);
 
     [[nodiscard]] bool navigate(QStringView input);
+    [[nodiscard]] bool navigateFromWorker(const QString &packageId,
+                                          const QString &route);
     [[nodiscard]] bool goBack();
     [[nodiscard]] bool goForward();
 
@@ -71,4 +73,5 @@ private:
     QString currentAppUrl_;
     HostSurfaceKind activeSurface_ = HostSurfaceKind::TrustedError;
     bool navigationInProgress_ = false;
+    QString activeWorkerPackageId_;
 };

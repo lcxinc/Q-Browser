@@ -65,6 +65,13 @@ void ProtocolMessageTest::parsesValidMessages_data()
                        {QStringLiteral("payload"),
                         QJsonObject{{QStringLiteral("route"), QStringLiteral("/orders/42")}}}}
         << ProtocolType::RouteLoad;
+    QTest::newRow("navigation-request")
+        << QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                       {QStringLiteral("type"), QStringLiteral("navigationRequest")},
+                       {QStringLiteral("requestId"), QStringLiteral("navigate-1")},
+                       {QStringLiteral("payload"),
+                        QJsonObject{{QStringLiteral("route"), QStringLiteral("/orders/42")}}}}
+        << ProtocolType::NavigationRequest;
     QTest::newRow("structured-log")
         << QJsonObject{{QStringLiteral("protocolVersion"), 1},
                        {QStringLiteral("type"), QStringLiteral("structuredLog")},
@@ -207,6 +214,8 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
     const ProtocolMessage surfaceReady = *ProtocolMessage::surfaceReady(QStringLiteral("123456"));
     const ProtocolMessage routeLoad = *ProtocolMessage::routeLoad(QStringLiteral("route-1"),
                                                                   QStringLiteral("/orders"));
+    const ProtocolMessage navigationRequest = *ProtocolMessage::navigationRequest(
+        QStringLiteral("navigate-1"), QStringLiteral("/orders/42"));
     const ProtocolMessage structuredLog = *ProtocolMessage::structuredLog(
         QStringLiteral("info"), QStringLiteral("worker"), QStringLiteral("ready"));
     const ProtocolMessage shutdown = *ProtocolMessage::shutdown(QStringLiteral("host.request"));
@@ -217,6 +226,7 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
                                 heartbeat,
                                 surfaceReady,
                                 routeLoad,
+                                navigationRequest,
                                 structuredLog,
                                 shutdown}) {
         const auto reparsed = ProtocolMessage::parse(message.toJson());
@@ -244,6 +254,12 @@ void ProtocolMessageTest::factoriesRejectInvalidArguments()
                  .has_value());
     QVERIFY(!ProtocolMessage::shutdown(QString()).has_value());
     QVERIFY(!ProtocolMessage::routeLoad(QStringLiteral("req"), QStringLiteral("relative"))
+                 .has_value());
+    QVERIFY(!ProtocolMessage::navigationRequest(QStringLiteral("req"),
+                                                 QStringLiteral("https://evil.test"))
+                 .has_value());
+    QVERIFY(!ProtocolMessage::navigationRequest(QStringLiteral("req"),
+                                                 QStringLiteral("//other-app/orders"))
                  .has_value());
     QVERIFY(!ProtocolMessage::structuredLog(QStringLiteral("fatal"), QStringLiteral("qml"),
                                             QStringLiteral("message"))

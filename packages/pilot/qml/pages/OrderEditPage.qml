@@ -16,6 +16,7 @@ Item {
     readonly property alias notesControl: notes
     readonly property alias saveControl: saveButton
     readonly property alias mutationErrorControl: mutationError
+    readonly property alias retryControl: retryButton
     readonly property bool formVisible: dataModel.orderEditState === Models.RuntimeModels.Content
     readonly property bool mutationSaving: dataModel.orderEditMutationState
                                            === Models.RuntimeModels.MutationSaving
@@ -73,6 +74,8 @@ Item {
                 }
             }
         }
+        Text { Layout.fillWidth: true; visible: dataModel.orderEditState === Models.RuntimeModels.Error; text: dataModel.orderEditLoadError; color: Theme.error; font.family: Typography.family; font.pixelSize: Typography.body; wrapMode: Text.Wrap; Accessible.name: text; Accessible.role: Accessible.AlertMessage }
+        AppButton { id: retryButton; visible: dataModel.orderEditState === Models.RuntimeModels.Error; enabled: !dataModel.laneBusy("orderEditFlow"); text: "Retry"; accessibleDescription: "Retry loading order for editing"; onClicked: root.refresh() }
         AppToast { id: savedToast; Layout.alignment: Qt.AlignHCenter; accessibleName: dataModel.orderEditMessage }
     }
 }

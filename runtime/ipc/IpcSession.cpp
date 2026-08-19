@@ -14,6 +14,7 @@ bool outgoingTypeAllowed(const IpcRole role, const ProtocolType type)
     }
     return type == ProtocolType::Handshake || type == ProtocolType::SurfaceReady
         || type == ProtocolType::Ready || type == ProtocolType::Request
+        || type == ProtocolType::NavigationRequest
         || type == ProtocolType::Response || type == ProtocolType::Heartbeat
         || type == ProtocolType::StructuredLog || type == ProtocolType::Shutdown;
 }
@@ -57,7 +58,8 @@ bool IpcSession::sendInternal(const ProtocolMessage &message,
     }
     if (!allowTrackedMessage
         && (message.type() == ProtocolType::Request
-            || message.type() == ProtocolType::RouteLoad)) {
+            || message.type() == ProtocolType::RouteLoad
+            || message.type() == ProtocolType::NavigationRequest)) {
         lastErrorCode_ = QStringLiteral("ipc.session.tracking_required");
         return false;
     }
@@ -110,6 +112,15 @@ bool IpcSession::sendRouteLoad(const QString &requestId,
                                const int timeoutMs)
 {
     return sendTracked(requestId, ProtocolMessage::routeLoad(requestId, route), timeoutMs);
+}
+
+bool IpcSession::sendNavigationRequest(const QString &requestId,
+                                       const QString &route,
+                                       const int timeoutMs)
+{
+    return sendTracked(requestId,
+                       ProtocolMessage::navigationRequest(requestId, route),
+                       timeoutMs);
 }
 
 SessionReceiveResult IpcSession::receive(const int timeoutMs)
@@ -289,7 +300,8 @@ SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
                     QStringLiteral("ipc.session.unexpected_message_direction"));
     }
 
-    if (message.type() == ProtocolType::Request || message.type() == ProtocolType::RouteLoad) {
+    if (message.type() == ProtocolType::Request || message.type() == ProtocolType::RouteLoad
+        || message.type() == ProtocolType::NavigationRequest) {
         if (receivedRequestIds_.contains(message.requestId())) {
             return fail(SessionStatus::Failed,
                         QStringLiteral("ipc.session.duplicate_request_id"));

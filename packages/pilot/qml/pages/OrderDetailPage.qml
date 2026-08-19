@@ -10,6 +10,7 @@ Item {
     readonly property alias model: dataModel
     readonly property alias statusControl: statusNavigation
     readonly property alias mutationErrorControl: mutationError
+    readonly property alias retryControl: retryButton
     readonly property bool detailVisible: dataModel.orderDetailState === Models.RuntimeModels.Content
     readonly property bool mutationSaving: dataModel.orderStatusMutationState
                                            === Models.RuntimeModels.MutationSaving
@@ -29,6 +30,8 @@ Item {
             Layout.fillWidth: true; Layout.fillHeight: true; viewState: dataModel.orderDetailState; errorMessage: dataModel.orderDetailError; emptyMessage: "Load order details"
             AppCard { anchors.fill: parent; accessibleName: "Order details"; ColumnLayout { anchors.fill: parent; spacing: Spacing.sm; Text { text: dataModel.order.customerName || ""; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.headingSmall } AppStatusBadge { text: dataModel.order.status || "unknown"; status: dataModel.order.status === "delivered" ? "success" : "neutral" } Text { text: dataModel.order.shippingAddress || ""; color: Theme.textSecondary; font.family: Typography.family; font.pixelSize: Typography.body; wrapMode: Text.Wrap } } }
         }
+        Text { Layout.fillWidth: true; visible: dataModel.orderDetailState === Models.RuntimeModels.Error; text: dataModel.orderDetailError; color: Theme.error; font.family: Typography.family; font.pixelSize: Typography.body; wrapMode: Text.Wrap; Accessible.name: text; Accessible.role: Accessible.AlertMessage }
+        AppButton { id: retryButton; visible: dataModel.orderDetailState === Models.RuntimeModels.Error; enabled: !dataModel.laneBusy("orderDetailFlow"); text: "Retry"; accessibleDescription: "Retry loading order details"; onClicked: root.refresh() }
         AppNavigation {
             id: statusNavigation
             Layout.fillWidth: true; Layout.preferredHeight: Spacing.touchTarget
@@ -36,7 +39,7 @@ Item {
             model: ["pending", "processing", "shipped", "delivered", "cancelled"]
             currentIndex: model.indexOf(String(dataModel.order.status || ""))
             enabled: dataModel.orderDetailState === Models.RuntimeModels.Content
-                     && !root.mutationSaving
+                     && !root.mutationSaving && !dataModel.laneBusy("orderDetailFlow")
             accessibleName: "Change order status"
             accessibleDescription: dataModel.orderStatusError.length > 0
                                    ? dataModel.orderStatusError : "Select the new order status"

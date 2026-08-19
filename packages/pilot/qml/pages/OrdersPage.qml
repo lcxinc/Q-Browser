@@ -29,8 +29,8 @@ Item {
         Text { text: "Orders"; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.heading; font.weight: Typography.boldWeight }
         RowLayout {
             Layout.fillWidth: true; spacing: Spacing.sm
-            AppTextField { id: query; Layout.fillWidth: true; label: "Search"; accessibleName: "Search orders"; placeholderText: "Order or customer"; onAccepted: root.search(text, root.selectedStatus, 1) }
-            AppButton { text: "Search"; onClicked: root.search(query.text, root.selectedStatus, 1) }
+            AppTextField { id: query; Layout.fillWidth: true; enabled: !dataModel.laneBusy("orders"); label: "Search"; accessibleName: "Search orders"; placeholderText: "Order or customer"; onAccepted: if (!dataModel.laneBusy("orders")) root.search(text, root.selectedStatus, 1) }
+            AppButton { text: "Search"; enabled: !dataModel.laneBusy("orders"); onClicked: root.search(query.text, root.selectedStatus, 1) }
         }
         AppNavigation {
             id: statusNavigation
@@ -38,6 +38,7 @@ Item {
             orientation: Qt.Horizontal
             model: ["all", "pending", "processing", "shipped", "delivered", "cancelled"]
             currentIndex: 0
+            enabled: !dataModel.laneBusy("orders")
             accessibleName: "Order status filter"
             onActivated: (index, value) => {
                 root.selectedStatus = String(value)
@@ -51,10 +52,10 @@ Item {
         }
         RowLayout {
             Layout.fillWidth: true
-            AppButton { text: "Previous"; enabled: dataModel.ordersPage > 1; onClicked: root.search(dataModel.ordersQuery, dataModel.ordersStatus, dataModel.ordersPage - 1) }
+            AppButton { text: "Previous"; enabled: !dataModel.laneBusy("orders") && dataModel.ordersPage > 1; onClicked: root.search(dataModel.ordersQuery, dataModel.ordersStatus, dataModel.ordersPage - 1) }
             Text { Layout.fillWidth: true; text: "Page " + dataModel.ordersPage + " of " + dataModel.ordersTotalPages; color: Theme.textSecondary; font.family: Typography.family; font.pixelSize: Typography.body; horizontalAlignment: Text.AlignHCenter; Accessible.name: text; Accessible.role: Accessible.StaticText }
             AppButton { text: "Open selected"; enabled: orderTable.currentIndex >= 0; onClicked: root.openSelectedOrder(orderTable.currentIndex) }
-            AppButton { text: "Next"; enabled: dataModel.ordersPage < dataModel.ordersTotalPages; onClicked: root.search(dataModel.ordersQuery, dataModel.ordersStatus, dataModel.ordersPage + 1) }
+            AppButton { text: "Next"; enabled: !dataModel.laneBusy("orders") && dataModel.ordersPage < dataModel.ordersTotalPages; onClicked: root.search(dataModel.ordersQuery, dataModel.ordersStatus, dataModel.ordersPage + 1) }
         }
     }
 }

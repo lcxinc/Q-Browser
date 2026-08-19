@@ -21,6 +21,8 @@ QString typeName(const ProtocolType type)
         return QStringLiteral("surfaceReady");
     case ProtocolType::RouteLoad:
         return QStringLiteral("routeLoad");
+    case ProtocolType::NavigationRequest:
+        return QStringLiteral("navigationRequest");
     case ProtocolType::Ready:
         return QStringLiteral("ready");
     case ProtocolType::Request:
@@ -43,6 +45,7 @@ std::optional<ProtocolType> parseType(const QString &name)
                                     ProtocolType::HandshakeAck,
                                     ProtocolType::SurfaceReady,
                                     ProtocolType::RouteLoad,
+                                    ProtocolType::NavigationRequest,
                                     ProtocolType::Ready,
                                     ProtocolType::Request,
                                     ProtocolType::Response,
@@ -120,12 +123,15 @@ bool validPayload(const ProtocolType type, const QJsonObject &payload)
     case ProtocolType::Ready:
     case ProtocolType::Heartbeat:
         return payload.isEmpty();
-    case ProtocolType::RouteLoad: {
+    case ProtocolType::RouteLoad:
+    case ProtocolType::NavigationRequest: {
         if (!hasExactKeys(payload, {QStringLiteral("route")})) {
             return false;
         }
         const QJsonValue route = payload.value(QStringLiteral("route"));
-        return validText(route, 2048) && route.toString().startsWith(u'/');
+        const QString value = route.toString();
+        return validText(route, 2048) && value.startsWith(u'/')
+               && !value.startsWith(QStringLiteral("//")) && !value.contains(u'#');
     }
     case ProtocolType::Request:
         return hasExactKeys(payload,
@@ -211,7 +217,8 @@ ProtocolParseResult ProtocolMessage::parse(const QJsonObject &object)
     }
 
     const bool needsRequestId = *type == ProtocolType::Request
-        || *type == ProtocolType::Response || *type == ProtocolType::RouteLoad;
+        || *type == ProtocolType::Response || *type == ProtocolType::RouteLoad
+        || *type == ProtocolType::NavigationRequest;
     if (needsRequestId && !object.contains(QStringLiteral("requestId"))) {
         return error(ProtocolError::InvalidRequestId,
                      QStringLiteral("ipc.protocol.invalid_request_id"));
@@ -281,6 +288,14 @@ std::optional<ProtocolMessage> ProtocolMessage::routeLoad(const QString &request
                                                           const QString &route)
 {
     return validated(ProtocolType::RouteLoad,
+                     requestId,
+                     QJsonObject{{QStringLiteral("route"), route}});
+}
+
+std::optional<ProtocolMessage> ProtocolMessage::navigationRequest(const QString &requestId,
+                                                                  const QString &route)
+{
+    return validated(ProtocolType::NavigationRequest,
                      requestId,
                      QJsonObject{{QStringLiteral("route"), route}});
 }

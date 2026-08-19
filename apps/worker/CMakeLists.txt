@@ -17,6 +17,7 @@ target_include_directories(q_browser_worker_app
 target_link_libraries(q_browser_worker_app
   PUBLIC
     q_browser_ipc
+    q_browser_router
     Qt6::Core
     Qt6::Gui
     Qt6::Network

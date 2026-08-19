@@ -10,6 +10,7 @@ enum class ProtocolType {
     HandshakeAck,
     SurfaceReady,
     RouteLoad,
+    NavigationRequest,
     Ready,
     Request,
     Response,
@@ -42,6 +43,8 @@ public:
     static std::optional<ProtocolMessage> surfaceReady(const QString &windowHandle);
     static std::optional<ProtocolMessage> routeLoad(const QString &requestId,
                                                     const QString &route);
+    static std::optional<ProtocolMessage> navigationRequest(const QString &requestId,
+                                                            const QString &route);
     static ProtocolMessage ready();
     static std::optional<ProtocolMessage> request(const QString &requestId,
                                                  const QString &capability,

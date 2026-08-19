@@ -43,6 +43,8 @@ WorkerApplication::WorkerApplication(QObject *parent)
     connect(&heartbeatTimer_, &QTimer::timeout, this, &WorkerApplication::sendHeartbeat);
     connect(&runtimeFacade_, &RuntimeFacade::capabilityRequested,
             this, &WorkerApplication::sendCapabilityRequest);
+    connect(&runtimeFacade_, &RuntimeFacade::navigationRequested,
+            this, &WorkerApplication::sendNavigationRequest);
 }
 
 WorkerApplication::~WorkerApplication() = default;
@@ -233,6 +235,15 @@ void WorkerApplication::sendCapabilityRequest(const QString &requestId,
     }
     if (state_ != State::Ready
         || !session_->sendRequest(requestId, capability, operation, payload, 5000)) {
+        failClosed();
+    }
+}
+
+void WorkerApplication::sendNavigationRequest(const QString &requestId,
+                                              const QString &route)
+{
+    if (session_ == nullptr || state_ != State::Ready
+        || !session_->sendNavigationRequest(requestId, route, 5000)) {
         failClosed();
     }
 }

@@ -27,6 +27,8 @@ add_library(q_browser_package STATIC
   PackageInstallerTestHooks.h
   PosixStableIo.cpp
   PosixStableIo.h
+  QmlSourcePolicy.cpp
+  QmlSourcePolicy.h
   SignatureVerifier.cpp
   SignatureVerifier.h
   SignatureTestHooks.cpp

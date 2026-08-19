@@ -32,6 +32,7 @@ class WorkerHandshakeTest final : public QObject
 private slots:
     void directLaunchWithoutInheritedHandlesFailsClosed();
     void sandboxedWorkerCompletesLifecycle();
+    void sandboxedWorkerNavigationIsTrackedAndRouteLoadedByHost();
     void heartbeatInterleavingIsDispatched();
     void receiveUntilMissingTargetHonorsAbsoluteDeadline();
     void receiveUntilBoundsOverBudgetHeartbeatFlood();
@@ -83,6 +84,49 @@ void WorkerHandshakeTest::sandboxedWorkerCompletesLifecycle()
     QCOMPARE(shutdown.message->type(), ProtocolType::Shutdown);
     QVERIFY(launch->process.waitForFinished(5000));
     QCOMPARE(launch->process.exitCode(), DWORD(0));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void WorkerHandshakeTest::sandboxedWorkerNavigationIsTrackedAndRouteLoadedByHost()
+{
+    const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
+Rectangle {
+    width: 320; height: 200
+    Timer {
+        interval: 200; running: true; repeat: false
+        onTriggered: Runtime.navigate("/orders")
+    }
+})QML");
+    WorkerTestEnvironment environment(qml);
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto launch = environment.launch(QStringLiteral("navigation-nonce"),
+                                     QStringLiteral("navigation-nonce"), 100);
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::SurfaceReady).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    const SessionReceiveResult request = receiveUntil(
+        launch->hostSession, ProtocolType::NavigationRequest, 5000);
+    QCOMPARE(request.status, SessionStatus::MessageReady);
+    QCOMPARE(request.message->payload().value(QStringLiteral("route")).toString(),
+             QStringLiteral("/orders"));
+    QVERIFY(launch->hostSession.send(*ProtocolMessage::successResponse(
+        request.message->requestId(), QJsonObject{}), 5000));
+    QVERIFY(launch->hostSession.sendRouteLoad(QStringLiteral("route-navigation"),
+                                              QStringLiteral("/orders"), 5000));
+    const SessionReceiveResult routeAck = receiveUntil(
+        launch->hostSession, ProtocolType::Response, 5000);
+    QCOMPARE(routeAck.status, SessionStatus::MessageReady);
+    QCOMPARE(routeAck.message->requestId(), QStringLiteral("route-navigation"));
+    QVERIFY(launch->hostSession.send(*ProtocolMessage::shutdown(
+        QStringLiteral("navigation.complete")), 5000));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }

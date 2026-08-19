@@ -29,10 +29,10 @@ Item {
             anchors.fill: parent
             spacing: Spacing.md
             Text { text: "Pilot Console"; color: Theme.textPrimary; font.family: Typography.family; font.pixelSize: Typography.heading; font.weight: Typography.boldWeight }
-            AppTextField { id: email; Layout.fillWidth: true; label: "Email"; accessibleName: "Email"; required: true; externalError: dataModel.emailError; inputMethodHints: Qt.ImhEmailCharactersOnly; onAccepted: password.inputControl.forceActiveFocus(Qt.TabFocusReason) }
-            AppTextField { id: password; Layout.fillWidth: true; label: "Password"; accessibleName: "Password"; required: true; externalError: dataModel.passwordError; echoMode: TextInput.Password; onAccepted: root.submitCredentials(email.text, password.text) }
+            AppTextField { id: email; Layout.fillWidth: true; enabled: !dataModel.laneBusy("login"); label: "Email"; accessibleName: "Email"; required: true; externalError: dataModel.emailError; inputMethodHints: Qt.ImhEmailCharactersOnly; onAccepted: password.inputControl.forceActiveFocus(Qt.TabFocusReason) }
+            AppTextField { id: password; Layout.fillWidth: true; enabled: !dataModel.laneBusy("login"); label: "Password"; accessibleName: "Password"; required: true; externalError: dataModel.passwordError; echoMode: TextInput.Password; onAccepted: if (!dataModel.laneBusy("login")) root.submitCredentials(email.text, password.text) }
             Text { Layout.fillWidth: true; visible: dataModel.serverError.length > 0; text: dataModel.serverError; color: Theme.error; font.family: Typography.family; font.pixelSize: Typography.body; wrapMode: Text.Wrap; Accessible.name: text; Accessible.role: Accessible.AlertMessage }
-            AppButton { Layout.fillWidth: true; text: "Sign in"; accessibleDescription: "Submit credentials"; onClicked: root.submitCredentials(email.text, password.text) }
+            AppButton { Layout.fillWidth: true; enabled: !dataModel.laneBusy("login"); text: dataModel.laneBusy("login") ? "Signing in" : "Sign in"; accessibleDescription: "Submit credentials"; onClicked: root.submitCredentials(email.text, password.text) }
         }
     }
 }

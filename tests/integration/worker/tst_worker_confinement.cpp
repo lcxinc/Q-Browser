@@ -52,6 +52,7 @@ class WorkerConfinementTest final : public QObject
     Q_OBJECT
 private slots:
     void pendingCapabilityQueueIsTypedBoundedAndFifo();
+    void runtimeFacadeNavigationIsValidByConstructionAndBounded();
     void rejectsEntryOutsideVerifiedPackage();
     void rejectsPollutedImportAndNativePlugin();
     void loadsApprovedBuiltInDesignModuleFromWorkerClosure();
@@ -59,6 +60,25 @@ private slots:
     void loadingFacadeCallsAndRawNetworkAreBrokeredOrDenied();
     void loadingQueueOverflowFailsClosedBeforeReady();
 };
+
+void WorkerConfinementTest::runtimeFacadeNavigationIsValidByConstructionAndBounded()
+{
+    RuntimeFacade facade;
+    QSignalSpy requested(&facade, &RuntimeFacade::navigationRequested);
+    QSignalSpy finished(&facade, &RuntimeFacade::navigationFinished);
+    QVERIFY(facade.navigate(QStringLiteral("https://evil.test/orders")).isEmpty());
+    QVERIFY(facade.navigate(QStringLiteral("//other-app/orders")).isEmpty());
+    QVERIFY(facade.navigate(QStringLiteral("/orders/../settings")).isEmpty());
+    const QString requestId = facade.navigate(QStringLiteral("/orders/ORD-0001"));
+    QVERIFY(!requestId.isEmpty());
+    QCOMPARE(requested.count(), 1);
+    QCOMPARE(requested.first().at(1).toString(), QStringLiteral("/orders/ORD-0001"));
+    QVERIFY(facade.navigate(QStringLiteral("/settings")).isEmpty());
+    facade.complete(requestId, QJsonObject{{QStringLiteral("ok"), true},
+                                            {QStringLiteral("result"), QJsonObject{}}});
+    QCOMPARE(finished.count(), 1);
+    QVERIFY(!facade.navigate(QStringLiteral("/settings")).isEmpty());
+}
 
 void WorkerConfinementTest::pendingCapabilityQueueIsTypedBoundedAndFifo()
 {

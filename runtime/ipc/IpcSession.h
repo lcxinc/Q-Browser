@@ -51,6 +51,9 @@ public:
                      const QJsonObject &payload,
                      int timeoutMs);
     bool sendRouteLoad(const QString &requestId, const QString &route, int timeoutMs);
+    bool sendNavigationRequest(const QString &requestId,
+                               const QString &route,
+                               int timeoutMs);
     SessionReceiveResult receive(int timeoutMs);
     SessionReceiveResult poll(int timeoutMs = 0);
 

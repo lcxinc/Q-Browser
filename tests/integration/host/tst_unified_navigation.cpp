@@ -73,19 +73,25 @@ private:
     QList<QByteArray> requests_;
 };
 
-RouteRegistry routes(const QUrl &helpUrl)
+RouteRegistry routes(const QUrl &helpUrl,
+                     const QString &workerPackageId = QStringLiteral("com.qbrowser.pilot"))
 {
     RouteRegistry registry;
     const RouteRecord workerRoute{QStringLiteral("/web-shaped-worker/:id"),
                                   Engine::QmlWorker,
-                                  QStringLiteral("com.qbrowser.pilot"),
+                                  workerPackageId,
                                   QStringLiteral("qml/Main.qml")};
     const RouteRecord webRoute{QStringLiteral("/worker-shaped-web"),
                                Engine::WebEngine,
                                QStringLiteral("com.qbrowser.web"),
                                helpUrl.toString(QUrl::FullyEncoded)};
+    const RouteRecord workerListRoute{QStringLiteral("/orders"),
+                                      Engine::QmlWorker,
+                                      workerPackageId,
+                                      QStringLiteral("qml/Main.qml")};
     if (registry.add(workerRoute) != RouteAddResult::Added
-        || registry.add(webRoute) != RouteAddResult::Added) {
+        || registry.add(webRoute) != RouteAddResult::Added
+        || registry.add(workerListRoute) != RouteAddResult::Added) {
         return {};
     }
     return registry;
@@ -116,6 +122,7 @@ class UnifiedNavigationTest final : public QObject
 
 private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
+    void workerNavigationIsSameAppAndHistoryAware();
     void navigationTransactionsRejectReentrantCommands();
 };
 
@@ -254,6 +261,74 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QCOMPARE(window.currentAppUrl(), missingAppUrl);
     QCOMPARE(address->text(), missingAppUrl);
     QVERIFY(currentUrlSpy.count() >= 6);
+
+    window.close();
+    launch->hostSession.close();
+    launch->process.terminate(ERROR_PROCESS_ABORTED);
+    QVERIFY(launch->process.waitForFinished(5000));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::workerNavigationIsSameAppAndHistoryAware()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
+Rectangle {
+    width: 320; height: 200
+    Timer { interval: 1000; running: true; onTriggered: Runtime.navigate("/orders") }
+})QML");
+    WorkerTestEnvironment workerEnvironment(qml);
+    QVERIFY2(workerEnvironment.isValid(), qPrintable(workerEnvironment.error()));
+    auto launch = workerEnvironment.launch(QStringLiteral("worker-request-nonce"),
+                                           QStringLiteral("worker-request-nonce"), 100);
+    QVERIFY2(launch.has_value(), qPrintable(workerEnvironment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceReady = receiveUntil(launch->hostSession, ProtocolType::SurfaceReady);
+    QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    WorkerSurface *workerSurface = WorkerSurface::create(
+        surfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        launch->process.nativeProcessHandle(), WorkerAttemptId{102});
+    QVERIFY(workerSurface != nullptr);
+    MainWindow window(routes(server.helpUrl(), workerEnvironment.appId()),
+                      server.origin(), workerSurface);
+    window.resize(900, 600);
+    window.show();
+    const QString initial = QStringLiteral("app://pilot/web-shaped-worker/42");
+    QVERIFY(window.navigate(initial));
+
+    const SessionReceiveResult navigation = receiveUntil(
+        launch->hostSession, ProtocolType::NavigationRequest, 5000);
+    QCOMPARE(navigation.status, SessionStatus::MessageReady);
+    const QString requestedRoute = navigation.message->payload()
+                                       .value(QStringLiteral("route")).toString();
+    QVERIFY(window.navigateFromWorker(launch->hostSession.appIdentity(), requestedRoute));
+    QVERIFY(launch->hostSession.send(*ProtocolMessage::successResponse(
+        navigation.message->requestId(), QJsonObject{}), 5000));
+    QVERIFY(launch->hostSession.sendRouteLoad(QStringLiteral("host-route-load"),
+                                              requestedRoute, 5000));
+    const SessionReceiveResult routeAck = receiveUntil(
+        launch->hostSession, ProtocolType::Response, 5000);
+    QCOMPARE(routeAck.status, SessionStatus::MessageReady);
+    QCOMPARE(routeAck.message->requestId(), QStringLiteral("host-route-load"));
+    QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
+    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyIndex(), 1);
+    QVERIFY(!window.navigateFromWorker(QStringLiteral("com.qbrowser.other"),
+                                       QStringLiteral("/orders")));
+    QVERIFY(!window.navigateFromWorker(workerEnvironment.appId(),
+                                       QStringLiteral("https://evil.test/orders")));
+    QVERIFY(!window.navigateFromWorker(workerEnvironment.appId(),
+                                       QStringLiteral("/worker-shaped-web")));
+    QCOMPARE(window.historyCount(), 2);
+    QVERIFY(window.goBack());
+    QCOMPARE(window.currentAppUrl(), initial);
+    QVERIFY(window.goForward());
+    QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
 
     window.close();
     launch->hostSession.close();

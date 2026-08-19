@@ -13,6 +13,9 @@ TestCase {
     Component {
         id: runtimeComponent
         QtObject {
+            readonly property string appIdentity: "com.qbrowser.pilot"
+            readonly property string apiOrigin: "http://127.0.0.1:4173"
+            readonly property string route: "/orders/ORD-0001"
             property int calls: 0
             property string lastRequestId: ""
             property string lastCapability: ""
@@ -26,7 +29,14 @@ TestCase {
                 lastOperation = operation; lastPayload = payload; return lastRequestId
             }
             function finish(response) { capabilityFinished(lastRequestId, response) }
-            function loadRoute(route) { ++routeCalls; lastRoute = route }
+            signal navigationFinished(string requestId, var response)
+            signal navigationRequested(string requestId, string route)
+            function navigate(route) {
+                ++routeCalls; lastRoute = route
+                const requestId = "navigation-" + routeCalls
+                navigationRequested(requestId, route)
+                return requestId
+            }
         }
     }
     Component { id: ordersComponent; Pages.OrdersPage { width: 800; height: 600 } }
@@ -45,7 +55,19 @@ TestCase {
         }
     }
     Component { id: customersComponent; Pages.CustomersPage { width: 800; height: 600 } }
-    Component { id: customerDetailComponent; Pages.CustomerDetailPage { width: 800; height: 600 } }
+    Component {
+        id: customerDetailWindowComponent
+        Window {
+            id: detailWindow
+            property var runtime: null
+            readonly property alias page: customerDetailPage
+            width: 800; height: 600; visible: true
+            Pages.CustomerDetailPage {
+                id: customerDetailPage
+                anchors.fill: parent; runtime: detailWindow.runtime; customerId: "CUS-001"
+            }
+        }
+    }
     Component { id: filesComponent; Pages.FilesPage { width: 800; height: 600 } }
     Component { id: routerComponent; Pilot.PilotRouter { width: 900; height: 600 } }
 
@@ -88,6 +110,7 @@ TestCase {
         verify(router.navigate("/customers"))
         compare(runtime.routeCalls, 1)
         compare(runtime.lastRoute, "/customers")
+        compare(router.route, "/orders/ORD-0001")
         router.route = "/orders"
         compare(router.navigationControl.currentIndex, 1)
 
@@ -138,6 +161,13 @@ TestCase {
         verify(runtime.lastPayload.url.indexOf("query=acme%20north") >= 0)
         verify(runtime.lastPayload.url.indexOf("status=pending") >= 0)
         verify(runtime.lastPayload.url.indexOf("page=1") >= 0)
+        compare(page.statusControl.enabled, false)
+        const callsWhileBusy = runtime.calls
+        keyClick(Qt.Key_Right)
+        compare(runtime.calls, callsWhileBusy)
+        runtime.finish({ ok: true, result: { status: 200,
+            bodyBase64: Base64.encode(JSON.stringify({ items: [], page: 1, totalPages: 1 })) } })
+        tryVerify(function() { return page.statusControl.enabled })
 
         window.requestActivate()
         tryVerify(function() { return window.active })
@@ -166,9 +196,21 @@ TestCase {
         verify(list.openSelectedCustomer(0))
         compare(navigationSpy.signalArguments[0][0], "/customers/CUS-001")
 
-        const detail = createTemporaryObject(customerDetailComponent, this,
-                                             { runtime: runtime, customerId: "CUS-001" })
+        const detailWindow = createTemporaryObject(customerDetailWindowComponent, this,
+                                                   { runtime: runtime })
+        verify(detailWindow)
+        const detail = detailWindow.page
         detail.refresh()
+        runtime.finish({ ok: true, result: { status: 503,
+            bodyBase64: Base64.encode(JSON.stringify({ error: { message: "Customer unavailable" } })) } })
+        tryCompare(detail.model, "customerDetailState", Models.RuntimeModels.Error)
+        tryVerify(function() { return detail.retryControl.visible })
+        detailWindow.requestActivate()
+        tryVerify(function() { return detailWindow.active })
+        detail.retryControl.forceActiveFocus(Qt.TabFocusReason)
+        tryVerify(function() { return detail.retryControl.activeFocus })
+        keyClick(Qt.Key_Return)
+        compare(detail.model.customerDetailState, Models.RuntimeModels.Loading)
         runtime.finish({ ok: true, result: { status: 200,
             bodyBase64: Base64.encode(JSON.stringify({ id: "CUS-001", name: "Acme",
                                                 orders: [{ id: "ORD-0001" }] })) } })

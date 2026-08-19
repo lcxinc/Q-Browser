@@ -2,6 +2,7 @@
 
 #include <QJsonObject>
 #include <QObject>
+#include <QSet>
 
 class RuntimeFacade final : public QObject
 {
@@ -23,6 +24,7 @@ public:
     Q_INVOKABLE QString invoke(const QString &capability,
                                const QString &operation,
                                const QJsonObject &payload = {});
+    Q_INVOKABLE QString navigate(const QString &route);
     void complete(const QString &requestId, const QJsonObject &response);
 
 signals:
@@ -34,9 +36,12 @@ signals:
                              const QString &operation,
                              const QJsonObject &payload);
     void capabilityFinished(const QString &requestId, const QJsonObject &response);
+    void navigationRequested(const QString &requestId, const QString &route);
+    void navigationFinished(const QString &requestId, const QJsonObject &response);
 
 private:
     QString appIdentity_;
     QString apiOrigin_;
     QString route_ = QStringLiteral("/");
+    QSet<QString> pendingNavigationRequests_;
 };

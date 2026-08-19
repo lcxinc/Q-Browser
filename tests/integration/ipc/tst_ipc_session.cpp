@@ -112,6 +112,7 @@ private slots:
     void rejectsWrongNonceAndMalformedPeer();
     void correlatesResponsesAndRejectsDuplicateRequestIds();
     void correlatesRouteLoadAcknowledgement();
+    void correlatesWorkerNavigationAndRejectsReplay();
     void rejectsUnknownProtocolAndDuplicateInboundRequests();
     void expiresPendingRequests();
     void reportsTimeoutPeerCloseAndHeartbeat();
@@ -393,6 +394,37 @@ void IpcSessionTest::correlatesRouteLoadAcknowledgement()
     QVERIFY(worker.send(*ProtocolMessage::successResponse(QStringLiteral("route-1"), {})));
     QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
     QCOMPARE(host.pendingRequestCount(), qsizetype(0));
+#endif
+}
+
+void IpcSessionTest::correlatesWorkerNavigationAndRejectsReplay()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    IpcSession host(pair.takeHost(), IpcRole::Host,
+                    HostLaunchContext{QStringLiteral("n"), QStringLiteral("com.qbrowser.pilot")});
+    IpcSession worker(WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+                      IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(QStringLiteral("n"))));
+    QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
+
+    QVERIFY(worker.sendNavigationRequest(QStringLiteral("navigate-1"),
+                                         QStringLiteral("/orders/42"), 1000));
+    QVERIFY(!worker.sendNavigationRequest(QStringLiteral("navigate-1"),
+                                          QStringLiteral("/orders/42"), 1000));
+    QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.duplicate_request_id"));
+    const SessionReceiveResult navigation = host.receive(1000);
+    QCOMPARE(navigation.status, SessionStatus::MessageReady);
+    QCOMPARE(navigation.message->type(), ProtocolType::NavigationRequest);
+    QCOMPARE(navigation.message->payload().value(QStringLiteral("route")).toString(),
+             QStringLiteral("/orders/42"));
+    QVERIFY(host.send(*ProtocolMessage::successResponse(QStringLiteral("navigate-1"),
+                                                        QJsonObject{})));
+    QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.pendingRequestCount(), qsizetype(0));
 #endif
 }
 

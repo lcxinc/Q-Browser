@@ -125,6 +125,26 @@ bool MainWindow::navigate(const QStringView input)
     return activated;
 }
 
+bool MainWindow::navigateFromWorker(const QString &packageId, const QString &route)
+{
+    if (activeSurface_ != HostSurfaceKind::Worker || packageId.isEmpty()
+        || packageId != activeWorkerPackageId_ || !route.startsWith(u'/')
+        || route.startsWith(QStringLiteral("//"))) {
+        return false;
+    }
+    const AppUrl parsed = AppUrl::parse(QStringLiteral("app://pilot") + route,
+                                        QStringLiteral("pilot"));
+    if (!parsed.isValid()) {
+        return false;
+    }
+    const RouteMatch match = routes_.match(parsed.path());
+    if (!match.isValid() || match.record.engine != Engine::QmlWorker
+        || match.record.packageId != packageId) {
+        return false;
+    }
+    return navigate(canonicalAppUrl(parsed));
+}
+
 bool MainWindow::goBack()
 {
     if (navigationInProgress_ || historyIndex_ <= 0) {
@@ -205,6 +225,7 @@ bool MainWindow::activate(const QString &canonicalUrl)
             webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Frozen);
         }
         activeSurface_ = HostSurfaceKind::Worker;
+        activeWorkerPackageId_ = match.record.packageId;
         emit workerRouteRequested(match.record.packageId,
                                   match.record.entryPoint,
                                   variantParameters(match.parameters),
@@ -213,6 +234,7 @@ bool MainWindow::activate(const QString &canonicalUrl)
     case Engine::WebEngine: {
         surfaceStack_->setCurrentWidget(webSurface_);
         activeSurface_ = HostSurfaceKind::Web;
+        activeWorkerPackageId_.clear();
         if (webSurface_->page() != nullptr) {
             webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Active);
         }
@@ -238,6 +260,7 @@ void MainWindow::showTrustedError(const QString &message)
     trustedErrorLabel_->setText(message);
     surfaceStack_->setCurrentWidget(trustedErrorSurface_);
     activeSurface_ = HostSurfaceKind::TrustedError;
+    activeWorkerPackageId_.clear();
     if (webSurface_->page() != nullptr) {
         webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Frozen);
     }
