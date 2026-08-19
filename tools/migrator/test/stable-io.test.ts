@@ -161,7 +161,7 @@ describe("migrator stable IO", () => {
     try {
       await mkdir(root, { recursive: true });
       await writeFile(input, "<!doctype html><link rel='stylesheet' href='site.css'><main>AAAAAAAA</main>", "utf8");
-      await writeFile(css, "main { color: #111111; }", "utf8");
+      await writeFile(css, ":root { --brand: #111111; }", "utf8");
       let htmlSharingViolation = false;
       setStableIoTestHooks({
         betweenInputSnapshots: async (opened: string) => {
@@ -184,7 +184,7 @@ describe("migrator stable IO", () => {
       setStableIoTestHooks({
         betweenInputSnapshots: async (opened: string) => {
           if (opened !== css) return;
-          try { await writeFile(css, "main { color: #222222; }", "utf8"); }
+          try { await writeFile(css, ":root { --brand: #222222; }", "utf8"); }
           catch (error) {
             cssSharingViolation = error instanceof Error && "code" in error
               && ["EPERM", "EACCES", "EBUSY"].includes(String(error.code));

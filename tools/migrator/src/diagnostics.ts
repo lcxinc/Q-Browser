@@ -1,4 +1,4 @@
-import type { Diagnostic, DiagnosticSeverity, SourceRange } from "./types.ts";
+import type { Diagnostic, DiagnosticSeverity, SourceRange } from "./types.js";
 
 export const MAX_DIAGNOSTICS = 500;
 export const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;

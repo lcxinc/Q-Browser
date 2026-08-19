@@ -4,14 +4,19 @@
   "private": true,
   "type": "module",
   "bin": {
-    "qbrowser-migrate": "src/cli.ts"
+    "qbrowser-migrate": "dist/cli.js"
   },
+  "files": ["dist", "stable-lock-helper.ps1"],
+  "engines": { "node": ">=24" },
   "scripts": {
-    "build": "tsc -b",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -b",
     "test": "vitest run",
-    "lint": "tsc -b --pretty false"
+    "lint": "tsc -p tsconfig.test.json --pretty false"
   },
   "dependencies": {
-    "entities": "8.0.0"
+    "css-tree": "3.2.1",
+    "entities": "8.0.0",
+    "parse5": "8.0.1"
   }
 }

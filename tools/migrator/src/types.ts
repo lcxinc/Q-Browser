@@ -43,27 +43,8 @@ export type MigrationNodeKind =
 export interface MigrationStyle {
   display?: "flex" | "grid";
   flexDirection?: "row" | "column";
-  justifyContent?: "start" | "center" | "end" | "space-between" | "space-around" | "space-evenly";
-  alignItems?: "start" | "center" | "end" | "stretch";
   gridTemplateColumns?: string;
   gap?: string;
-  margin?: string;
-  marginTop?: string;
-  marginRight?: string;
-  marginBottom?: string;
-  marginLeft?: string;
-  padding?: string;
-  paddingTop?: string;
-  paddingRight?: string;
-  paddingBottom?: string;
-  paddingLeft?: string;
-  fontFamily?: string;
-  fontSize?: string;
-  fontWeight?: string;
-  lineHeight?: string;
-  color?: string;
-  backgroundColor?: string;
-  textAlign?: "left" | "center" | "right";
 }
 
 export interface ControlValidation {

@@ -4,5 +4,60 @@
   "generatedFiles": [
     "Main.qml"
   ],
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: margin",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 1,
+          "column": 58,
+          "offset": 57
+        },
+        "end": {
+          "line": 1,
+          "column": 69,
+          "offset": 68
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: font-size",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 2,
+          "column": 9,
+          "offset": 80
+        },
+        "end": {
+          "line": 2,
+          "column": 24,
+          "offset": 95
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: line-height",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 2,
+          "column": 26,
+          "offset": 97
+        },
+        "end": {
+          "line": 2,
+          "column": 43,
+          "offset": 114
+        }
+      }
+    }
+  ]
 }

@@ -4,5 +4,60 @@
   "generatedFiles": [
     "Main.qml"
   ],
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "code": "UNSUPPORTED_LAYOUT",
+      "severity": "warning",
+      "message": "Unsupported CSS value for grid-template-columns: 1fr 2fr",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 1,
+          "column": 23,
+          "offset": 22
+        },
+        "end": {
+          "line": 1,
+          "column": 53,
+          "offset": 52
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: padding",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 1,
+          "column": 70,
+          "offset": 69
+        },
+        "end": {
+          "line": 1,
+          "column": 83,
+          "offset": 82
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: font-weight",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 2,
+          "column": 9,
+          "offset": 94
+        },
+        "end": {
+          "line": 2,
+          "column": 25,
+          "offset": 110
+        }
+      }
+    }
+  ]
 }

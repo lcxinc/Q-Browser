@@ -1,4 +1,4 @@
-import { MIGRATION_IR_VERSION, type Diagnostic, type MigrationIR, type MigrationNode, type MigrationNodeKind, type SourceRange } from "./types.ts";
+import { MIGRATION_IR_VERSION, type Diagnostic, type MigrationIR, type MigrationNode, type MigrationNodeKind, type SourceRange } from "./types.js";
 
 export class IrBuilder {
   readonly diagnostics: Diagnostic[] = [];

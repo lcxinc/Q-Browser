@@ -32,7 +32,7 @@ Item {
             }
             GridLayout {
                 Layout.fillWidth: true
-                columns: 2
+                columns: 1
                 rowSpacing: 8
                 columnSpacing: 16
                 AppTextField {

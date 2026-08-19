@@ -69,7 +69,7 @@ function insideBoundary(boundary: string, candidate: string): boolean {
 const LOCK_PROTOCOL_LIMIT = 4096;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
 const WINDOWS_POWERSHELL_NT = String.raw`\\?\GLOBALROOT\SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`;
-const LOCK_HELPER_SCRIPT = fileURLToPath(new URL("./stable-lock-helper.ps1", import.meta.url));
+const LOCK_HELPER_SCRIPT = fileURLToPath(new URL("../stable-lock-helper.ps1", import.meta.url));
 
 interface WindowsSystemPaths {
   powershell: string;

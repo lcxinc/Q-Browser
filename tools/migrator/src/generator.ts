@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { link, lstat, mkdir, open, rename, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
-import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.ts";
+import { isGeneratedStyleSupported, parseSupportedGap, parseSupportedGridColumns } from "./css.js";
+import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.js";
 import {
   acquireStableDirectoryLock,
   capturePathIdentity,
@@ -19,8 +20,8 @@ import {
   type PathIdentity,
   type StablePathLock,
   type StableParentSnapshot,
-} from "./stable-io.ts";
-import type { Diagnostic, MigrationIR, MigrationNode } from "./types.ts";
+} from "./stable-io.js";
+import type { Diagnostic, MigrationIR, MigrationNode } from "./types.js";
 
 export const GENERATOR_LIMITS = Object.freeze({ files: 64, outputBytes: 5_242_880, stringLength: 65_536 });
 
@@ -34,6 +35,13 @@ export interface GenerationReport {
 export interface GeneratedProject {
   files: Record<string, string>;
   report: GenerationReport;
+}
+
+/** Generation publication relies on Windows delete-denial directory handles. */
+export function assertGenerationPlatform(platform: string = process.platform): void {
+  if (platform !== "win32") {
+    throw new Error("PLATFORM_UNSUPPORTED: generate transactions require Windows");
+  }
 }
 
 export function assertDisjointGenerationPaths(outputPath: string, reportPath: string): void {
@@ -65,11 +73,12 @@ const QML_RESERVED = new Set([
 ]);
 
 export function qmlIdentifier(value: string, fallback = "item"): string {
-  let normalized = value.normalize("NFC").replace(/[^\p{L}\p{N}_]/gu, "_");
+  const source = value.length > 0 ? value : fallback;
+  let normalized = source.normalize("NFC").replace(/[^\p{L}\p{N}_]/gu, "_");
   if (!/^[_\p{L}]/u.test(normalized)) normalized = `_${normalized}`;
-  if (normalized.length === 0) normalized = fallback;
+  if (normalized.length === 0) normalized = "item";
   if (QML_RESERVED.has(normalized)) normalized = `${normalized}_item`;
-  return normalized.slice(0, 128);
+  return [...normalized].slice(0, 128).join("");
 }
 
 export function qmlString(value: string): string {
@@ -144,20 +153,6 @@ function indent(lines: string[], level: number): string[] {
   return lines.map((line) => line.length > 0 ? `${prefix}${line}` : line);
 }
 
-function lengthValue(value: string | undefined, fallback: string): string {
-  if (!value) return fallback;
-  const numeric = /^(\d+(?:\.\d+)?)px$/u.exec(value);
-  return numeric ? numeric[1]! : fallback;
-}
-
-function gridSpacing(value: string | undefined): { row: string; column: string } {
-  const [row, column] = value?.trim().split(/\s+/u) ?? [];
-  return {
-    row: lengthValue(row, "Spacing.md"),
-    column: lengthValue(column ?? row, "Spacing.md"),
-  };
-}
-
 function sourceCommentFile(value: string): string {
   return value.normalize("NFC").replace(/[^\p{L}\p{N}_.-]/gu, "_").slice(0, 128) || "input.html";
 }
@@ -185,25 +180,22 @@ function emitChildren(node: MigrationNode, context: GenerationContext): string[]
   return node.children.flatMap((child) => emitNode(child, context));
 }
 
-function gridColumns(value: string | undefined): number {
-  if (!value) return 1;
-  const repeated = /^repeat\(([1-9]\d{0,2}),/u.exec(value);
-  if (repeated) return Math.min(32, Number(repeated[1]));
-  return Math.max(1, Math.min(32, value.split(" ").length));
-}
-
 function emitLayout(node: MigrationNode, card: boolean, context: GenerationContext): string[] {
   const content = emitChildren(node, context);
   const layoutType = node.style.display === "grid"
     ? "GridLayout" : node.style.display === "flex" && node.style.flexDirection !== "column"
       ? "RowLayout" : "ColumnLayout";
-  const spacing = lengthValue(node.style.gap, "Spacing.md");
-  const gridGap = gridSpacing(node.style.gap);
+  const parsedGap = node.style.gap && isGeneratedStyleSupported(node.kind, node.tag ?? "", node.style, "gap")
+    ? parseSupportedGap(node.style.gap) : undefined;
+  const spacing = parsedGap?.row ?? "Spacing.md";
+  const gridColumns = node.style.gridTemplateColumns
+    && isGeneratedStyleSupported(node.kind, node.tag ?? "", node.style, "gridTemplateColumns")
+    ? parseSupportedGridColumns(node.style.gridTemplateColumns) : undefined;
   const layout = [
     `${layoutType} {`,
     ...(card ? ["    anchors.fill: parent"] : ["    Layout.fillWidth: true"]),
     ...(layoutType === "GridLayout"
-      ? [`    columns: ${gridColumns(node.style.gridTemplateColumns)}`, `    rowSpacing: ${gridGap.row}`, `    columnSpacing: ${gridGap.column}`]
+      ? [`    columns: ${gridColumns ?? 1}`, `    rowSpacing: ${parsedGap?.row ?? "Spacing.md"}`, `    columnSpacing: ${parsedGap?.column ?? "Spacing.md"}`]
       : [`    spacing: ${spacing}`]),
     ...indent(content.length > 0 ? content : emitText(textContent(node) || "Content", false, node), 1),
     "}",
@@ -258,6 +250,13 @@ function emitUnsupportedControl(node: MigrationNode, kind: string, context: Gene
 }
 
 function emitNode(node: MigrationNode, context: GenerationContext): string[] {
+  for (const key of Object.keys(node.style) as Array<keyof typeof node.style>) {
+    if (!isGeneratedStyleSupported(node.kind, node.tag ?? "", node.style, key)) {
+      addDiagnostic(context.diagnostics, createDiagnostic(
+        "UNSUPPORTED_CSS_CONTEXT", "warning", `Unsupported CSS context for ${String(key)} on ${node.tag ?? node.kind}`, node.location,
+      ));
+    }
+  }
   if (node.kind === "text") return emitText(node.text ?? "", false, node);
   if (node.kind === "heading") return emitText(textContent(node), true, node);
   if (node.kind === "navigation") {
@@ -395,6 +394,7 @@ function validateOutputFiles(files: Readonly<Record<string, string>>): Array<[st
 }
 
 export async function generateToDirectory(outputDirectory: string, generated: GeneratedProject): Promise<void> {
+  assertGenerationPlatform();
   const output = path.resolve(outputDirectory);
   const entries = validateOutputFiles(generated.files);
   const parent = await prepareStableParent(output);
@@ -571,6 +571,7 @@ export async function publishGenerationTransaction(
   reportPath: string,
   generated: GeneratedProject,
 ): Promise<void> {
+  assertGenerationPlatform();
   const output = path.resolve(outputDirectory);
   const report = path.resolve(reportPath);
   assertDisjointGenerationPaths(output, report);

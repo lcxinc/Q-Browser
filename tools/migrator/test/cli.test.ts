@@ -4,26 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 
+import { runCli } from "../src/cli.ts";
+
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
-const cli = path.join(repositoryRoot, "tools/migrator/src/cli.ts");
+const bootstrap = path.join(repositoryRoot, "tools/migrator/test/cli-bootstrap.mjs");
 const workspaceBin = path.join(repositoryRoot, "tools/node_modules/.bin", process.platform === "win32" ? "qbrowser-migrate.cmd" : "qbrowser-migrate");
 const input = path.join(repositoryRoot, "fixtures/migration/dashboard/index.html");
 
 function launch(args: string[]) {
-  return spawnSync(process.execPath, [cli, ...args], {
+  return spawnSync(process.execPath, [bootstrap, ...args], {
     cwd: repositoryRoot,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      PATH: "C:\\Windows\\System32",
-      SystemRoot: "Z:\\poisoned-system-root",
-      WINDIR: "Z:\\poisoned-system-root",
-      COMSPEC: "Z:\\poisoned-command-processor.exe",
-      HTTP_PROXY: "http://127.0.0.1:1",
-      HTTPS_PROXY: "http://127.0.0.1:1",
-      LANG: "tr_TR.UTF-8",
-      TZ: "Pacific/Kiritimati",
-    },
+    env: { ...process.env },
     timeout: 10_000,
   });
 }
@@ -41,13 +33,32 @@ function launchWorkspaceBin(args: string[]) {
 }
 
 describe("qbrowser-migrate CLI", () => {
+  test("rejects generate on unsupported platforms before input or output IO", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-platform-${process.pid}-${Date.now()}`);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    try {
+      const result = await runCli([
+        "generate", path.join(root, "missing.html"),
+        "--output", path.join(root, "new", "output"),
+        "--report", path.join(root, "other", "report.json"),
+      ], { stdout: (message) => stdout.push(message), stderr: (message) => stderr.push(message) }, "linux");
+      expect(result).toBe(1);
+      expect(stdout).toEqual([]);
+      expect(stderr.join("")).toContain("PLATFORM_UNSUPPORTED");
+      await expect(access(root)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("launches as a real process and emits deterministic scan/generate files", async () => {
     const root = path.join(os.tmpdir(), `qbrowser-cli-${process.pid}-${Date.now()}`);
     try {
       const scanA = launch(["scan", input, "--json", path.join(root, "a.json")]);
       const scanB = launch(["scan", input, "--json", path.join(root, "b.json")]);
       expect({ status: scanA.status, stdout: scanA.stdout, stderr: scanA.stderr }).toEqual({
-        status: 0, stdout: "Scanned index.html: 0 diagnostic(s)\n", stderr: "",
+        status: 0, stdout: "Scanned index.html: 3 diagnostic(s)\n", stderr: "",
       });
       expect(scanB.status).toBe(0);
       expect(await readFile(path.join(root, "a.json"))).toEqual(await readFile(path.join(root, "b.json")));
@@ -55,7 +66,7 @@ describe("qbrowser-migrate CLI", () => {
       const generateA = launch(["generate", input, "--output", path.join(root, "out-a"), "--report", path.join(root, "report-a.json")]);
       const generateB = launch(["generate", input, "--output", path.join(root, "out-b"), "--report", path.join(root, "report-b.json")]);
       expect({ status: generateA.status, stdout: generateA.stdout, stderr: generateA.stderr }).toEqual({
-        status: 0, stdout: "Generated 1 file(s): 0 diagnostic(s)\n", stderr: "",
+        status: 0, stdout: "Generated 1 file(s): 3 diagnostic(s)\n", stderr: "",
       });
       expect(generateB.status).toBe(0);
       expect(await readFile(path.join(root, "out-a/Main.qml"))).toEqual(await readFile(path.join(root, "out-b/Main.qml")));
@@ -142,13 +153,27 @@ describe("qbrowser-migrate CLI", () => {
     try {
       const result = launchWorkspaceBin(["scan", input, "--json", path.join(root, "ir.json")]);
       expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
-        status: 0, stdout: "Scanned index.html: 0 diagnostic(s)\n", stderr: "",
+        status: 0, stdout: "Scanned index.html: 3 diagnostic(s)\n", stderr: "",
       });
       expect(JSON.parse(await readFile(path.join(root, "ir.json"), "utf8"))).toMatchObject({ version: 1, sourceFile: "index.html" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test.runIf(process.platform === "win32")("survives ten consecutive polluted-bootstrap helper launches", async () => {
+    const root = path.join(os.tmpdir(), `qbrowser-cli-polluted-${process.pid}-${Date.now()}`);
+    try {
+      for (let iteration = 0; iteration < 10; iteration += 1) {
+        const result = launch(["scan", input, "--json", path.join(root, `scan-${iteration}.json`)]);
+        expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+          status: 0, stdout: "Scanned index.html: 3 diagnostic(s)\n", stderr: "",
+        });
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("returns exit 2 and publishes nothing for fatal diagnostics", async () => {
     const root = path.join(os.tmpdir(), `qbrowser-cli-fatal-${process.pid}-${Date.now()}`);

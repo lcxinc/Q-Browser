@@ -10,9 +10,9 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -b",
-    "test": "vitest run --pool=threads --maxWorkers=1",
-    "lint": "tsc -b --pretty false"
+    "build": "npm run clean --workspace @q-browser/migrator && tsc -b --clean && tsc -b && npm rebuild --workspace @q-browser/migrator --ignore-scripts",
+    "test": "npm run build && vitest run --pool=threads --maxWorkers=1",
+    "lint": "tsc -b --pretty false && tsc -p migrator/tsconfig.test.json --pretty false"
   },
   "dependencies": {
     "entities": "8.0.0"

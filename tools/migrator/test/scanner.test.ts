@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 
-import { scanDocument, scanFile } from "../src/scanner.ts";
+import { SCANNER_LIMITS, scanDocument, scanFile } from "../src/scanner.ts";
 import type { MigrationNode } from "../src/types.ts";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
@@ -29,7 +29,7 @@ describe("migrator scanner and IR", () => {
     expect(nodes.every((node) => node.location.start.line > 0 && node.location.start.column > 0)).toBe(true);
     expect(first.styles.variables).toEqual({ "--brand": "#315efb", "--space": "16px" });
     expect(nodes.find((node) => node.kind === "section")?.style).toMatchObject({
-      display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: "16px", padding: "24px",
+      display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: "16px",
     });
   });
 
@@ -100,8 +100,9 @@ describe("migrator scanner and IR", () => {
       stylesheets: [{ sourceFile: "flex.css", css: ".layout { display: flex; flex-direction: row; justify-content: space-between; align-items: center; gap: 4px; }" }],
     });
     expect(flatten(ir.root).find((node) => node.kind === "main")?.style).toMatchObject({
-      display: "flex", flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: "4px",
+      display: "flex", flexDirection: "row", gap: "4px",
     });
+    expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_PROPERTY")).toHaveLength(2);
   });
 
   test("fails closed on invalid UTF-8 and supports NFC Unicode Windows paths", async () => {
@@ -185,14 +186,171 @@ describe("migrator scanner and IR", () => {
       await mkdir(path.join(temporaryRoot, "a"), { recursive: true });
       await mkdir(path.join(temporaryRoot, "b"), { recursive: true });
       await writeFile(path.join(temporaryRoot, "index.html"), "<!doctype html><link rel='stylesheet' href='b/styles.css'><link rel='stylesheet' href='a/styles.css'><main class='x'>Safe</main>", "utf8");
-      await writeFile(path.join(temporaryRoot, "a/styles.css"), ".x { color: red; unknown-a: 1 }", "utf8");
-      await writeFile(path.join(temporaryRoot, "b/styles.css"), ".x { color: blue; unknown-b: 1 }", "utf8");
+      await writeFile(path.join(temporaryRoot, "a/styles.css"), ".x { display:flex; gap:4px; unknown-a: 1 }", "utf8");
+      await writeFile(path.join(temporaryRoot, "b/styles.css"), ".x { display:flex; gap:2px; unknown-b: 1 }", "utf8");
       const ir = await scanFile(path.join(temporaryRoot, "index.html"));
-      expect(flatten(ir.root).find((node) => node.kind === "main")?.style.color).toBe("red");
+      expect(flatten(ir.root).find((node) => node.kind === "main")?.style.gap).toBe("4px");
       expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_PROPERTY").map((item) => item.location.file))
         .toEqual(["a/styles.css", "b/styles.css"]);
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("applies interleaved inline and external stylesheets in document order", async () => {
+    const temporaryRoot = path.join(os.tmpdir(), `qbrowser-css-document-order-${process.pid}-${Date.now()}`);
+    try {
+      await mkdir(temporaryRoot, { recursive: true });
+      await writeFile(path.join(temporaryRoot, "index.html"), [
+        "<style>.x { display:flex; gap:1px }</style>",
+        "<link rel='alternate STYLEsheet preload' href='middle.css'>",
+        "<style>.x { gap:3px }</style>",
+        "<main class='x'>Safe</main>",
+      ].join("\n"), "utf8");
+      await writeFile(path.join(temporaryRoot, "middle.css"), ".x { gap:2px }", "utf8");
+      const ir = await scanFile(path.join(temporaryRoot, "index.html"));
+      expect(flatten(ir.root).find((node) => node.kind === "main")?.style.gap).toBe("3px");
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("enforces the stylesheet file budget while collecting descriptors", () => {
+    const links = Array.from({ length: SCANNER_LIMITS.files }, (_, index) =>
+      `<link rel='stylesheet' href='sheet-${index}.css'>`).join("");
+    expect(() => scanDocument({ sourceFile: "files.html", html: `${links}<main>Safe</main>` }))
+      .toThrow("FILE_LIMIT_EXCEEDED");
+  });
+
+  test("uses iterative bounded DOM traversal for very deep and wide documents", () => {
+    const deep = "<main>" + "<div>".repeat(20_000) + "x" + "</div>".repeat(20_000) + "</main>";
+    expect(() => scanDocument({ sourceFile: "deep.html", html: deep })).toThrow("DOM_DEPTH_LIMIT_EXCEEDED");
+    const wide = `<main>${"<span>x</span>".repeat(10_100)}</main>`;
+    expect(() => scanDocument({ sourceFile: "wide.html", html: wide })).toThrow("NODE_LIMIT_EXCEEDED");
+  });
+
+  test("computes root end positions for CR, LF, and CRLF", () => {
+    const endings = ["<main>A</main>\rB", "<main>A</main>\nB", "<main>A</main>\r\nB"];
+    expect(endings.map((html) => scanDocument({ sourceFile: "lines.html", html }).root.location.end))
+      .toEqual([
+        { line: 2, column: 2, offset: 16 },
+        { line: 2, column: 2, offset: 16 },
+        { line: 2, column: 2, offset: 17 },
+      ]);
+  });
+
+  test("treats rel as an ASCII-whitespace case-insensitive token list", () => {
+    const ir = scanDocument({
+      sourceFile: "rel.html",
+      html: "<link rel='alternate\tSTYLEsheet\npreload' href='https://example.invalid/theme.css'><main>Safe</main>",
+    });
+    expect(ir.diagnostics.map((item) => item.code)).toContain("UNSUPPORTED_EXTERNAL_STYLESHEET");
+  });
+
+  test("preserves custom-property case and diagnoses undefined and cyclic var references", () => {
+    const ir = scanDocument({
+      sourceFile: "variables.html",
+      html: "<style>:root { --Brand: 6px; --brand: 10px; --a: var(--b); --b: var(--a) } .x { display:flex; gap:var(--Brand); grid-template-columns:var(--missing); flex-direction:var(--a) }</style><main class='x'>Safe</main>",
+    });
+    const main = flatten(ir.root).find((node) => node.kind === "main")!;
+    expect(ir.styles.variables).toMatchObject({ "--Brand": "6px", "--brand": "10px" });
+    expect(main.style.gap).toBe("6px");
+    expect(ir.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "UNDEFINED_CSS_VARIABLE", "CYCLIC_CSS_VARIABLE",
+    ]));
+  });
+
+  test("diagnoses unsupported custom-property scope and important cascade", () => {
+    const ir = scanDocument({
+      sourceFile: "variable-cascade.html",
+      html: "<style>:root { --Brand: 6px !important } .x { --Local: 4px; display:flex; gap:var(--Local) }</style><main class='x'>Safe</main>",
+    });
+    expect(ir.styles.variables).toEqual({});
+    expect(ir.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "UNSUPPORTED_CSS_CASCADE", "UNSUPPORTED_CSS_VARIABLE_SCOPE", "UNDEFINED_CSS_VARIABLE",
+    ]));
+  });
+
+  test("locates unsupported custom properties declared in an inline style", () => {
+    const ir = scanDocument({
+      sourceFile: "inline-variable.html",
+      html: "<main style='display:flex; --Local:4px; gap:var(--Local)'>Safe</main>",
+    });
+    const diagnostic = ir.diagnostics.find((item) => item.code === "UNSUPPORTED_CSS_VARIABLE_SCOPE");
+    expect(diagnostic?.location).toMatchObject({
+      file: "inline-variable.html",
+      start: { line: 1, column: 28 },
+    });
+  });
+
+  test("uses var fallback and never silently accepts unsupported explicit CSS semantics", () => {
+    const ir = scanDocument({
+      sourceFile: "capabilities.html",
+      html: "<main class='x'>Safe</main>",
+      stylesheets: [{ sourceFile: "capabilities.css", css: ".x { display:flex; gap:var(--missing, 12px); justify-content:center; align-items:center; color:red; font-size:18px; margin:4px; padding:8px }" }],
+    });
+    const main = flatten(ir.root).find((node) => node.kind === "main")!;
+    expect(main.style).toEqual({ display: "flex", gap: "12px" });
+    expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_PROPERTY")).toHaveLength(6);
+  });
+
+  test("rejects unmappable gap values and applies specificity before source order", () => {
+    const ir = scanDocument({
+      sourceFile: "cascade.html",
+      html: "<main id='target' class='x'>Safe</main>",
+      stylesheets: [{ sourceFile: "cascade.css", css: ".x { display:flex; gap:calc(1px + 2%); } #target { gap:4px } .x { gap:8px !important }" }],
+    });
+    expect(flatten(ir.root).find((node) => node.kind === "main")?.style.gap).toBe("4px");
+    expect(ir.diagnostics.map((item) => item.code)).toEqual(expect.arrayContaining([
+      "UNSUPPORTED_LAYOUT", "UNSUPPORTED_CSS_CASCADE",
+    ]));
+  });
+
+  test("diagnoses supported CSS used on nodes or combinations the generator cannot consume", () => {
+    const ir = scanDocument({
+      sourceFile: "style-context.html",
+      html: "<style>input { display:flex; gap:8px } main { gap:4px; grid-template-columns:repeat(2,1fr) }</style><main><input></main>",
+    });
+    const nodes = flatten(ir.root);
+    expect(nodes.find((node) => node.kind === "control")?.style).toEqual({});
+    expect(nodes.find((node) => node.kind === "main")?.style).toEqual({});
+    expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_CONTEXT")).toHaveLength(4);
+  });
+
+  test("does not revive lower-priority supported values beneath unsupported cascade winners", () => {
+    const stylesheetWinner = scanDocument({
+      sourceFile: "cascade-tombstone.html",
+      html: "<main class='x'>Safe</main>",
+      stylesheets: [{ sourceFile: "cascade.css", css: ".x { display:flex; gap:8px } .x { display:block; gap:1em }" }],
+    });
+    expect(flatten(stylesheetWinner.root).find((node) => node.kind === "main")?.style).toEqual({});
+    expect(stylesheetWinner.diagnostics.filter((item) => item.code === "UNSUPPORTED_LAYOUT")).toHaveLength(2);
+
+    const inlineWinner = scanDocument({
+      sourceFile: "inline-tombstone.html",
+      html: "<main class='x' style='display:block'>Safe</main>",
+      stylesheets: [{ sourceFile: "base.css", css: ".x { display:flex; gap:8px }" }],
+    });
+    expect(flatten(inlineWinner.root).find((node) => node.kind === "main")?.style).toEqual({});
+  });
+
+  test("diagnoses query and fragment stylesheet URLs instead of opening literal filenames", async () => {
+    const temporaryRoot = path.join(os.tmpdir(), `qbrowser-css-url-${process.pid}-${Date.now()}`);
+    try {
+      await mkdir(temporaryRoot, { recursive: true });
+      await writeFile(path.join(temporaryRoot, "index.html"), "<link rel='stylesheet' href='styles.css?rev=1'><link rel='stylesheet' href='theme.css#dark'><main>Safe</main>", "utf8");
+      await writeFile(path.join(temporaryRoot, "styles.css"), "main { display:flex }", "utf8");
+      const ir = await scanFile(path.join(temporaryRoot, "index.html"));
+      expect(ir.diagnostics.filter((item) => item.code === "UNSUPPORTED_EXTERNAL_STYLESHEET")).toHaveLength(2);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("preflights attribute value lengths even on skipped and unsupported elements", () => {
+    const oversized = "x".repeat(SCANNER_LIMITS.attributeLength + 1);
+    for (const html of [`<style data-long='${oversized}'>main{display:flex}</style>`, `<script data-long='${oversized}'></script>`]) {
+      expect(() => scanDocument({ sourceFile: "attributes.html", html })).toThrow("ATTRIBUTE_LENGTH_LIMIT_EXCEEDED");
     }
   });
 });

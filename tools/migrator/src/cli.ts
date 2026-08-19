@@ -3,8 +3,8 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { assertDisjointGenerationPaths, generateProject, publishGenerationTransaction, publishNewFile } from "./generator.ts";
-import { scanFile } from "./scanner.ts";
+import { assertDisjointGenerationPaths, assertGenerationPlatform, generateProject, publishGenerationTransaction, publishNewFile } from "./generator.js";
+import { scanFile } from "./scanner.js";
 
 export interface CliIo {
   stdout(message: string): void;
@@ -28,7 +28,7 @@ function parseFlag(args: string[], name: string): string {
 export async function runCli(args: string[], io: CliIo = {
   stdout: (message) => process.stdout.write(message),
   stderr: (message) => process.stderr.write(message),
-}): Promise<number> {
+}, platform: string = process.platform): Promise<number> {
   try {
     const command = args[0];
     const input = args[1];
@@ -43,6 +43,7 @@ export async function runCli(args: string[], io: CliIo = {
     }
     if (command === "generate") {
       if (args.length !== 6 || args[2] !== "--output" || args[4] !== "--report") throw new Error("INVALID_ARGUMENTS");
+      assertGenerationPlatform(platform);
       const output = parseFlag(args, "--output");
       const report = parseFlag(args, "--report");
       const resolvedOutput = path.resolve(output);

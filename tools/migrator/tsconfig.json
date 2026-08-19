@@ -1,13 +1,13 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "allowImportingTsExtensions": true,
-    "emitDeclarationOnly": true,
     "noEmit": false,
     "outDir": "./dist",
-    "rootDir": ".",
-    "tsBuildInfoFile": "./dist/tsconfig.tsbuildinfo",
-    "types": ["node", "vitest/globals"]
+    "rootDir": "./src",
+    "sourceMap": false,
+    "declarationMap": false,
+    "tsBuildInfoFile": "../node_modules/.cache/migrator.tsbuildinfo",
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

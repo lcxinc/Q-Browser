@@ -4,5 +4,60 @@
   "generatedFiles": [
     "Main.qml"
   ],
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: font-family",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 2,
+          "column": 8,
+          "offset": 50
+        },
+        "end": {
+          "line": 2,
+          "column": 43,
+          "offset": 85
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: color",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 2,
+          "column": 45,
+          "offset": 87
+        },
+        "end": {
+          "line": 2,
+          "column": 59,
+          "offset": 101
+        }
+      }
+    },
+    {
+      "code": "UNSUPPORTED_CSS_PROPERTY",
+      "severity": "warning",
+      "message": "Unsupported CSS property: padding",
+      "location": {
+        "file": "styles.css",
+        "start": {
+          "line": 3,
+          "column": 85,
+          "offset": 189
+        },
+        "end": {
+          "line": 3,
+          "column": 98,
+          "offset": 202
+        }
+      }
+    }
+  ]
 }

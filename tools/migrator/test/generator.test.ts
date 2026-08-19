@@ -3,12 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 
-import { generateProject, generateToDirectory, qmlIdentifier, qmlString } from "../src/generator.ts";
+import { assertGenerationPlatform, generateProject, generateToDirectory, qmlIdentifier, qmlString } from "../src/generator.ts";
 import { scanDocument, scanFile } from "../src/scanner.ts";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
 
 describe("migrator QML generator", () => {
+  test("declares generation transactions unsupported off Windows before filesystem work", () => {
+    expect(() => assertGenerationPlatform("linux")).toThrow("PLATFORM_UNSUPPORTED");
+    expect(() => assertGenerationPlatform("darwin")).toThrow("PLATFORM_UNSUPPORTED");
+    expect(() => assertGenerationPlatform("win32")).not.toThrow();
+  });
+
   for (const fixture of ["dashboard", "list", "form", "settings"] as const) {
     test(`matches the deterministic ${fixture} golden skeleton`, async () => {
       const input = path.join(repositoryRoot, `fixtures/migration/${fixture}/index.html`);
@@ -70,6 +76,33 @@ describe("migrator QML generator", () => {
     expect(row).toContain("columnSpacing: 4");
   });
 
+  test("emits every CSS capability classified as supported and reports the rest", () => {
+    const generated = generateProject(scanDocument({
+      sourceFile: "css-contract.html",
+      html: "<main class='row'><section class='grid'><p>A</p><p>B</p></section></main>",
+      stylesheets: [{ sourceFile: "contract.css", css: ".row { display:flex; flex-direction:row; gap:8px; justify-content:center; color:red } .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:4px 6px; padding:12px }" }],
+    }));
+    expect(generated.files["Main.qml"]).toContain("RowLayout {");
+    expect(generated.files["Main.qml"]).toContain("spacing: 8");
+    expect(generated.files["Main.qml"]).toContain("rowSpacing: 4");
+    expect(generated.files["Main.qml"]).toContain("columnSpacing: 6");
+    expect(generated.report.diagnostics.filter((item) => item.code === "UNSUPPORTED_CSS_PROPERTY")).toHaveLength(3);
+  });
+
+  test("does not classify grid track ratios that GridLayout cannot preserve", () => {
+    const generated = generateProject(scanDocument({
+      sourceFile: "grid-ratio.html",
+      html: "<main class='grid'><p>A</p><p>B</p></main>",
+      stylesheets: [{ sourceFile: "ratio.css", css: ".grid { display:grid; grid-template-columns:1fr 2fr; gap:4px }" }],
+    }));
+    expect(generated.files["Main.qml"]).toContain("GridLayout {");
+    expect(generated.files["Main.qml"]).toContain("columns: 1");
+    expect(generated.report.diagnostics).toContainEqual(expect.objectContaining({
+      code: "UNSUPPORTED_LAYOUT",
+      message: "Unsupported CSS value for grid-template-columns: 1fr 2fr",
+    }));
+  });
+
   test("maps only supported controls and preserves labels for unsupported controls", () => {
     const generated = generateProject(scanDocument({
       sourceFile: "controls.html",
@@ -109,6 +142,11 @@ describe("migrator QML generator", () => {
   test("normalizes identifiers and rejects Windows case-folded output collisions", async () => {
     expect(qmlIdentifier("class")).toBe("class_item");
     expect(qmlIdentifier("42 naïve-name")).toBe("_42_naïve_name");
+    expect(qmlIdentifier("", "class")).toBe("class_item");
+    expect(qmlIdentifier("", "42 fallback-name")).toBe("_42_fallback_name");
+    const astral = qmlIdentifier(`${"a".repeat(127)}𐐀`);
+    expect(astral.isWellFormed()).toBe(true);
+    expect([...astral]).toHaveLength(128);
     const temporaryRoot = path.join(os.tmpdir(), `qbrowser-migrator-collision-${process.pid}-${Date.now()}`);
     try {
       await expect(generateToDirectory(temporaryRoot, {

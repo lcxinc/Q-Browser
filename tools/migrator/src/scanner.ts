@@ -3,11 +3,11 @@ import { DecodingMode, EntityDecoder } from "entities";
 import { htmlDecodeTree } from "entities/decode";
 import { parse, type DefaultTreeAdapterMap, type ParserError } from "parse5";
 
-import { createCssBudget, parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.ts";
-import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.ts";
-import { IrBuilder } from "./ir.ts";
-import { readStableRegularFile } from "./stable-io.ts";
-import type { ControlValidation, MigrationIR, MigrationNode, MigrationNodeKind, ScanDocumentInput, SourceRange } from "./types.ts";
+import { createCssBudget, parseInlineStyle, parseStylesheets, resolveStyle, type StylesheetSource } from "./css.js";
+import { addDiagnostic, createDiagnostic, sortDiagnostics } from "./diagnostics.js";
+import { IrBuilder } from "./ir.js";
+import { readStableRegularFile } from "./stable-io.js";
+import type { ControlValidation, MigrationIR, MigrationNode, MigrationNodeKind, ScanDocumentInput, SourceRange } from "./types.js";
 
 export const SCANNER_LIMITS = Object.freeze({
   inputBytes: 2_097_152,
@@ -84,6 +84,7 @@ function boundedInteger(value: string | undefined): number | undefined {
 function isLocalAssetReference(value: string): boolean {
   const normalized = value.trim().replaceAll("\\", "/");
   return normalized.length > 0
+    && !/[?#]/u.test(normalized)
     && !normalized.startsWith("/")
     && !normalized.startsWith("//")
     && !/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(normalized)
@@ -115,6 +116,33 @@ function childNodes(node: P5Node): P5Node[] {
   return "childNodes" in node ? [...node.childNodes] : [];
 }
 
+function relIncludesStylesheet(value: string | undefined): boolean {
+  return value?.split(/[\t\n\f\r ]+/u).some((token) => token.toLowerCase() === "stylesheet") ?? false;
+}
+
+function walkDocument(document: DefaultTreeAdapterMap["document"], visitor: (node: P5Node, depth: number) => void): void {
+  const stack: Array<{ node: P5Node; depth: number }> = [];
+  let count = 1;
+  const push = (node: P5Node, depth: number): void => {
+    if (depth > SCANNER_LIMITS.domDepth) throw new Error("DOM_DEPTH_LIMIT_EXCEEDED");
+    if (++count > SCANNER_LIMITS.nodes) throw new Error("NODE_LIMIT_EXCEEDED");
+    if (isElement(node)) {
+      if (node.attrs.length > SCANNER_LIMITS.attributesPerNode) throw new Error("ATTRIBUTE_LIMIT_EXCEEDED");
+      if (node.attrs.some((attribute) => attribute.value.length > SCANNER_LIMITS.attributeLength)) {
+        throw new Error("ATTRIBUTE_LENGTH_LIMIT_EXCEEDED");
+      }
+    }
+    stack.push({ node, depth });
+  };
+  for (let index = document.childNodes.length - 1; index >= 0; index -= 1) push(document.childNodes[index]!, 1);
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    visitor(current.node, current.depth);
+    const children = childNodes(current.node);
+    for (let index = children.length - 1; index >= 0; index -= 1) push(children[index]!, current.depth + 1);
+  }
+}
+
 function positionAt(source: string, offset: number): { line: number; column: number; offset: number } {
   let line = 1;
   let column = 1;
@@ -140,6 +168,7 @@ function inlineStyleSource(
   source: string,
   sourceFile: string,
   decodedValue: string,
+  lineStarts: ReadonlyArray<number>,
 ): StylesheetSource {
   const attribute = element.sourceCodeLocation?.attrs?.style;
   if (!attribute) return { sourceFile, css: decodedValue };
@@ -155,14 +184,39 @@ function inlineStyleSource(
   const decodedToRaw = decodedOffsetMap(source.slice(rawStart, rawEnd), decodedValue, rawStart);
   const fallback: SourceRange = {
     file: sourceFile,
-    start: positionAt(source, rawStart),
-    end: positionAt(source, rawEnd),
+    start: positionFromLineStarts(rawStart, lineStarts),
+    end: positionFromLineStarts(rawEnd, lineStarts),
   };
   return {
     sourceFile,
     css: decodedValue,
-    rawMapping: { source, decodedToRaw: decodedToRaw ?? [], fallback },
+    rawMapping: { source, decodedToRaw: decodedToRaw ?? [], lineStarts, fallback },
   };
+}
+
+function lineStartOffsets(source: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < source.length;) {
+    if (source[index] === "\r") {
+      index += source[index + 1] === "\n" ? 2 : 1;
+      starts.push(index);
+    } else if (source[index] === "\n") {
+      index += 1;
+      starts.push(index);
+    } else index += 1;
+  }
+  return starts;
+}
+
+function positionFromLineStarts(offset: number, starts: ReadonlyArray<number>): { line: number; column: number; offset: number } {
+  let low = 0;
+  let high = starts.length;
+  while (low + 1 < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (starts[middle]! <= offset) low = middle;
+    else high = middle;
+  }
+  return { line: low + 1, column: offset - starts[low]! + 1, offset };
 }
 
 function decodedOffsetMap(raw: string, decoded: string, absoluteStart: number): Array<number | undefined> | undefined {
@@ -208,31 +262,59 @@ function decodedOffsetMap(raw: string, decoded: string, absoluteStart: number): 
   return decodedIndex === decoded.length ? offsets : undefined;
 }
 
-function inlineStylesheets(document: DefaultTreeAdapterMap["document"], sourceFile: string): StylesheetSource[] {
-  const sheets: StylesheetSource[] = [];
-  function visit(node: P5Node): void {
-    if (isElement(node) && node.tagName.toLowerCase() === "style") {
-      const css = childNodes(node).filter(isText).map((child) => child.value).join("");
-      const start = node.sourceCodeLocation?.startTag;
-      sheets.push({
-        sourceFile,
-        css,
-        origin: start ? { line: start.endLine, column: start.endCol, offset: start.endOffset } : undefined,
-      });
-      return;
-    }
-    for (const child of childNodes(node)) visit(child);
-  }
-  for (const node of document.childNodes) visit(node);
-  return sheets;
+interface StylesheetDescriptor {
+  inline?: StylesheetSource;
+  reference?: string;
 }
 
-export function scanDocument(input: ScanDocumentInput): MigrationIR {
-  if (Buffer.byteLength(input.html, "utf8") > SCANNER_LIMITS.inputBytes) throw new Error("INPUT_LIMIT_EXCEEDED");
-  const html = input.html;
-  const sourceFile = safeDisplayName(input.sourceFile);
-  const builder = new IrBuilder();
-  const document = parse(html, {
+function stylesheetDescriptors(document: DefaultTreeAdapterMap["document"], sourceFile: string): StylesheetDescriptor[] {
+  const descriptors: StylesheetDescriptor[] = [];
+  const localReferences = new Set<string>();
+  walkDocument(document, (node) => {
+    if (!isElement(node)) return;
+    const tag = node.tagName.toLowerCase();
+    if (tag === "style") {
+      const css = childNodes(node).filter(isText).map((child) => child.value).join("");
+      const start = node.sourceCodeLocation?.startTag;
+      descriptors.push({ inline: {
+          sourceFile,
+          css,
+          origin: start ? { line: start.endLine, column: start.endCol, offset: start.endOffset } : undefined,
+        } });
+    } else if (tag === "link") {
+      const values = Object.fromEntries(node.attrs.map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
+      if (relIncludesStylesheet(values.rel) && values.href) {
+        const reference = values.href.trim().replaceAll("\\", "/").normalize("NFC");
+        if (isLocalAssetReference(reference) && !localReferences.has(reference)) {
+          if (localReferences.size + 2 > SCANNER_LIMITS.files) throw new Error("FILE_LIMIT_EXCEEDED");
+          localReferences.add(reference);
+        }
+        descriptors.push({ reference });
+      }
+    }
+  });
+  return descriptors;
+}
+
+function orderedStylesheets(
+  descriptors: ReadonlyArray<StylesheetDescriptor>,
+  provided: ReadonlyArray<StylesheetSource>,
+): StylesheetSource[] {
+  const matched = new Set<number>();
+  const ordered: StylesheetSource[] = [];
+  for (const descriptor of descriptors) {
+    if (descriptor.inline) { ordered.push(descriptor.inline); continue; }
+    if (!descriptor.reference || !isLocalAssetReference(descriptor.reference)) continue;
+    const normalized = descriptor.reference.replaceAll("\\", "/").normalize("NFC");
+    const index = provided.findIndex((sheet) => sheet.sourceFile.replaceAll("\\", "/").normalize("NFC") === normalized);
+    if (index >= 0) { ordered.push(provided[index]!); matched.add(index); }
+  }
+  provided.forEach((sheet, index) => { if (!matched.has(index)) ordered.push(sheet); });
+  return ordered;
+}
+
+function parseDocument(html: string, sourceFile: string, builder: IrBuilder): DefaultTreeAdapterMap["document"] {
+  return parse(html, {
     sourceCodeLocationInfo: true,
     onParseError(error) {
       addDiagnostic(builder.diagnostics, createDiagnostic(
@@ -241,16 +323,24 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
       ));
     },
   });
+}
+
+function scanParsedDocument(
+  input: ScanDocumentInput,
+  sourceFile: string,
+  builder: IrBuilder,
+  document: DefaultTreeAdapterMap["document"],
+  descriptors: ReadonlyArray<StylesheetDescriptor>,
+): MigrationIR {
+  const html = input.html;
+  const lineStarts = lineStartOffsets(html);
+  if ((input.stylesheets?.length ?? 0) + 1 > SCANNER_LIMITS.files) throw new Error("FILE_LIMIT_EXCEEDED");
   const cssBudget = createCssBudget();
-  const parsedCss = parseStylesheets([...inlineStylesheets(document, sourceFile), ...(input.stylesheets ?? [])], builder.diagnostics, cssBudget);
+  const parsedCss = parseStylesheets(orderedStylesheets(descriptors, input.stylesheets ?? []), builder.diagnostics, cssBudget);
   const rootLocation: SourceRange = {
     file: sourceFile,
     start: { line: 1, column: 1, offset: 0 },
-    end: {
-      line: html.split("\n").length,
-      column: html.length - html.lastIndexOf("\n"),
-      offset: html.length,
-    },
+    end: positionAt(html, html.length),
   };
   const root = builder.createNode("document", rootLocation, { tag: "#document" });
   let count = 1;
@@ -272,10 +362,11 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
     }
 
     const tag = node.tagName.toLowerCase();
+    const kind = nodeKind(tag);
     const location = rangeFor(node, sourceFile);
     if (tag === "style") return;
     const rawAttributes = Object.fromEntries(node.attrs.map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
-    if (tag === "link" && rawAttributes.rel?.toLowerCase() === "stylesheet" && rawAttributes.href
+    if (tag === "link" && relIncludesStylesheet(rawAttributes.rel) && rawAttributes.href
         && !isLocalAssetReference(rawAttributes.href)) {
       addDiagnostic(builder.diagnostics, createDiagnostic(
         "UNSUPPORTED_EXTERNAL_STYLESHEET", "warning", "External stylesheet is not loaded", location,
@@ -291,14 +382,15 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
     }
 
     const attributes = collectAttributes(node);
-    let inlineDeclarations: Array<{ property: string; value: string }> = [];
+    let inlineDeclarations: ReturnType<typeof parseInlineStyle> = [];
     if (typeof attributes.style === "string") {
       try {
         inlineDeclarations = parseInlineStyle(
           attributes.style,
           builder.diagnostics,
-          inlineStyleSource(node, html, sourceFile, attributes.style),
+          inlineStyleSource(node, html, sourceFile, attributes.style, lineStarts),
           cssBudget,
+          parsedCss,
         );
       }
       catch (error) {
@@ -307,7 +399,6 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
       }
       delete attributes.style;
     }
-    const kind = nodeKind(tag);
     const imageSource = kind === "image" && typeof attributes.src === "string" ? attributes.src : "";
     const imageIsLocal = isLocalAssetReference(imageSource);
     if (kind === "image" && imageSource.length > 0 && !imageIsLocal) {
@@ -327,7 +418,7 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
         height: boundedInteger(typeof attributes.height === "string" ? attributes.height : undefined),
         local: imageIsLocal,
       } : undefined,
-      style: resolveStyle(parsedCss, tag, attributes, inlineDeclarations),
+      style: resolveStyle(parsedCss, tag, attributes, inlineDeclarations, kind, builder.diagnostics),
     });
     if (kind === "image") delete migrationNode.attributes.src;
     parent.children.push(migrationNode);
@@ -340,23 +431,18 @@ export function scanDocument(input: ScanDocumentInput): MigrationIR {
   return result;
 }
 
+export function scanDocument(input: ScanDocumentInput): MigrationIR {
+  if (Buffer.byteLength(input.html, "utf8") > SCANNER_LIMITS.inputBytes) throw new Error("INPUT_LIMIT_EXCEEDED");
+  const sourceFile = safeDisplayName(input.sourceFile);
+  const builder = new IrBuilder();
+  const document = parseDocument(input.html, sourceFile, builder);
+  const descriptors = stylesheetDescriptors(document, sourceFile);
+  return scanParsedDocument(input, sourceFile, builder, document, descriptors);
+}
+
 function decodeUtf8(bytes: Uint8Array, label: string): string {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new Error(`INVALID_UTF8: ${label}`); }
-}
-
-function localStylesheetReferences(html: string): string[] {
-  const document = parse(html);
-  const references: string[] = [];
-  function visit(node: P5Node): void {
-    if (isElement(node) && node.tagName.toLowerCase() === "link") {
-      const values = Object.fromEntries(node.attrs.map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
-      if (values.rel?.toLowerCase() === "stylesheet" && values.href && isLocalAssetReference(values.href)) references.push(values.href);
-    }
-    for (const child of childNodes(node)) visit(child);
-  }
-  for (const node of document.childNodes) visit(node);
-  return references.filter((reference, index) => references.indexOf(reference) === index);
 }
 
 export async function scanFile(inputPath: string): Promise<MigrationIR> {
@@ -367,17 +453,24 @@ export async function scanFile(inputPath: string): Promise<MigrationIR> {
     await readStableRegularFile(resolvedInput, SCANNER_LIMITS.inputBytes, inputDirectory),
     path.basename(resolvedInput),
   );
+  const sourceFile = safeDisplayName(resolvedInput);
+  const builder = new IrBuilder();
+  const document = parseDocument(html, sourceFile, builder);
+  const descriptors = stylesheetDescriptors(document, sourceFile);
   const sheets: Array<{ sourceFile: string; css: string }> = [];
-  const references = localStylesheetReferences(html);
-  if (references.length + 1 > SCANNER_LIMITS.files) throw new Error("FILE_LIMIT_EXCEEDED");
-  for (const reference of references) {
+  const references = descriptors
+    .map((descriptor) => descriptor.reference)
+    .filter((reference): reference is string => Boolean(reference && isLocalAssetReference(reference)))
+    .filter((reference, index, all) => all.indexOf(reference) === index);
+  const loaded = await Promise.all(references.map(async (reference) => {
     const candidate = path.resolve(inputDirectory, reference);
     const relative = path.relative(inputDirectory, candidate);
     if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("SOURCE_BOUNDARY_VIOLATION");
-    sheets.push({
+    return {
       sourceFile: path.relative(inputDirectory, candidate).replaceAll("\\", "/").normalize("NFC"),
       css: decodeUtf8(await readStableRegularFile(candidate, 1_048_576, inputDirectory), reference),
-    });
-  }
-  return scanDocument({ html, sourceFile: safeDisplayName(resolvedInput), stylesheets: sheets });
+    };
+  }));
+  sheets.push(...loaded);
+  return scanParsedDocument({ html, sourceFile, stylesheets: sheets }, sourceFile, builder, document, descriptors);
 }
