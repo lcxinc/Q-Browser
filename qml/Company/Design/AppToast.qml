@@ -37,7 +37,7 @@ Control {
 
     Accessible.name: accessibleName
     Accessible.description: error ? "Error notification" : "Notification"
-    Accessible.role: Accessible.StaticText
+    Accessible.role: Accessible.AlertMessage
 
     contentItem: Text {
         id: toastText

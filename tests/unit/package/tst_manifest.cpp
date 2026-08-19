@@ -423,8 +423,8 @@ void ManifestTest::usesExactJsonIntegerSemantics_data()
                         QByteArrayLiteral("\"memoryMiB\": 1.00e2"))
         << true << ManifestErrorCode::InvalidJson << QString{};
     QTest::newRow("limit-mathematical-integer-exponent")
-        << replacingRaw(valid, QByteArrayLiteral("\"processes\": 1\n"),
-                        QByteArrayLiteral("\"processes\": 1e0\n"))
+        << replacingRaw(valid, QByteArrayLiteral("\"processes\": 1"),
+                        QByteArrayLiteral("\"processes\": 1e0"))
         << true << ManifestErrorCode::InvalidJson << QString{};
     QTest::newRow("limit-rounded-fraction")
         << replacingRaw(valid, QByteArrayLiteral("\"packageBytes\": 52428800"),

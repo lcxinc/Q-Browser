@@ -44,7 +44,7 @@ TestCase {
         toast.show("Order saved", 500)
         verify(toast.shown)
         compare(toast.Accessible.name, "Order saved")
-        compare(toast.Accessible.role, Accessible.StaticText)
+        compare(toast.Accessible.role, Accessible.AlertMessage)
         compare(AccessibilityRecorder.count, 1)
         compare(AccessibilityRecorder.lastMessage, "Order saved")
         compare(AccessibilityRecorder.lastPoliteness, Accessible.Polite)
@@ -54,6 +54,7 @@ TestCase {
         compare(AccessibilityRecorder.count, 2)
         compare(AccessibilityRecorder.lastMessage, "Save failed")
         compare(AccessibilityRecorder.lastPoliteness, Accessible.Assertive)
+        compare(toast.Accessible.role, Accessible.AlertMessage)
     }
 
     function test_shownTracksVisibilityAndMessage() {

@@ -466,10 +466,12 @@ void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()
     QVERIFY(source.open(QIODevice::ReadOnly));
     const QByteArray implementation = source.readAll();
 #ifdef Q_OS_WIN
+    QByteArray normalizedImplementation = implementation;
+    normalizedImplementation.replace("\r\n", "\n");
     QVERIFY(implementation.contains("IFileOpenDialog"));
     QVERIFY(implementation.contains("IFileDialogEvents"));
     QVERIFY(implementation.contains("OnFileOk"));
-    QVERIFY(implementation.contains(
+    QVERIFY(normalizedImplementation.contains(
         "if (dialog == nullptr || FAILED(dialog->GetResult(item.put()))) {\n"
         "            return S_FALSE;"));
     QVERIFY(implementation.contains("CreateFileW"));
