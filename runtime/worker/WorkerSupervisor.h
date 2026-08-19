@@ -60,7 +60,9 @@ public:
     WorkerActivationId beginActivation(qint64 nowMs);
     std::optional<WorkerAttemptId> beginAttempt(WorkerActivationId activation,
                                                 qint64 nowMs);
+    bool authenticatedHandshake(WorkerAttemptKey key, qint64 nowMs);
     void heartbeat(WorkerAttemptKey key, qint64 nowMs);
+    [[nodiscard]] bool isHealthy(WorkerAttemptKey key, qint64 nowMs) const noexcept;
     WorkerSupervisionAction checkHealth(WorkerAttemptKey key, qint64 nowMs);
     WorkerSupervisionAction workerExited(WorkerAttemptKey key,
                                          WorkerExitReason reason,
@@ -84,10 +86,12 @@ private:
     WorkerAttemptKey lastFailedAttempt_;
     WorkerSupervisorState state_ = WorkerSupervisorState::Retired;
     qint64 attemptStartMs_ = 0;
+    qint64 handshakeMs_ = 0;
     qint64 lastHeartbeatMs_ = 0;
     bool restartUsed_ = false;
     bool rollbackCalled_ = false;
     bool hasAttempt_ = false;
     bool hasLastFailedAttempt_ = false;
     bool crashLoop_ = false;
+    bool hasAuthenticatedHandshake_ = false;
 };

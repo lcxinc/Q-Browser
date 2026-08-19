@@ -38,6 +38,7 @@ public:
 signals:
     void failed(const QString &errorCode);
     void routeLoadAcknowledged(const QString &route);
+    void heartbeatObserved();
 
 private:
     struct OutboundCommand final {

@@ -1,12 +1,12 @@
 set(q_browser_runtime_components
   router
+  telemetry
+  worker
   package
   policy
   ipc
-  telemetry
   broker
   sandbox/windows
-  worker
   webengine)
 
 foreach(q_browser_runtime_component IN LISTS q_browser_runtime_components)

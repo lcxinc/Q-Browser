@@ -23,6 +23,7 @@ target_include_directories(q_browser_host
 target_link_libraries(q_browser_host
   PUBLIC
     q_browser_ipc
+    q_browser_package
     q_browser_router
     q_browser_webengine
     q_browser_worker_runtime

@@ -734,6 +734,49 @@ ActivationStateResult PackageStore::activationState(const QString &appId) const
     return {PackageStoreError::None, *state, {}};
 }
 
+ActivationStateResult PackageStore::recordedActivationState(
+    const QString &appId) const
+{
+    if (!validAppId(appId)) {
+        return stateFailure(PackageStoreError::InvalidArgument,
+                            QStringLiteral("invalid application identifier"));
+    }
+    const QString statePath = appRoot(appId) + QStringLiteral("/activation.json");
+    if (!QFileInfo::exists(statePath)) return {};
+    QByteArray stateBytes;
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree storeTree;
+    const qint64 expectedSize = QFileInfo(statePath).size();
+    qbrowser_archive_detail::WindowsStableFile stateFile;
+    if (!openStableAppTree(m_root, appRoot(appId), storeTree)
+        || expectedSize < 0 || expectedSize > 4096
+        || !stateFile.openReadLocked(statePath, storeTree)
+        || !stateFile.readExact(static_cast<quint64>(expectedSize), 4096,
+                                stateBytes)) {
+        return stateFailure(PackageStoreError::StateUnavailable,
+                            QStringLiteral("activation state is unavailable"));
+    }
+#else
+    QFile file(statePath);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 4096) {
+        return stateFailure(PackageStoreError::StateUnavailable,
+                            QStringLiteral("activation state is unavailable"));
+    }
+    stateBytes = file.readAll();
+#endif
+    const std::optional<ActivationState> state = ActivationState::fromJson(stateBytes);
+    const auto syntacticallyValid = [](const QString &target) {
+        return target.isEmpty() || validVersionDirectory(target);
+    };
+    if (!state.has_value() || !syntacticallyValid(state->current)
+        || !syntacticallyValid(state->previous)
+        || !syntacticallyValid(state->lastKnownGood)) {
+        return stateFailure(PackageStoreError::InvalidState,
+                            QStringLiteral("activation state target is invalid"));
+    }
+    return {PackageStoreError::None, *state, {}};
+}
+
 PackageStoreResult PackageStore::writeState(
     const QString &appId,
     const ActivationState &state) const
@@ -869,6 +912,34 @@ PackageStoreResult PackageStore::markCurrentLastKnownGood(
     return writeState(appId, next);
 }
 
+PackageStoreResult PackageStore::recoverLastKnownGood(const QString &appId) const
+{
+    if (!ensureAppDirectories(appId)) {
+        return failure(PackageStoreError::UnsafeStore,
+                       QStringLiteral("package store is unavailable"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+    const ActivationStateResult loaded = recordedActivationState(appId);
+    if (!loaded.hasValue()) return failure(loaded.error, loaded.message);
+    if (loaded.state.lastKnownGood.isEmpty()
+        || !stateTargetIsValid(appId, loaded.state.lastKnownGood, false)) {
+        return failure(PackageStoreError::RollbackUnavailable,
+                       QStringLiteral("last known good version is unavailable"));
+    }
+    if (loaded.state.current == loaded.state.lastKnownGood
+        && stateTargetIsValid(appId, loaded.state.current, false)) {
+        return {};
+    }
+    const ActivationState recovered{loaded.state.lastKnownGood,
+                                    {},
+                                    loaded.state.lastKnownGood};
+    return writeState(appId, recovered);
+}
+
 PackageStoreResult PackageStore::rollback(const QString &appId) const
 {
     if (!ensureAppDirectories(appId)) {
@@ -891,10 +962,8 @@ PackageStoreResult PackageStore::rollback(const QString &appId) const
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
     }
-    QString target = loaded.state.previous;
-    if (target.isEmpty()) {
-        target = loaded.state.lastKnownGood;
-    }
+    QString target = loaded.state.lastKnownGood;
+    if (target.isEmpty()) target = loaded.state.previous;
     if (target.isEmpty() || target == loaded.state.current
         || !stateTargetIsValid(appId, target, false)) {
         return failure(PackageStoreError::RollbackUnavailable,

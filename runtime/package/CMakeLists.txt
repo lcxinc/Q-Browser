@@ -31,6 +31,8 @@ add_library(q_browser_package STATIC
   QmlSourcePolicy.h
   SignatureVerifier.cpp
   SignatureVerifier.h
+  UpdateLifecycleCoordinator.cpp
+  UpdateLifecycleCoordinator.h
   SignatureTestHooks.cpp
   SignatureTestHooks.h
   WindowsStableIo.cpp
@@ -43,6 +45,8 @@ target_include_directories(q_browser_package
 target_link_libraries(q_browser_package
   PUBLIC
     Qt6::Core
+    q_browser_worker_runtime
+    q_browser_telemetry
   PRIVATE
     q_browser_router
     miniz

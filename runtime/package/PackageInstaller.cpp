@@ -20,6 +20,7 @@
 #include <QVersionNumber>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace
@@ -244,6 +245,105 @@ PackageInstaller::PackageInstaller(PackageStore &store,
     , m_trustedPublicKeyPem(std::move(trustedPublicKeyPem))
     , m_policy(std::move(policy))
 {
+}
+
+InstallResult PackageInstaller::verifyInstalled(
+    const QString &appId,
+    const QString &versionDirectory) const
+{
+    const QString root = m_store.versionPath(appId, versionDirectory);
+    const QFileInfo rootInfo(root);
+    if (root.isEmpty() || !rootInfo.isDir() || rootInfo.isSymLink()) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    QVector<ArchiveFile> files;
+    quint64 totalBytes = 0;
+    quint64 scannedMembers = 0;
+    const quint64 maximumScannedMembers =
+        m_policy.archiveLimits.maximumEntries
+                > std::numeric_limits<quint64>::max() / 64
+        ? std::numeric_limits<quint64>::max()
+        : m_policy.archiveLimits.maximumEntries * 64;
+    QDirIterator iterator(root,
+                          QDir::AllEntries | QDir::Hidden | QDir::System
+                              | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString path = iterator.next();
+        const QFileInfo info = iterator.fileInfo();
+        if (scannedMembers >= maximumScannedMembers) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        ++scannedMembers;
+        if (info.isSymLink()) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        if (info.isDir()) continue;
+        if (!info.isFile()
+            || static_cast<quint64>(files.size()) >= m_policy.archiveLimits.maximumEntries
+            || info.size() < 0
+            || static_cast<quint64>(info.size()) > m_policy.archiveLimits.maximumEntryBytes) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        const QByteArray relative = QDir(root).relativeFilePath(path).toUtf8();
+        if (!qbrowser_archive_detail::validateArchivePath(
+                 relative, m_policy.archiveLimits).has_value()
+            || totalBytes > m_policy.archiveLimits.maximumTotalBytes
+                   - static_cast<quint64>(info.size())) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        const QByteArray bytes = file.read(info.size() + 1);
+        if (bytes.size() != info.size()) {
+            return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                           QStringLiteral("installed_content_invalid"));
+        }
+        totalBytes += static_cast<quint64>(bytes.size());
+        files.push_back({relative, bytes});
+    }
+    std::ranges::sort(files, [](const ArchiveFile &left, const ArchiveFile &right) {
+        return qbrowser_archive_detail::archivePathBytewiseLess(left.path, right.path);
+    });
+    const ArchiveFile *signatureFile = findFile(
+        files, QByteArrayLiteral("metadata/signature.ed25519"));
+    const ContentDigestResult signedDigest = ContentDigest::signedPackage(files);
+    const ContentDigestValidation content = ContentDigest::validatePayload(files);
+    const ArchiveFile *manifestFile = findFile(files, QByteArrayLiteral("manifest.json"));
+    if (signatureFile == nullptr || signatureFile->contents.size() != 64
+        || !signedDigest.hasValue()
+        || !SignatureVerifier::verifyPem(signedDigest.bytes(),
+                                         m_trustedPublicKeyPem,
+                                         signatureFile->contents).isVerified()
+        || !content.isValid() || manifestFile == nullptr) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    const ManifestParseResult parsed = Manifest::parse(manifestFile->contents);
+    if (!parsed.hasValue() || parsed.value().appId() != appId
+        || !runtimeIsCompatible(m_policy.runtimeVersion, parsed.value().runtime())
+        || !importsAreAllowed(parsed.value().imports(), m_policy.allowedImports)
+        || !sourcesPassPolicy(files)
+        || versionDirectory != parsed.value().version() + QLatin1Char('-')
+               + QString::fromLatin1(content.digest().toHex())) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    const QFileInfo entry(root + QLatin1Char('/') + parsed.value().entryPoint());
+    if (!entry.isFile() || entry.isSymLink()) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    return {InstallPhase::Complete, InstallError::None, {}, appId,
+            parsed.value().version(), root};
 }
 
 InstallResult PackageInstaller::install(const QString &packagePath) const

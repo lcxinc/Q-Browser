@@ -41,6 +41,7 @@ signals:
                            const QJsonObject &payload);
     void sessionFailed(quint64 generation, const QString &errorCode);
     void shutdownFinished(quint64 generation);
+    void heartbeatObserved(quint64 generation);
 
 private:
     void pollSession();

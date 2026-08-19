@@ -68,6 +68,9 @@ public:
                      InstallPolicy policy);
 
     [[nodiscard]] InstallResult install(const QString &packagePath) const;
+    [[nodiscard]] InstallResult verifyInstalled(
+        const QString &appId,
+        const QString &versionDirectory) const;
 
 private:
     PackageStore &m_store;

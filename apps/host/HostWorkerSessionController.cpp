@@ -108,6 +108,13 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
             [this](const quint64 generation, const QString &errorCode) {
                 if (generation == generation_) failClosed(errorCode);
             }, Qt::QueuedConnection);
+    connect(io_.data(), &HostWorkerSessionIo::heartbeatObserved, this,
+            [this](const quint64 generation) {
+                if (generation == generation_
+                    && state_ == HostWorkerSessionState::Running) {
+                    emit heartbeatObserved();
+                }
+            }, Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::shutdownFinished, this,
             [this](const quint64 generation) {
                 if (generation != generation_

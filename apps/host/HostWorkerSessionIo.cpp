@@ -160,6 +160,8 @@ void HostWorkerSessionIo::pollSession()
             emit shutdownFinished(generation_);
             return;
         case ProtocolType::Heartbeat:
+            emit heartbeatObserved(generation_);
+            break;
         case ProtocolType::Ready:
         case ProtocolType::SurfaceReady:
         case ProtocolType::StructuredLog:

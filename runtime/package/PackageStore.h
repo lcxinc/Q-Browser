@@ -69,7 +69,13 @@ public:
 #endif
     [[nodiscard]] ActivationStateResult activationState(
         const QString &appId) const;
+    // Returns only syntactically valid recorded targets. Callers must verify a
+    // target's authenticated package contents before requesting recovery.
+    [[nodiscard]] ActivationStateResult recordedActivationState(
+        const QString &appId) const;
     [[nodiscard]] PackageStoreResult markCurrentLastKnownGood(
+        const QString &appId) const;
+    [[nodiscard]] PackageStoreResult recoverLastKnownGood(
         const QString &appId) const;
     [[nodiscard]] PackageStoreResult rollback(const QString &appId) const;
     [[nodiscard]] PackageStoreResult resolveCurrent(const QString &appId) const;

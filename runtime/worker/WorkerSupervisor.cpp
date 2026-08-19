@@ -32,6 +32,7 @@ WorkerActivationId WorkerSupervisor::beginActivation(const qint64 nowMs)
     hasAttempt_ = false;
     hasLastFailedAttempt_ = false;
     crashLoop_ = false;
+    hasAuthenticatedHandshake_ = false;
     return activation_;
 }
 
@@ -48,15 +49,39 @@ std::optional<WorkerAttemptId> WorkerSupervisor::beginAttempt(
     state_ = WorkerSupervisorState::Running;
     attemptStartMs_ = nowMs;
     lastHeartbeatMs_ = nowMs;
+    hasAuthenticatedHandshake_ = false;
     return attempt_;
+}
+
+bool WorkerSupervisor::authenticatedHandshake(const WorkerAttemptKey key,
+                                               const qint64 nowMs)
+{
+    if (state_ != WorkerSupervisorState::Running || !isCurrent(key)
+        || nowMs < attemptStartMs_ || hasAuthenticatedHandshake_) {
+        return false;
+    }
+    handshakeMs_ = nowMs;
+    lastHeartbeatMs_ = nowMs;
+    hasAuthenticatedHandshake_ = true;
+    return true;
 }
 
 void WorkerSupervisor::heartbeat(const WorkerAttemptKey key, const qint64 nowMs)
 {
     if (state_ == WorkerSupervisorState::Running && isCurrent(key)
+        && hasAuthenticatedHandshake_
         && nowMs >= lastHeartbeatMs_) {
         lastHeartbeatMs_ = nowMs;
     }
+}
+
+bool WorkerSupervisor::isHealthy(const WorkerAttemptKey key,
+                                 const qint64 nowMs) const noexcept
+{
+    return state_ == WorkerSupervisorState::Running && isCurrent(key)
+        && hasAuthenticatedHandshake_ && nowMs >= handshakeMs_
+        && nowMs - handshakeMs_ >= policy_.healthWindowMs
+        && nowMs <= lastHeartbeatMs_ + policy_.heartbeatTimeoutMs;
 }
 
 WorkerSupervisionAction WorkerSupervisor::checkHealth(const WorkerAttemptKey key,
