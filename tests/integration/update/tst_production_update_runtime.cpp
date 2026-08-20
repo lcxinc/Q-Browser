@@ -68,7 +68,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         keys.value().privateKeyPem, false, simpleQml, environment.appId());
     const QString two = updateSignedPackage(
         temporary, QStringLiteral("production-two"), QStringLiteral("1.1.0"),
-        keys.value().privateKeyPem, false, recoveredQml, environment.appId());
+        keys.value().privateKeyPem, false, recoveredQml, environment.appId(),
+        QStringLiteral("qml/Start.qml"));
     const QString crashing = updateSignedPackage(
         temporary, QStringLiteral("production-crashing"), QStringLiteral("1.2.0"),
         keys.value().privateKeyPem, false, simpleQml, environment.appId());
@@ -134,6 +135,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QCOMPARE(QFileInfo(readyPath(1)).canonicalFilePath(),
              QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
                  .canonicalFilePath());
+    QVERIFY(QFileInfo::exists(readyPath(1) + QStringLiteral("/qml/Start.qml")));
+    QVERIFY(!QFileInfo::exists(readyPath(1) + QStringLiteral("/qml/Main.qml")));
     QTRY_VERIFY_WITH_TIMEOUT(
         observedStore.activationState(environment.appId()).state.lastKnownGood
             == QFileInfo(readyPath(1)).fileName(),

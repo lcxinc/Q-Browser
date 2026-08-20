@@ -76,13 +76,14 @@ public:
 
 inline QByteArray updateManifest(
     const QString &version,
-    const QString &appId = QStringLiteral("company.pilot"))
+    const QString &appId = QStringLiteral("company.pilot"),
+    const QString &entryPoint = QStringLiteral("qml/Main.qml"))
 {
     return QJsonDocument(QJsonObject{
         {QStringLiteral("schemaVersion"), 1},
         {QStringLiteral("appId"), appId},
         {QStringLiteral("version"), version},
-        {QStringLiteral("entryPoint"), QStringLiteral("qml/Main.qml")},
+        {QStringLiteral("entryPoint"), entryPoint},
         {QStringLiteral("runtime"),
          QJsonObject{{QStringLiteral("minVersion"), QStringLiteral("1.0.0")},
                      {QStringLiteral("maxVersion"), QStringLiteral("1.x")}}},
@@ -103,11 +104,12 @@ inline QString updateSignedPackage(QTemporaryDir &temporary,
                                    const bool corruptSignature = false,
                                    QByteArray qml = QByteArrayLiteral(
                                        "import QtQuick\nItem { width: 320; height: 200 }"),
-                                   const QString &appId = QStringLiteral("company.pilot"))
+                                   const QString &appId = QStringLiteral("company.pilot"),
+                                   const QString &entryPoint = QStringLiteral("qml/Main.qml"))
 {
     QVector<ArchiveFile> files{{QByteArrayLiteral("manifest.json"),
-                                updateManifest(version, appId)},
-                               {QByteArrayLiteral("qml/Main.qml"),
+                                updateManifest(version, appId, entryPoint)},
+                               {entryPoint.toUtf8(),
                                 std::move(qml)}};
     const ContentDigestResult payload = ContentDigest::payload(files);
     if (!payload.hasValue()) return {};

@@ -47,6 +47,7 @@ struct InstallResult final
     QString appId;
     QString version;
     QString path;
+    QString entryPoint;
     std::optional<ActivationBinding> activationBinding;
 
     [[nodiscard]] bool succeeded() const noexcept
@@ -74,6 +75,9 @@ public:
     [[nodiscard]] InstallResult verifyInstalled(
         const QString &appId,
         const QString &versionDirectory) const;
+    [[nodiscard]] InstallResult reverifyInstalledVersion(
+        const QString &appId,
+        const ActivationBinding &expected) const;
 
 private:
     PackageStore &m_store;

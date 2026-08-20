@@ -26,6 +26,7 @@ struct UpdateLaunchRequest final
     QString appId;
     QString packageVersion;
     QString packageDirectory;
+    QString entryPoint;
     WorkerAttemptKey key;
     bool recovery = false;
 };
@@ -107,6 +108,7 @@ private:
     [[nodiscard]] UpdateLifecycleResult beginLaunch(
         QString version,
         QString path,
+        QString entryPoint,
         ActivationBinding binding,
         qint64 nowMs,
         bool recovery,
@@ -136,6 +138,7 @@ private:
     WorkerSupervisor supervisor_;
     QString currentVersion_;
     QString currentPath_;
+    QString currentEntryPoint_;
     std::optional<ActivationBinding> currentBinding_;
     std::optional<WorkerAttemptKey> currentKey_;
     bool currentHealthy_ = false;

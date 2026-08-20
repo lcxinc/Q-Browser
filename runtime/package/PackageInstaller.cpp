@@ -350,7 +350,40 @@ InstallResult PackageInstaller::verifyInstalled(
     }
 #endif
     return {InstallPhase::Complete, InstallError::None, {}, appId,
-            parsed.value().version(), root, std::nullopt};
+            parsed.value().version(), root, parsed.value().entryPoint(),
+            std::nullopt};
+}
+
+InstallResult PackageInstaller::reverifyInstalledVersion(
+    const QString &appId,
+    const ActivationBinding &expected) const
+{
+    const qsizetype separator = expected.currentDirectory.lastIndexOf(
+        QLatin1Char('-'));
+    if (separator <= 0
+        || expected.currentDirectory.sliced(separator + 1).toLatin1()
+            != expected.versionDigestHex) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    const ActivationStateResult active = m_store.activationState(appId);
+    if (!active.hasValue()
+        || active.state.current != expected.currentDirectory
+        || active.state.generation != expected.generation) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    InstallResult verified = verifyInstalled(appId, expected.currentDirectory);
+    if (!verified.succeeded()) return verified;
+    const ActivationStateResult rebound = m_store.activationState(appId);
+    if (!rebound.hasValue()
+        || rebound.state.current != expected.currentDirectory
+        || rebound.state.generation != expected.generation) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    verified.activationBinding = expected;
+    return verified;
 }
 
 InstallResult PackageInstaller::install(const QString &packagePath) const
@@ -531,11 +564,10 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
         result.path = candidate.path;
         return result;
     }
-    return {InstallPhase::Complete,
-            InstallError::None,
-            {},
-            manifest.appId(),
-            manifest.version(),
-            candidate.path,
-            activated.activationBinding};
+    if (!activated.activationBinding.has_value()) {
+        return failure(InstallPhase::Activate, InstallError::ActivationFailed,
+                       QStringLiteral("activation_failed"));
+    }
+    return reverifyInstalledVersion(manifest.appId(),
+                                    *activated.activationBinding);
 }

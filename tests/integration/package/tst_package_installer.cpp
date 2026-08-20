@@ -5,6 +5,7 @@
 #include "PackageInstallerTestHooks.h"
 #include "PackageStore.h"
 #include "SignatureVerifier.h"
+#include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -71,7 +72,11 @@ public:
             paths.push_back(iterator.next());
         }
         for (const QString &entry : paths) {
-            QString native = QDir::toNativeSeparators(entry);
+            const auto extended = qbrowser_archive_detail::windowsApiPath(entry);
+            if (!extended) {
+                continue;
+            }
+            QString native = *extended;
             (void)SetNamedSecurityInfoW(
                 reinterpret_cast<LPWSTR>(native.data()),
                 SE_FILE_OBJECT,
@@ -98,7 +103,8 @@ public:
 QByteArray manifest(const QString &version,
                     const QString &minimumRuntime = QStringLiteral("1.0.0"),
                     const QString &maximumRuntime = QStringLiteral("1.x"),
-                    const QStringList &imports = {QStringLiteral("QtQuick")})
+                    const QStringList &imports = {QStringLiteral("QtQuick")},
+                    const QString &entryPoint = QStringLiteral("qml/Main.qml"))
 {
     QJsonArray importArray;
     for (const QString &name : imports) {
@@ -108,7 +114,7 @@ QByteArray manifest(const QString &version,
         {QStringLiteral("schemaVersion"), 1},
         {QStringLiteral("appId"), QStringLiteral("company.pilot")},
         {QStringLiteral("version"), version},
-        {QStringLiteral("entryPoint"), QStringLiteral("qml/Main.qml")},
+        {QStringLiteral("entryPoint"), entryPoint},
         {QStringLiteral("runtime"),
          QJsonObject{{QStringLiteral("minVersion"), minimumRuntime},
                      {QStringLiteral("maxVersion"), maximumRuntime}}},
@@ -128,11 +134,12 @@ QString signedPackage(QTemporaryDir &temporary,
                       QByteArray manifestBytes,
                       const bool corruptSignature = false,
                       QByteArray mainQml = QByteArrayLiteral("import QtQuick\nItem {}"),
-                      QVector<ArchiveFile> extraFiles = {})
+                      QVector<ArchiveFile> extraFiles = {},
+                      const QByteArray &entryPoint = QByteArrayLiteral("qml/Main.qml"))
 {
     QVector<ArchiveFile> files{
         {QByteArrayLiteral("manifest.json"), std::move(manifestBytes)},
-        {QByteArrayLiteral("qml/Main.qml"), std::move(mainQml)}};
+        {entryPoint, std::move(mainQml)}};
     files.append(std::move(extraFiles));
     const ContentDigestResult payload = ContentDigest::payload(files);
     if (!payload.hasValue()) {
@@ -189,7 +196,123 @@ private slots:
     void postVerificationReplacementCannotPublishUnderOldDigest();
     void unexpectedEmptyDirectoryFailsCandidate();
     void publicationRaceRestoresOwnedStagingCleanup();
+    void reverifyRejectsMismatchedActivationGeneration();
+    void reverifyRejectsActivationChangedDuringSnapshot();
+    void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
 };
+
+void PackageInstallerTest::reverifyRejectsActivationChangedDuringSnapshot()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("snapshot-a"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    const InstallResult second = installer.install(signedPackage(
+        temporary, QStringLiteral("snapshot-b"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.1.0"))));
+    QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+    QVERIFY(second.activationBinding.has_value());
+    const PackageStoreResult rolledBack = store.rollbackForTesting(
+        QStringLiteral("company.pilot"), *second.activationBinding);
+    QVERIFY(rolledBack.succeeded());
+    QVERIFY(rolledBack.activationBinding.has_value());
+
+    bool changed = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.afterVerifyInstalled = [&](const QString &, const QString &) {
+        if (changed) return;
+        changed = true;
+        const PackageStoreResult activated = store.activateForTesting(
+            QStringLiteral("company.pilot"), QFileInfo(second.path).fileName());
+        QVERIFY(activated.succeeded());
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.reverifyInstalledVersion(
+        QStringLiteral("company.pilot"), *rolledBack.activationBinding);
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(changed);
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QVERIFY(!rejected.succeeded());
+}
+
+void PackageInstallerTest::installsReverifiesAndActivatesEntryBeyondWindowsMaxPath()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows extended paths are Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString storeRoot = temporary.filePath(QString(112, QLatin1Char('s')));
+    PackageStore store(storeRoot);
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const QString entryPoint = QStringLiteral("qml/")
+        + QString(96, QLatin1Char('e')) + QStringLiteral("/Start.qml");
+    const QString packagePath = signedPackage(
+        temporary,
+        QStringLiteral("long-installed-entry"),
+        keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"),
+                 QStringLiteral("1.0.0"),
+                 QStringLiteral("1.x"),
+                 {QStringLiteral("QtQuick")},
+                 entryPoint),
+        false,
+        QByteArrayLiteral("import QtQuick\nItem {}"),
+        {},
+        entryPoint.toUtf8());
+    QVERIFY(!packagePath.isEmpty());
+
+    const InstallResult installed = installer.install(packagePath);
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    QVERIFY(installed.activationBinding.has_value());
+    QCOMPARE(installed.entryPoint, entryPoint);
+    const QString installedEntry = installed.path + QLatin1Char('/') + entryPoint;
+    QVERIFY2(QFileInfo(installedEntry).absoluteFilePath().size() > 260,
+             qPrintable(installedEntry));
+    QVERIFY(QFileInfo::exists(installedEntry));
+
+    const InstallResult reverifed = installer.reverifyInstalledVersion(
+        QStringLiteral("company.pilot"), *installed.activationBinding);
+    QVERIFY2(reverifed.succeeded(), qPrintable(reverifed.stableError));
+    QCOMPARE(reverifed.path, installed.path);
+    QCOMPARE(reverifed.entryPoint, entryPoint);
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
+             installed.path);
+#endif
+}
+
+void PackageInstallerTest::reverifyRejectsMismatchedActivationGeneration()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("bound-metadata"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    QVERIFY(installed.activationBinding.has_value());
+    QCOMPARE(installed.entryPoint, QStringLiteral("qml/Main.qml"));
+
+    ActivationBinding mismatched = *installed.activationBinding;
+    ++mismatched.generation;
+    const InstallResult rejected = installer.reverifyInstalledVersion(
+        QStringLiteral("company.pilot"), mismatched);
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QVERIFY(!rejected.succeeded());
+}
 
 void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
 {

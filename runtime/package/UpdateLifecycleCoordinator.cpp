@@ -85,7 +85,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
                                 QStringLiteral("update.activation_binding_missing"));
     }
     UpdateLifecycleResult result = beginLaunch(
-        installed.version, installed.path, *installed.activationBinding, nowMs, false,
+        installed.version, installed.path, installed.entryPoint,
+        *installed.activationBinding, nowMs, false,
         UpdateLifecycleAction::LaunchRequested);
     result.appId = installed.appId;
     result.version = installed.version;
@@ -123,8 +124,17 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                 return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
                                         QStringLiteral("update.current_changed"));
             }
-            return beginLaunch(current.version, current.path,
-                               *confirmed.activationBinding, nowMs, false,
+            const InstallResult rebound = installer_.reverifyInstalledVersion(
+                appId_, *confirmed.activationBinding);
+            if (!rebound.succeeded()) {
+                (void)enterFailedClosed();
+                return lifecycleFailure(
+                    UpdateLifecycleError::PackageVerificationFailed,
+                    QStringLiteral("update.current_verification_failed"));
+            }
+            return beginLaunch(rebound.version, rebound.path,
+                               rebound.entryPoint, *confirmed.activationBinding,
+                               nowMs, false,
                                UpdateLifecycleAction::LaunchRequested);
         }
     }
@@ -147,13 +157,22 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
         return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
                                 QStringLiteral("update.recovery_commit_failed"));
     }
-    return beginLaunch(lkg.version, lkg.path, *recovered.activationBinding, nowMs, true,
+    const InstallResult rebound = installer_.reverifyInstalledVersion(
+        appId_, *recovered.activationBinding);
+    if (!rebound.succeeded()) {
+        (void)enterFailedClosed();
+        return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
+                                QStringLiteral("update.lkg_verification_failed"));
+    }
+    return beginLaunch(rebound.version, rebound.path, rebound.entryPoint,
+                       *recovered.activationBinding, nowMs, true,
                        UpdateLifecycleAction::RecoveredAndLaunched);
 }
 
 UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     QString version,
     QString path,
+    QString entryPoint,
     ActivationBinding binding,
     const qint64 nowMs,
     const bool recovery,
@@ -162,6 +181,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     stopCurrentAttempt();
     currentVersion_ = std::move(version);
     currentPath_ = std::move(path);
+    currentEntryPoint_ = std::move(entryPoint);
     currentBinding_ = std::move(binding);
     currentHealthy_ = false;
     handshakeAccepted_ = false;
@@ -180,7 +200,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
     const UpdateLaunchRequest request{appId_, currentVersion_, currentPath_,
-                                      *currentKey_, recovery};
+                                      currentEntryPoint_, *currentKey_, recovery};
     if (!launch_(request)) {
         const WorkerSupervisionAction action = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
@@ -318,7 +338,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
     }
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
-    if (!launch_({appId_, currentVersion_, currentPath_, *currentKey_,
+    if (!launch_({appId_, currentVersion_, currentPath_, currentEntryPoint_, *currentKey_,
                   recoveryLaunch_})) {
         const WorkerSupervisionAction failed = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
@@ -345,12 +365,14 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
     if (!state.hasValue()) {
         return enterFailedClosed();
     }
-    const InstallResult verified = installer_.verifyInstalled(appId_, state.state.current);
+    const InstallResult verified = installer_.reverifyInstalledVersion(
+        appId_, *rolledBack.activationBinding);
     if (!verified.succeeded()) {
         return enterFailedClosed();
     }
     const UpdateLifecycleResult launched = beginLaunch(
-        verified.version, verified.path, *rolledBack.activationBinding, nowMs, true,
+        verified.version, verified.path, verified.entryPoint,
+        *rolledBack.activationBinding, nowMs, true,
         UpdateLifecycleAction::RolledBackAndLaunched);
     if (!launched.succeeded()) {
         return enterFailedClosed();

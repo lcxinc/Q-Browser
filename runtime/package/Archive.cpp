@@ -1271,8 +1271,10 @@ bool publishArchiveBytes(
 bool isReparsePoint(const QString &path)
 {
 #ifdef Q_OS_WIN
+    const auto apiPath = qbrowser_archive_detail::windowsApiPath(path);
+    if (!apiPath) return true;
     const DWORD attributes = GetFileAttributesW(
-        reinterpret_cast<LPCWSTR>(path.utf16()));
+        reinterpret_cast<LPCWSTR>(apiPath->utf16()));
     return attributes == INVALID_FILE_ATTRIBUTES
         || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U;
 #else

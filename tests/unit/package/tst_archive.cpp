@@ -1,5 +1,6 @@
 #include "Archive.h"
 #include "ArchiveTestHooks.h"
+#include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QCryptographicHash>
@@ -347,7 +348,75 @@ private slots:
     void sourceParentsRemainStableDuringRead();
     void writesByteForByteDeterministicArchives();
     void rejectsUnsafeSourceTreesBeforeWriting();
+    void roundTripsCompleteWindowsChildPathBeyondMaxPath();
+    void normalizesWindowsExtendedPathsWithoutDoublePrefixing();
 };
+
+void ArchiveTest::normalizesWindowsExtendedPathsWithoutDoublePrefixing()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows extended paths are Windows-specific");
+#else
+    const QString drive = QStringLiteral("C:\\root\\file.txt");
+    QCOMPARE(qbrowser_archive_detail::windowsApiPath(drive),
+             std::optional<QString>(QStringLiteral("\\\\?\\C:\\root\\file.txt")));
+    const QString unc = QStringLiteral("\\\\server\\share\\file.txt");
+    QCOMPARE(qbrowser_archive_detail::windowsApiPath(unc),
+             std::optional<QString>(
+                 QStringLiteral("\\\\?\\UNC\\server\\share\\file.txt")));
+    const QString extended = QStringLiteral("\\\\?\\C:\\root\\file.txt");
+    QCOMPARE(qbrowser_archive_detail::windowsApiPath(extended),
+             std::optional<QString>(extended));
+    QVERIFY(!qbrowser_archive_detail::windowsApiPath(
+                 QStringLiteral("\\\\?\\relative\\file.txt")).has_value());
+    QVERIFY(!qbrowser_archive_detail::windowsApiPath(
+                 QStringLiteral("\\\\?\\C:relative\\file.txt")).has_value());
+    QVERIFY(!qbrowser_archive_detail::windowsApiPath(
+                 QStringLiteral("relative\\file.txt")).has_value());
+#endif
+}
+
+void ArchiveTest::roundTripsCompleteWindowsChildPathBeyondMaxPath()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows extended paths are Windows-specific");
+#else
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString sourceRoot = temporary.filePath(
+        QString(100, QLatin1Char('s')) + QStringLiteral("/source"));
+    const QString stagingRoot = temporary.filePath(
+        QString(100, QLatin1Char('t')) + QStringLiteral("/staging"));
+    const QString relative = QString(50, QLatin1Char('a')) + QStringLiteral("/")
+        + QString(50, QLatin1Char('b')) + QStringLiteral("/")
+        + QString(50, QLatin1Char('c')) + QStringLiteral("/payload.txt");
+    const QString sourceFile = QDir(sourceRoot).filePath(relative);
+    const QString extractedFile = QDir(stagingRoot).filePath(relative);
+    QVERIFY(sourceFile.size() > 260);
+    QVERIFY(extractedFile.size() > 260);
+    QVERIFY(QDir().mkpath(QFileInfo(sourceFile).absolutePath()));
+    const QByteArray payload = QByteArrayLiteral("complete-long-path-payload");
+    QVERIFY(writeFile(sourceFile, payload));
+
+    const QString package = temporary.filePath(QStringLiteral("long.qapkg"));
+    const ArchiveResult created = Archive::create(sourceRoot, package);
+    QVERIFY2(created.hasValue(), qPrintable(created.error().message));
+    const ArchiveResult inspected = Archive::inspect(package);
+    QVERIFY2(inspected.hasValue(), qPrintable(inspected.error().message));
+    QCOMPARE(inspected.entries().size(), 1);
+    QCOMPARE(inspected.entries().front().path, relative.toUtf8());
+
+    QVERIFY(QDir().mkpath(stagingRoot));
+    const ArchiveResult extracted = Archive::extract(package, stagingRoot);
+    QVERIFY2(extracted.hasValue(), qPrintable(extracted.error().message));
+    QFile output(extractedFile);
+    QVERIFY(output.open(QIODevice::ReadOnly));
+    QCOMPARE(output.readAll(), payload);
+    output.close();
+    QVERIFY(QDir(temporary.path()).removeRecursively());
+    temporary.setAutoRemove(false);
+#endif
+}
 
 void ArchiveTest::extractsOnlyTheAuthenticatedSnapshot()
 {

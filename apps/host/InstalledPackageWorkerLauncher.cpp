@@ -1,5 +1,6 @@
 #include "InstalledPackageWorkerLauncher.h"
 
+#include "WindowsStableIo.h"
 #include "WorkerSurface.h"
 
 #include <QDir>
@@ -9,6 +10,7 @@
 #include <QThread>
 #include <QUuid>
 
+#include <algorithm>
 #include <utility>
 
 namespace
@@ -47,6 +49,51 @@ ExpectedMessage receiveExpected(IpcSession &session,
         }
     }
     return {false, {}, QStringLiteral("host.launch.timeout")};
+}
+
+bool isStrictRelativeEntryPoint(const QString &entryPoint)
+{
+    if (entryPoint.isEmpty() || entryPoint.contains(u'\0')
+        || entryPoint.contains(u'\\') || QDir::isAbsolutePath(entryPoint)
+        || QDir::fromNativeSeparators(QDir::cleanPath(entryPoint)) != entryPoint) {
+        return false;
+    }
+    const QStringList components = entryPoint.split(QLatin1Char('/'));
+    return std::ranges::all_of(components, [](const QString &component) {
+        return !component.isEmpty() && component != QLatin1String(".")
+            && component != QLatin1String("..");
+    });
+}
+
+bool isStableEntryPoint(const QString &packageDirectory,
+                        const QString &entryPoint)
+{
+    if (!isStrictRelativeEntryPoint(entryPoint)) return false;
+    const QString expected = QDir(packageDirectory).absoluteFilePath(entryPoint);
+    const QFileInfo information(expected);
+    const QString canonical = information.canonicalFilePath();
+    const QString packagePrefix = QDir::toNativeSeparators(packageDirectory)
+        + QDir::separator();
+    if (!information.isFile() || information.isSymLink() || canonical.isEmpty()
+        || canonical.compare(QDir::cleanPath(expected), Qt::CaseInsensitive) != 0
+        || !QDir::toNativeSeparators(canonical).startsWith(
+            packagePrefix, Qt::CaseInsensitive)) {
+        return false;
+    }
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree tree;
+    if (!tree.openRoot(packageDirectory)) return false;
+    QString parent = packageDirectory;
+    const QStringList components = entryPoint.split(QLatin1Char('/'));
+    for (qsizetype index = 0; index + 1 < components.size(); ++index) {
+        parent = QDir(parent).absoluteFilePath(components.at(index));
+        if (!tree.addImmutableDirectory(parent)) return false;
+    }
+    qbrowser_archive_detail::WindowsStableFile file;
+    return file.openSource(expected, tree) && file.isSameIdentityAt(expected);
+#else
+    return true;
+#endif
 }
 }
 
@@ -97,7 +144,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     const UpdateLaunchRequest &request)
 {
     if (!accepting_ || request.appId.isEmpty() || request.packageVersion.isEmpty()
-        || request.packageDirectory.isEmpty() || request.key.activation.value == 0
+        || request.packageDirectory.isEmpty() || request.entryPoint.isEmpty()
+        || request.key.activation.value == 0
         || request.key.attempt.value == 0) {
         return false;
     }
@@ -109,6 +157,10 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                         Qt::CaseInsensitive)
             != 0) {
         fail(request.key, QStringLiteral("host.launch.package_path_invalid"));
+        return false;
+    }
+    if (!isStableEntryPoint(canonicalPackage, request.entryPoint)) {
+        fail(request.key, QStringLiteral("host.launch.entry_point_invalid"));
         return false;
     }
     if (currentProcess_ != nullptr) {
@@ -135,7 +187,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     launchRequest.tempDirectory = tempDirectory;
     launchRequest.arguments = {
         QStringLiteral("--qbrowser-package"), canonicalPackage,
-        QStringLiteral("--qbrowser-entry"), QStringLiteral("qml/Main.qml"),
+        QStringLiteral("--qbrowser-entry"), request.entryPoint,
         QStringLiteral("--qbrowser-api-origin"),
         apiOrigin_.toString(QUrl::FullyEncoded),
         QStringLiteral("--qbrowser-nonce"), nonce,

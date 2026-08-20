@@ -10,10 +10,13 @@
 #include <qt_windows.h>
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace qbrowser_archive_detail
 {
+[[nodiscard]] std::optional<QString> windowsApiPath(const QString &path);
+
 class UniqueWindowsHandle final
 {
 public:
