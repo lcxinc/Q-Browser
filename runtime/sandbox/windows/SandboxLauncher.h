@@ -11,8 +11,24 @@
 #include <qt_windows.h>
 
 #include <optional>
+#include <functional>
 #include <mutex>
 #include <vector>
+
+#ifdef Q_BROWSER_SANDBOX_TESTING
+namespace qbrowser_sandbox_testing
+{
+struct SandboxProcessTestHooks final
+{
+    bool forceCloseWaitTimeout = false;
+    std::function<bool(const QString &)> failAclRestore;
+};
+
+void setSandboxProcessTestHooks(SandboxProcessTestHooks hooks);
+void resetSandboxProcessTestHooks();
+[[nodiscard]] const SandboxProcessTestHooks &sandboxProcessTestHooks();
+}
+#endif
 
 class SandboxProcess final
 {
@@ -35,6 +51,15 @@ public:
     void requestTerminateNoWait(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
     void terminate(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
     [[nodiscard]] SandboxValueResult<bool> close() noexcept;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    [[nodiscard]] static SandboxProcess adoptForTesting(
+        HANDLE process,
+        DWORD processId,
+        JobLimits job,
+        std::vector<AclGrant> grants,
+        QString appContainerSid) noexcept;
+    [[nodiscard]] qsizetype pendingGrantCountForTesting() const noexcept;
+#endif
 
 private:
     friend class SandboxLauncher;
@@ -51,6 +76,7 @@ private:
     std::vector<AclGrant> grants_;
     QString appContainerSid_;
     mutable std::mutex mutex_;
+    std::mutex closeMutex_;
 };
 
 struct SandboxLaunchResult final

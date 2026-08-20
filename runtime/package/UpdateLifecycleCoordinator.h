@@ -27,6 +27,7 @@ struct UpdateLaunchRequest final
     QString packageVersion;
     QString packageDirectory;
     QString entryPoint;
+    ActivationBinding expectedActivation;
     WorkerAttemptKey key;
     bool recovery = false;
 };
@@ -99,6 +100,8 @@ public:
     [[nodiscard]] UpdateLifecycleAction checkHealth(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction workerExited(WorkerAttemptKey key,
                                                      WorkerExitReason reason);
+    [[nodiscard]] UpdateLifecycleAction workerCleanupFailed(
+        WorkerAttemptKey key);
     void beginHostShutdown() noexcept;
 
     [[nodiscard]] std::optional<WorkerAttemptKey> currentAttemptKey() const noexcept;

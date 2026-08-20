@@ -10,6 +10,7 @@ namespace qbrowser_package_installer_testing
 {
 struct PackageInstallerTestHooks final
 {
+    std::function<void(const QString &)> afterAppIdPrecheckBeforeSourceCopy;
     std::function<void(const QString &)> beforeCandidateCommit;
     std::function<void(const QString &)> afterCandidateScanBeforeSeal;
     std::function<void(const QString &, const QString &)> beforeCandidatePublish;

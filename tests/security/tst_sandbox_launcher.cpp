@@ -24,6 +24,7 @@
 #include <winioctl.h>
 
 #include <optional>
+#include <memory>
 #include <cstring>
 #include <type_traits>
 #include <utility>
@@ -501,6 +502,61 @@ bool createDirectoryJunction(const QString &junctionPath,
                nullptr) != FALSE;
 }
 
+struct SandboxProcessCloseFixture final
+{
+    std::unique_ptr<QTemporaryDir> root;
+    QString profileName;
+    QString grantPath;
+    QString sid;
+    SandboxProcess process;
+};
+
+std::optional<SandboxProcessCloseFixture> makeSandboxProcessCloseFixture()
+{
+    auto root = std::make_unique<QTemporaryDir>();
+    if (!root->isValid()) return std::nullopt;
+    const QString appId = uniqueAppId(QStringLiteral("close-transaction"));
+    auto profile = AppContainerProfile::createOrOpen(appId);
+    if (!profile.has_value()) return std::nullopt;
+    const auto sid = profile->sidString();
+    if (!sid.value.has_value()) return std::nullopt;
+
+    const QString executable = QString::fromUtf8(Q_BROWSER_SANDBOX_PROBE_PATH);
+    const QString command = quoted(executable) + QStringLiteral(" --wait-forever");
+    std::wstring mutableCommand = command.toStdWString();
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION launched{};
+    if (!CreateProcessW(reinterpret_cast<LPCWSTR>(executable.utf16()),
+                        mutableCommand.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr,
+                        &startup, &launched)) {
+        return std::nullopt;
+    }
+    UniqueHandle process(launched.hProcess);
+    UniqueHandle thread(launched.hThread);
+    auto job = JobLimits::create(
+        SandboxResourceLimits{1, 64ULL * 1024ULL * 1024ULL});
+    if (!job.has_value()
+        || !job->assignProcess(process.get()).value.has_value()) {
+        return std::nullopt;
+    }
+    const QString grantPath = root->filePath(QStringLiteral("worker-temp"));
+    if (!QDir().mkdir(grantPath)) return std::nullopt;
+    auto grant = AclGrant::apply(grantPath, profile->sid(),
+                                 SandboxPathAccess::ReadWrite, true);
+    if (!grant.has_value()) return std::nullopt;
+    if (ResumeThread(thread.get()) == DWORD(-1)) return std::nullopt;
+    std::vector<AclGrant> grants;
+    grants.push_back(std::move(*grant));
+    return SandboxProcessCloseFixture{
+        std::move(root), profile->name(), grantPath, *sid.value,
+        SandboxProcess::adoptForTesting(process.release(), launched.dwProcessId,
+                                        std::move(*job), std::move(grants),
+                                        *sid.value)};
+}
+
 } // namespace
 
 class SandboxLauncherTest final : public QObject
@@ -520,7 +576,62 @@ private slots:
     void closingJobKillsAssignedProcess();
     void launchProbeProvesPositiveAndNegativeBoundaries();
     void dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeClosure();
+    void closeWaitTimeoutRetainsAllOwnershipForRetry();
+    void closeAclRestoreFailureRetainsGrantForRetry();
 };
+
+void SandboxLauncherTest::closeWaitTimeoutRetainsAllOwnershipForRetry()
+{
+    auto fixture = makeSandboxProcessCloseFixture();
+    QVERIFY(fixture.has_value());
+    fixture->process.requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    QVERIFY(fixture->process.waitForFinished(5000));
+
+    qbrowser_sandbox_testing::SandboxProcessTestHooks hooks;
+    hooks.forceCloseWaitTimeout = true;
+    qbrowser_sandbox_testing::setSandboxProcessTestHooks(std::move(hooks));
+    const auto timedOut = fixture->process.close();
+    qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+
+    QVERIFY(!timedOut.value.has_value());
+    QCOMPARE(timedOut.errorCode,
+             QStringLiteral("sandbox.process.wait_timeout"));
+    QVERIFY(fixture->process.isValid());
+    QCOMPARE(fixture->process.pendingGrantCountForTesting(), qsizetype(1));
+    const auto retried = fixture->process.close();
+    QVERIFY2(retried.value.has_value(), qPrintable(retried.errorCode));
+    QCOMPARE(fixture->process.pendingGrantCountForTesting(), qsizetype(0));
+    deleteProfileIfPresent(fixture->profileName);
+}
+
+void SandboxLauncherTest::closeAclRestoreFailureRetainsGrantForRetry()
+{
+    auto fixture = makeSandboxProcessCloseFixture();
+    QVERIFY(fixture.has_value());
+    PSID sid = nullptr;
+    QVERIFY(ConvertStringSidToSidW(
+        reinterpret_cast<LPCWSTR>(fixture->sid.utf16()), &sid));
+    QVERIFY(explicitAllowMask(fixture->grantPath, sid) != 0U);
+    fixture->process.requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    QVERIFY(fixture->process.waitForFinished(5000));
+
+    qbrowser_sandbox_testing::SandboxProcessTestHooks hooks;
+    hooks.failAclRestore = [](const QString &) { return true; };
+    qbrowser_sandbox_testing::setSandboxProcessTestHooks(std::move(hooks));
+    const auto failed = fixture->process.close();
+    qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+
+    QVERIFY(!failed.value.has_value());
+    QCOMPARE(failed.errorCode, QStringLiteral("sandbox.acl.restore_failed"));
+    QCOMPARE(fixture->process.pendingGrantCountForTesting(), qsizetype(1));
+    QVERIFY(explicitAllowMask(fixture->grantPath, sid) != 0U);
+    const auto retried = fixture->process.close();
+    QVERIFY2(retried.value.has_value(), qPrintable(retried.errorCode));
+    QCOMPARE(fixture->process.pendingGrantCountForTesting(), qsizetype(0));
+    QCOMPARE(explicitAllowMask(fixture->grantPath, sid), quint32(0));
+    LocalFree(sid);
+    deleteProfileIfPresent(fixture->profileName);
+}
 
 void SandboxLauncherTest::deterministicProfileNamesAreBoundedAndRejectInvalidIds()
 {

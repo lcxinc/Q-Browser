@@ -13,6 +13,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 class InstalledPackageWorkerLauncher final : public QObject
 {
@@ -33,11 +35,14 @@ public:
     using StopCallback = std::function<void()>;
     using ExitCallback = std::function<void(WorkerAttemptKey, bool)>;
     using FailureCallback = std::function<void(WorkerAttemptKey, const QString &)>;
+    using BindingValidator = std::function<InstallResult(
+        const QString &, const ActivationBinding &)>;
 
     InstalledPackageWorkerLauncher(SandboxTrustBoundary boundary,
                                    QString workerExecutable,
                                    QString sandboxTempRoot,
                                    QUrl apiOrigin,
+                                   BindingValidator validateBinding,
                                    AttachCallback attach,
                                    StopCallback stop,
                                    ExitCallback exited,
@@ -53,6 +58,9 @@ public:
     void stopCurrent();
     void cancel() noexcept;
     [[nodiscard]] bool isAccepting() const noexcept;
+#ifdef Q_BROWSER_HOST_TESTING
+    [[nodiscard]] bool retryFatalCleanupForTesting();
+#endif
 
 signals:
     void ready(const QString &appId,
@@ -64,28 +72,33 @@ signals:
     void unexpectedExit(quint64 activation, quint64 attempt);
 
 private:
+    struct LaunchRetirementContext;
     struct ReadyPayload;
 
     void completeLaunch(quint64 serial, std::shared_ptr<ReadyPayload> payload);
-    void observeProcess(WorkerAttemptKey key,
-                        std::shared_ptr<SandboxProcess> process,
-                        std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree,
-                        QString tempDirectory,
-                        quint64 serial);
+    void observeProcess(std::shared_ptr<LaunchRetirementContext> context);
+    void handleRetirement(
+        std::shared_ptr<LaunchRetirementContext> context,
+        bool succeeded,
+        const QString &stableError);
     void fail(WorkerAttemptKey key, const QString &stableError);
 
     SandboxTrustBoundary boundary_;
     QString workerExecutable_;
     QString sandboxTempRoot_;
     QUrl apiOrigin_;
+    BindingValidator validateBinding_;
     AttachCallback attach_;
     StopCallback stop_;
     ExitCallback exited_;
     FailureCallback failed_;
     std::shared_ptr<SandboxProcess> currentProcess_;
+    std::shared_ptr<LaunchRetirementContext> currentRetirement_;
     std::optional<WorkerAttemptKey> currentKey_;
     std::optional<WorkerAttemptKey> expectedStop_;
     std::optional<UpdateLaunchRequest> pendingRequest_;
+    std::unordered_map<quint64, std::shared_ptr<LaunchRetirementContext>> inflight_;
+    std::vector<std::shared_ptr<LaunchRetirementContext>> fatalCleanup_;
     quint64 serial_ = 0;
     bool accepting_ = true;
 };

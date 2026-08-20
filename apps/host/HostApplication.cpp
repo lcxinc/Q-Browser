@@ -27,8 +27,8 @@ constexpr qsizetype MaximumPendingLifecycleOperations = 512;
 class HostLifecycleRuntime final : public QObject
 {
 public:
-    HostLifecycleRuntime(std::unique_ptr<PackageStore> store,
-                         std::unique_ptr<PackageInstaller> installer,
+    HostLifecycleRuntime(std::shared_ptr<PackageStore> store,
+                         std::shared_ptr<PackageInstaller> installer,
                          std::unique_ptr<EventRecorder> recorder,
                          std::unique_ptr<UpdateLifecycleCoordinator> coordinator)
         : store_(std::move(store))
@@ -78,8 +78,8 @@ public:
     }
 
 private:
-    std::unique_ptr<PackageStore> store_;
-    std::unique_ptr<PackageInstaller> installer_;
+    std::shared_ptr<PackageStore> store_;
+    std::shared_ptr<PackageInstaller> installer_;
     std::unique_ptr<EventRecorder> recorder_;
     std::unique_ptr<UpdateLifecycleCoordinator> coordinator_;
     std::atomic<qsizetype> pending_{0};
@@ -150,6 +150,12 @@ void HostApplication::forceLifecycleQueueFullForTesting(const bool full) noexcep
 {
     lifecycleQueueFullForTesting_ = full;
 }
+
+bool HostApplication::retryWorkerCleanupForTesting()
+{
+    return installedPackageLauncher_ != nullptr
+        && installedPackageLauncher_->retryFatalCleanupForTesting();
+}
 #endif
 
 bool HostApplication::requestPackageInstall(const QString &packagePath)
@@ -196,11 +202,23 @@ bool HostApplication::initializePackageRuntime()
         return false;
     }
 
+    auto store = std::make_shared<PackageStore>(runtimeConfig_->packageStoreRoot());
+    InstallPolicy installPolicy;
+    installPolicy.expectedAppId = runtimeConfig_->appId();
+    installPolicy.runtimeVersion = QStringLiteral("1.2.0");
+    installPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                    QStringLiteral("Company.Design")};
+    installPolicy.preflight = [](const Manifest &, const QString &) { return true; };
+    auto installer = std::make_shared<PackageInstaller>(
+        *store, runtimeConfig_->trustedPublicKeyPem(), std::move(installPolicy));
+
     QPointer<HostApplication> guard(this);
     installedPackageLauncher_ = std::make_unique<InstalledPackageWorkerLauncher>(
         std::move(*boundary.value), runtimeConfig_->workerExecutable(),
-        runtimeConfig_->sandboxTempRoot(),
-        runtimeConfig_->mockOrigin(),
+        runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
+        [installer](const QString &appId, const ActivationBinding &binding) {
+            return installer->reverifyInstalledVersion(appId, binding);
+        },
         [guard](std::unique_ptr<IpcSession> session,
                 std::unique_ptr<WorkerSurface> surface,
                 std::shared_ptr<SandboxProcess> process,
@@ -230,13 +248,24 @@ bool HostApplication::initializePackageRuntime()
         },
         [guard](const WorkerAttemptKey key, const QString &stableError) {
             if (!guard) return;
-            emit guard->updateLifecycleFailed(
-                stableError.isEmpty() ? QStringLiteral("host.launch.failed")
-                                      : stableError);
+            const QString error = stableError.isEmpty()
+                ? QStringLiteral("host.launch.failed") : stableError;
+            emit guard->updateLifecycleFailed(error);
+            const bool cleanupFailure = error == QStringLiteral(
+                    "host.launch.temp_cleanup_failed")
+                || error == QStringLiteral("host.launch.process_wait_failed")
+                || error == QStringLiteral("host.launch.process_cleanup_failed")
+                || error.startsWith(QStringLiteral("sandbox.process."))
+                || error.startsWith(QStringLiteral("sandbox.job."))
+                || error.startsWith(QStringLiteral("sandbox.acl."));
             (void)guard->enqueueLifecycle(
-                [key](UpdateLifecycleCoordinator &coordinator) {
-                    (void)coordinator.workerExited(
-                        key, WorkerExitReason::StartupFailure);
+                [key, cleanupFailure](UpdateLifecycleCoordinator &coordinator) {
+                    if (cleanupFailure) {
+                        (void)coordinator.workerCleanupFailed(key);
+                    } else {
+                        (void)coordinator.workerExited(
+                            key, WorkerExitReason::StartupFailure);
+                    }
                 });
         }, this);
     if (!installedPackageLauncher_->isAccepting()) {
@@ -251,15 +280,6 @@ bool HostApplication::initializePackageRuntime()
             &InstalledPackageWorkerLauncher::unexpectedExit,
             this, &HostApplication::packageWorkerExited);
 
-    auto store = std::make_unique<PackageStore>(runtimeConfig_->packageStoreRoot());
-    InstallPolicy installPolicy;
-    installPolicy.expectedAppId = runtimeConfig_->appId();
-    installPolicy.runtimeVersion = QStringLiteral("1.2.0");
-    installPolicy.allowedImports = {QStringLiteral("QtQuick"),
-                                    QStringLiteral("Company.Design")};
-    installPolicy.preflight = [](const Manifest &, const QString &) { return true; };
-    auto installer = std::make_unique<PackageInstaller>(
-        *store, runtimeConfig_->trustedPublicKeyPem(), std::move(installPolicy));
     EventRecorderConfig recorderConfig;
     recorderConfig.directoryPath = runtimeConfig_->telemetryDirectory();
     auto recorder = std::make_unique<EventRecorder>(std::move(recorderConfig));

@@ -195,6 +195,36 @@ bool copyBounded(const QString &sourcePath,
     return true;
 }
 
+class EmptyStagingParentCleanup final
+{
+public:
+    EmptyStagingParentCleanup(QString stagingParent,
+                              const bool storeRootExisted,
+                              const bool stagingParentExisted)
+        : stagingParent_(std::move(stagingParent))
+        , storeRoot_(QFileInfo(stagingParent_).dir().absolutePath())
+        , storeRootExisted_(storeRootExisted)
+        , stagingParentExisted_(stagingParentExisted)
+    {
+    }
+
+    ~EmptyStagingParentCleanup()
+    {
+        if (!stagingParentExisted_) {
+            (void)QDir().rmdir(stagingParent_);
+        }
+        if (!storeRootExisted_) {
+            (void)QDir().rmdir(storeRoot_);
+        }
+    }
+
+private:
+    QString stagingParent_;
+    QString storeRoot_;
+    bool storeRootExisted_ = false;
+    bool stagingParentExisted_ = false;
+};
+
 std::optional<QVersionNumber> strictRuntimeVersion(const QString &version)
 {
     const qsizetype suffix = version.indexOf(QLatin1Char('-'));
@@ -417,12 +447,23 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
         return failure(InstallPhase::Verify, InstallError::AppIdMismatch,
                        QStringLiteral("app_id_mismatch"));
     }
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+    if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterAppIdPrecheckBeforeSourceCopy) {
+        qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterAppIdPrecheckBeforeSourceCopy(packagePath);
+    }
+#endif
     const QString stagingParent = m_store.root() + QStringLiteral("/.staging");
+    const bool storeRootExisted = QFileInfo::exists(m_store.root());
+    const bool stagingParentExisted = QFileInfo::exists(stagingParent);
     if (!QDir().mkpath(stagingParent)) {
         return failure(InstallPhase::Staging,
                        InstallError::StagingFailed,
                        QStringLiteral("staging_failed"));
     }
+    EmptyStagingParentCleanup emptyParentCleanup(
+        stagingParent, storeRootExisted, stagingParentExisted);
     const QFileInfo stagingInfo(stagingParent);
     if (!stagingInfo.isDir() || stagingInfo.isSymLink()) {
         return failure(InstallPhase::Staging,
@@ -510,6 +551,11 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
                        QStringLiteral("manifest_invalid"));
     }
     const Manifest &manifest = parsed.value();
+    if (!m_policy.expectedAppId.isEmpty()
+        && manifest.appId() != m_policy.expectedAppId) {
+        return failure(InstallPhase::Verify, InstallError::AppIdMismatch,
+                       QStringLiteral("app_id_mismatch"));
+    }
     if (!runtimeIsCompatible(m_policy.runtimeVersion, manifest.runtime())) {
         return failure(InstallPhase::Verify,
                        InstallError::RuntimeIncompatible,

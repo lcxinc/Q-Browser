@@ -202,7 +202,51 @@ private slots:
     void reverifyRejectsActivationChangedDuringSnapshot();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
+    void rejectsAuthenticatedAppSwappedAfterPrecheckWithoutStoreMutation();
 };
+
+void PackageInstallerTest::rejectsAuthenticatedAppSwappedAfterPrecheckWithoutStoreMutation()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString storeRoot = temporary.filePath(QStringLiteral("store"));
+    PackageStore store(storeRoot);
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const QString sourcePackage = signedPackage(
+        temporary, QStringLiteral("swap-source"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0")));
+    const QString otherPackage = signedPackage(
+        temporary, QStringLiteral("swap-other"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("9.9.9"), QStringLiteral("1.0.0"),
+                 QStringLiteral("1.x"), {QStringLiteral("QtQuick")},
+                 QStringLiteral("qml/Main.qml"),
+                 QStringLiteral("company.other")));
+    QVERIFY(!sourcePackage.isEmpty());
+    QVERIFY(!otherPackage.isEmpty());
+
+    bool swapped = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.afterAppIdPrecheckBeforeSourceCopy = [&](const QString &path) {
+        QCOMPARE(path, sourcePackage);
+        QVERIFY(QFile::remove(path));
+        QVERIFY(QFile::copy(otherPackage, path));
+        swapped = true;
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const InstallResult rejected = installer.install(sourcePackage);
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+
+    QVERIFY(swapped);
+    QCOMPARE(rejected.error, InstallError::AppIdMismatch);
+    QCOMPARE(rejected.stableError, QStringLiteral("app_id_mismatch"));
+    QVERIFY(!QFileInfo::exists(store.appRoot(QStringLiteral("company.other"))));
+    QVERIFY(!QFileInfo::exists(
+        storeRoot + QStringLiteral("/apps/company.other/state.json")));
+    QVERIFY(!QFileInfo::exists(storeRoot + QStringLiteral("/.staging")));
+}
 
 void PackageInstallerTest::rejectsAuthenticatedOtherAppBeforeStoreMutation()
 {

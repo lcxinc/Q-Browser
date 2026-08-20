@@ -200,7 +200,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
     const UpdateLaunchRequest request{appId_, currentVersion_, currentPath_,
-                                      currentEntryPoint_, *currentKey_, recovery};
+                                      currentEntryPoint_, *currentBinding_,
+                                      *currentKey_, recovery};
     if (!launch_(request)) {
         const WorkerSupervisionAction action = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
@@ -236,6 +237,11 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
         return applySupervisionAction(timeout, nowMs);
     }
     if (handshakeAccepted_) return UpdateLifecycleAction::None;
+    if (!currentBinding_.has_value()
+        || !installer_.reverifyInstalledVersion(appId_, *currentBinding_)
+                .succeeded()) {
+        return enterFailedClosed();
+    }
     if (!supervisor_.authenticatedHandshake(key, nowMs)) {
         return UpdateLifecycleAction::FailedClosed;
     }
@@ -282,6 +288,13 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::workerExited(
     if (hostShuttingDown_) reason = WorkerExitReason::Clean;
     return applySupervisionAction(supervisor_.workerExited(key, reason, nowMs),
                                   nowMs);
+}
+
+UpdateLifecycleAction UpdateLifecycleCoordinator::workerCleanupFailed(
+    const WorkerAttemptKey key)
+{
+    Q_UNUSED(key);
+    return enterFailedClosed();
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::transitionToHealthy(
@@ -345,8 +358,8 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
     }
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
-    if (!launch_({appId_, currentVersion_, currentPath_, currentEntryPoint_, *currentKey_,
-                  recoveryLaunch_})) {
+    if (!launch_({appId_, currentVersion_, currentPath_, currentEntryPoint_,
+                  *currentBinding_, *currentKey_, recoveryLaunch_})) {
         const WorkerSupervisionAction failed = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
         return applySupervisionAction(failed, nowMs);

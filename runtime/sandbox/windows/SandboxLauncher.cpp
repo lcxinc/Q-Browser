@@ -335,10 +335,54 @@ bool inheritablePipeHandle(const HANDLE handle)
 
 } // namespace
 
+#ifdef Q_BROWSER_SANDBOX_TESTING
+namespace qbrowser_sandbox_testing
+{
+namespace
+{
+SandboxProcessTestHooks currentHooks;
+}
+
+void setSandboxProcessTestHooks(SandboxProcessTestHooks hooks)
+{
+    currentHooks = std::move(hooks);
+}
+
+void resetSandboxProcessTestHooks()
+{
+    currentHooks = {};
+}
+
+const SandboxProcessTestHooks &sandboxProcessTestHooks()
+{
+    return currentHooks;
+}
+}
+#endif
+
 SandboxProcess::~SandboxProcess()
 {
     closeBestEffort();
 }
+
+#ifdef Q_BROWSER_SANDBOX_TESTING
+SandboxProcess SandboxProcess::adoptForTesting(
+    HANDLE process,
+    const DWORD processId,
+    JobLimits job,
+    std::vector<AclGrant> grants,
+    QString appContainerSid) noexcept
+{
+    return SandboxProcess(process, processId, std::move(job), std::move(grants),
+                          std::move(appContainerSid));
+}
+
+qsizetype SandboxProcess::pendingGrantCountForTesting() const noexcept
+{
+    std::lock_guard lock(mutex_);
+    return static_cast<qsizetype>(grants_.size());
+}
+#endif
 
 SandboxProcess::SandboxProcess(SandboxProcess &&other) noexcept
 {
@@ -440,61 +484,88 @@ void SandboxProcess::terminate(const DWORD exitCode) noexcept
 
 SandboxValueResult<bool> SandboxProcess::close() noexcept
 {
-    HANDLE process = nullptr;
-    JobLimits job;
-    std::vector<AclGrant> grants;
+    std::lock_guard closeLock(closeMutex_);
+    HANDLE waitHandle = nullptr;
     {
         std::lock_guard lock(mutex_);
-        process = std::exchange(process_, nullptr);
-        processId_ = 0;
-        job = std::move(job_);
-        grants = std::move(grants_);
-        appContainerSid_.clear();
+        if (validHandle(process_)
+            && !DuplicateHandle(GetCurrentProcess(), process_,
+                                GetCurrentProcess(), &waitHandle,
+                                SYNCHRONIZE, FALSE, 0)) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.wait_failed"),
+                    SandboxNativeError::win32(GetLastError())};
+        }
     }
+    if (validHandle(waitHandle)) {
+        DWORD waited = WaitForSingleObject(waitHandle, 5000);
+#ifdef Q_BROWSER_SANDBOX_TESTING
+        if (qbrowser_sandbox_testing::sandboxProcessTestHooks()
+                .forceCloseWaitTimeout) {
+            waited = WAIT_TIMEOUT;
+        }
+#endif
+        const DWORD waitError = waited == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+        (void)CloseHandle(waitHandle);
+        if (waited == WAIT_FAILED) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.wait_failed"),
+                    SandboxNativeError::win32(waitError)};
+        }
+        if (waited != WAIT_OBJECT_0) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.wait_timeout"),
+                    SandboxNativeError::win32(ERROR_TIMEOUT)};
+        }
+    }
+
+    std::lock_guard lock(mutex_);
+    if (validHandle(process_)) {
+        if (!CloseHandle(process_)) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.close_failed"),
+                    SandboxNativeError::win32(GetLastError())};
+        }
+        process_ = nullptr;
+        processId_ = 0;
+    }
+    const auto jobClosed = job_.close();
+    if (!jobClosed.value.has_value()) return jobClosed;
+
     QString firstErrorCode;
     SandboxNativeError firstNativeError;
-    const auto remember = [&firstErrorCode, &firstNativeError](
-                              const QString &code,
-                              const SandboxNativeError error) {
-        if (firstErrorCode.isEmpty()) {
-            firstErrorCode = code;
-            firstNativeError = error;
+    for (qsizetype index = static_cast<qsizetype>(grants_.size());
+         index > 0; --index) {
+        AclGrant &grant = grants_[static_cast<std::size_t>(index - 1)];
+        SandboxValueResult<bool> restored;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+        const auto &hooks = qbrowser_sandbox_testing::sandboxProcessTestHooks();
+        if (hooks.failAclRestore && hooks.failAclRestore(grant.finalPath())) {
+            restored = {std::nullopt,
+                        QStringLiteral("sandbox.acl.restore_failed"),
+                        SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
+        } else
+#endif
+        {
+            restored = grant.close();
         }
-    };
-    const auto jobClosed = job.close();
-    if (!jobClosed.value.has_value()) {
-        remember(jobClosed.errorCode, jobClosed.nativeError);
-    }
-    if (validHandle(process)) {
-        const DWORD waited = WaitForSingleObject(process, 5000);
-        if (waited == WAIT_FAILED) {
-            const DWORD error = GetLastError();
-            remember(QStringLiteral("sandbox.process.wait_failed"),
-                     SandboxNativeError::win32(error));
-        } else if (waited == WAIT_TIMEOUT) {
-            remember(QStringLiteral("sandbox.process.wait_timeout"),
-                     SandboxNativeError::win32(ERROR_TIMEOUT));
-        }
-        if (!CloseHandle(process)) {
-            const DWORD error = GetLastError();
-            remember(QStringLiteral("sandbox.process.close_failed"),
-                     SandboxNativeError::win32(error));
+        if (restored.value.has_value()) {
+            grants_.erase(grants_.begin() + (index - 1));
+        } else if (firstErrorCode.isEmpty()) {
+            firstErrorCode = restored.errorCode;
+            firstNativeError = restored.nativeError;
         }
     }
-    for (auto grant = grants.rbegin(); grant != grants.rend(); ++grant) {
-        const auto restored = grant->close();
-        if (!restored.value.has_value()) {
-            remember(restored.errorCode, restored.nativeError);
-        }
+    if (!firstErrorCode.isEmpty()) {
+        return {std::nullopt, firstErrorCode, firstNativeError};
     }
-    if (firstErrorCode.isEmpty()) {
-        return {true, {}, {}};
-    }
-    return {std::nullopt, firstErrorCode, firstNativeError};
+    appContainerSid_.clear();
+    return {true, {}, {}};
 }
 
 void SandboxProcess::closeBestEffort() noexcept
 {
+    requestTerminateNoWait(ERROR_PROCESS_ABORTED);
     (void)close();
 }
 

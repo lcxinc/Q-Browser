@@ -53,6 +53,7 @@ public:
     [[nodiscard]] HostWorkerSessionController *workerSessionController() const noexcept;
 #ifdef Q_BROWSER_HOST_TESTING
     void forceLifecycleQueueFullForTesting(bool full) noexcept;
+    [[nodiscard]] bool retryWorkerCleanupForTesting();
 #endif
 
 signals:

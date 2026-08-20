@@ -106,6 +106,15 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
     const UpdateLifecycleResult first = coordinator.installAndLaunch(one);
     QVERIFY2(first.succeeded(), qPrintable(first.stableError));
     QCOMPARE(launches.size(), 1);
+    const ActivationState firstState = store.activationState(
+        QStringLiteral("company.pilot")).state;
+    QCOMPARE(launches.back().expectedActivation.currentDirectory,
+             firstState.current);
+    QCOMPARE(launches.back().expectedActivation.generation,
+             firstState.generation);
+    QCOMPARE(launches.back().expectedActivation.versionDigestHex,
+             firstState.current.sliced(firstState.current.lastIndexOf(u'-') + 1)
+                 .toLatin1());
     const WorkerAttemptKey firstKey = launches.back().key;
     clock.set(100);
     QCOMPARE(coordinator.heartbeat(firstKey),
