@@ -90,10 +90,132 @@ private slots:
     void rejectsInvalidOrEscapingPointerTargets();
     void pinsStoreDirectoriesDuringStateCommit();
     void activationTransactionsSerializeWithoutLostUpdates();
+    void activationReadsSerializeWithStateCommits();
+    void compareAndCommitRejectsStaleActivationBindings();
     void canonicalCandidateKeysRejectCaseFoldedDuplicates();
     void activationLockIsNonStaleAndPreservesStateOnTimeout();
     void recoversExpiredMalformedActivationLocks();
 };
+
+void PackageStoreTest::activationReadsSerializeWithStateCommits()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    const QString candidate = createCandidate(
+        temporary, QStringLiteral("serialized-read"), QByteArrayLiteral("one"));
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionOne(), digest('a'), candidate)
+                .succeeded());
+    const QString one = targetName(versionOne(), digest('a'));
+    QVERIFY(store.activateForTesting(appId(), one).succeeded());
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool writerLocked = false;
+    bool releaseWriter = false;
+    bool readerFinished = false;
+    qbrowser_package_store_testing::PackageStoreTestHooks hooks;
+    hooks.afterActivationLockAcquired = [&](const QString &, const QString &operation) {
+        if (operation != QStringLiteral("mark_lkg")) return;
+        std::unique_lock lock(mutex);
+        writerLocked = true;
+        condition.notify_all();
+        condition.wait(lock, [&releaseWriter] { return releaseWriter; });
+    };
+    qbrowser_package_store_testing::setPackageStoreTestHooks(std::move(hooks));
+
+    PackageStoreResult marked;
+    ActivationStateResult read;
+    std::thread writer([&] {
+        marked = store.markCurrentLastKnownGoodForTesting(appId());
+    });
+    {
+        std::unique_lock lock(mutex);
+        if (!condition.wait_for(lock, std::chrono::seconds(2),
+                                [&writerLocked] { return writerLocked; })) {
+            releaseWriter = true;
+            condition.notify_all();
+            lock.unlock();
+            writer.join();
+            qbrowser_package_store_testing::resetPackageStoreTestHooks();
+            QFAIL("writer did not acquire the activation transaction lock");
+        }
+    }
+    std::thread reader([&] {
+        read = store.activationState(appId());
+        std::lock_guard lock(mutex);
+        readerFinished = true;
+        condition.notify_all();
+    });
+    bool completedWhileWriterHeld = false;
+    {
+        std::unique_lock lock(mutex);
+        completedWhileWriterHeld = condition.wait_for(
+            lock, std::chrono::milliseconds(250),
+            [&readerFinished] { return readerFinished; });
+        releaseWriter = true;
+        condition.notify_all();
+    }
+    writer.join();
+    reader.join();
+    qbrowser_package_store_testing::resetPackageStoreTestHooks();
+    QVERIFY(!completedWhileWriterHeld);
+    QVERIFY(marked.succeeded());
+    QVERIFY(read.hasValue());
+    QCOMPARE(read.state.lastKnownGood, one);
+}
+
+void PackageStoreTest::compareAndCommitRejectsStaleActivationBindings()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageStore competingStore(store.root());
+    const QString first = createCandidate(
+        temporary, QStringLiteral("binding-one"), QByteArrayLiteral("one"));
+    const QString second = createCandidate(
+        temporary, QStringLiteral("binding-two"), QByteArrayLiteral("two"));
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionOne(), digest('a'), first)
+                .succeeded());
+    QVERIFY(store.commitCandidateForTesting(
+                      appId(), versionTwo(), digest('b'), second)
+                .succeeded());
+    const QString one = targetName(versionOne(), digest('a'));
+    const QString two = targetName(versionTwo(), digest('b'));
+    const PackageStoreResult activatedOne = store.activateForTesting(appId(), one);
+    QVERIFY(activatedOne.succeeded());
+    QVERIFY(activatedOne.activationBinding.has_value());
+    const ActivationBinding stale = *activatedOne.activationBinding;
+
+    const PackageStoreResult activatedTwo = competingStore.activateForTesting(
+        appId(), two);
+    QVERIFY(activatedTwo.succeeded());
+    QVERIFY(activatedTwo.activationBinding.has_value());
+    QVERIFY(activatedTwo.activationBinding->generation > stale.generation);
+
+    const PackageStoreResult staleMark = store.markCurrentLastKnownGoodForTesting(
+        appId(), stale);
+    QCOMPARE(staleMark.error, PackageStoreError::StateConflict);
+    const ActivationState afterStaleMark = store.activationState(appId()).state;
+    QCOMPARE(afterStaleMark.current, two);
+    QVERIFY(afterStaleMark.lastKnownGood.isEmpty());
+    QCOMPARE(afterStaleMark.generation,
+             activatedTwo.activationBinding->generation);
+
+    const PackageStoreResult currentMark = store.markCurrentLastKnownGoodForTesting(
+        appId(), *activatedTwo.activationBinding);
+    QVERIFY2(currentMark.succeeded(), qPrintable(currentMark.message));
+    const ActivationState marked = store.activationState(appId()).state;
+    QCOMPARE(marked.lastKnownGood, two);
+    QVERIFY(marked.generation > afterStaleMark.generation);
+
+    const PackageStoreResult staleRollback = store.rollbackForTesting(
+        appId(), *activatedTwo.activationBinding);
+    QCOMPARE(staleRollback.error, PackageStoreError::StateConflict);
+    QCOMPARE(store.activationState(appId()).state, marked);
+}
 
 void PackageStoreTest::storesVersionDirectoriesWithoutReplacingExistingContent()
 {
@@ -152,7 +274,7 @@ void PackageStoreTest::atomicallyTracksCurrentPreviousAndLastKnownGood()
     const QString two = targetName(versionTwo(), digest('b'));
 
     QVERIFY(store.activateForTesting(appId(), one).succeeded());
-    QVERIFY(store.markCurrentLastKnownGood(appId()).succeeded());
+    QVERIFY(store.markCurrentLastKnownGoodForTesting(appId()).succeeded());
     QVERIFY(store.activateForTesting(appId(), two).succeeded());
 
     const ActivationStateResult loaded = store.activationState(appId());
@@ -190,12 +312,12 @@ void PackageStoreTest::activationIsIdempotentAndRollbackRestoresPrevious()
     const QString one = targetName(versionOne(), digest('a'));
     const QString two = targetName(versionTwo(), digest('b'));
     QVERIFY(store.activateForTesting(appId(), one).succeeded());
-    QVERIFY(store.markCurrentLastKnownGood(appId()).succeeded());
+    QVERIFY(store.markCurrentLastKnownGoodForTesting(appId()).succeeded());
     QVERIFY(store.activateForTesting(appId(), two).succeeded());
 
     QVERIFY(store.activateForTesting(appId(), two).succeeded());
     QCOMPARE(store.activationState(appId()).state.previous, one);
-    QVERIFY(store.rollback(appId()).succeeded());
+    QVERIFY(store.rollbackForTesting(appId()).succeeded());
     const ActivationState state = store.activationState(appId()).state;
     QCOMPARE(state.current, one);
     QCOMPARE(state.previous, two);
@@ -365,7 +487,7 @@ void PackageStoreTest::activationTransactionsSerializeWithoutLostUpdates()
     PackageStoreResult markResult;
     PackageStoreResult activateResult;
     std::thread markThread([&] {
-        markResult = store.markCurrentLastKnownGood(appId());
+        markResult = store.markCurrentLastKnownGoodForTesting(appId());
     });
     bool firstEntered = false;
     {
@@ -416,7 +538,7 @@ void PackageStoreTest::activationTransactionsSerializeWithoutLostUpdates()
     PackageStoreResult rollbackResult;
     PackageStoreResult remarkResult;
     std::thread rollbackThread([&] {
-        rollbackResult = store.rollback(appId());
+        rollbackResult = store.rollbackForTesting(appId());
     });
     bool rollbackEntered = false;
     {
@@ -436,7 +558,7 @@ void PackageStoreTest::activationTransactionsSerializeWithoutLostUpdates()
         return;
     }
     std::thread remarkThread([&] {
-        remarkResult = competingStore.markCurrentLastKnownGood(appId());
+        remarkResult = competingStore.markCurrentLastKnownGoodForTesting(appId());
     });
     bool remarkEnteredBeforeRelease = false;
     {
@@ -579,7 +701,7 @@ void PackageStoreTest::recoversExpiredMalformedActivationLocks()
             QFileDevice::FileModificationTime));
         oldLock.close();
         const PackageStoreResult recovered =
-            store.markCurrentLastKnownGood(appId());
+            store.markCurrentLastKnownGoodForTesting(appId());
         QVERIFY2(recovered.succeeded(), qPrintable(recovered.message));
         QVERIFY(!QFileInfo::exists(lockPath));
     }

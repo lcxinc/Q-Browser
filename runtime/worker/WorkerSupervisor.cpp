@@ -163,7 +163,10 @@ WorkerSupervisionAction WorkerSupervisor::unexpectedFailure(
         if (restart_) restart_(activation_);
         return WorkerSupervisionAction::Restart;
     }
-    if (nowMs <= attemptStartMs_ + policy_.healthWindowMs) {
+    const qint64 healthWindowStart = hasAuthenticatedHandshake_
+        ? handshakeMs_
+        : attemptStartMs_;
+    if (nowMs <= healthWindowStart + policy_.healthWindowMs) {
         crashLoop_ = true;
         state_ = WorkerSupervisorState::Retired;
         if (!rollbackCalled_) {

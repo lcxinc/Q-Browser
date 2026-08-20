@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QThread>
 #include <QUuid>
 
 #include <aclapi.h>
@@ -167,7 +168,7 @@ WorkerTestEnvironment::Launch::Launch(IpcSession host, SandboxProcess child)
 }
 
 WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml, QString packageSource)
-    : appId_(QStringLiteral("com.qbrowser.workertest.%1")
+    : appId_(QStringLiteral("com.qbrowser.workertest.a%1")
                  .arg(QUuid::createUuid().toString(QUuid::Id128).toLower())),
       mainQml_(std::move(mainQml)), packageSource_(std::move(packageSource))
 {
@@ -178,10 +179,44 @@ WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml, QString package
 
 WorkerTestEnvironment::~WorkerTestEnvironment()
 {
+    boundary_.reset();
     const auto profileName = AppContainerProfile::deterministicName(appId_);
     if (profileName.has_value()) {
         (void)DeleteAppContainerProfile(
             reinterpret_cast<PCWSTR>(profileName->utf16()));
+    }
+    if (!root_.isValid()) return;
+    QStringList paths{root_.path()};
+    QDirIterator iterator(root_.path(),
+                          QDir::AllEntries | QDir::Hidden | QDir::System
+                              | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) paths.push_back(iterator.next());
+    for (const QString &entry : paths) {
+        QString native = QDir::toNativeSeparators(entry);
+        QString apiPath = native;
+        if (!apiPath.startsWith(QStringLiteral("\\\\?\\"))) {
+            apiPath = apiPath.startsWith(QStringLiteral("\\\\"))
+                ? QStringLiteral("\\\\?\\UNC\\") + apiPath.sliced(2)
+                : QStringLiteral("\\\\?\\") + apiPath;
+        }
+        (void)SetNamedSecurityInfoW(
+            reinterpret_cast<LPWSTR>(apiPath.data()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr);
+        const auto *pathText = reinterpret_cast<LPCWSTR>(apiPath.utf16());
+        const DWORD attributes = GetFileAttributesW(pathText);
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            (void)SetFileAttributesW(pathText,
+                                     attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+    }
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (QDir(root_.path()).removeRecursively()) {
+            root_.setAutoRemove(false);
+            break;
+        }
+        QThread::msleep(50);
     }
 }
 
@@ -199,6 +234,11 @@ QString WorkerTestEnvironment::appId() const
 {
     return appId_;
 }
+
+QString WorkerTestEnvironment::packageRoot() const { return packageRoot_; }
+QString WorkerTestEnvironment::sandboxTempRoot() const { return tempRoot_; }
+QString WorkerTestEnvironment::runtimeRoot() const { return runtimeRoot_; }
+QString WorkerTestEnvironment::workerExecutable() const { return workerExecutable_; }
 
 bool WorkerTestEnvironment::prepare()
 {

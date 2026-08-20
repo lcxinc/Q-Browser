@@ -1,15 +1,18 @@
 #pragma once
 
 #include "IpcSession.h"
+#include "HostRuntimeConfig.h"
 #include "WorkerSupervisor.h"
 
 #include <QObject>
 #include <QUrl>
+#include <QVariantMap>
 
 #include <memory>
 #include <functional>
 #include <optional>
 #include <atomic>
+#include <QPointer>
 
 class MainWindow;
 class HostWorkerSessionController;
@@ -17,6 +20,7 @@ class WorkerSurface;
 class UpdateLifecycleCoordinator;
 class QTimer;
 class QThread;
+class InstalledPackageWorkerLauncher;
 
 struct HostWorkerAttachContext final
 {
@@ -33,11 +37,11 @@ class HostApplication final : public QObject
 
 public:
     explicit HostApplication(QUrl mockOrigin, QObject *parent = nullptr);
+    explicit HostApplication(HostRuntimeConfig runtimeConfig,
+                             QObject *parent = nullptr);
     ~HostApplication() override;
 
     [[nodiscard]] bool start();
-    [[nodiscard]] bool setUpdateLifecycleCoordinator(
-        std::unique_ptr<UpdateLifecycleCoordinator> coordinator);
     [[nodiscard]] bool requestPackageInstall(const QString &packagePath);
     [[nodiscard]] bool requestOfflineStart();
     [[nodiscard]] bool attachWorkerSession(std::unique_ptr<IpcSession> session);
@@ -49,21 +53,32 @@ public:
 
 signals:
     void updateLifecycleFailed(const QString &stableError);
+    void packageWorkerReady(const QString &appId,
+                            const QString &version,
+                            const QString &packageDirectory,
+                            quint64 activation,
+                            quint64 attempt,
+                            quint32 processId);
+    void packageWorkerExited(quint64 activation, quint64 attempt);
+    void workerCapabilityRequestObserved(const QString &capability,
+                                         const QString &operation,
+                                         const QVariantMap &payload);
 
 private:
     [[nodiscard]] bool enqueueLifecycle(
         std::function<void(UpdateLifecycleCoordinator &)> operation);
+    [[nodiscard]] bool initializePackageRuntime();
 
-    static constexpr qsizetype maximumPendingLifecycleOperations = 512;
+    std::optional<HostRuntimeConfig> runtimeConfig_;
     QUrl mockOrigin_;
     std::unique_ptr<MainWindow> mainWindow_;
     std::unique_ptr<HostWorkerSessionController> workerSessionController_;
     std::shared_ptr<void> workerProcessLifetime_;
     std::function<void()> stopWorkerProcess_;
-    std::unique_ptr<UpdateLifecycleCoordinator> updateLifecycleCoordinator_;
+    std::unique_ptr<InstalledPackageWorkerLauncher> installedPackageLauncher_;
     std::unique_ptr<QTimer> updateHealthTimer_;
     std::optional<WorkerAttemptKey> attachedWorkerKey_;
-    std::unique_ptr<QThread> updateLifecycleThread_;
-    QObject *updateLifecycleDispatch_ = nullptr;
-    std::atomic<qsizetype> pendingLifecycleOperations_{0};
+    QPointer<QObject> updateLifecycleRuntime_;
+    QThread *updateLifecycleThread_ = nullptr;
+    std::atomic_bool acceptingLifecycle_{true};
 };

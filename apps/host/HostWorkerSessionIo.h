@@ -3,6 +3,7 @@
 #include "IpcSession.h"
 
 #include <QObject>
+#include <QVariantMap>
 #include <memory>
 
 class QTimer;
@@ -42,6 +43,10 @@ signals:
     void sessionFailed(quint64 generation, const QString &errorCode);
     void shutdownFinished(quint64 generation);
     void heartbeatObserved(quint64 generation);
+    void capabilityRequestObserved(quint64 generation,
+                                   const QString &capability,
+                                   const QString &operation,
+                                   const QVariantMap &payload);
 
 private:
     void pollSession();

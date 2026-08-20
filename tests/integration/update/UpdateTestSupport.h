@@ -5,6 +5,7 @@
 #include "PackageInstaller.h"
 #include "PackageStore.h"
 #include "SignatureVerifier.h"
+#include "UpdateLifecycleCoordinator.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -18,6 +19,28 @@
 #include <Aclapi.h>
 #include <qt_windows.h>
 #endif
+
+class ManualLifecycleClock final
+{
+public:
+    [[nodiscard]] LifecycleClock source()
+    {
+        return { [this] { return steadyNowMs_; },
+                 [this] { return utcNowMs_; } };
+    }
+
+    void set(const qint64 steadyNowMs)
+    {
+        steadyNowMs_ = steadyNowMs;
+        utcNowMs_ = 1'900'000'000'000LL + steadyNowMs;
+    }
+
+    void setUtc(const qint64 utcNowMs) { utcNowMs_ = utcNowMs; }
+
+private:
+    qint64 steadyNowMs_ = 0;
+    qint64 utcNowMs_ = 1'900'000'000'000LL;
+};
 
 class UpdateTemporaryDir final : public QTemporaryDir
 {
@@ -51,11 +74,13 @@ public:
     }
 };
 
-inline QByteArray updateManifest(const QString &version)
+inline QByteArray updateManifest(
+    const QString &version,
+    const QString &appId = QStringLiteral("company.pilot"))
 {
     return QJsonDocument(QJsonObject{
         {QStringLiteral("schemaVersion"), 1},
-        {QStringLiteral("appId"), QStringLiteral("company.pilot")},
+        {QStringLiteral("appId"), appId},
         {QStringLiteral("version"), version},
         {QStringLiteral("entryPoint"), QStringLiteral("qml/Main.qml")},
         {QStringLiteral("runtime"),
@@ -77,10 +102,11 @@ inline QString updateSignedPackage(QTemporaryDir &temporary,
                                    const QByteArray &privateKey,
                                    const bool corruptSignature = false,
                                    QByteArray qml = QByteArrayLiteral(
-                                       "import QtQuick\nItem { width: 320; height: 200 }"))
+                                       "import QtQuick\nItem { width: 320; height: 200 }"),
+                                   const QString &appId = QStringLiteral("company.pilot"))
 {
     QVector<ArchiveFile> files{{QByteArrayLiteral("manifest.json"),
-                                updateManifest(version)},
+                                updateManifest(version, appId)},
                                {QByteArrayLiteral("qml/Main.qml"),
                                 std::move(qml)}};
     const ContentDigestResult payload = ContentDigest::payload(files);

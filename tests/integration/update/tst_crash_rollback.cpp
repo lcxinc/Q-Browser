@@ -39,6 +39,7 @@ void CrashRollbackTest::commitsRollbackBeforeLaunchingRecoveredRealLpacWorker()
     bool stopObserved = false;
     std::unique_ptr<WorkerTestEnvironment> workerEnvironment;
     std::unique_ptr<WorkerTestEnvironment::Launch> workerLaunch;
+    ManualLifecycleClock clock;
     UpdateLifecycleCoordinator *coordinatorPointer = nullptr;
     UpdateLifecycleCoordinator coordinator(
         QStringLiteral("company.pilot"), store, installer, {2'000, 500},
@@ -72,71 +73,82 @@ void CrashRollbackTest::commitsRollbackBeforeLaunchingRecoveredRealLpacWorker()
             workerLaunch = std::make_unique<WorkerTestEnvironment::Launch>(
                 std::move(*launched));
             return coordinatorPointer != nullptr;
-        });
+        }, clock.source());
     coordinatorPointer = &coordinator;
     coordinator.setBeforeRelaunchCallback([&] { stopObserved = true; });
 
+    clock.set(0);
     const UpdateLifecycleResult first = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("one"),
-                            QStringLiteral("1.0.0"), keys.value().privateKeyPem), 0);
+                            QStringLiteral("1.0.0"), keys.value().privateKeyPem));
     QVERIFY(first.succeeded());
     WorkerAttemptKey healthyKey = coordinator.currentAttemptKey().value();
-    (void)coordinator.authenticatedHandshake(healthyKey, 1);
+    clock.set(1);
+    (void)coordinator.authenticatedHandshake(healthyKey);
     for (qint64 now = 401; now < 2'001; now += 400) {
-        QCOMPARE(coordinator.heartbeat(healthyKey, now),
+        clock.set(now);
+        QCOMPARE(coordinator.heartbeat(healthyKey),
                  UpdateLifecycleAction::None);
     }
-    QCOMPARE(coordinator.heartbeat(healthyKey, 2'001),
+    clock.set(2'001);
+    QCOMPARE(coordinator.heartbeat(healthyKey),
              UpdateLifecycleAction::MarkedHealthy);
+    clock.set(3'000);
     const UpdateLifecycleResult stable = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("two"),
-                            QStringLiteral("1.1.0"), keys.value().privateKeyPem),
-        3'000);
+                            QStringLiteral("1.1.0"), keys.value().privateKeyPem));
     QVERIFY(stable.succeeded());
     healthyKey = coordinator.currentAttemptKey().value();
-    (void)coordinator.authenticatedHandshake(healthyKey, 3'001);
+    clock.set(3'001);
+    (void)coordinator.authenticatedHandshake(healthyKey);
     for (qint64 now = 3'401; now < 5'001; now += 400) {
-        QCOMPARE(coordinator.heartbeat(healthyKey, now),
+        clock.set(now);
+        QCOMPARE(coordinator.heartbeat(healthyKey),
                  UpdateLifecycleAction::None);
     }
-    QCOMPARE(coordinator.heartbeat(healthyKey, 5'001),
+    clock.set(5'001);
+    QCOMPARE(coordinator.heartbeat(healthyKey),
              UpdateLifecycleAction::MarkedHealthy);
 
+    clock.set(6'000);
     const UpdateLifecycleResult crashing = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("crashing"),
                             QStringLiteral("1.2.0"), keys.value().privateKeyPem,
                             false,
                             QByteArrayLiteral(
                                 "import QtQuick\nItem { Timer { interval: 500; running: true; "
-                                "onTriggered: Qt.quit() } }")),
-        6'000);
+                                "onTriggered: Qt.quit() } }")));
     QVERIFY2(crashing.succeeded(), qPrintable(crashing.stableError));
     QVERIFY(workerLaunch != nullptr);
     const WorkerAttemptKey firstKey = coordinator.currentAttemptKey().value();
     const SessionReceiveResult handshake = receiveUntil(
         workerLaunch->hostSession, ProtocolType::Handshake);
     QCOMPARE(handshake.status, SessionStatus::MessageReady);
-    QCOMPARE(coordinator.authenticatedHandshake(firstKey, 6'010),
+    clock.set(6'010);
+    QCOMPARE(coordinator.authenticatedHandshake(firstKey),
              UpdateLifecycleAction::None);
     workerLaunch->process.terminate(ERROR_PROCESS_ABORTED);
     QVERIFY(workerLaunch->process.waitForFinished(10'000));
     workerLaunch->hostSession.close();
     QVERIFY(workerLaunch->process.close().value.has_value());
 
-    QCOMPARE(coordinator.workerExited(firstKey, WorkerExitReason::Crashed, 6'600),
+    clock.set(6'600);
+    QCOMPARE(coordinator.workerExited(firstKey, WorkerExitReason::Crashed),
              UpdateLifecycleAction::Restarted);
     QVERIFY(workerLaunch != nullptr);
     const WorkerAttemptKey secondKey = coordinator.currentAttemptKey().value();
     QCOMPARE(receiveUntil(workerLaunch->hostSession, ProtocolType::Handshake).status,
              SessionStatus::MessageReady);
-    QCOMPARE(coordinator.authenticatedHandshake(secondKey, 6'610),
+    clock.set(6'610);
+    QCOMPARE(coordinator.authenticatedHandshake(secondKey),
              UpdateLifecycleAction::None);
     workerLaunch->process.terminate(ERROR_PROCESS_ABORTED);
     QVERIFY(workerLaunch->process.waitForFinished(10'000));
     workerLaunch->hostSession.close();
     QVERIFY(workerLaunch->process.close().value.has_value());
 
-    QCOMPARE(coordinator.workerExited(secondKey, WorkerExitReason::Crashed, 7'200),
+    clock.set(7'200);
+    QCOMPARE(coordinator.workerExited(secondKey, WorkerExitReason::Crashed),
              UpdateLifecycleAction::RolledBackAndLaunched);
     QCOMPARE(launchVersions.back(), QStringLiteral("1.1.0"));
     QVERIFY(stateCommittedAtLaunch.back());
@@ -150,7 +162,8 @@ void CrashRollbackTest::commitsRollbackBeforeLaunchingRecoveredRealLpacWorker()
     const WorkerAttemptKey recoveredKey = coordinator.currentAttemptKey().value();
     QCOMPARE(receiveUntil(workerLaunch->hostSession, ProtocolType::Handshake).status,
              SessionStatus::MessageReady);
-    QCOMPARE(coordinator.authenticatedHandshake(recoveredKey, 7'210),
+    clock.set(7'210);
+    QCOMPARE(coordinator.authenticatedHandshake(recoveredKey),
              UpdateLifecycleAction::None);
     QCOMPARE(receiveUntil(workerLaunch->hostSession, ProtocolType::SurfaceReady).status,
              SessionStatus::MessageReady);
@@ -169,7 +182,8 @@ void CrashRollbackTest::commitsRollbackBeforeLaunchingRecoveredRealLpacWorker()
     QVERIFY(response.has_value());
     QVERIFY(workerLaunch->hostSession.send(*response, 5'000));
 
-    QCOMPARE(coordinator.workerExited(secondKey, WorkerExitReason::Crashed, 7'201),
+    clock.set(7'211);
+    QCOMPARE(coordinator.workerExited(secondKey, WorkerExitReason::Crashed),
              UpdateLifecycleAction::IgnoredStaleAttempt);
     QCOMPARE(launchVersions.count(QStringLiteral("1.1.0")), 2);
     workerLaunch->hostSession.close();

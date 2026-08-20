@@ -11,7 +11,7 @@ constexpr qsizetype MaximumActivationStateBytes = 4096;
 
 bool containsExactlyStateMembers(const QJsonObject &object)
 {
-    if (object.size() != 3) {
+    if (object.size() != 4) {
         return false;
     }
     static const QStringList members{
@@ -23,7 +23,11 @@ bool containsExactlyStateMembers(const QJsonObject &object)
             return false;
         }
     }
-    return true;
+    const QJsonValue generation = object.value(QStringLiteral("generation"));
+    return generation.isDouble() && generation.toDouble() >= 0.0
+        && generation.toDouble() <= 9'007'199'254'740'991.0
+        && generation.toDouble() == static_cast<double>(
+               static_cast<qint64>(generation.toDouble()));
 }
 
 QString persistedTarget(const QString &target)
@@ -50,6 +54,7 @@ QByteArray ActivationState::toJson() const
     object.insert(QStringLiteral("current"), persistedTarget(current));
     object.insert(QStringLiteral("previous"), persistedTarget(previous));
     object.insert(QStringLiteral("lastKnownGood"), persistedTarget(lastKnownGood));
+    object.insert(QStringLiteral("generation"), generation);
     return QJsonDocument(object).toJson(QJsonDocument::Compact) + '\n';
 }
 
@@ -80,5 +85,9 @@ std::optional<ActivationState> ActivationState::fromJson(
         || !lastKnownGood.has_value()) {
         return std::nullopt;
     }
-    return ActivationState{*current, *previous, *lastKnownGood};
+    return ActivationState{
+        *current,
+        *previous,
+        *lastKnownGood,
+        static_cast<qint64>(object.value(QStringLiteral("generation")).toDouble())};
 }

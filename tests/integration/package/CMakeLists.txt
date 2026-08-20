@@ -37,7 +37,8 @@ endif()
 
 target_compile_definitions(tst_package_installer PRIVATE
   Q_BROWSER_ARCHIVE_TESTING
-  Q_BROWSER_PACKAGE_INSTALLER_TESTING)
+  Q_BROWSER_PACKAGE_INSTALLER_TESTING
+  Q_BROWSER_PACKAGE_STORE_TESTING)
 
 q_browser_enable_strict_warnings(tst_package_installer)
 

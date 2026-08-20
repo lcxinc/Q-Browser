@@ -34,6 +34,10 @@ public:
     bool isValid() const noexcept;
     QString error() const;
     QString appId() const;
+    QString packageRoot() const;
+    QString sandboxTempRoot() const;
+    QString runtimeRoot() const;
+    QString workerExecutable() const;
 
     struct Launch final {
         IpcSession hostSession;

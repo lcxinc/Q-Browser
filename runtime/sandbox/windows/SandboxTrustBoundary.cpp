@@ -94,6 +94,16 @@ QString absolutePath(const QString &path)
         QDir::cleanPath(QFileInfo(withoutExtendedPrefix(path)).absoluteFilePath()));
 }
 
+QString windowsApiPath(const QString &path)
+{
+    const QString native = absolutePath(path);
+    if (native.startsWith(QStringLiteral("\\\\?\\"))) return native;
+    if (native.startsWith(QStringLiteral("\\\\"))) {
+        return QStringLiteral("\\\\?\\UNC\\") + native.sliced(2);
+    }
+    return QStringLiteral("\\\\?\\") + native;
+}
+
 QString pathKey(const QString &path)
 {
     return QDir::toNativeSeparators(path).toCaseFolded();
@@ -164,8 +174,9 @@ SandboxValueResult<bool> noReparseAncestors(const QString &path)
     }
     std::reverse(ancestors.begin(), ancestors.end());
     for (const QString &ancestor : ancestors) {
+        const QString apiPath = windowsApiPath(ancestor);
         UniqueHandle handle(CreateFileW(
-            reinterpret_cast<LPCWSTR>(ancestor.utf16()),
+            reinterpret_cast<LPCWSTR>(apiPath.utf16()),
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -213,8 +224,9 @@ SandboxValueResult<StablePath> openStablePath(const QString &path,
     // apply and roll back the exact AppContainer ACE on every retained path.
     const DWORD access = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES
         | (directory ? 0U : GENERIC_READ | FILE_EXECUTE);
+    const QString apiPath = windowsApiPath(normalized);
     UniqueHandle handle(CreateFileW(
-        reinterpret_cast<LPCWSTR>(normalized.utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         access,
         FILE_SHARE_READ,
         nullptr,

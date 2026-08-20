@@ -24,6 +24,16 @@ QString absolutePath(const QString &path)
         QDir::cleanPath(QFileInfo(path).absoluteFilePath()));
 }
 
+QString windowsApiPath(const QString &path)
+{
+    const QString native = absolutePath(path);
+    if (native.startsWith(QStringLiteral("\\\\?\\"))) return native;
+    if (native.startsWith(QStringLiteral("\\\\"))) {
+        return QStringLiteral("\\\\?\\UNC\\") + native.sliced(2);
+    }
+    return QStringLiteral("\\\\?\\") + native;
+}
+
 QString pathKey(const QString &path)
 {
     return absolutePath(path).toCaseFolded();
@@ -186,8 +196,9 @@ bool restoreHandleSecurity(HANDLE handle, const QByteArray &security)
 
 UniqueWindowsHandle openSecurityTarget(const QString &path, const bool directory)
 {
+    const QString apiPath = windowsApiPath(path);
     return UniqueWindowsHandle(CreateFileW(
-        reinterpret_cast<LPCWSTR>(absolutePath(path).utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
@@ -202,8 +213,9 @@ UniqueWindowsHandle openDirectory(
     DWORD desiredAccess,
     DWORD shareMode)
 {
+    const QString apiPath = windowsApiPath(path);
     return UniqueWindowsHandle(CreateFileW(
-        reinterpret_cast<LPCWSTR>(path.utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         desiredAccess,
         shareMode,
         nullptr,
@@ -353,9 +365,9 @@ bool WindowsStableDirectoryTree::createAndHoldDirectory(const QString &path)
         return contains(path);
     }
     const QString parent = QFileInfo(absolutePath(path)).dir().absolutePath();
+    const QString apiPath = windowsApiPath(path);
     if (!contains(parent)
-        || CreateDirectoryW(
-               reinterpret_cast<LPCWSTR>(absolutePath(path).utf16()), nullptr)
+        || CreateDirectoryW(reinterpret_cast<LPCWSTR>(apiPath.utf16()), nullptr)
             == FALSE) {
         return false;
     }
@@ -411,7 +423,7 @@ bool WindowsStableDirectoryTree::publishRootNoReplace(
     if (rootRecord == m_directories.end() || !rootRecord->handle.isValid()) {
         return false;
     }
-    const QString normalizedDestination = absolutePath(destination);
+    const QString normalizedDestination = windowsApiPath(destination);
     const size_t nameBytes = static_cast<size_t>(normalizedDestination.size())
         * sizeof(wchar_t);
     constexpr size_t renameHeaderSize = sizeof(FILE_RENAME_INFO);
@@ -485,7 +497,7 @@ bool WindowsStableDirectoryTree::restoreMutationSeals() noexcept
 bool WindowsStableDirectoryTree::verifyMovedTree(
     const QString &destination) const
 {
-    const QString normalizedDestination = absolutePath(destination);
+    const QString normalizedDestination = windowsApiPath(destination);
     const auto rootRecord = std::find_if(
         m_directories.cbegin(),
         m_directories.cend(),
@@ -691,8 +703,9 @@ bool WindowsStableFile::createOwnedOutput(
 {
     constexpr DWORD desiredAccess =
         GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES;
+    const QString apiPath = windowsApiPath(path);
     m_handle.reset(CreateFileW(
-        reinterpret_cast<LPCWSTR>(path.utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         desiredAccess,
         0U,
         securityAttributes,
@@ -812,7 +825,7 @@ bool WindowsStableFile::publishNoReplace(
         || !tree.contains(QFileInfo(destination).dir().absolutePath())) {
         return false;
     }
-    const QString normalizedDestination = absolutePath(destination);
+    const QString normalizedDestination = windowsApiPath(destination);
     const size_t nameBytes = static_cast<size_t>(normalizedDestination.size())
         * sizeof(wchar_t);
     constexpr size_t renameHeaderSize = sizeof(FILE_RENAME_INFO);
@@ -929,8 +942,9 @@ bool WindowsStableFile::restoreMutationSeal(const QString &path) noexcept
 
 bool WindowsStableFile::isSameIdentityAt(const QString &path) const
 {
+    const QString apiPath = windowsApiPath(path);
     UniqueWindowsHandle reopened(CreateFileW(
-        reinterpret_cast<LPCWSTR>(absolutePath(path).utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
@@ -973,8 +987,9 @@ bool WindowsStableFile::openAndVerify(
     DWORD shareMode,
     const WindowsStableDirectoryTree &tree)
 {
+    const QString apiPath = windowsApiPath(path);
     m_handle.reset(CreateFileW(
-        reinterpret_cast<LPCWSTR>(path.utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         access,
         shareMode,
         nullptr,

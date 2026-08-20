@@ -209,7 +209,9 @@ void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
     QCOMPARE(installedFirst.appId, QStringLiteral("company.pilot"));
     QCOMPARE(installedFirst.version, QStringLiteral("1.0.0"));
     QVERIFY(QFileInfo::exists(installedFirst.path + QStringLiteral("/qml/Main.qml")));
-    QVERIFY(store.markCurrentLastKnownGood(QStringLiteral("company.pilot")).succeeded());
+    QVERIFY(store.markCurrentLastKnownGoodForTesting(
+                      QStringLiteral("company.pilot"))
+                .succeeded());
 
     const QString second = signedPackage(
         temporary, QStringLiteral("two"), keys.value().privateKeyPem,
@@ -218,7 +220,7 @@ void PackageInstallerTest::installsActivatesAndRollsBackVerifiedVersions()
     QVERIFY2(installedSecond.succeeded(), qPrintable(installedSecond.stableError));
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
              installedSecond.path);
-    QVERIFY(store.rollback(QStringLiteral("company.pilot")).succeeded());
+    QVERIFY(store.rollbackForTesting(QStringLiteral("company.pilot")).succeeded());
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
              installedFirst.path);
 }

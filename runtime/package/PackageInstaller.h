@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ArchiveLimits.h"
+#include "ActivationState.h"
 #include "Manifest.h"
 
 #include <QByteArray>
@@ -8,6 +9,7 @@
 #include <QString>
 
 #include <functional>
+#include <optional>
 
 class PackageStore;
 
@@ -45,6 +47,7 @@ struct InstallResult final
     QString appId;
     QString version;
     QString path;
+    std::optional<ActivationBinding> activationBinding;
 
     [[nodiscard]] bool succeeded() const noexcept
     {

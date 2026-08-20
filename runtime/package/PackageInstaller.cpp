@@ -342,8 +342,15 @@ InstallResult PackageInstaller::verifyInstalled(
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                        QStringLiteral("installed_content_invalid"));
     }
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+    if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterVerifyInstalled) {
+        qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterVerifyInstalled(appId, versionDirectory);
+    }
+#endif
     return {InstallPhase::Complete, InstallError::None, {}, appId,
-            parsed.value().version(), root};
+            parsed.value().version(), root, std::nullopt};
 }
 
 InstallResult PackageInstaller::install(const QString &packagePath) const
@@ -529,5 +536,6 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
             {},
             manifest.appId(),
             manifest.version(),
-            candidate.path};
+            candidate.path,
+            activated.activationBinding};
 }

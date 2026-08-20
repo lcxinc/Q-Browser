@@ -684,6 +684,24 @@ ActivationStateResult PackageStore::activationState(const QString &appId) const
         return stateFailure(PackageStoreError::InvalidArgument,
                             QStringLiteral("invalid application identifier"));
     }
+    if (!QFileInfo::exists(appRoot(appId) + QStringLiteral("/activation.json"))) {
+        return {};
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return stateFailure(PackageStoreError::StateUnavailable,
+                            QStringLiteral("activation state is busy"));
+    }
+    return activationStateUnlocked(appId);
+}
+
+ActivationStateResult PackageStore::activationStateUnlocked(
+    const QString &appId) const
+{
+    if (!validAppId(appId)) {
+        return stateFailure(PackageStoreError::InvalidArgument,
+                            QStringLiteral("invalid application identifier"));
+    }
     const QString statePath = appRoot(appId) + QStringLiteral("/activation.json");
     if (!QFileInfo::exists(statePath)) {
         return {};
@@ -735,6 +753,24 @@ ActivationStateResult PackageStore::activationState(const QString &appId) const
 }
 
 ActivationStateResult PackageStore::recordedActivationState(
+    const QString &appId) const
+{
+    if (!validAppId(appId)) {
+        return stateFailure(PackageStoreError::InvalidArgument,
+                            QStringLiteral("invalid application identifier"));
+    }
+    if (!QFileInfo::exists(appRoot(appId) + QStringLiteral("/activation.json"))) {
+        return {};
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return stateFailure(PackageStoreError::StateUnavailable,
+                            QStringLiteral("activation state is busy"));
+    }
+    return recordedActivationStateUnlocked(appId);
+}
+
+ActivationStateResult PackageStore::recordedActivationStateUnlocked(
     const QString &appId) const
 {
     if (!validAppId(appId)) {
@@ -838,17 +874,36 @@ PackageStoreResult PackageStore::activateVerified(
         return failure(PackageStoreError::VersionUnavailable,
                        QStringLiteral("version is unavailable"));
     }
-    const ActivationStateResult loaded = activationState(appId);
+    const ActivationStateResult loaded = activationStateUnlocked(appId);
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
     }
     if (loaded.state.current == versionDirectory) {
-        return {};
+        const auto binding = bindingForState(loaded.state);
+        if (!binding.has_value()) {
+            return failure(PackageStoreError::InvalidState,
+                           QStringLiteral("activation binding is invalid"));
+        }
+        return {PackageStoreError::None, versionPath(appId, versionDirectory),
+                {}, binding};
+    }
+    if (loaded.state.generation >= 9'007'199'254'740'991LL) {
+        return failure(PackageStoreError::StateCommitFailed,
+                       QStringLiteral("activation generation is exhausted"));
     }
     ActivationState next = loaded.state;
     next.previous = next.current;
     next.current = versionDirectory;
-    return writeState(appId, next);
+    ++next.generation;
+    PackageStoreResult committed = writeState(appId, next);
+    if (!committed.succeeded()) return committed;
+    committed.path = versionPath(appId, versionDirectory);
+    committed.activationBinding = bindingForState(next);
+    if (!committed.activationBinding.has_value()) {
+        return failure(PackageStoreError::InvalidState,
+                       QStringLiteral("activation binding is invalid"));
+    }
+    return committed;
 }
 
 #ifdef Q_BROWSER_PACKAGE_STORE_TESTING
@@ -875,10 +930,50 @@ PackageStoreResult PackageStore::activateForTesting(
 {
     return activateVerified(appId, versionDirectory);
 }
+
+PackageStoreResult PackageStore::markCurrentLastKnownGoodForTesting(
+    const QString &appId) const
+{
+    const ActivationStateResult state = activationState(appId);
+    if (!state.hasValue()) return failure(state.error, state.message);
+    const auto binding = bindingForState(state.state);
+    if (!binding.has_value()) {
+        return failure(PackageStoreError::InvalidState,
+                       QStringLiteral("activation binding is invalid"));
+    }
+    return markCurrentLastKnownGood(appId, *binding);
+}
+
+PackageStoreResult PackageStore::markCurrentLastKnownGoodForTesting(
+    const QString &appId,
+    const ActivationBinding &expected) const
+{
+    return markCurrentLastKnownGood(appId, expected);
+}
+
+PackageStoreResult PackageStore::rollbackForTesting(const QString &appId) const
+{
+    const ActivationStateResult state = activationState(appId);
+    if (!state.hasValue()) return failure(state.error, state.message);
+    const auto binding = bindingForState(state.state);
+    if (!binding.has_value()) {
+        return failure(PackageStoreError::InvalidState,
+                       QStringLiteral("activation binding is invalid"));
+    }
+    return rollback(appId, *binding);
+}
+
+PackageStoreResult PackageStore::rollbackForTesting(
+    const QString &appId,
+    const ActivationBinding &expected) const
+{
+    return rollback(appId, expected);
+}
 #endif
 
 PackageStoreResult PackageStore::markCurrentLastKnownGood(
-    const QString &appId) const
+    const QString &appId,
+    const ActivationBinding &expected) const
 {
     if (!ensureAppDirectories(appId)) {
         return failure(PackageStoreError::UnsafeStore,
@@ -896,7 +991,7 @@ PackageStoreResult PackageStore::markCurrentLastKnownGood(
             .afterActivationLockAcquired(appId, QStringLiteral("mark_lkg"));
     }
 #endif
-    const ActivationStateResult loaded = activationState(appId);
+    const ActivationStateResult loaded = activationStateUnlocked(appId);
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
     }
@@ -904,15 +999,32 @@ PackageStoreResult PackageStore::markCurrentLastKnownGood(
         return failure(PackageStoreError::VersionUnavailable,
                        QStringLiteral("no current version is active"));
     }
+    const auto actual = bindingForState(loaded.state);
+    if (!actual.has_value() || *actual != expected) {
+        return failure(PackageStoreError::StateConflict,
+                       QStringLiteral("activation state changed"));
+    }
     if (loaded.state.lastKnownGood == loaded.state.current) {
-        return {};
+        return {PackageStoreError::None, versionPath(appId, loaded.state.current),
+                {}, actual};
+    }
+    if (loaded.state.generation >= 9'007'199'254'740'991LL) {
+        return failure(PackageStoreError::StateCommitFailed,
+                       QStringLiteral("activation generation is exhausted"));
     }
     ActivationState next = loaded.state;
     next.lastKnownGood = next.current;
-    return writeState(appId, next);
+    ++next.generation;
+    PackageStoreResult committed = writeState(appId, next);
+    if (!committed.succeeded()) return committed;
+    committed.path = versionPath(appId, next.current);
+    committed.activationBinding = bindingForState(next);
+    return committed;
 }
 
-PackageStoreResult PackageStore::recoverLastKnownGood(const QString &appId) const
+PackageStoreResult PackageStore::recoverLastKnownGood(
+    const QString &appId,
+    const ActivationBinding &expected) const
 {
     if (!ensureAppDirectories(appId)) {
         return failure(PackageStoreError::UnsafeStore,
@@ -923,8 +1035,13 @@ PackageStoreResult PackageStore::recoverLastKnownGood(const QString &appId) cons
         return failure(PackageStoreError::StateUnavailable,
                        QStringLiteral("activation state is busy"));
     }
-    const ActivationStateResult loaded = recordedActivationState(appId);
+    const ActivationStateResult loaded = recordedActivationStateUnlocked(appId);
     if (!loaded.hasValue()) return failure(loaded.error, loaded.message);
+    const auto actual = bindingForState(loaded.state);
+    if (!actual.has_value() || *actual != expected) {
+        return failure(PackageStoreError::StateConflict,
+                       QStringLiteral("activation state changed"));
+    }
     if (loaded.state.lastKnownGood.isEmpty()
         || !stateTargetIsValid(appId, loaded.state.lastKnownGood, false)) {
         return failure(PackageStoreError::RollbackUnavailable,
@@ -932,15 +1049,27 @@ PackageStoreResult PackageStore::recoverLastKnownGood(const QString &appId) cons
     }
     if (loaded.state.current == loaded.state.lastKnownGood
         && stateTargetIsValid(appId, loaded.state.current, false)) {
-        return {};
+        return {PackageStoreError::None, versionPath(appId, loaded.state.current),
+                {}, actual};
+    }
+    if (loaded.state.generation >= 9'007'199'254'740'991LL) {
+        return failure(PackageStoreError::StateCommitFailed,
+                       QStringLiteral("activation generation is exhausted"));
     }
     const ActivationState recovered{loaded.state.lastKnownGood,
                                     {},
-                                    loaded.state.lastKnownGood};
-    return writeState(appId, recovered);
+                                    loaded.state.lastKnownGood,
+                                    loaded.state.generation + 1};
+    PackageStoreResult committed = writeState(appId, recovered);
+    if (!committed.succeeded()) return committed;
+    committed.path = versionPath(appId, recovered.current);
+    committed.activationBinding = bindingForState(recovered);
+    return committed;
 }
 
-PackageStoreResult PackageStore::rollback(const QString &appId) const
+PackageStoreResult PackageStore::rollback(
+    const QString &appId,
+    const ActivationBinding &expected) const
 {
     if (!ensureAppDirectories(appId)) {
         return failure(PackageStoreError::UnsafeStore,
@@ -958,9 +1087,14 @@ PackageStoreResult PackageStore::rollback(const QString &appId) const
             .afterActivationLockAcquired(appId, QStringLiteral("rollback"));
     }
 #endif
-    const ActivationStateResult loaded = activationState(appId);
+    const ActivationStateResult loaded = activationStateUnlocked(appId);
     if (!loaded.hasValue()) {
         return failure(loaded.error, loaded.message);
+    }
+    const auto actual = bindingForState(loaded.state);
+    if (!actual.has_value() || *actual != expected) {
+        return failure(PackageStoreError::StateConflict,
+                       QStringLiteral("activation state changed"));
     }
     QString target = loaded.state.lastKnownGood;
     if (target.isEmpty()) target = loaded.state.previous;
@@ -969,10 +1103,74 @@ PackageStoreResult PackageStore::rollback(const QString &appId) const
         return failure(PackageStoreError::RollbackUnavailable,
                        QStringLiteral("rollback target is unavailable"));
     }
+    if (loaded.state.generation >= 9'007'199'254'740'991LL) {
+        return failure(PackageStoreError::StateCommitFailed,
+                       QStringLiteral("activation generation is exhausted"));
+    }
     ActivationState next = loaded.state;
     next.previous = next.current;
     next.current = target;
-    return writeState(appId, next);
+    ++next.generation;
+    PackageStoreResult committed = writeState(appId, next);
+    if (!committed.succeeded()) return committed;
+    committed.path = versionPath(appId, next.current);
+    committed.activationBinding = bindingForState(next);
+    return committed;
+}
+
+PackageStoreResult PackageStore::confirmCurrent(
+    const QString &appId,
+    const ActivationBinding &expected) const
+{
+    if (!ensureAppDirectories(appId)) {
+        return failure(PackageStoreError::UnsafeStore,
+                       QStringLiteral("package store is unavailable"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+    const ActivationStateResult loaded = recordedActivationStateUnlocked(appId);
+    if (!loaded.hasValue()) return failure(loaded.error, loaded.message);
+    const auto actual = bindingForState(loaded.state);
+    if (!actual.has_value() || *actual != expected) {
+        return failure(PackageStoreError::StateConflict,
+                       QStringLiteral("activation state changed"));
+    }
+    if (loaded.state.generation >= 9'007'199'254'740'991LL) {
+        return failure(PackageStoreError::StateCommitFailed,
+                       QStringLiteral("activation generation is exhausted"));
+    }
+    ActivationState confirmed = loaded.state;
+    ++confirmed.generation;
+    PackageStoreResult committed = writeState(appId, confirmed);
+    if (!committed.succeeded()) return committed;
+    committed.path = versionPath(appId, confirmed.current);
+    committed.activationBinding = bindingForState(confirmed);
+    if (!committed.activationBinding.has_value()) {
+        return failure(PackageStoreError::InvalidState,
+                       QStringLiteral("activation binding is invalid"));
+    }
+    return committed;
+}
+
+std::optional<ActivationBinding> PackageStore::bindingForState(
+    const ActivationState &state) const
+{
+    if (state.generation < 0 || state.current.isEmpty()) return std::nullopt;
+    const qsizetype separator = state.current.lastIndexOf(QLatin1Char('-'));
+    if (separator <= 0 || state.current.size() - separator - 1 != 64) {
+        return std::nullopt;
+    }
+    const QByteArray digest = state.current.sliced(separator + 1).toLatin1();
+    for (const char value : digest) {
+        if (!((value >= '0' && value <= '9')
+              || (value >= 'a' && value <= 'f'))) {
+            return std::nullopt;
+        }
+    }
+    return ActivationBinding{state.current, digest, state.generation};
 }
 
 PackageStoreResult PackageStore::resolveCurrent(const QString &appId) const

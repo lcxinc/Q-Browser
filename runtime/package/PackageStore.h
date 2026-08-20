@@ -7,6 +7,8 @@
 #include <QByteArray>
 #include <QString>
 
+#include <optional>
+
 enum class PackageStoreError
 {
     None,
@@ -20,6 +22,7 @@ enum class PackageStoreError
     VersionUnavailable,
     StateCommitFailed,
     RollbackUnavailable,
+    StateConflict,
 };
 
 struct PackageStoreResult final
@@ -27,6 +30,7 @@ struct PackageStoreResult final
     PackageStoreError error = PackageStoreError::None;
     QString path;
     QString message;
+    std::optional<ActivationBinding> activationBinding;
 
     [[nodiscard]] bool succeeded() const noexcept
     {
@@ -66,6 +70,16 @@ public:
     [[nodiscard]] PackageStoreResult activateForTesting(
         const QString &appId,
         const QString &versionDirectory) const;
+    [[nodiscard]] PackageStoreResult markCurrentLastKnownGoodForTesting(
+        const QString &appId) const;
+    [[nodiscard]] PackageStoreResult markCurrentLastKnownGoodForTesting(
+        const QString &appId,
+        const ActivationBinding &expected) const;
+    [[nodiscard]] PackageStoreResult rollbackForTesting(
+        const QString &appId) const;
+    [[nodiscard]] PackageStoreResult rollbackForTesting(
+        const QString &appId,
+        const ActivationBinding &expected) const;
 #endif
     [[nodiscard]] ActivationStateResult activationState(
         const QString &appId) const;
@@ -73,15 +87,11 @@ public:
     // target's authenticated package contents before requesting recovery.
     [[nodiscard]] ActivationStateResult recordedActivationState(
         const QString &appId) const;
-    [[nodiscard]] PackageStoreResult markCurrentLastKnownGood(
-        const QString &appId) const;
-    [[nodiscard]] PackageStoreResult recoverLastKnownGood(
-        const QString &appId) const;
-    [[nodiscard]] PackageStoreResult rollback(const QString &appId) const;
     [[nodiscard]] PackageStoreResult resolveCurrent(const QString &appId) const;
 
 private:
     friend class PackageInstaller;
+    friend class UpdateLifecycleCoordinator;
 
     [[nodiscard]] PackageStoreResult commitVerifiedCandidate(
         const QString &appId,
@@ -104,9 +114,27 @@ private:
     [[nodiscard]] PackageStoreResult activateVerified(
         const QString &appId,
         const QString &versionDirectory) const;
+    [[nodiscard]] PackageStoreResult confirmCurrent(
+        const QString &appId,
+        const ActivationBinding &expected) const;
+    [[nodiscard]] PackageStoreResult markCurrentLastKnownGood(
+        const QString &appId,
+        const ActivationBinding &expected) const;
+    [[nodiscard]] PackageStoreResult recoverLastKnownGood(
+        const QString &appId,
+        const ActivationBinding &expected) const;
+    [[nodiscard]] PackageStoreResult rollback(
+        const QString &appId,
+        const ActivationBinding &expected) const;
+    [[nodiscard]] std::optional<ActivationBinding> bindingForState(
+        const ActivationState &state) const;
     [[nodiscard]] PackageStoreResult writeState(
         const QString &appId,
         const ActivationState &state) const;
+    [[nodiscard]] ActivationStateResult activationStateUnlocked(
+        const QString &appId) const;
+    [[nodiscard]] ActivationStateResult recordedActivationStateUnlocked(
+        const QString &appId) const;
     [[nodiscard]] bool stateTargetIsValid(
         const QString &appId,
         const QString &target,

@@ -138,6 +138,12 @@ void HostWorkerSessionIo::pollSession()
             emit routeLoadResponse(generation_, message.requestId(), message.payload());
             return;
         case ProtocolType::Request: {
+            const QJsonObject requestPayload = message.payload();
+            emit capabilityRequestObserved(
+                generation_,
+                requestPayload.value(QStringLiteral("capability")).toString(),
+                requestPayload.value(QStringLiteral("operation")).toString(),
+                requestPayload.value(QStringLiteral("payload")).toObject().toVariantMap());
             const auto response = ProtocolMessage::errorResponse(
                 message.requestId(), QStringLiteral("capability.unhandled"),
                 QStringLiteral("No capability handler is attached."));

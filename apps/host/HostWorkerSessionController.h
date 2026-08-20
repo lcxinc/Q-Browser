@@ -39,6 +39,9 @@ signals:
     void failed(const QString &errorCode);
     void routeLoadAcknowledged(const QString &route);
     void heartbeatObserved();
+    void capabilityRequestObserved(const QString &capability,
+                                   const QString &operation,
+                                   const QVariantMap &payload);
 
 private:
     struct OutboundCommand final {

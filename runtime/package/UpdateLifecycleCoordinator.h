@@ -12,6 +12,15 @@
 class EventRecorder;
 class PackageStore;
 
+struct LifecycleClock final
+{
+    std::function<qint64()> steadyNowMilliseconds;
+    std::function<qint64()> utcNowMilliseconds;
+
+    [[nodiscard]] static LifecycleClock system();
+    [[nodiscard]] bool isValid() const noexcept;
+};
+
 struct UpdateLaunchRequest final
 {
     QString appId;
@@ -73,6 +82,7 @@ public:
                                PackageInstaller &installer,
                                WorkerSupervisionPolicy supervisionPolicy,
                                LaunchCallback launch,
+                               LifecycleClock clock = LifecycleClock::system(),
                                EventRecorder *recorder = nullptr);
 
     // Configure before dispatching lifecycle work. The callback must stop and
@@ -80,19 +90,14 @@ public:
     void setBeforeRelaunchCallback(BeforeRelaunchCallback callback);
 
     [[nodiscard]] UpdateLifecycleResult installAndLaunch(
-        const QString &packagePath,
-        qint64 nowMs);
-    [[nodiscard]] UpdateLifecycleResult startOffline(qint64 nowMs);
+        const QString &packagePath);
+    [[nodiscard]] UpdateLifecycleResult startOffline();
     [[nodiscard]] UpdateLifecycleAction authenticatedHandshake(
-        WorkerAttemptKey key,
-        qint64 nowMs);
-    [[nodiscard]] UpdateLifecycleAction heartbeat(WorkerAttemptKey key,
-                                                  qint64 nowMs);
-    [[nodiscard]] UpdateLifecycleAction checkHealth(WorkerAttemptKey key,
-                                                    qint64 nowMs);
+        WorkerAttemptKey key);
+    [[nodiscard]] UpdateLifecycleAction heartbeat(WorkerAttemptKey key);
+    [[nodiscard]] UpdateLifecycleAction checkHealth(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction workerExited(WorkerAttemptKey key,
-                                                     WorkerExitReason reason,
-                                                     qint64 nowMs);
+                                                     WorkerExitReason reason);
     void beginHostShutdown() noexcept;
 
     [[nodiscard]] std::optional<WorkerAttemptKey> currentAttemptKey() const noexcept;
@@ -102,6 +107,7 @@ private:
     [[nodiscard]] UpdateLifecycleResult beginLaunch(
         QString version,
         QString path,
+        ActivationBinding binding,
         qint64 nowMs,
         bool recovery,
         UpdateLifecycleAction successAction);
@@ -110,11 +116,13 @@ private:
         qint64 nowMs);
     [[nodiscard]] UpdateLifecycleAction restart(qint64 nowMs);
     [[nodiscard]] UpdateLifecycleAction rollbackAndRecover(qint64 nowMs);
+    [[nodiscard]] UpdateLifecycleAction transitionToHealthy(
+        WorkerAttemptKey key,
+        qint64 steadyNowMs);
     void stopCurrentAttempt();
     [[nodiscard]] UpdateLifecycleAction enterFailedClosed();
     void record(SafeEventPhase phase,
                 SafeEventCode code,
-                qint64 nowMs,
                 qint64 durationMs,
                 const SafeMetrics &metrics = {}) const;
 
@@ -124,9 +132,11 @@ private:
     LaunchCallback launch_;
     BeforeRelaunchCallback beforeRelaunch_;
     EventRecorder *recorder_ = nullptr;
+    LifecycleClock clock_;
     WorkerSupervisor supervisor_;
     QString currentVersion_;
     QString currentPath_;
+    std::optional<ActivationBinding> currentBinding_;
     std::optional<WorkerAttemptKey> currentKey_;
     bool currentHealthy_ = false;
     bool handshakeAccepted_ = false;

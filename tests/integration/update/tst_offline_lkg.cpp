@@ -1,10 +1,12 @@
 #include "UpdateLifecycleCoordinator.h"
 #include "UpdateTestSupport.h"
+#include "PackageInstallerTestHooks.h"
 
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
 #include <QTest>
+#include <QScopeGuard>
 
 #include <algorithm>
 
@@ -19,7 +21,113 @@ class OfflineLkgTest final : public QObject
 private slots:
     void restoresVerifiedLkgWhenCurrentIsCorruptAndIgnoresPartialState();
     void stateCommitFailureDoesNotLaunchOrOverwrite();
+    void concurrentActivationAfterVerificationNeverLaunchesStalePackage();
+    void currentOfflineStartCompareAndCommitsBeforeLaunch();
 };
+
+void OfflineLkgTest::currentOfflineStartCompareAndCommitsBeforeLaunch()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               updateInstallPolicy());
+    ManualLifecycleClock clock;
+    QVector<qint64> launchGenerations;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {100, 150},
+        [&](const UpdateLaunchRequest &) {
+            launchGenerations.push_back(
+                store.activationState(QStringLiteral("company.pilot"))
+                    .state.generation);
+            return true;
+        }, clock.source());
+    clock.set(0);
+    QVERIFY(coordinator.installAndLaunch(updateSignedPackage(
+                temporary, QStringLiteral("offline-confirm"),
+                QStringLiteral("1.0.0"), keys.value().privateKeyPem))
+                .succeeded());
+    const WorkerAttemptKey key = coordinator.currentAttemptKey().value();
+    clock.set(1);
+    QCOMPARE(coordinator.authenticatedHandshake(key),
+             UpdateLifecycleAction::None);
+    clock.set(101);
+    QCOMPARE(coordinator.heartbeat(key), UpdateLifecycleAction::MarkedHealthy);
+    const qint64 beforeOffline = store.activationState(
+        QStringLiteral("company.pilot")).state.generation;
+
+    clock.set(1'000);
+    const UpdateLifecycleResult offline = coordinator.startOffline();
+    QVERIFY2(offline.succeeded(), qPrintable(offline.stableError));
+    QCOMPARE(offline.action, UpdateLifecycleAction::LaunchRequested);
+    QCOMPARE(store.activationState(QStringLiteral("company.pilot"))
+                 .state.generation,
+             beforeOffline + 1);
+    QCOMPARE(launchGenerations.back(), beforeOffline + 1);
+}
+
+void OfflineLkgTest::concurrentActivationAfterVerificationNeverLaunchesStalePackage()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               updateInstallPolicy());
+    QVector<UpdateLaunchRequest> launches;
+    ManualLifecycleClock clock;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {100, 150},
+        [&](const UpdateLaunchRequest &request) {
+            launches.push_back(request);
+            return true;
+        }, clock.source());
+    clock.set(0);
+    const UpdateLifecycleResult first = coordinator.installAndLaunch(
+        updateSignedPackage(temporary, QStringLiteral("race-a"),
+                            QStringLiteral("1.0.0"), keys.value().privateKeyPem));
+    QVERIFY(first.succeeded());
+    const WorkerAttemptKey key = coordinator.currentAttemptKey().value();
+    clock.set(1);
+    (void)coordinator.authenticatedHandshake(key);
+    clock.set(101);
+    QCOMPARE(coordinator.heartbeat(key),
+             UpdateLifecycleAction::MarkedHealthy);
+    const QString packageB = updateSignedPackage(
+        temporary, QStringLiteral("race-b"), QStringLiteral("1.1.0"),
+        keys.value().privateKeyPem);
+    PackageStore competingStore(store.root());
+    PackageInstaller competingInstaller(
+        competingStore, keys.value().publicKeyPem, updateInstallPolicy());
+    bool activatedB = false;
+    QString activatedDirectory;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.afterVerifyInstalled = [&](const QString &, const QString &) {
+        if (activatedB) return;
+        activatedB = true;
+        const InstallResult installedB = competingInstaller.install(packageB);
+        QVERIFY2(installedB.succeeded(), qPrintable(installedB.stableError));
+        activatedDirectory = QFileInfo(installedB.path).fileName();
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+    });
+
+    launches.clear();
+    clock.set(1'000);
+    const UpdateLifecycleResult offline = coordinator.startOffline();
+    QVERIFY(activatedB);
+    QCOMPARE(offline.error, UpdateLifecycleError::StateCommitFailed);
+    QVERIFY(coordinator.failedClosed());
+    QVERIFY(launches.isEmpty());
+    QCOMPARE(store.activationState(QStringLiteral("company.pilot")).state.current,
+             activatedDirectory);
+}
 
 void OfflineLkgTest::restoresVerifiedLkgWhenCurrentIsCorruptAndIgnoresPartialState()
 {
@@ -32,6 +140,7 @@ void OfflineLkgTest::restoresVerifiedLkgWhenCurrentIsCorruptAndIgnoresPartialSta
                                updateInstallPolicy());
     QVector<UpdateLaunchRequest> launches;
     QVector<bool> stateCommittedAtLaunch;
+    ManualLifecycleClock clock;
     UpdateLifecycleCoordinator coordinator(
         QStringLiteral("company.pilot"), store, installer, {100, 150},
         [&](const UpdateLaunchRequest &request) {
@@ -41,31 +150,36 @@ void OfflineLkgTest::restoresVerifiedLkgWhenCurrentIsCorruptAndIgnoresPartialSta
                 state.current == QFileInfo(request.packageDirectory).fileName());
             launches.push_back(request);
             return true;
-        });
+        }, clock.source());
 
+    clock.set(0);
     const UpdateLifecycleResult first = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("one"),
-                            QStringLiteral("1.0.0"), keys.value().privateKeyPem), 0);
+                            QStringLiteral("1.0.0"), keys.value().privateKeyPem));
     QVERIFY(first.succeeded());
     WorkerAttemptKey key = coordinator.currentAttemptKey().value();
-    QCOMPARE(coordinator.authenticatedHandshake(key, 1),
+    clock.set(1);
+    QCOMPARE(coordinator.authenticatedHandshake(key),
              UpdateLifecycleAction::None);
-    QCOMPARE(coordinator.heartbeat(key, 101),
+    clock.set(101);
+    QCOMPARE(coordinator.heartbeat(key),
              UpdateLifecycleAction::MarkedHealthy);
+    clock.set(1'000);
     const UpdateLifecycleResult stable = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("two"),
-                            QStringLiteral("1.1.0"), keys.value().privateKeyPem),
-        1'000);
+                            QStringLiteral("1.1.0"), keys.value().privateKeyPem));
     QVERIFY(stable.succeeded());
     key = coordinator.currentAttemptKey().value();
-    QCOMPARE(coordinator.authenticatedHandshake(key, 1'001),
+    clock.set(1'001);
+    QCOMPARE(coordinator.authenticatedHandshake(key),
              UpdateLifecycleAction::None);
-    QCOMPARE(coordinator.heartbeat(key, 1'101),
+    clock.set(1'101);
+    QCOMPARE(coordinator.heartbeat(key),
              UpdateLifecycleAction::MarkedHealthy);
+    clock.set(2'000);
     const UpdateLifecycleResult candidate = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("three"),
-                            QStringLiteral("1.2.0"), keys.value().privateKeyPem),
-        2'000);
+                            QStringLiteral("1.2.0"), keys.value().privateKeyPem));
     QVERIFY(candidate.succeeded());
 
     const QString appRoot = store.appRoot(QStringLiteral("company.pilot"));
@@ -92,7 +206,8 @@ void OfflineLkgTest::restoresVerifiedLkgWhenCurrentIsCorruptAndIgnoresPartialSta
                           + QStringLiteral("/.staging/unverified-candidate/qml")));
 
     const int beforeRecoveryLaunches = launches.size();
-    const UpdateLifecycleResult recovered = coordinator.startOffline(3'000);
+    clock.set(3'000);
+    const UpdateLifecycleResult recovered = coordinator.startOffline();
     QVERIFY2(recovered.succeeded(), qPrintable(recovered.stableError));
     QCOMPARE(recovered.action, UpdateLifecycleAction::RecoveredAndLaunched);
     QCOMPARE(launches.size(), beforeRecoveryLaunches + 1);
@@ -120,19 +235,23 @@ void OfflineLkgTest::stateCommitFailureDoesNotLaunchOrOverwrite()
     PackageInstaller installer(store, keys.value().publicKeyPem,
                                updateInstallPolicy());
     int launches = 0;
+    ManualLifecycleClock clock;
     UpdateLifecycleCoordinator coordinator(
         QStringLiteral("company.pilot"), store, installer, {100, 150},
         [&](const UpdateLaunchRequest &) {
             ++launches;
             return true;
-        });
+        }, clock.source());
+    clock.set(0);
     const UpdateLifecycleResult stable = coordinator.installAndLaunch(
         updateSignedPackage(temporary, QStringLiteral("stable"),
-                            QStringLiteral("1.0.0"), keys.value().privateKeyPem), 0);
+                            QStringLiteral("1.0.0"), keys.value().privateKeyPem));
     QVERIFY(stable.succeeded());
     const WorkerAttemptKey key = coordinator.currentAttemptKey().value();
-    (void)coordinator.authenticatedHandshake(key, 1);
-    QCOMPARE(coordinator.heartbeat(key, 101),
+    clock.set(1);
+    (void)coordinator.authenticatedHandshake(key);
+    clock.set(101);
+    QCOMPARE(coordinator.heartbeat(key),
              UpdateLifecycleAction::MarkedHealthy);
 
     const QString appRoot = store.appRoot(QStringLiteral("company.pilot"));
@@ -154,7 +273,8 @@ void OfflineLkgTest::stateCommitFailureDoesNotLaunchOrOverwrite()
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     QVERIFY(blocker != INVALID_HANDLE_VALUE);
     const int launchesBeforeRecovery = launches;
-    const UpdateLifecycleResult rejected = coordinator.startOffline(1'000);
+    clock.set(1'000);
+    const UpdateLifecycleResult rejected = coordinator.startOffline();
     CloseHandle(blocker);
 
     QCOMPARE(rejected.error, UpdateLifecycleError::StateCommitFailed);

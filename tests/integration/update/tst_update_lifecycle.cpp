@@ -1,8 +1,12 @@
 #include "UpdateLifecycleCoordinator.h"
 #include "UpdateTestSupport.h"
+#include "EventRecorder.h"
 
 #include <QFileInfo>
+#include <QFile>
 #include <QTest>
+
+#include <algorithm>
 
 class UpdateLifecycleTest final : public QObject
 {
@@ -10,7 +14,71 @@ class UpdateLifecycleTest final : public QObject
 
 private slots:
     void marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg();
+    void wallClockJumpsDoNotAffectHealthAndHealthyCommitsOnce();
 };
+
+void UpdateLifecycleTest::wallClockJumpsDoNotAffectHealthAndHealthyCommitsOnce()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               updateInstallPolicy());
+    const QString telemetryDirectory = temporary.filePath(
+        QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetryDirectory));
+    EventRecorder recorder({telemetryDirectory, QStringLiteral("events.jsonl"),
+                            64 * 1024, 1, 64});
+    QVERIFY(recorder.isValid());
+    qint64 steadyNow = 0;
+    qint64 utcNow = 1'900'000'000'000;
+    LifecycleClock clock{
+        [&] { return steadyNow; },
+        [&] { return utcNow; },
+    };
+    QVector<UpdateLaunchRequest> launches;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {1'000, 300},
+        [&](const UpdateLaunchRequest &request) {
+            launches.push_back(request);
+            return true;
+        },
+        clock, &recorder);
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("clock"), QStringLiteral("1.0.0"),
+        keys.value().privateKeyPem);
+    QVERIFY(coordinator.installAndLaunch(package).succeeded());
+    const WorkerAttemptKey key = launches.back().key;
+    QCOMPARE(coordinator.authenticatedHandshake(key),
+             UpdateLifecycleAction::None);
+    const qint64 generationBeforeHealthy = store.activationState(
+        QStringLiteral("company.pilot")).state.generation;
+    for (steadyNow = 200; steadyNow < 1'000; steadyNow += 200) {
+        utcNow = (steadyNow == 400) ? 1 : 8'000'000'000'000;
+        QCOMPARE(coordinator.heartbeat(key), UpdateLifecycleAction::None);
+    }
+    steadyNow = 1'000;
+    utcNow = 2;
+    QCOMPARE(coordinator.heartbeat(key), UpdateLifecycleAction::MarkedHealthy);
+    QCOMPARE(coordinator.checkHealth(key), UpdateLifecycleAction::None);
+    const ActivationState healthy = store.activationState(
+        QStringLiteral("company.pilot")).state;
+    QCOMPARE(healthy.generation, generationBeforeHealthy + 1);
+    QCOMPARE(coordinator.heartbeat(key), UpdateLifecycleAction::None);
+    QCOMPARE(store.activationState(QStringLiteral("company.pilot"))
+                 .state.generation,
+             healthy.generation);
+    QVERIFY(recorder.flush(5'000));
+    QFile events(QDir(telemetryDirectory).filePath(QStringLiteral("events.jsonl")));
+    QVERIFY(events.open(QIODevice::ReadOnly));
+    const QList<QByteArray> lines = events.readAll().split('\n');
+    QCOMPARE(std::ranges::count_if(lines, [](const QByteArray &line) {
+                 return line.contains(QByteArrayLiteral("\"code\":\"healthy\""));
+             }),
+             1);
+}
 
 void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg()
 {
@@ -22,32 +90,37 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
     PackageInstaller installer(store, keys.value().publicKeyPem,
                                updateInstallPolicy());
     QVector<UpdateLaunchRequest> launches;
+    ManualLifecycleClock clock;
     UpdateLifecycleCoordinator coordinator(
         QStringLiteral("company.pilot"), store, installer,
         {1'000, 300},
         [&](const UpdateLaunchRequest &request) {
             launches.push_back(request);
             return true;
-        });
+        }, clock.source());
 
     const QString one = updateSignedPackage(
         temporary, QStringLiteral("one"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem);
-    const UpdateLifecycleResult first = coordinator.installAndLaunch(one, 0);
+    clock.set(0);
+    const UpdateLifecycleResult first = coordinator.installAndLaunch(one);
     QVERIFY2(first.succeeded(), qPrintable(first.stableError));
     QCOMPARE(launches.size(), 1);
     const WorkerAttemptKey firstKey = launches.back().key;
-    QCOMPARE(coordinator.heartbeat(firstKey, 100),
+    clock.set(100);
+    QCOMPARE(coordinator.heartbeat(firstKey),
              UpdateLifecycleAction::IgnoredUntilHandshake);
     QVERIFY(store.activationState(QStringLiteral("company.pilot"))
                 .state.lastKnownGood.isEmpty());
-    QCOMPARE(coordinator.authenticatedHandshake(firstKey, 100),
+    QCOMPARE(coordinator.authenticatedHandshake(firstKey),
              UpdateLifecycleAction::None);
     for (qint64 now = 300; now < 1'100; now += 200) {
-        QCOMPARE(coordinator.heartbeat(firstKey, now),
+        clock.set(now);
+        QCOMPARE(coordinator.heartbeat(firstKey),
                  UpdateLifecycleAction::None);
     }
-    QCOMPARE(coordinator.heartbeat(firstKey, 1'100),
+    clock.set(1'100);
+    QCOMPARE(coordinator.heartbeat(firstKey),
              UpdateLifecycleAction::MarkedHealthy);
     const QString firstDirectory = QFileInfo(first.path).fileName();
     QCOMPARE(store.activationState(QStringLiteral("company.pilot"))
@@ -57,15 +130,19 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
     const QString two = updateSignedPackage(
         temporary, QStringLiteral("two"), QStringLiteral("1.1.0"),
         keys.value().privateKeyPem);
-    const UpdateLifecycleResult second = coordinator.installAndLaunch(two, 2'000);
+    clock.set(2'000);
+    const UpdateLifecycleResult second = coordinator.installAndLaunch(two);
     QVERIFY2(second.succeeded(), qPrintable(second.stableError));
     const WorkerAttemptKey secondKey = launches.back().key;
-    QCOMPARE(coordinator.authenticatedHandshake(secondKey, 2'010),
+    clock.set(2'010);
+    QCOMPARE(coordinator.authenticatedHandshake(secondKey),
              UpdateLifecycleAction::None);
     for (qint64 now = 2'210; now < 3'010; now += 200) {
-        (void)coordinator.heartbeat(secondKey, now);
+        clock.set(now);
+        (void)coordinator.heartbeat(secondKey);
     }
-    QCOMPARE(coordinator.heartbeat(secondKey, 3'011),
+    clock.set(3'011);
+    QCOMPARE(coordinator.heartbeat(secondKey),
              UpdateLifecycleAction::MarkedHealthy);
     const ActivationState healthy = store.activationState(
         QStringLiteral("company.pilot")).state;
@@ -74,8 +151,8 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
     const QString tampered = updateSignedPackage(
         temporary, QStringLiteral("tampered"), QStringLiteral("1.2.0"),
         keys.value().privateKeyPem, true);
-    const UpdateLifecycleResult rejected = coordinator.installAndLaunch(
-        tampered, 4'000);
+    clock.set(4'000);
+    const UpdateLifecycleResult rejected = coordinator.installAndLaunch(tampered);
     QCOMPARE(rejected.error, UpdateLifecycleError::InstallRejected);
     QCOMPARE(launches.size(), 2);
     QCOMPARE(store.activationState(QStringLiteral("company.pilot")).state.current,
@@ -84,18 +161,22 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
                  .state.lastKnownGood,
              healthy.lastKnownGood);
 
-    QCOMPARE(coordinator.heartbeat(firstKey, 5'000),
+    clock.set(5'000);
+    QCOMPARE(coordinator.heartbeat(firstKey),
              UpdateLifecycleAction::IgnoredStaleAttempt);
 
     const QString delayed = updateSignedPackage(
         temporary, QStringLiteral("delayed"), QStringLiteral("1.2.0"),
         keys.value().privateKeyPem);
-    QVERIFY(coordinator.installAndLaunch(delayed, 6'000).succeeded());
+    clock.set(6'000);
+    QVERIFY(coordinator.installAndLaunch(delayed).succeeded());
     const WorkerAttemptKey delayedKey = coordinator.currentAttemptKey().value();
-    QCOMPARE(coordinator.authenticatedHandshake(delayedKey, 6'301),
+    clock.set(6'301);
+    QCOMPARE(coordinator.authenticatedHandshake(delayedKey),
              UpdateLifecycleAction::Restarted);
     QVERIFY(coordinator.currentAttemptKey().value() != delayedKey);
-    QCOMPARE(coordinator.authenticatedHandshake(delayedKey, 6'302),
+    clock.set(6'302);
+    QCOMPARE(coordinator.authenticatedHandshake(delayedKey),
              UpdateLifecycleAction::IgnoredStaleAttempt);
 }
 

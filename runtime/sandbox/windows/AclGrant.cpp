@@ -22,6 +22,16 @@ QString absoluteNativePath(const QString &path)
         QDir::cleanPath(QFileInfo(path).absoluteFilePath()));
 }
 
+QString windowsApiPath(const QString &path)
+{
+    const QString native = absoluteNativePath(path);
+    if (native.startsWith(QStringLiteral("\\\\?\\"))) return native;
+    if (native.startsWith(QStringLiteral("\\\\"))) {
+        return QStringLiteral("\\\\?\\UNC\\") + native.sliced(2);
+    }
+    return QStringLiteral("\\\\?\\") + native;
+}
+
 bool inspectTarget(const HANDLE target,
                    bool &directory,
                    QString &finalPath,
@@ -153,8 +163,9 @@ SandboxValueResult<AclGrant> AclGrant::apply(
                 SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
     const QString normalized = absoluteNativePath(path);
+    const QString apiPath = windowsApiPath(normalized);
     HANDLE target = CreateFileW(
-        reinterpret_cast<LPCWSTR>(normalized.utf16()),
+        reinterpret_cast<LPCWSTR>(apiPath.utf16()),
         READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,

@@ -5,6 +5,10 @@ endif()
 add_library(q_browser_host STATIC
   HostApplication.cpp
   HostApplication.h
+  HostRuntimeConfig.cpp
+  HostRuntimeConfig.h
+  InstalledPackageWorkerLauncher.cpp
+  InstalledPackageWorkerLauncher.h
   HostWorkerSessionController.cpp
   HostWorkerSessionController.h
   HostWorkerSessionIo.cpp
@@ -25,6 +29,7 @@ target_link_libraries(q_browser_host
     q_browser_ipc
     q_browser_package
     q_browser_router
+    q_browser_sandbox
     q_browser_webengine
     q_browser_worker_runtime
     Qt6::Core

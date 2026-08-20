@@ -4,7 +4,9 @@
 #include "PackageStore.h"
 
 #include <QFileInfo>
+#include <QDateTime>
 
+#include <chrono>
 #include <utility>
 
 namespace
@@ -16,23 +18,43 @@ UpdateLifecycleResult lifecycleFailure(const UpdateLifecycleError error,
 }
 }
 
+LifecycleClock LifecycleClock::system()
+{
+    return {
+        [] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        },
+        [] { return QDateTime::currentMSecsSinceEpoch(); },
+    };
+}
+
+bool LifecycleClock::isValid() const noexcept
+{
+    return static_cast<bool>(steadyNowMilliseconds)
+        && static_cast<bool>(utcNowMilliseconds);
+}
+
 UpdateLifecycleCoordinator::UpdateLifecycleCoordinator(
     QString appId,
     PackageStore &store,
     PackageInstaller &installer,
     const WorkerSupervisionPolicy supervisionPolicy,
     LaunchCallback launch,
+    LifecycleClock clock,
     EventRecorder *recorder)
     : appId_(std::move(appId))
     , store_(store)
     , installer_(installer)
     , launch_(std::move(launch))
     , recorder_(recorder)
+    , clock_(std::move(clock))
     , supervisor_(supervisionPolicy,
                   [this](WorkerActivationId) { restartRequested_ = true; },
                   [this](WorkerActivationId) { rollbackRequested_ = true; })
 {
-    if (appId_.isEmpty() || !launch_) failedClosed_ = true;
+    if (appId_.isEmpty() || !launch_ || !clock_.isValid()) failedClosed_ = true;
 }
 
 void UpdateLifecycleCoordinator::setBeforeRelaunchCallback(
@@ -42,21 +64,28 @@ void UpdateLifecycleCoordinator::setBeforeRelaunchCallback(
 }
 
 UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
-    const QString &packagePath,
-    const qint64 nowMs)
+    const QString &packagePath)
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
         return lifecycleFailure(UpdateLifecycleError::InvalidConfiguration,
                                 QStringLiteral("update.invalid_configuration"));
     }
     const InstallResult installed = installer_.install(packagePath);
     if (!installed.succeeded() || installed.appId != appId_) {
-        record(SafeEventPhase::Install, SafeEventCode::Rejected, nowMs, 0);
+        record(SafeEventPhase::Install, SafeEventCode::Rejected, 0);
         return lifecycleFailure(UpdateLifecycleError::InstallRejected,
-                                QStringLiteral("update.install_rejected"));
+                                installed.stableError.isEmpty()
+                                    ? QStringLiteral("update.install_rejected")
+                                    : installed.stableError);
+    }
+    if (!installed.activationBinding.has_value()) {
+        (void)enterFailedClosed();
+        return lifecycleFailure(UpdateLifecycleError::StateUnavailable,
+                                QStringLiteral("update.activation_binding_missing"));
     }
     UpdateLifecycleResult result = beginLaunch(
-        installed.version, installed.path, nowMs, false,
+        installed.version, installed.path, *installed.activationBinding, nowMs, false,
         UpdateLifecycleAction::LaunchRequested);
     result.appId = installed.appId;
     result.version = installed.version;
@@ -64,8 +93,9 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
     return result;
 }
 
-UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline(const qint64 nowMs)
+UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
         return lifecycleFailure(UpdateLifecycleError::InvalidConfiguration,
                                 QStringLiteral("update.invalid_configuration"));
@@ -76,11 +106,25 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline(const qint64 nowM
         return lifecycleFailure(UpdateLifecycleError::StateUnavailable,
                                 QStringLiteral("update.state_unavailable"));
     }
+    const auto recordedBinding = store_.bindingForState(recordedState.state);
+    if (!recordedBinding.has_value()) {
+        (void)enterFailedClosed();
+        return lifecycleFailure(UpdateLifecycleError::StateUnavailable,
+                                QStringLiteral("update.activation_binding_invalid"));
+    }
     if (!recordedState.state.current.isEmpty()) {
         const InstallResult current = installer_.verifyInstalled(
             appId_, recordedState.state.current);
         if (current.succeeded()) {
-            return beginLaunch(current.version, current.path, nowMs, false,
+            const PackageStoreResult confirmed = store_.confirmCurrent(
+                appId_, *recordedBinding);
+            if (!confirmed.succeeded() || !confirmed.activationBinding.has_value()) {
+                (void)enterFailedClosed();
+                return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
+                                        QStringLiteral("update.current_changed"));
+            }
+            return beginLaunch(current.version, current.path,
+                               *confirmed.activationBinding, nowMs, false,
                                UpdateLifecycleAction::LaunchRequested);
         }
     }
@@ -96,19 +140,21 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline(const qint64 nowM
         return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
                                 QStringLiteral("update.lkg_verification_failed"));
     }
-    const PackageStoreResult recovered = store_.recoverLastKnownGood(appId_);
-    if (!recovered.succeeded()) {
+    const PackageStoreResult recovered = store_.recoverLastKnownGood(
+        appId_, *recordedBinding);
+    if (!recovered.succeeded() || !recovered.activationBinding.has_value()) {
         (void)enterFailedClosed();
         return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
                                 QStringLiteral("update.recovery_commit_failed"));
     }
-    return beginLaunch(lkg.version, lkg.path, nowMs, true,
+    return beginLaunch(lkg.version, lkg.path, *recovered.activationBinding, nowMs, true,
                        UpdateLifecycleAction::RecoveredAndLaunched);
 }
 
 UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     QString version,
     QString path,
+    ActivationBinding binding,
     const qint64 nowMs,
     const bool recovery,
     const UpdateLifecycleAction successAction)
@@ -116,6 +162,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     stopCurrentAttempt();
     currentVersion_ = std::move(version);
     currentPath_ = std::move(path);
+    currentBinding_ = std::move(binding);
     currentHealthy_ = false;
     handshakeAccepted_ = false;
     recoveryLaunch_ = recovery;
@@ -151,16 +198,16 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     currentAttemptStopped_ = false;
     record(recovery ? SafeEventPhase::Rollback : SafeEventPhase::Activate,
            recovery ? SafeEventCode::Recovered : SafeEventCode::Started,
-           nowMs, 0, {{SafeMetric::AttemptNumber,
+           0, {{SafeMetric::AttemptNumber,
                        static_cast<double>(attempt->value)}});
     return {UpdateLifecycleError::None, successAction, {}, appId_,
             currentVersion_, currentPath_};
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
-    const WorkerAttemptKey key,
-    const qint64 nowMs)
+    const WorkerAttemptKey key)
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (!currentKey_.has_value() || key != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
     }
@@ -177,9 +224,9 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::heartbeat(
-    const WorkerAttemptKey key,
-    const qint64 nowMs)
+    const WorkerAttemptKey key)
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (!currentKey_.has_value() || key != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
     }
@@ -189,22 +236,13 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::heartbeat(
     }
     if (!handshakeAccepted_) return UpdateLifecycleAction::IgnoredUntilHandshake;
     supervisor_.heartbeat(key, nowMs);
-    if (!currentHealthy_ && supervisor_.isHealthy(key, nowMs)) {
-        const PackageStoreResult marked = store_.markCurrentLastKnownGood(appId_);
-        if (!marked.succeeded()) {
-            return enterFailedClosed();
-        }
-        currentHealthy_ = true;
-        record(SafeEventPhase::Health, SafeEventCode::Healthy, nowMs, 0);
-        return UpdateLifecycleAction::MarkedHealthy;
-    }
-    return UpdateLifecycleAction::None;
+    return transitionToHealthy(key, nowMs);
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::checkHealth(
-    const WorkerAttemptKey key,
-    const qint64 nowMs)
+    const WorkerAttemptKey key)
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (!currentKey_.has_value() || key != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
     }
@@ -212,26 +250,37 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::checkHealth(
     if (action != WorkerSupervisionAction::None) {
         return applySupervisionAction(action, nowMs);
     }
-    if (handshakeAccepted_ && !currentHealthy_
-        && supervisor_.isHealthy(key, nowMs)) {
-        const PackageStoreResult marked = store_.markCurrentLastKnownGood(appId_);
-        if (!marked.succeeded()) {
-            return enterFailedClosed();
-        }
-        currentHealthy_ = true;
-        return UpdateLifecycleAction::MarkedHealthy;
-    }
-    return UpdateLifecycleAction::None;
+    if (!handshakeAccepted_) return UpdateLifecycleAction::None;
+    return transitionToHealthy(key, nowMs);
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::workerExited(
     const WorkerAttemptKey key,
-    WorkerExitReason reason,
-    const qint64 nowMs)
+    WorkerExitReason reason)
 {
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (hostShuttingDown_) reason = WorkerExitReason::Clean;
     return applySupervisionAction(supervisor_.workerExited(key, reason, nowMs),
                                   nowMs);
+}
+
+UpdateLifecycleAction UpdateLifecycleCoordinator::transitionToHealthy(
+    const WorkerAttemptKey key,
+    const qint64 steadyNowMs)
+{
+    if (currentHealthy_ || !supervisor_.isHealthy(key, steadyNowMs)) {
+        return UpdateLifecycleAction::None;
+    }
+    if (!currentBinding_.has_value()) return enterFailedClosed();
+    const PackageStoreResult marked = store_.markCurrentLastKnownGood(
+        appId_, *currentBinding_);
+    if (!marked.succeeded() || !marked.activationBinding.has_value()) {
+        return enterFailedClosed();
+    }
+    currentBinding_ = marked.activationBinding;
+    currentHealthy_ = true;
+    record(SafeEventPhase::Health, SafeEventCode::Healthy, 0);
+    return UpdateLifecycleAction::MarkedHealthy;
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::applySupervisionAction(
@@ -276,7 +325,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
         return applySupervisionAction(failed, nowMs);
     }
     currentAttemptStopped_ = false;
-    record(SafeEventPhase::Worker, SafeEventCode::Restarted, nowMs, 0,
+    record(SafeEventPhase::Worker, SafeEventCode::Restarted, 0,
            {{SafeMetric::RestartCount, 1.0},
             {SafeMetric::AttemptNumber, static_cast<double>(attempt->value)}});
     return UpdateLifecycleAction::Restarted;
@@ -287,8 +336,9 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
 {
     rollbackRequested_ = false;
     stopCurrentAttempt();
-    const PackageStoreResult rolledBack = store_.rollback(appId_);
-    if (!rolledBack.succeeded()) {
+    if (!currentBinding_.has_value()) return enterFailedClosed();
+    const PackageStoreResult rolledBack = store_.rollback(appId_, *currentBinding_);
+    if (!rolledBack.succeeded() || !rolledBack.activationBinding.has_value()) {
         return enterFailedClosed();
     }
     const ActivationStateResult state = store_.activationState(appId_);
@@ -300,7 +350,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
         return enterFailedClosed();
     }
     const UpdateLifecycleResult launched = beginLaunch(
-        verified.version, verified.path, nowMs, true,
+        verified.version, verified.path, *rolledBack.activationBinding, nowMs, true,
         UpdateLifecycleAction::RolledBackAndLaunched);
     if (!launched.succeeded()) {
         return enterFailedClosed();
@@ -341,13 +391,12 @@ bool UpdateLifecycleCoordinator::failedClosed() const noexcept
 void UpdateLifecycleCoordinator::record(
     const SafeEventPhase phase,
     const SafeEventCode code,
-    const qint64 nowMs,
     const qint64 durationMs,
     const SafeMetrics &metrics) const
 {
     if (recorder_ == nullptr || currentVersion_.isEmpty()) return;
     const SafeEventResult event = SafeEvent::create(
-        nowMs, appId_, currentVersion_, phase, code, durationMs,
+        clock_.utcNowMilliseconds(), appId_, currentVersion_, phase, code, durationMs,
         QStringLiteral("/"), metrics);
     if (event.hasValue()) (void)recorder_->record(event.value());
 }

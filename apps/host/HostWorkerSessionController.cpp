@@ -115,6 +115,14 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
                     emit heartbeatObserved();
                 }
             }, Qt::QueuedConnection);
+    connect(io_.data(), &HostWorkerSessionIo::capabilityRequestObserved, this,
+            [this](const quint64 generation, const QString &capability,
+                   const QString &operation, const QVariantMap &payload) {
+                if (generation == generation_
+                    && state_ == HostWorkerSessionState::Running) {
+                    emit capabilityRequestObserved(capability, operation, payload);
+                }
+            }, Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::shutdownFinished, this,
             [this](const quint64 generation) {
                 if (generation != generation_
