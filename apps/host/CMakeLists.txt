@@ -35,6 +35,10 @@ target_link_libraries(q_browser_host
     Qt6::Core
     Qt6::Widgets)
 
+if(WIN32)
+  target_link_libraries(q_browser_host PRIVATE bcrypt)
+endif()
+
 q_browser_enable_strict_warnings(q_browser_host)
 
 if(BUILD_TESTING)

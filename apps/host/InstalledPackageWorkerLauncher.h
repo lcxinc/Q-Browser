@@ -4,6 +4,8 @@
 #include "SandboxLauncher.h"
 #include "SandboxTrustBoundary.h"
 #include "UpdateLifecycleCoordinator.h"
+#include "WindowsStableIo.h"
+#include "WorkerSurface.h"
 
 #include <QObject>
 #include <QUrl>
@@ -12,16 +14,20 @@
 #include <memory>
 #include <optional>
 
-class WorkerSurface;
-
 class InstalledPackageWorkerLauncher final : public QObject
 {
     Q_OBJECT
 
 public:
-    using AttachCallback = std::function<bool(
+    enum class AttachResult
+    {
+        Attached,
+        ConsumedFailure,
+    };
+
+    using AttachCallback = std::function<AttachResult(
         std::unique_ptr<IpcSession>,
-        WorkerSurface *,
+        std::unique_ptr<WorkerSurface>,
         std::shared_ptr<SandboxProcess>,
         WorkerAttemptKey)>;
     using StopCallback = std::function<void()>;
@@ -63,6 +69,8 @@ private:
     void completeLaunch(quint64 serial, std::shared_ptr<ReadyPayload> payload);
     void observeProcess(WorkerAttemptKey key,
                         std::shared_ptr<SandboxProcess> process,
+                        std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree,
+                        QString tempDirectory,
                         quint64 serial);
     void fail(WorkerAttemptKey key, const QString &stableError);
 

@@ -2,6 +2,7 @@
 
 #include "IpcSession.h"
 #include "HostRuntimeConfig.h"
+#include "InstalledPackageWorkerLauncher.h"
 #include "WorkerSupervisor.h"
 
 #include <QObject>
@@ -20,12 +21,11 @@ class WorkerSurface;
 class UpdateLifecycleCoordinator;
 class QTimer;
 class QThread;
-class InstalledPackageWorkerLauncher;
 
 struct HostWorkerAttachContext final
 {
     std::unique_ptr<IpcSession> session;
-    WorkerSurface *surface = nullptr;
+    std::unique_ptr<WorkerSurface> surface;
     std::shared_ptr<void> processLifetime;
     std::function<void()> stopProcess;
     std::optional<WorkerAttemptKey> supervisionKey;
@@ -45,11 +45,15 @@ public:
     [[nodiscard]] bool requestPackageInstall(const QString &packagePath);
     [[nodiscard]] bool requestOfflineStart();
     [[nodiscard]] bool attachWorkerSession(std::unique_ptr<IpcSession> session);
-    [[nodiscard]] bool attachWorkerContext(HostWorkerAttachContext context);
+    [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult attachWorkerContext(
+        HostWorkerAttachContext context);
     void detachWorkerContext(const QString &reason);
     [[nodiscard]] bool hasWorkerContext() const noexcept;
     [[nodiscard]] MainWindow *mainWindow() const noexcept;
     [[nodiscard]] HostWorkerSessionController *workerSessionController() const noexcept;
+#ifdef Q_BROWSER_HOST_TESTING
+    void forceLifecycleQueueFullForTesting(bool full) noexcept;
+#endif
 
 signals:
     void updateLifecycleFailed(const QString &stableError);
@@ -81,4 +85,7 @@ private:
     QPointer<QObject> updateLifecycleRuntime_;
     QThread *updateLifecycleThread_ = nullptr;
     std::atomic_bool acceptingLifecycle_{true};
+#ifdef Q_BROWSER_HOST_TESTING
+    bool lifecycleQueueFullForTesting_ = false;
+#endif
 };

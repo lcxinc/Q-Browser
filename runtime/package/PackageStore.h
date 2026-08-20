@@ -117,6 +117,9 @@ private:
     [[nodiscard]] PackageStoreResult confirmCurrent(
         const QString &appId,
         const ActivationBinding &expected) const;
+    [[nodiscard]] PackageStoreResult compareCurrent(
+        const QString &appId,
+        const ActivationBinding &expected) const;
     [[nodiscard]] PackageStoreResult markCurrentLastKnownGood(
         const QString &appId,
         const ActivationBinding &expected) const;

@@ -128,6 +128,9 @@ HostApplication::~HostApplication()
 bool HostApplication::enqueueLifecycle(
     std::function<void(UpdateLifecycleCoordinator &)> operation)
 {
+#ifdef Q_BROWSER_HOST_TESTING
+    if (lifecycleQueueFullForTesting_) return false;
+#endif
     if (!operation || !acceptingLifecycle_.load(std::memory_order_acquire))
         return false;
     QPointer<HostLifecycleRuntime> runtime(
@@ -141,6 +144,13 @@ bool HostApplication::enqueueLifecycle(
     if (!queued && runtime) runtime->release();
     return queued;
 }
+
+#ifdef Q_BROWSER_HOST_TESTING
+void HostApplication::forceLifecycleQueueFullForTesting(const bool full) noexcept
+{
+    lifecycleQueueFullForTesting_ = full;
+}
+#endif
 
 bool HostApplication::requestPackageInstall(const QString &packagePath)
 {
@@ -191,16 +201,18 @@ bool HostApplication::initializePackageRuntime()
         std::move(*boundary.value), runtimeConfig_->workerExecutable(),
         runtimeConfig_->sandboxTempRoot(),
         runtimeConfig_->mockOrigin(),
-        [guard](std::unique_ptr<IpcSession> session, WorkerSurface *surface,
+        [guard](std::unique_ptr<IpcSession> session,
+                std::unique_ptr<WorkerSurface> surface,
                 std::shared_ptr<SandboxProcess> process,
                 const WorkerAttemptKey key) {
-            if (!guard || process == nullptr) return false;
+            if (!guard || process == nullptr)
+                return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
             HostWorkerAttachContext context;
             context.session = std::move(session);
-            context.surface = surface;
+            context.surface = std::move(surface);
             context.processLifetime = std::static_pointer_cast<void>(process);
             context.stopProcess = [process] {
-                process->terminate(ERROR_PROCESS_ABORTED);
+                process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
             };
             context.supervisionKey = key;
             return guard->attachWorkerContext(std::move(context));
@@ -241,6 +253,7 @@ bool HostApplication::initializePackageRuntime()
 
     auto store = std::make_unique<PackageStore>(runtimeConfig_->packageStoreRoot());
     InstallPolicy installPolicy;
+    installPolicy.expectedAppId = runtimeConfig_->appId();
     installPolicy.runtimeVersion = QStringLiteral("1.2.0");
     installPolicy.allowedImports = {QStringLiteral("QtQuick"),
                                     QStringLiteral("Company.Design")};
@@ -356,16 +369,20 @@ bool HostApplication::attachWorkerSession(std::unique_ptr<IpcSession> session)
         && workerSessionController_->attach(std::move(session));
 }
 
-bool HostApplication::attachWorkerContext(HostWorkerAttachContext context)
+InstalledPackageWorkerLauncher::AttachResult
+HostApplication::attachWorkerContext(HostWorkerAttachContext context)
 {
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
-        || workerProcessLifetime_ != nullptr
-        || !mainWindow_->attachWorkerSurface(context.surface)) return false;
+        || workerProcessLifetime_ != nullptr)
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    WorkerSurface *const surface = context.surface.get();
+    if (!mainWindow_->attachWorkerSurface(std::move(context.surface)))
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     if (!workerSessionController_->attach(std::move(context.session))) {
         mainWindow_->detachWorkerSurface();
-        return false;
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
@@ -387,10 +404,11 @@ bool HostApplication::attachWorkerContext(HostWorkerAttachContext context)
             })) {
             detachWorkerContext(
                 QStringLiteral("host.worker_context.supervision_queue_full"));
-            return false;
+            return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
         }
     }
-    return true;
+    Q_ASSERT(mainWindow_->workerSurface() == surface);
+    return InstalledPackageWorkerLauncher::AttachResult::Attached;
 }
 
 void HostApplication::detachWorkerContext(const QString &reason)

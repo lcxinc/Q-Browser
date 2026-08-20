@@ -176,6 +176,7 @@ private slots:
     void workerNavigationIsSameAppAndHistoryAware();
     void hostApplicationOwnsAttachableWorkerSessionController();
     void hostApplicationBindsWorkerContextLifecycle();
+    void failedWorkerContextAttachmentConsumesSurfaceExactlyOnce();
     void hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation();
     void stalledWorkerReaderNeverBlocksTheGuiThread();
     void gracefulShutdownCleansIoBeforeReattach();
@@ -800,21 +801,23 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
              SessionStatus::MessageReady);
     auto process = std::make_shared<SandboxProcess>(std::move(launch->process));
-    WorkerSurface *surface = WorkerSurface::create(
+    std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
         surfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
-        process->nativeProcessHandle(), WorkerAttemptId{104});
+        process->nativeProcessHandle(), WorkerAttemptId{104}));
     QVERIFY(surface != nullptr);
+    WorkerSurface *const surfacePointer = surface.get();
 
     HostApplication application(server.origin());
     QVERIFY(application.start());
     HostWorkerAttachContext context;
     context.session = std::make_unique<IpcSession>(std::move(launch->hostSession));
-    context.surface = surface;
+    context.surface = std::move(surface);
     context.processLifetime = process;
     context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
-    QVERIFY(application.attachWorkerContext(std::move(context)));
+    QCOMPARE(application.attachWorkerContext(std::move(context)),
+             InstalledPackageWorkerLauncher::AttachResult::Attached);
     QVERIFY(application.hasWorkerContext());
-    QCOMPARE(application.mainWindow()->workerSurface(), surface);
+    QCOMPARE(application.mainWindow()->workerSurface(), surfacePointer);
     QCOMPARE(application.workerSessionController()->state(),
              HostWorkerSessionState::Running);
 
@@ -825,6 +828,74 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     const auto closed = process->close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
     application.mainWindow()->close();
+}
+
+void UnifiedNavigationTest::failedWorkerContextAttachmentConsumesSurfaceExactlyOnce()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+
+    const auto runFailure = [&](const bool failLifecycleAdmission) {
+        auto launch = environment.launch(
+            failLifecycleAdmission ? QStringLiteral("queue-failure")
+                                   : QStringLiteral("session-failure"),
+            failLifecycleAdmission ? QStringLiteral("queue-failure")
+                                   : QStringLiteral("session-failure"),
+            100);
+        QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+        QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+                 SessionStatus::MessageReady);
+        const auto surfaceReady = receiveUntil(
+            launch->hostSession, ProtocolType::SurfaceReady);
+        QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+        QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+                 SessionStatus::MessageReady);
+        auto process = std::make_shared<SandboxProcess>(std::move(launch->process));
+        std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
+            surfaceReady.message->payload()
+                .value(QStringLiteral("windowHandle")).toString(),
+            process->nativeProcessHandle(), WorkerAttemptId{105}));
+        QVERIFY(surface != nullptr);
+        int destroyed = 0;
+        connect(surface.get(), &QObject::destroyed, this,
+                [&destroyed] { ++destroyed; });
+
+        HostApplication application(server.origin());
+        QVERIFY(application.start());
+        application.forceLifecycleQueueFullForTesting(failLifecycleAdmission);
+        HostWorkerAttachContext context;
+        if (failLifecycleAdmission) {
+            context.session = std::make_unique<IpcSession>(
+                std::move(launch->hostSession));
+            context.supervisionKey = WorkerAttemptKey{
+                WorkerActivationId{1}, WorkerAttemptId{105}};
+        } else {
+            context.session = std::make_unique<IpcSession>(
+                WinPipeTransport{}, IpcRole::Host,
+                HostLaunchContext{QStringLiteral("invalid"),
+                                  QStringLiteral("com.qbrowser.pilot")});
+        }
+        context.surface = std::move(surface);
+        context.processLifetime = process;
+        context.stopProcess = [process] {
+            process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        };
+        QCOMPARE(application.attachWorkerContext(std::move(context)),
+                 InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure);
+        QCOMPARE(destroyed, 1);
+        QCOMPARE(application.mainWindow()->workerSurface(), nullptr);
+        QVERIFY(!application.hasWorkerContext());
+        process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        QVERIFY(process->waitForFinished(5000));
+        const auto closed = process->close();
+        QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+        application.mainWindow()->close();
+    };
+
+    runFailure(false);
+    runFailure(true);
 }
 
 void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()

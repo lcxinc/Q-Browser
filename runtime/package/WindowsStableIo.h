@@ -54,6 +54,9 @@ public:
     [[nodiscard]] bool addExistingDirectory(const QString &path);
     [[nodiscard]] bool addImmutableDirectory(const QString &path);
     [[nodiscard]] bool createAndHoldDirectory(const QString &path);
+    [[nodiscard]] bool adoptCreatedDirectoryRoot(
+        WindowsStableDirectoryTree &source,
+        const QString &path);
     [[nodiscard]] bool contains(const QString &path) const;
     [[nodiscard]] bool isStable() const;
     [[nodiscard]] bool publishRootNoReplace(
@@ -122,6 +125,8 @@ public:
         quint64 expected,
         quint64 maximum,
         QByteArray &bytes);
+    [[nodiscard]] bool readBounded(quint64 maximum, QByteArray &bytes);
+    [[nodiscard]] bool hasRestrictedTrustAcl() const;
     [[nodiscard]] bool publishNoReplace(
         const QString &destination,
         const WindowsStableDirectoryTree &tree);
@@ -136,6 +141,7 @@ public:
 
     [[nodiscard]] bool isOpen() const noexcept;
     [[nodiscard]] const QString &path() const noexcept;
+    [[nodiscard]] WindowsFileIdentity identity() const noexcept;
 
 private:
     [[nodiscard]] bool openAndVerify(

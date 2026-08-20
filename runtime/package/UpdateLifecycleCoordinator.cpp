@@ -330,6 +330,13 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
     restartRequested_ = false;
     handshakeAccepted_ = false;
     stopCurrentAttempt();
+    if (!currentBinding_.has_value()) return enterFailedClosed();
+    const InstallResult rebound = installer_.reverifyInstalledVersion(
+        appId_, *currentBinding_);
+    if (!rebound.succeeded()) return enterFailedClosed();
+    currentVersion_ = rebound.version;
+    currentPath_ = rebound.path;
+    currentEntryPoint_ = rebound.entryPoint;
     const WorkerActivationId activation = supervisor_.activeActivation();
     const std::optional<WorkerAttemptId> attempt = supervisor_.beginAttempt(
         activation, nowMs);

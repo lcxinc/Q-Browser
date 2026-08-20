@@ -179,12 +179,12 @@ bool MainWindow::goForward()
     return true;
 }
 
-bool MainWindow::attachWorkerSurface(WorkerSurface *surface)
+bool MainWindow::attachWorkerSurface(std::unique_ptr<WorkerSurface> surface)
 {
     if (workerSurface_ != nullptr || surface == nullptr || !surface->isValid()) {
         return false;
     }
-    workerSurface_ = surface;
+    workerSurface_ = surface.release();
     workerSurface_->setParent(surfaceStack_);
     workerSurface_->setObjectName(QStringLiteral("worker-surface"));
     surfaceStack_->insertWidget(0, workerSurface_);

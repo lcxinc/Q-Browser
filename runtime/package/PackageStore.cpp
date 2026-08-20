@@ -1155,6 +1155,32 @@ PackageStoreResult PackageStore::confirmCurrent(
     return committed;
 }
 
+PackageStoreResult PackageStore::compareCurrent(
+    const QString &appId,
+    const ActivationBinding &expected) const
+{
+    if (!validAppId(appId)) {
+        return failure(PackageStoreError::InvalidArgument,
+                       QStringLiteral("invalid application identifier"));
+    }
+    const auto transactionLock = acquireActivationTransactionLock(appRoot(appId));
+    if (!transactionLock) {
+        return failure(PackageStoreError::StateUnavailable,
+                       QStringLiteral("activation state is busy"));
+    }
+    const ActivationStateResult loaded = recordedActivationStateUnlocked(appId);
+    if (!loaded.hasValue()) return failure(loaded.error, loaded.message);
+    const auto actual = bindingForState(loaded.state);
+    if (!actual.has_value() || *actual != expected) {
+        return failure(PackageStoreError::StateConflict,
+                       QStringLiteral("activation state changed"));
+    }
+    PackageStoreResult matched;
+    matched.path = versionPath(appId, expected.currentDirectory);
+    matched.activationBinding = expected;
+    return matched;
+}
+
 std::optional<ActivationBinding> PackageStore::bindingForState(
     const ActivationState &state) const
 {

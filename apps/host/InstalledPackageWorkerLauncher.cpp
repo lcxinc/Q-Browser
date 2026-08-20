@@ -6,11 +6,13 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QDirIterator>
 #include <QPointer>
 #include <QThread>
-#include <QUuid>
+#include <bcrypt.h>
 
 #include <algorithm>
+#include <array>
 #include <utility>
 
 namespace
@@ -95,6 +97,106 @@ bool isStableEntryPoint(const QString &packageDirectory,
     return true;
 #endif
 }
+
+std::optional<QString> cryptographicNonce()
+{
+    std::array<unsigned char, 16> bytes{};
+    if (BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        return std::nullopt;
+    }
+    return QString::fromLatin1(
+        QByteArray(reinterpret_cast<const char *>(bytes.data()),
+                   static_cast<qsizetype>(bytes.size())).toHex());
+}
+
+struct OwnedWorkerTemp final
+{
+    QString path;
+    std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tree;
+};
+
+std::optional<OwnedWorkerTemp> createOwnedWorkerTemp(const QString &sandboxRoot)
+{
+    using qbrowser_archive_detail::WindowsStableDirectoryTree;
+    WindowsStableDirectoryTree parentTree;
+    if (!parentTree.openRoot(sandboxRoot)) return std::nullopt;
+    const QString workers = QDir(sandboxRoot).absoluteFilePath(
+        QStringLiteral("workers"));
+    const QFileInfo workersInfo(workers);
+    if (workersInfo.exists()) {
+        if (!workersInfo.isDir() || workersInfo.isSymLink()
+            || !parentTree.addExistingDirectory(workers)) {
+            return std::nullopt;
+        }
+    } else if (!parentTree.createAndHoldDirectory(workers)) {
+        return std::nullopt;
+    }
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const auto nonce = cryptographicNonce();
+        if (!nonce.has_value()) return std::nullopt;
+        const QString path = QDir(workers).absoluteFilePath(
+            QStringLiteral("launch-") + *nonce);
+        if (!parentTree.createAndHoldDirectory(path)) continue;
+        auto owned = std::make_shared<WindowsStableDirectoryTree>();
+        if (!owned->adoptCreatedDirectoryRoot(parentTree, path)) {
+            parentTree.cleanupCreatedDirectories();
+            return std::nullopt;
+        }
+        return OwnedWorkerTemp{path, std::move(owned)};
+    }
+    return std::nullopt;
+}
+
+bool cleanupOwnedWorkerTemp(
+    const QString &root,
+    qbrowser_archive_detail::WindowsStableDirectoryTree &tree)
+{
+    QStringList files;
+    qsizetype members = 0;
+    QDirIterator iterator(
+        root, QDir::AllEntries | QDir::Hidden | QDir::System
+                  | QDir::NoDotAndDotDot,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString path = iterator.next();
+        const QFileInfo info = iterator.fileInfo();
+        if (++members > 4096 || info.isSymLink()) return false;
+        if (info.isDir()) {
+            if (!tree.addExistingDirectory(path)) return false;
+        } else if (info.isFile()) {
+            files.push_back(path);
+        } else {
+            return false;
+        }
+    }
+    if (!tree.isStable()) return false;
+    for (const QString &path : files) {
+        qbrowser_archive_detail::WindowsStableFile file;
+        if (!file.openForDelete(path, tree) || !file.deleteOwned()) return false;
+    }
+    return tree.deleteHeldTree();
+}
+
+void retireProcess(
+    std::shared_ptr<SandboxProcess> process,
+    std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree,
+    QString tempDirectory)
+{
+    if (process == nullptr) return;
+    QThread *const observer = QThread::create(
+        [process = std::move(process), tempTree = std::move(tempTree),
+         tempDirectory = std::move(tempDirectory)]() mutable {
+            process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+            while (!process->waitForFinished(100)) {}
+            (void)process->close();
+            if (tempTree != nullptr)
+                (void)cleanupOwnedWorkerTemp(tempDirectory, *tempTree);
+        });
+    QObject::connect(observer, &QThread::finished,
+                     observer, &QObject::deleteLater);
+    observer->start();
+}
 }
 
 struct InstalledPackageWorkerLauncher::ReadyPayload final
@@ -102,6 +204,8 @@ struct InstalledPackageWorkerLauncher::ReadyPayload final
     UpdateLaunchRequest request;
     std::unique_ptr<IpcSession> session;
     std::shared_ptr<SandboxProcess> process;
+    std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree;
+    QString tempDirectory;
     QString windowHandle;
 };
 
@@ -170,12 +274,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     }
     ++serial_;
     const quint64 launchSerial = serial_;
-    const QString tempDirectory = QDir(sandboxTempRoot_).filePath(
-        QStringLiteral("workers/%1-%2-%3")
-            .arg(request.appId)
-            .arg(request.key.activation.value)
-            .arg(request.key.attempt.value));
-    if (!QDir().mkpath(tempDirectory)) {
+    const auto ownedTemp = createOwnedWorkerTemp(sandboxTempRoot_);
+    if (!ownedTemp.has_value()) {
         fail(request.key, QStringLiteral("host.launch.temp_unavailable"));
         return false;
     }
@@ -184,7 +284,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     launchRequest.appId = request.appId;
     launchRequest.executablePath = workerExecutable_;
     launchRequest.packageDirectory = canonicalPackage;
-    launchRequest.tempDirectory = tempDirectory;
+    launchRequest.tempDirectory = ownedTemp->path;
     launchRequest.arguments = {
         QStringLiteral("--qbrowser-package"), canonicalPackage,
         QStringLiteral("--qbrowser-entry"), request.entryPoint,
@@ -196,6 +296,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     launchRequest.resourceLimits = {1, 512ULL * 1024ULL * 1024ULL};
     auto configured = boundary_.makeLaunchConfig(launchRequest);
     if (!configured.value.has_value()) {
+        (void)cleanupOwnedWorkerTemp(ownedTemp->path, *ownedTemp->tree);
         fail(request.key, configured.errorCode.isEmpty()
                               ? QStringLiteral("host.launch.trust_rejected")
                               : configured.errorCode);
@@ -204,14 +305,18 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     QPointer<InstalledPackageWorkerLauncher> guard(this);
     QThread *const thread = QThread::create(
         [guard, request, nonce, launchSerial,
+         tempDirectory = ownedTemp->path, tempTree = ownedTemp->tree,
          config = std::move(*configured.value)]() mutable {
             auto payload = std::make_shared<ReadyPayload>();
             payload->request = request;
+            payload->tempDirectory = tempDirectory;
+            payload->tempTree = tempTree;
             WinPipePair pair = WinPipeTransport::createHostPair();
             if (!pair.isValid()) {
                 if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.key] {
                     if (guard) guard->fail(key, QStringLiteral("host.launch.pipe_failed"));
                 }, Qt::QueuedConnection);
+                (void)cleanupOwnedWorkerTemp(tempDirectory, *tempTree);
                 return;
             }
             WinPipeTransport hostPipe = pair.takeHost();
@@ -224,6 +329,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.key, error] {
                     if (guard) guard->fail(key, error);
                 }, Qt::QueuedConnection);
+                (void)cleanupOwnedWorkerTemp(tempDirectory, *tempTree);
                 return;
             }
             payload->process = std::make_shared<SandboxProcess>(
@@ -241,6 +347,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 : surface;
             if (!ready.succeeded || surface.windowHandle.isEmpty()) {
                 payload->process->terminate(ERROR_PROCESS_ABORTED);
+                (void)payload->process->close();
+                (void)cleanupOwnedWorkerTemp(tempDirectory, *tempTree);
                 const QString error = ready.stableError.isEmpty()
                     ? QStringLiteral("host.launch.handshake_failed")
                     : ready.stableError;
@@ -269,17 +377,19 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     if (!accepting_ || serial != serial_ || payload == nullptr
         || payload->process == nullptr || payload->session == nullptr) {
         if (payload != nullptr && payload->process != nullptr)
-            payload->process->terminate(ERROR_PROCESS_ABORTED);
+            retireProcess(std::move(payload->process), std::move(payload->tempTree),
+                          std::move(payload->tempDirectory));
         return;
     }
-    WorkerSurface *const surface = WorkerSurface::create(
+    std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
         payload->windowHandle, payload->process->nativeProcessHandle(),
-        payload->request.key.attempt);
+        payload->request.key.attempt));
     if (surface == nullptr
-        || !attach_(std::move(payload->session), surface, payload->process,
-                    payload->request.key)) {
-        delete surface;
-        payload->process->terminate(ERROR_PROCESS_ABORTED);
+        || attach_(std::move(payload->session), std::move(surface),
+                   payload->process, payload->request.key)
+            != AttachResult::Attached) {
+        retireProcess(std::move(payload->process), std::move(payload->tempTree),
+                      std::move(payload->tempDirectory));
         fail(payload->request.key, QStringLiteral("host.launch.attach_failed"));
         return;
     }
@@ -291,21 +401,43 @@ void InstalledPackageWorkerLauncher::completeLaunch(
                payload->request.key.activation.value,
                payload->request.key.attempt.value,
                payload->process->processId());
-    observeProcess(payload->request.key, payload->process, serial);
+    observeProcess(payload->request.key, payload->process,
+                   std::move(payload->tempTree),
+                   std::move(payload->tempDirectory), serial);
 }
 
 void InstalledPackageWorkerLauncher::observeProcess(
     const WorkerAttemptKey key,
     std::shared_ptr<SandboxProcess> process,
+    std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree,
+    QString tempDirectory,
     const quint64 serial)
 {
     QPointer<InstalledPackageWorkerLauncher> guard(this);
     QThread *const observer = QThread::create(
-        [guard, key, process = std::move(process), serial]() mutable {
-        while (!process->waitForFinished(100)) {
-            if (!guard) return;
+        [guard, key, process = std::move(process),
+         tempTree = std::move(tempTree), tempDirectory = std::move(tempDirectory),
+         serial]() mutable {
+        while (!process->waitForFinished(100)) {}
+        (void)process->close();
+        const bool cleaned = tempTree != nullptr
+            && cleanupOwnedWorkerTemp(tempDirectory, *tempTree);
+        if (!cleaned) {
+            if (guard) QMetaObject::invokeMethod(
+                guard, [guard, key] {
+                    if (!guard) return;
+                    guard->accepting_ = false;
+                    guard->pendingRequest_.reset();
+                    if (guard->currentKey_.has_value()
+                        && *guard->currentKey_ == key) {
+                        guard->currentKey_.reset();
+                        guard->currentProcess_.reset();
+                    }
+                    guard->fail(
+                        key, QStringLiteral("host.launch.temp_cleanup_failed"));
+                }, Qt::QueuedConnection);
+            return;
         }
-        process.reset();
         if (guard) QMetaObject::invokeMethod(guard, [guard, key, serial] {
             if (!guard) return;
             const bool expected = guard->expectedStop_.has_value()
@@ -331,9 +463,13 @@ void InstalledPackageWorkerLauncher::observeProcess(
 
 void InstalledPackageWorkerLauncher::stopCurrent()
 {
-    if (currentKey_.has_value()) expectedStop_ = currentKey_;
+    if (currentKey_.has_value() && currentProcess_ != nullptr
+        && currentProcess_->isRunning()) {
+        expectedStop_ = currentKey_;
+    }
     if (stop_) stop_();
-    if (currentProcess_ != nullptr) currentProcess_->terminate(ERROR_PROCESS_ABORTED);
+    if (currentProcess_ != nullptr)
+        currentProcess_->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
 }
 
 void InstalledPackageWorkerLauncher::cancel() noexcept

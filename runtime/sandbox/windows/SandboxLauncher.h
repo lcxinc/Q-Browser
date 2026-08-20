@@ -11,6 +11,7 @@
 #include <qt_windows.h>
 
 #include <optional>
+#include <mutex>
 #include <vector>
 
 class SandboxProcess final
@@ -25,11 +26,13 @@ public:
     SandboxProcess &operator=(SandboxProcess &&other) noexcept;
 
     [[nodiscard]] bool isValid() const noexcept;
+    [[nodiscard]] bool isRunning() const noexcept;
     [[nodiscard]] HANDLE nativeProcessHandle() const noexcept;
     [[nodiscard]] DWORD processId() const noexcept;
-    [[nodiscard]] const QString &appContainerSid() const noexcept;
+    [[nodiscard]] QString appContainerSid() const;
     bool waitForFinished(int timeoutMs) const noexcept;
     [[nodiscard]] DWORD exitCode() const noexcept;
+    void requestTerminateNoWait(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
     void terminate(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
     [[nodiscard]] SandboxValueResult<bool> close() noexcept;
 
@@ -47,6 +50,7 @@ private:
     JobLimits job_;
     std::vector<AclGrant> grants_;
     QString appContainerSid_;
+    mutable std::mutex mutex_;
 };
 
 struct SandboxLaunchResult final

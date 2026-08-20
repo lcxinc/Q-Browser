@@ -37,6 +37,7 @@ if(WIN32)
       Qt6::Gui
       Qt6::Quick
       Qt6::Widgets
+      Advapi32
       Userenv)
   target_include_directories(tst_crash_rollback
     PRIVATE "${PROJECT_SOURCE_DIR}/tests/integration/worker")

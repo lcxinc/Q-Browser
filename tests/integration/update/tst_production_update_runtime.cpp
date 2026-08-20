@@ -13,8 +13,10 @@
 #include <QSignalSpy>
 #include <QProcess>
 #include <QTest>
+#include <QTemporaryDir>
 
 #include <qt_windows.h>
+#include <Aclapi.h>
 
 namespace
 {
@@ -23,6 +25,48 @@ bool writeNewFile(const QString &path, const QByteArray &bytes)
     QFile file(path);
     return file.open(QIODevice::WriteOnly | QIODevice::NewOnly)
         && file.write(bytes) == bytes.size();
+}
+
+bool protectTrustKey(const QString &path)
+{
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (GetNamedSecurityInfoW(
+            const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+            SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+            &owner, nullptr, nullptr, nullptr, &descriptor) != ERROR_SUCCESS
+        || descriptor == nullptr || owner == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return false;
+    }
+    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD systemBytes = sizeof(systemBuffer);
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, systemBuffer,
+                            &systemBytes)) {
+        LocalFree(descriptor);
+        return false;
+    }
+    EXPLICIT_ACCESSW entries[2]{};
+    for (EXPLICIT_ACCESSW &entry : entries) {
+        entry.grfAccessPermissions = GENERIC_ALL;
+        entry.grfAccessMode = GRANT_ACCESS;
+        entry.grfInheritance = NO_INHERITANCE;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    }
+    entries[0].Trustee.ptstrName = static_cast<LPWSTR>(owner);
+    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(systemBuffer);
+    PACL dacl = nullptr;
+    const DWORD aclResult = SetEntriesInAclW(2, entries, nullptr, &dacl);
+    const DWORD applied = aclResult == ERROR_SUCCESS
+        ? SetNamedSecurityInfoW(
+              const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+              SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr, nullptr, dacl, nullptr)
+        : aclResult;
+    if (dacl != nullptr) LocalFree(dacl);
+    LocalFree(descriptor);
+    return applied == ERROR_SUCCESS;
 }
 
 bool terminateProcessId(const quint32 processId)
@@ -34,6 +78,16 @@ bool terminateProcessId(const quint32 processId)
     const bool finished = terminated && WaitForSingleObject(process, 10'000) == WAIT_OBJECT_0;
     CloseHandle(process);
     return finished;
+}
+
+bool waitForProcessExit(const quint32 processId, const int timeoutMs)
+{
+    const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, processId);
+    if (process == nullptr) return GetLastError() == ERROR_INVALID_PARAMETER;
+    const bool exited = WaitForSingleObject(process, static_cast<DWORD>(timeoutMs))
+        == WAIT_OBJECT_0;
+    CloseHandle(process);
+    return exited;
 }
 }
 
@@ -51,12 +105,17 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
     UpdateTemporaryDir temporary;
     QVERIFY(temporary.isValid());
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
-    const QString publicKey = temporary.filePath(QStringLiteral("trusted.pem"));
-    const QString telemetry = temporary.filePath(QStringLiteral("telemetry"));
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
     const QByteArray recoveredQml = QByteArrayLiteral(
         "import QtQuick\nItem { width: 320; height: 200; "
         "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", "
@@ -167,13 +226,17 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QCOMPARE(failure.count(), 0);
     QVERIFY(QCoreApplication::instance() != nullptr);
     const int readyBeforeShutdownRace = ready.count();
-    QVERIFY(terminateProcessId(readyPid(4)));
-    QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 3, 10'000);
+    const quint32 liveWorker = readyPid(4);
     QElapsedTimer destruction;
     destruction.start();
     host.reset();
-    QVERIFY2(destruction.elapsed() < 250,
+    QVERIFY2(destruction.elapsed() < 100,
              "Host destruction blocked on the lifecycle thread");
+    QVERIFY(waitForProcessExit(liveWorker, 10'000));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
     QTest::qWait(500);
     QCOMPARE(ready.count(), readyBeforeShutdownRace);
 
@@ -182,7 +245,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         if (!events.open(QIODevice::ReadOnly)) return qsizetype{0};
         return events.readAll().count(QByteArrayLiteral("\"code\":\"started\""));
     };
-    const QString cliTelemetry = temporary.filePath(QStringLiteral("cli-telemetry"));
+    const QString cliTelemetry = telemetryRoot.filePath(
+        QStringLiteral("cli-telemetry"));
     QVERIFY(QDir().mkpath(cliTelemetry));
     QStringList installArguments = arguments;
     for (QString &argument : installArguments) {

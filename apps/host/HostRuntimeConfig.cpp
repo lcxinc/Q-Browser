@@ -1,5 +1,8 @@
 #include "HostRuntimeConfig.h"
 
+#include "SignatureVerifier.h"
+#include "WindowsStableIo.h"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -217,6 +220,30 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         return failure(HostRuntimeConfigError::UnsafePath,
                        QStringLiteral("host.config.unsafe_public_key_path"));
     }
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsStableDirectoryTree keyTree;
+    qbrowser_archive_detail::WindowsStableFile keyFile;
+    QByteArray keyBytes;
+    const QString keyParent = QFileInfo(*keyPath).absolutePath();
+    if (!keyTree.openRoot(keyParent)
+        || !keyFile.openReadLocked(*keyPath, keyTree)
+        || !keyFile.readBounded(MaximumPublicKeyBytes, keyBytes)
+        || !keyFile.isSameIdentityAt(*keyPath)
+        || !keyFile.isStableWithin(keyTree) || !keyTree.isStable()) {
+        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
+                       QStringLiteral("host.config.public_key_unavailable"));
+    }
+    if (!keyFile.hasRestrictedTrustAcl()) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.unsafe_public_key_path"));
+    }
+    if (!SignatureVerifier::isValidPublicKeyPem(keyBytes)) {
+        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
+                       QStringLiteral("host.config.public_key_unavailable"));
+    }
+    config.trustedPublicKeyPem_ = std::move(keyBytes);
+    config.trustedPublicKeyIdentity_ = keyFile.identity();
+#else
     QFile keyFile(*keyPath);
     if (!keyFile.open(QIODevice::ReadOnly) || keyFile.size() <= 0
         || keyFile.size() > MaximumPublicKeyBytes) {
@@ -224,6 +251,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
                        QStringLiteral("host.config.public_key_unavailable"));
     }
     config.trustedPublicKeyPem_ = keyFile.readAll();
+    if (!SignatureVerifier::isValidPublicKeyPem(config.trustedPublicKeyPem_)) {
+        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
+                       QStringLiteral("host.config.public_key_unavailable"));
+    }
+#endif
 
     const auto store = safeExistingPath(
         singleValues.value(QStringLiteral("package-store")), true);
@@ -250,7 +282,8 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         }
         config.immutableRuntimeRoots_.push_back(*root);
     }
-    QStringList boundaryRoots{config.packageStoreRoot_, config.sandboxTempRoot_};
+    QStringList boundaryRoots{config.packageStoreRoot_, config.sandboxTempRoot_,
+                              config.telemetryDirectory_};
     boundaryRoots.append(config.immutableRuntimeRoots_);
     for (qsizetype left = 0; left < boundaryRoots.size(); ++left) {
         for (qsizetype right = left + 1; right < boundaryRoots.size(); ++right) {
@@ -259,6 +292,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
                                QStringLiteral("host.config.overlapping_roots"));
             }
         }
+    }
+    if (overlaps(config.telemetryDirectory_,
+                 QFileInfo(*keyPath).absolutePath())) {
+        return failure(HostRuntimeConfigError::OverlappingRoots,
+                       QStringLiteral("host.config.overlapping_roots"));
     }
     bool workerInRuntime = false;
     for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
@@ -280,6 +318,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         if (!package.has_value()) {
             return failure(HostRuntimeConfigError::UnsafePath,
                            QStringLiteral("host.config.unsafe_install_package"));
+        }
+        if (overlaps(config.telemetryDirectory_,
+                     QFileInfo(*package).absolutePath())) {
+            return failure(HostRuntimeConfigError::OverlappingRoots,
+                           QStringLiteral("host.config.overlapping_roots"));
         }
         config.installPackage_ = *package;
     }

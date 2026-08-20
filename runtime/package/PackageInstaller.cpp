@@ -236,6 +236,32 @@ bool sourcesPassPolicy(const QVector<ArchiveFile> &files)
         return QmlSourcePolicy::violations(file.contents).isEmpty();
     });
 }
+
+std::optional<QString> authenticatedManifestAppId(
+    const QString &packagePath,
+    const QByteArray &trustedPublicKeyPem,
+    const ArchiveLimits &limits)
+{
+    const ArchiveSnapshotResult snapshot = Archive::snapshot(packagePath, limits);
+    if (!snapshot.hasValue()) return std::nullopt;
+    const QVector<ArchiveFile> &files = snapshot.files();
+    const ArchiveFile *signature = findFile(
+        files, QByteArrayLiteral("metadata/signature.ed25519"));
+    const ArchiveFile *manifest = findFile(
+        files, QByteArrayLiteral("manifest.json"));
+    const ContentDigestResult digest = ContentDigest::signedPackage(files);
+    if (signature == nullptr || signature->contents.size() != 64
+        || manifest == nullptr || !digest.hasValue()
+        || !SignatureVerifier::verifyPem(
+                digest.bytes(), trustedPublicKeyPem, signature->contents)
+                .isVerified()) {
+        return std::nullopt;
+    }
+    const ManifestParseResult parsed = Manifest::parse(manifest->contents);
+    return parsed.hasValue()
+        ? std::optional<QString>(parsed.value().appId())
+        : std::nullopt;
+}
 }
 
 PackageInstaller::PackageInstaller(PackageStore &store,
@@ -366,19 +392,15 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                        QStringLiteral("installed_content_invalid"));
     }
-    const ActivationStateResult active = m_store.activationState(appId);
-    if (!active.hasValue()
-        || active.state.current != expected.currentDirectory
-        || active.state.generation != expected.generation) {
+    const PackageStoreResult active = m_store.compareCurrent(appId, expected);
+    if (!active.succeeded()) {
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                        QStringLiteral("installed_content_invalid"));
     }
     InstallResult verified = verifyInstalled(appId, expected.currentDirectory);
     if (!verified.succeeded()) return verified;
-    const ActivationStateResult rebound = m_store.activationState(appId);
-    if (!rebound.hasValue()
-        || rebound.state.current != expected.currentDirectory
-        || rebound.state.generation != expected.generation) {
+    const PackageStoreResult rebound = m_store.compareCurrent(appId, expected);
+    if (!rebound.succeeded()) {
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                        QStringLiteral("installed_content_invalid"));
     }
@@ -388,6 +410,13 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
 
 InstallResult PackageInstaller::install(const QString &packagePath) const
 {
+    const std::optional<QString> authenticatedAppId = authenticatedManifestAppId(
+        packagePath, m_trustedPublicKeyPem, m_policy.archiveLimits);
+    if (!m_policy.expectedAppId.isEmpty() && authenticatedAppId.has_value()
+        && *authenticatedAppId != m_policy.expectedAppId) {
+        return failure(InstallPhase::Verify, InstallError::AppIdMismatch,
+                       QStringLiteral("app_id_mismatch"));
+    }
     const QString stagingParent = m_store.root() + QStringLiteral("/.staging");
     if (!QDir().mkpath(stagingParent)) {
         return failure(InstallPhase::Staging,

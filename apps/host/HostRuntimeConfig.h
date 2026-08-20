@@ -7,6 +7,10 @@
 
 #include <optional>
 
+#ifdef Q_OS_WIN
+#include "WindowsStableIo.h"
+#endif
+
 enum class HostRuntimeMode
 {
     TrustedShell,
@@ -53,6 +57,9 @@ private:
     QUrl mockOrigin_{QStringLiteral("http://127.0.0.1:4173/")};
     QString appId_;
     QByteArray trustedPublicKeyPem_;
+#ifdef Q_OS_WIN
+    qbrowser_archive_detail::WindowsFileIdentity trustedPublicKeyIdentity_;
+#endif
     QString packageStoreRoot_;
     QString sandboxTempRoot_;
     QStringList immutableRuntimeRoots_;

@@ -18,7 +18,62 @@ class CrashRollbackTest final : public QObject
 
 private slots:
     void commitsRollbackBeforeLaunchingRecoveredRealLpacWorker();
+    void concurrentActivationBeforeRestartFailsClosedWithoutLaunchingStalePackage();
 };
+
+void CrashRollbackTest::concurrentActivationBeforeRestartFailsClosedWithoutLaunchingStalePackage()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               updateInstallPolicy());
+    PackageStore competingStore(store.root());
+    PackageInstaller competingInstaller(
+        competingStore, keys.value().publicKeyPem, updateInstallPolicy());
+    const QString packageB = updateSignedPackage(
+        temporary, QStringLiteral("restart-b"), QStringLiteral("1.1.0"),
+        keys.value().privateKeyPem);
+    QVERIFY(!packageB.isEmpty());
+    QVector<UpdateLaunchRequest> launches;
+    ManualLifecycleClock clock;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {100, 150},
+        [&](const UpdateLaunchRequest &request) {
+            launches.push_back(request);
+            return true;
+        }, clock.source());
+    bool activatedB = false;
+    coordinator.setBeforeRelaunchCallback([&] {
+        const InstallResult installedB = competingInstaller.install(packageB);
+        QVERIFY2(installedB.succeeded(), qPrintable(installedB.stableError));
+        activatedB = true;
+    });
+
+    clock.set(0);
+    const UpdateLifecycleResult installedA = coordinator.installAndLaunch(
+        updateSignedPackage(temporary, QStringLiteral("restart-a"),
+                            QStringLiteral("1.0.0"),
+                            keys.value().privateKeyPem));
+    QVERIFY(installedA.succeeded());
+    QCOMPARE(launches.size(), 1);
+    const WorkerAttemptKey keyA = coordinator.currentAttemptKey().value();
+    clock.set(1);
+    QCOMPARE(coordinator.authenticatedHandshake(keyA),
+             UpdateLifecycleAction::None);
+
+    clock.set(10);
+    QCOMPARE(coordinator.workerExited(keyA, WorkerExitReason::Crashed),
+             UpdateLifecycleAction::FailedClosed);
+    QVERIFY(activatedB);
+    QVERIFY(coordinator.failedClosed());
+    QCOMPARE(launches.size(), 1);
+    QCOMPARE(store.activationState(QStringLiteral("company.pilot")).state.current,
+             QFileInfo(competingStore.resolveCurrent(
+                 QStringLiteral("company.pilot")).path).fileName());
+}
 
 void CrashRollbackTest::commitsRollbackBeforeLaunchingRecoveredRealLpacWorker()
 {

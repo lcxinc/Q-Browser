@@ -35,6 +35,7 @@ enum class InstallError
     RuntimeIncompatible,
     ImportDenied,
     PreflightRejected,
+    AppIdMismatch,
     CandidateFailed,
     ActivationFailed,
 };
@@ -58,6 +59,7 @@ struct InstallResult final
 
 struct InstallPolicy final
 {
+    QString expectedAppId;
     QString runtimeVersion;
     QSet<QString> allowedImports;
     std::function<bool(const Manifest &, const QString &)> preflight;

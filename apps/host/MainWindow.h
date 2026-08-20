@@ -5,6 +5,8 @@
 #include <QMainWindow>
 #include <QUrl>
 
+#include <memory>
+
 class QLabel;
 class NavigationBar;
 class QStackedWidget;
@@ -35,7 +37,7 @@ public:
                                           const QString &route);
     [[nodiscard]] bool goBack();
     [[nodiscard]] bool goForward();
-    [[nodiscard]] bool attachWorkerSurface(WorkerSurface *surface);
+    [[nodiscard]] bool attachWorkerSurface(std::unique_ptr<WorkerSurface> surface);
     void detachWorkerSurface();
 
     [[nodiscard]] HostSurfaceKind activeSurface() const noexcept;

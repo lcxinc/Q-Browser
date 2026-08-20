@@ -104,7 +104,8 @@ QByteArray manifest(const QString &version,
                     const QString &minimumRuntime = QStringLiteral("1.0.0"),
                     const QString &maximumRuntime = QStringLiteral("1.x"),
                     const QStringList &imports = {QStringLiteral("QtQuick")},
-                    const QString &entryPoint = QStringLiteral("qml/Main.qml"))
+                    const QString &entryPoint = QStringLiteral("qml/Main.qml"),
+                    const QString &appId = QStringLiteral("company.pilot"))
 {
     QJsonArray importArray;
     for (const QString &name : imports) {
@@ -112,7 +113,7 @@ QByteArray manifest(const QString &version,
     }
     const QJsonObject object{
         {QStringLiteral("schemaVersion"), 1},
-        {QStringLiteral("appId"), QStringLiteral("company.pilot")},
+        {QStringLiteral("appId"), appId},
         {QStringLiteral("version"), version},
         {QStringLiteral("entryPoint"), entryPoint},
         {QStringLiteral("runtime"),
@@ -167,6 +168,7 @@ QString signedPackage(QTemporaryDir &temporary,
 InstallPolicy policy()
 {
     InstallPolicy result;
+    result.expectedAppId = QStringLiteral("company.pilot");
     result.runtimeVersion = QStringLiteral("1.2.0");
     result.allowedImports = {QStringLiteral("QtQuick"), QStringLiteral("Company.Design")};
     result.preflight = [](const Manifest &, const QString &) { return true; };
@@ -199,7 +201,37 @@ private slots:
     void reverifyRejectsMismatchedActivationGeneration();
     void reverifyRejectsActivationChangedDuringSnapshot();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
+    void rejectsAuthenticatedOtherAppBeforeStoreMutation();
 };
+
+void PackageInstallerTest::rejectsAuthenticatedOtherAppBeforeStoreMutation()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString storeRoot = temporary.filePath(QStringLiteral("store"));
+    PackageStore store(storeRoot);
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const QString package = signedPackage(
+        temporary,
+        QStringLiteral("other-app"),
+        keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"),
+                 QStringLiteral("1.0.0"),
+                 QStringLiteral("1.x"),
+                 {QStringLiteral("QtQuick")},
+                 QStringLiteral("qml/Main.qml"),
+                 QStringLiteral("company.other")));
+    QVERIFY(!package.isEmpty());
+
+    const InstallResult rejected = installer.install(package);
+
+    QCOMPARE(rejected.error, InstallError::AppIdMismatch);
+    QCOMPARE(rejected.stableError, QStringLiteral("app_id_mismatch"));
+    QVERIFY(!QFileInfo::exists(storeRoot));
+    QVERIFY(!QFileInfo::exists(store.appRoot(QStringLiteral("company.other"))));
+}
 
 void PackageInstallerTest::reverifyRejectsActivationChangedDuringSnapshot()
 {

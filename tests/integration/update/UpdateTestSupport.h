@@ -129,6 +129,7 @@ inline QString updateSignedPackage(QTemporaryDir &temporary,
 inline InstallPolicy updateInstallPolicy()
 {
     InstallPolicy policy;
+    policy.expectedAppId = QStringLiteral("company.pilot");
     policy.runtimeVersion = QStringLiteral("1.2.0");
     policy.allowedImports = {QStringLiteral("QtQuick")};
     policy.preflight = [](const Manifest &, const QString &) { return true; };

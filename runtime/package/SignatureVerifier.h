@@ -103,6 +103,7 @@ private:
 class SignatureVerifier final
 {
 public:
+    [[nodiscard]] static bool isValidPublicKeyPem(const QByteArray &publicKeyPem);
     [[nodiscard]] static SignatureKeyPairResult generateKeyPair();
     [[nodiscard]] static SignatureOperationResult signRaw(
         const QByteArray &message,

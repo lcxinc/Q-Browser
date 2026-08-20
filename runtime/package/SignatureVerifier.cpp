@@ -275,6 +275,11 @@ SignatureKeyPairResult SignatureVerifier::generateKeyPair()
     return SignatureKeyPairResult(std::move(pair));
 }
 
+bool SignatureVerifier::isValidPublicKeyPem(const QByteArray &publicKeyPem)
+{
+    return static_cast<bool>(readPublicPem(publicKeyPem));
+}
+
 SignatureOperationResult SignatureVerifier::signRaw(
     const QByteArray &message, const QByteArray &privateSeed)
 {

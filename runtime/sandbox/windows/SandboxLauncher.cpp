@@ -341,18 +341,20 @@ SandboxProcess::~SandboxProcess()
 }
 
 SandboxProcess::SandboxProcess(SandboxProcess &&other) noexcept
-    : process_(std::exchange(other.process_, nullptr)),
-      processId_(std::exchange(other.processId_, 0)),
-      job_(std::move(other.job_)),
-      grants_(std::move(other.grants_)),
-      appContainerSid_(std::move(other.appContainerSid_))
 {
+    std::lock_guard lock(other.mutex_);
+    process_ = std::exchange(other.process_, nullptr);
+    processId_ = std::exchange(other.processId_, 0);
+    job_ = std::move(other.job_);
+    grants_ = std::move(other.grants_);
+    appContainerSid_ = std::move(other.appContainerSid_);
 }
 
 SandboxProcess &SandboxProcess::operator=(SandboxProcess &&other) noexcept
 {
     if (this != &other) {
         closeBestEffort();
+        std::scoped_lock lock(mutex_, other.mutex_);
         process_ = std::exchange(other.process_, nullptr);
         processId_ = std::exchange(other.processId_, 0);
         job_ = std::move(other.job_);
@@ -364,52 +366,91 @@ SandboxProcess &SandboxProcess::operator=(SandboxProcess &&other) noexcept
 
 bool SandboxProcess::isValid() const noexcept
 {
+    std::lock_guard lock(mutex_);
     return validHandle(process_) && job_.isValid() && processId_ != 0;
+}
+
+bool SandboxProcess::isRunning() const noexcept
+{
+    std::lock_guard lock(mutex_);
+    return validHandle(process_)
+        && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT;
 }
 
 HANDLE SandboxProcess::nativeProcessHandle() const noexcept
 {
+    std::lock_guard lock(mutex_);
     return process_;
 }
 
 DWORD SandboxProcess::processId() const noexcept
 {
+    std::lock_guard lock(mutex_);
     return processId_;
 }
 
-const QString &SandboxProcess::appContainerSid() const noexcept
+QString SandboxProcess::appContainerSid() const
 {
+    std::lock_guard lock(mutex_);
     return appContainerSid_;
 }
 
 bool SandboxProcess::waitForFinished(const int timeoutMs) const noexcept
 {
-    if (!validHandle(process_) || timeoutMs < 0) {
-        return false;
+    if (timeoutMs < 0) return false;
+    HANDLE duplicate = nullptr;
+    {
+        std::lock_guard lock(mutex_);
+        if (!validHandle(process_)
+            || !DuplicateHandle(GetCurrentProcess(), process_,
+                                GetCurrentProcess(), &duplicate,
+                                SYNCHRONIZE, FALSE, 0)) {
+            return false;
+        }
     }
-    return WaitForSingleObject(process_, static_cast<DWORD>(timeoutMs))
-        == WAIT_OBJECT_0;
+    const bool finished = WaitForSingleObject(
+        duplicate, static_cast<DWORD>(timeoutMs)) == WAIT_OBJECT_0;
+    (void)CloseHandle(duplicate);
+    return finished;
 }
 
 DWORD SandboxProcess::exitCode() const noexcept
 {
+    std::lock_guard lock(mutex_);
     DWORD code = ERROR_PROCESS_ABORTED;
     return validHandle(process_) && GetExitCodeProcess(process_, &code)
         ? code
         : ERROR_PROCESS_ABORTED;
 }
 
-void SandboxProcess::terminate(const DWORD exitCode) noexcept
+void SandboxProcess::requestTerminateNoWait(const DWORD exitCode) noexcept
 {
+    std::lock_guard lock(mutex_);
     if (validHandle(process_)
         && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) {
         (void)TerminateProcess(process_, exitCode);
-        (void)WaitForSingleObject(process_, 5000);
     }
+}
+
+void SandboxProcess::terminate(const DWORD exitCode) noexcept
+{
+    requestTerminateNoWait(exitCode);
+    (void)waitForFinished(5000);
 }
 
 SandboxValueResult<bool> SandboxProcess::close() noexcept
 {
+    HANDLE process = nullptr;
+    JobLimits job;
+    std::vector<AclGrant> grants;
+    {
+        std::lock_guard lock(mutex_);
+        process = std::exchange(process_, nullptr);
+        processId_ = 0;
+        job = std::move(job_);
+        grants = std::move(grants_);
+        appContainerSid_.clear();
+    }
     QString firstErrorCode;
     SandboxNativeError firstNativeError;
     const auto remember = [&firstErrorCode, &firstNativeError](
@@ -420,12 +461,12 @@ SandboxValueResult<bool> SandboxProcess::close() noexcept
             firstNativeError = error;
         }
     };
-    const auto jobClosed = job_.close();
+    const auto jobClosed = job.close();
     if (!jobClosed.value.has_value()) {
         remember(jobClosed.errorCode, jobClosed.nativeError);
     }
-    if (validHandle(process_)) {
-        const DWORD waited = WaitForSingleObject(process_, 5000);
+    if (validHandle(process)) {
+        const DWORD waited = WaitForSingleObject(process, 5000);
         if (waited == WAIT_FAILED) {
             const DWORD error = GetLastError();
             remember(QStringLiteral("sandbox.process.wait_failed"),
@@ -434,30 +475,19 @@ SandboxValueResult<bool> SandboxProcess::close() noexcept
             remember(QStringLiteral("sandbox.process.wait_timeout"),
                      SandboxNativeError::win32(ERROR_TIMEOUT));
         }
-        if (!CloseHandle(process_)) {
+        if (!CloseHandle(process)) {
             const DWORD error = GetLastError();
             remember(QStringLiteral("sandbox.process.close_failed"),
                      SandboxNativeError::win32(error));
-        } else {
-            process_ = nullptr;
         }
     }
-    bool grantsRestored = true;
-    for (auto grant = grants_.rbegin(); grant != grants_.rend(); ++grant) {
+    for (auto grant = grants.rbegin(); grant != grants.rend(); ++grant) {
         const auto restored = grant->close();
         if (!restored.value.has_value()) {
-            grantsRestored = false;
             remember(restored.errorCode, restored.nativeError);
         }
     }
-    if (grantsRestored) {
-        grants_.clear();
-    }
-    if (!validHandle(process_)) {
-        processId_ = 0;
-    }
     if (firstErrorCode.isEmpty()) {
-        appContainerSid_.clear();
         return {true, {}, {}};
     }
     return {std::nullopt, firstErrorCode, firstNativeError};
