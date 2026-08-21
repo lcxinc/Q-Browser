@@ -33,6 +33,7 @@ void WebFallbackE2eTest::productionHostSwitchesQmlWebQml()
     QVERIFY(window->navigate(QStringLiteral("app://pilot/settings")));
     QCOMPARE(window->activeSurface(), HostSurfaceKind::Worker);
     QVERIFY(environment.host()->hasWorkerContext());
+    QVERIFY2(environment.shutdown(), qPrintable(environment.error()));
 }
 
 QTEST_MAIN(WebFallbackE2eTest)

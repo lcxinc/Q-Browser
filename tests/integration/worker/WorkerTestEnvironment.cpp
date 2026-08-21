@@ -179,13 +179,27 @@ WorkerTestEnvironment::WorkerTestEnvironment(QByteArray mainQml, QString package
 
 WorkerTestEnvironment::~WorkerTestEnvironment()
 {
+    (void)cleanup();
+}
+
+bool WorkerTestEnvironment::cleanup()
+{
+    if (cleaned_) return cleanupError_.isEmpty();
+    cleaned_ = true;
     boundary_.reset();
     const auto profileName = AppContainerProfile::deterministicName(appId_);
     if (profileName.has_value()) {
-        (void)DeleteAppContainerProfile(
+        const HRESULT deleted = DeleteAppContainerProfile(
             reinterpret_cast<PCWSTR>(profileName->utf16()));
+        if (FAILED(deleted)
+            && deleted != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            cleanupError_ = QStringLiteral("AppContainer profile cleanup failed: %1")
+                                .arg(static_cast<quint32>(deleted));
+        }
     }
-    if (!root_.isValid()) return;
+    if (!root_.isValid() || !QFileInfo::exists(root_.path())) {
+        return cleanupError_.isEmpty();
+    }
     QStringList paths{root_.path()};
     QDirIterator iterator(root_.path(),
                           QDir::AllEntries | QDir::Hidden | QDir::System
@@ -214,11 +228,17 @@ WorkerTestEnvironment::~WorkerTestEnvironment()
     for (int attempt = 0; attempt < 5; ++attempt) {
         if (QDir(root_.path()).removeRecursively()) {
             root_.setAutoRemove(false);
-            break;
+            return cleanupError_.isEmpty();
         }
         QThread::msleep(50);
     }
+    if (cleanupError_.isEmpty()) {
+        cleanupError_ = QStringLiteral("worker temporary root cleanup failed");
+    }
+    return false;
 }
+
+QString WorkerTestEnvironment::cleanupError() const { return cleanupError_; }
 
 bool WorkerTestEnvironment::isValid() const noexcept
 {

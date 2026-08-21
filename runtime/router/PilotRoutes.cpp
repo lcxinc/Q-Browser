@@ -2,9 +2,12 @@
 
 #include <array>
 
-std::optional<RouteRegistry> createPilotRouteRegistry(const QUrl &mockOrigin)
+std::optional<RouteRegistry> createPilotRouteRegistry(
+    const QUrl &mockOrigin,
+    const QString &workerAppId)
 {
     if (!mockOrigin.isValid() || mockOrigin.isRelative()
+        || workerAppId.isEmpty()
         || (mockOrigin.scheme() != QStringLiteral("http")
             && mockOrigin.scheme() != QStringLiteral("https"))) {
         return std::nullopt;
@@ -16,7 +19,7 @@ std::optional<RouteRegistry> createPilotRouteRegistry(const QUrl &mockOrigin)
     for (const char *pattern : workerPatterns) {
         const RouteRecord worker{QString::fromLatin1(pattern),
                                  Engine::QmlWorker,
-                                 QStringLiteral("com.qbrowser.pilot"),
+                                 workerAppId,
                                  QStringLiteral("qml/Main.qml")};
         if (routes.add(worker) != RouteAddResult::Added) {
             return std::nullopt;

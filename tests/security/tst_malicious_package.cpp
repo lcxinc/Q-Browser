@@ -6,13 +6,185 @@
 #include "SignatureVerifier.h"
 
 #include <QFile>
+#include <QDir>
+#include <QDirIterator>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QtEndian>
+#include <QScopeGuard>
+
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#include <Aclapi.h>
+#endif
+
+#include <iterator>
+#include <optional>
 
 namespace {
+struct RawEntry final
+{
+    QByteArray name;
+    QByteArray data = QByteArrayLiteral("x");
+    quint16 method = 0;
+    std::optional<quint32> crc;
+    std::optional<quint32> compressedSize;
+    std::optional<quint32> uncompressedSize;
+};
+
+void append16(QByteArray &bytes, const quint16 value)
+{
+    const quint16 little = qToLittleEndian(value);
+    bytes.append(reinterpret_cast<const char *>(&little),
+                 static_cast<qsizetype>(sizeof(little)));
+}
+
+void append32(QByteArray &bytes, const quint32 value)
+{
+    const quint32 little = qToLittleEndian(value);
+    bytes.append(reinterpret_cast<const char *>(&little),
+                 static_cast<qsizetype>(sizeof(little)));
+}
+
+quint32 crc32(const QByteArray &data)
+{
+    quint32 crc = 0xFFFFFFFFU;
+    for (const unsigned char byte : data) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit) {
+            const quint32 mask = 0U - (crc & 1U);
+            crc = (crc >> 1U) ^ (0xEDB88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+QByteArray rawZip(const QVector<RawEntry> &entries)
+{
+    QByteArray bytes;
+    struct Central final {
+        RawEntry entry;
+        quint32 offset = 0;
+        quint32 crc = 0;
+        quint32 compressed = 0;
+        quint32 uncompressed = 0;
+    };
+    QVector<Central> central;
+    for (const RawEntry &entry : entries) {
+        Central item{entry,
+                     static_cast<quint32>(bytes.size()),
+                     entry.crc.value_or(crc32(entry.data)),
+                     entry.compressedSize.value_or(
+                         static_cast<quint32>(entry.data.size())),
+                     entry.uncompressedSize.value_or(
+                         static_cast<quint32>(entry.data.size()))};
+        central.push_back(item);
+        append32(bytes, 0x04034B50U);
+        append16(bytes, 20);
+        append16(bytes, 0);
+        append16(bytes, entry.method);
+        append16(bytes, 0);
+        append16(bytes, 0x0021);
+        append32(bytes, item.crc);
+        append32(bytes, item.compressed);
+        append32(bytes, item.uncompressed);
+        append16(bytes, static_cast<quint16>(entry.name.size()));
+        append16(bytes, 0);
+        bytes.append(entry.name);
+        bytes.append(entry.data);
+    }
+    const quint32 centralOffset = static_cast<quint32>(bytes.size());
+    for (const Central &item : central) {
+        append32(bytes, 0x02014B50U);
+        append16(bytes, 0x0314U);
+        append16(bytes, 20);
+        append16(bytes, 0);
+        append16(bytes, item.entry.method);
+        append16(bytes, 0);
+        append16(bytes, 0x0021);
+        append32(bytes, item.crc);
+        append32(bytes, item.compressed);
+        append32(bytes, item.uncompressed);
+        append16(bytes, static_cast<quint16>(item.entry.name.size()));
+        append16(bytes, 0);
+        append16(bytes, 0);
+        append16(bytes, 0);
+        append16(bytes, 0);
+        append32(bytes, 0x81A40000U);
+        append32(bytes, item.offset);
+        bytes.append(item.entry.name);
+    }
+    const quint32 centralSize = static_cast<quint32>(bytes.size()) - centralOffset;
+    append32(bytes, 0x06054B50U);
+    append16(bytes, 0);
+    append16(bytes, 0);
+    append16(bytes, static_cast<quint16>(central.size()));
+    append16(bytes, static_cast<quint16>(central.size()));
+    append32(bytes, centralSize);
+    append32(bytes, centralOffset);
+    append16(bytes, 0);
+    return bytes;
+}
+
+QString writeRawZip(QTemporaryDir &temporary,
+                    const QString &name,
+                    const QVector<RawEntry> &entries)
+{
+    const QString path = temporary.filePath(name + QStringLiteral(".qapkg"));
+    QFile file(path);
+    const QByteArray bytes = rawZip(entries);
+    return file.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+            && file.write(bytes) == bytes.size()
+        ? path : QString{};
+}
+
+QByteArray minimalPeImage()
+{
+    QByteArray image(128, '\0');
+    image[0] = 'M';
+    image[1] = 'Z';
+    qToLittleEndian<quint32>(64U,
+                             reinterpret_cast<uchar *>(image.data() + 0x3c));
+    image.replace(64, 4, QByteArray("PE\0\0", 4));
+    return image;
+}
+
+void restoreWritableFiles(const QString &root)
+{
+    QDirIterator iterator(root,
+                          QDir::Files | QDir::Hidden | QDir::System
+                              | QDir::NoSymLinks,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString path = iterator.next();
+#ifdef Q_OS_WIN
+        QString native = QDir::toNativeSeparators(path);
+        if (!native.startsWith(QStringLiteral("\\\\?\\"))) {
+            native = native.startsWith(QStringLiteral("\\\\"))
+                ? QStringLiteral("\\\\?\\UNC\\") + native.sliced(2)
+                : QStringLiteral("\\\\?\\") + native;
+        }
+        (void)SetNamedSecurityInfoW(
+            reinterpret_cast<LPWSTR>(native.data()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr);
+        const DWORD attributes = GetFileAttributesW(
+            reinterpret_cast<LPCWSTR>(native.utf16()));
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            (void)SetFileAttributesW(
+                reinterpret_cast<LPCWSTR>(native.utf16()),
+                attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+#else
+        (void)QFile::setPermissions(
+            path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+#endif
+    }
+}
+
 QByteArray manifest(const QString &version,
                     const QStringList &imports = {QStringLiteral("QtQuick")})
 {
@@ -76,12 +248,16 @@ private slots:
     void rejectsWrongKeyAndSignedPayloadTamper();
     void rejectsZipSlipCanonicalCollisionAndResourceBombs();
     void rejectsNativeCodeForbiddenImportsAndRemoteSources();
+    void rejectsSourceImportsMissingFromSignedManifest();
+    void distinguishesBenignMzAssetFromRenamedPe();
 };
 
 void MaliciousPackageTest::rejectsWrongKeyAndSignedPayloadTamper()
 {
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
+    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
+        [&] { restoreWritableFiles(temporary.path()); });
     const auto trusted = SignatureVerifier::generateKeyPair();
     const auto attacker = SignatureVerifier::generateKeyPair();
     QVERIFY(trusted.hasValue());
@@ -116,32 +292,86 @@ void MaliciousPackageTest::rejectsZipSlipCanonicalCollisionAndResourceBombs()
 {
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    const QString output = temporary.filePath(QStringLiteral("invalid.qapkg"));
-    const auto traversal = Archive::createFromFiles(
-        {{QByteArrayLiteral("../escape"), QByteArrayLiteral("x")}}, output);
-    QVERIFY(!traversal.hasValue());
-    QCOMPARE(traversal.error().code, ArchiveErrorCode::InvalidEntryPath);
-
-    const auto collision = Archive::createFromFiles(
-        {{QByteArrayLiteral("qml/Main.qml"), QByteArrayLiteral("a")},
-         {QByteArrayLiteral("QML/main.qml"), QByteArrayLiteral("b")}}, output);
-    QVERIFY(!collision.hasValue());
-    QCOMPARE(collision.error().code, ArchiveErrorCode::DuplicateEntryPath);
-
+    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
+        [&] { restoreWritableFiles(temporary.path()); });
     ArchiveLimits limits;
-    limits.maximumEntryBytes = 4;
-    limits.maximumTotalBytes = 4;
-    const auto bomb = Archive::createFromFiles(
-        {{QByteArrayLiteral("payload.bin"), QByteArray(5, 'x')}}, output, limits);
-    QVERIFY(!bomb.hasValue());
-    QVERIFY(bomb.error().code == ArchiveErrorCode::EntrySizeLimit
-            || bomb.error().code == ArchiveErrorCode::TotalSizeLimit);
+    limits.maximumEntries = 2;
+    limits.maximumEntryBytes = 2;
+    limits.maximumTotalBytes = 2;
+    limits.maximumCompressionRatio = 16;
+    const RawEntry one{QByteArrayLiteral("a"), QByteArrayLiteral("a")};
+    const RawEntry two{QByteArrayLiteral("b"), QByteArrayLiteral("b")};
+    const RawEntry three{QByteArrayLiteral("c"), QByteArrayLiteral("c")};
+    RawEntry oversized{QByteArrayLiteral("large"), QByteArrayLiteral("xxx")};
+    RawEntry ratio{QByteArrayLiteral("ratio")};
+    ratio.data = QByteArray::fromHex("4b4ca43d0000");
+    ratio.method = 8;
+    ratio.crc = crc32(QByteArray(100, 'a'));
+    ratio.uncompressedSize = 100;
+
+    const struct Fixture {
+        QString name;
+        QVector<RawEntry> entries;
+        ArchiveErrorCode expected;
+    } fixtures[]{
+        {QStringLiteral("traversal"),
+         {{QByteArrayLiteral("../outside.txt"), QByteArrayLiteral("x")}},
+         ArchiveErrorCode::InvalidEntryPath},
+        {QStringLiteral("collision"),
+         {{QByteArrayLiteral("qml/Main.qml"), QByteArrayLiteral("a")},
+          {QByteArrayLiteral("QML/main.qml"), QByteArrayLiteral("b")}},
+         ArchiveErrorCode::DuplicateEntryPath},
+        {QStringLiteral("entry-count"), {one, two, three},
+         ArchiveErrorCode::EntryCountLimit},
+        {QStringLiteral("entry-size"), {oversized},
+         ArchiveErrorCode::EntrySizeLimit},
+        {QStringLiteral("aggregate-size"), {one, two, three},
+         ArchiveErrorCode::TotalSizeLimit},
+        {QStringLiteral("ratio"), {ratio},
+         ArchiveErrorCode::CompressionRatioLimit},
+    };
+
+    const auto keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    for (const Fixture &fixture : fixtures) {
+        ArchiveLimits fixtureLimits = limits;
+        if (fixture.name == QStringLiteral("aggregate-size")) {
+            fixtureLimits.maximumEntries = 3;
+        } else if (fixture.name == QStringLiteral("ratio")) {
+            fixtureLimits.maximumEntryBytes = 100;
+            fixtureLimits.maximumTotalBytes = 100;
+        }
+        InstallPolicy installPolicy = policy();
+        installPolicy.archiveLimits = fixtureLimits;
+        PackageInstaller installer(store, keys.value().publicKeyPem,
+                                   std::move(installPolicy));
+        const QString path = writeRawZip(temporary, fixture.name, fixture.entries);
+        QVERIFY2(!path.isEmpty(), qPrintable(fixture.name));
+        const ArchiveResult inspected = Archive::inspect(path, fixtureLimits);
+        QVERIFY2(!inspected.hasValue(), qPrintable(fixture.name));
+        QCOMPARE(inspected.error().code, fixture.expected);
+        const auto snapshot = Archive::snapshot(path, fixtureLimits);
+        QVERIFY2(!snapshot.hasValue(), qPrintable(fixture.name));
+        const ArchiveErrorCode snapshotExpected = fixture.expected;
+        QVERIFY2(snapshot.error().code == snapshotExpected,
+                 qPrintable(fixture.name + QStringLiteral(": expected ")
+                            + QString::number(static_cast<int>(snapshotExpected))
+                            + QStringLiteral(", got ")
+                            + QString::number(static_cast<int>(snapshot.error().code))));
+        const InstallResult installed = installer.install(path);
+        QVERIFY2(!installed.succeeded(), qPrintable(fixture.name));
+        QCOMPARE(installed.error, InstallError::ArchiveInvalid);
+        QVERIFY(store.resolveCurrent(QStringLiteral("company.security")).path.isEmpty());
+    }
 }
 
 void MaliciousPackageTest::rejectsNativeCodeForbiddenImportsAndRemoteSources()
 {
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
+    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
+        [&] { restoreWritableFiles(temporary.path()); });
     const auto keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
@@ -166,7 +396,7 @@ void MaliciousPackageTest::rejectsNativeCodeForbiddenImportsAndRemoteSources()
     const QString renamedPePackage = signedPackage(
         temporary, QStringLiteral("1.1.2"), keys.value().privateKeyPem,
         QByteArrayLiteral("import QtQuick\nItem {}"), {QStringLiteral("QtQuick")},
-        {{QByteArrayLiteral("assets/logo.bin"), QByteArrayLiteral("MZpayload")}});
+        {{QByteArrayLiteral("assets/logo.bin"), minimalPeImage()}});
     const InstallResult renamedPe = installer.install(renamedPePackage);
     QVERIFY(!renamedPe.succeeded());
     QCOMPARE(renamedPe.error, InstallError::PreflightRejected);
@@ -188,6 +418,88 @@ void MaliciousPackageTest::rejectsNativeCodeForbiddenImportsAndRemoteSources()
     const InstallResult remote = installer.install(remotePackage);
     QVERIFY(!remote.succeeded());
     QCOMPARE(remote.error, InstallError::PreflightRejected);
+}
+
+void MaliciousPackageTest::rejectsSourceImportsMissingFromSignedManifest()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
+        [&] { restoreWritableFiles(temporary.path()); });
+    const auto keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    InstallPolicy installPolicy = policy();
+    installPolicy.allowedImports.insert(QStringLiteral("QtQml"));
+    installPolicy.allowedImports.insert(QStringLiteral("QtQuick.Controls"));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               std::move(installPolicy));
+    const QString baseline = signedPackage(
+        temporary, QStringLiteral("1.9.0"), keys.value().privateKeyPem,
+        QByteArrayLiteral("import QtQuick\nItem {}"),
+        {QStringLiteral("QtQuick")});
+    QVERIFY(installer.install(baseline).succeeded());
+    const QString expectedCurrent =
+        store.resolveCurrent(QStringLiteral("company.security")).path;
+    QVERIFY(!expectedCurrent.isEmpty());
+    const struct SourceCase {
+        QByteArray mainQml;
+        QVector<ArchiveFile> extras;
+    } cases[]{
+        {QByteArrayLiteral("// import Fake.Module\nimport QtQuick 2.15 as QQ\n"
+                           "import QtQml 2.15 as Qml\nQQ.Item {}"), {}},
+        {QByteArrayLiteral("import QtQuick\nItem {}"),
+         {{QByteArrayLiteral("scripts/escape.Js"),
+           QByteArrayLiteral("// .import Fake.Module\n"
+                             ".import QtQuick.Controls 2.15 as Controls")}}},
+        {QByteArrayLiteral("import QtQuick\nItem {}"),
+         {{QByteArrayLiteral("scripts/escape.MJS"),
+           QByteArrayLiteral("/* .import Fake.Module */\n"
+                             ".import QtQml as Qml")}}},
+    };
+    for (qsizetype index = 0; index < std::size(cases); ++index) {
+        const QString package = signedPackage(
+            temporary, QStringLiteral("2.0.%1").arg(index),
+            keys.value().privateKeyPem, cases[index].mainQml,
+            {QStringLiteral("QtQuick")}, cases[index].extras);
+        QVERIFY(!package.isEmpty());
+        const InstallResult result = installer.install(package);
+        QVERIFY(!result.succeeded());
+        QCOMPARE(result.phase, InstallPhase::Preflight);
+        QCOMPARE(result.error, InstallError::ImportDenied);
+        QCOMPARE(store.resolveCurrent(QStringLiteral("company.security")).path,
+                 expectedCurrent);
+    }
+}
+
+void MaliciousPackageTest::distinguishesBenignMzAssetFromRenamedPe()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
+        [&] { restoreWritableFiles(temporary.path()); });
+    const auto keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const QString benign = signedPackage(
+        temporary, QStringLiteral("3.0.0"), keys.value().privateKeyPem,
+        QByteArrayLiteral("import QtQuick\nItem {}"), {QStringLiteral("QtQuick")},
+        {{QByteArrayLiteral("assets/monogram.bin"),
+          QByteArrayLiteral("MZ is an ordinary resource prefix")}});
+    const InstallResult benignResult = installer.install(benign);
+    QVERIFY(benignResult.succeeded());
+    const QString current = store.resolveCurrent(QStringLiteral("company.security")).path;
+    QVERIFY(!current.isEmpty());
+
+    const QString renamed = signedPackage(
+        temporary, QStringLiteral("3.0.1"), keys.value().privateKeyPem,
+        QByteArrayLiteral("import QtQuick\nItem {}"), {QStringLiteral("QtQuick")},
+        {{QByteArrayLiteral("assets/preview.bin"), minimalPeImage()}});
+    const InstallResult renamedResult = installer.install(renamed);
+    QVERIFY(!renamedResult.succeeded());
+    QCOMPARE(renamedResult.error, InstallError::PreflightRejected);
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.security")).path, current);
 }
 
 QTEST_MAIN(MaliciousPackageTest)

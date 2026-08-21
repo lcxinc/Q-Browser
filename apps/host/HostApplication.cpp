@@ -365,7 +365,11 @@ bool HostApplication::start()
         mainWindow_->show();
         return true;
     }
-    auto routes = createPilotRouteRegistry(mockOrigin_);
+    const QString routeAppId = runtimeConfig_.has_value()
+            && runtimeConfig_->mode() == HostRuntimeMode::Package
+            && !runtimeConfig_->appId().isEmpty()
+        ? runtimeConfig_->appId() : QStringLiteral("com.qbrowser.pilot");
+    auto routes = createPilotRouteRegistry(mockOrigin_, routeAppId);
     if (!routes.has_value()) return false;
     auto window = std::make_unique<MainWindow>(std::move(*routes), mockOrigin_);
     if (!window->webSurface()->isConfigurationValid()) return false;

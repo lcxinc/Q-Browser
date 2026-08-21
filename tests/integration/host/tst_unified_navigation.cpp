@@ -184,7 +184,20 @@ private slots:
     void reattachAfterIoThreadFinishedBeforeGuiCleanup();
     void destroyAfterIoThreadFinishedBeforeGuiCleanup();
     void navigationTransactionsRejectReentrantCommands();
+    void trustedShellRuntimeConfigKeepsPilotRouteIdentity();
 };
+
+void UnifiedNavigationTest::trustedShellRuntimeConfigKeepsPilotRouteIdentity()
+{
+    const HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(
+        {QStringLiteral("--trusted-shell")});
+    QVERIFY(parsed.value.has_value());
+    QCOMPARE(parsed.value->mode(), HostRuntimeMode::TrustedShell);
+    QVERIFY(parsed.value->appId().isEmpty());
+    HostApplication host(std::move(*parsed.value));
+    QVERIFY(host.start());
+    QVERIFY(host.mainWindow() != nullptr);
+}
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()
 {

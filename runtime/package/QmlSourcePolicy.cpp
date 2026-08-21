@@ -4,6 +4,9 @@
 #include <QUrl>
 #include <QVector>
 
+#include <algorithm>
+#include <optional>
+
 namespace {
 
 enum class TokenKind { Identifier, Numeric, String, Template, Regex, Punctuation };
@@ -364,6 +367,39 @@ bool staticSourceBinding(const QVector<Token> &tokens, const qsizetype valueInde
             || tokens.at(next + 1).text == QStringLiteral("{"));
 }
 
+struct EsImportClassification final
+{
+    bool unsupportedSyntax = false;
+    std::optional<QString> bareSpecifier;
+};
+
+EsImportClassification classifyEsImport(const QVector<Token> &tokens,
+                                         const qsizetype importIndex)
+{
+    if (importIndex + 1 >= tokens.size()) return {};
+    const Token &next = tokens.at(importIndex + 1);
+    if (next.kind == TokenKind::String) return {false, next.text};
+    if (next.text == QStringLiteral("(")) return {};
+    if (next.text == QStringLiteral("*")
+        || next.text == QStringLiteral("{")) {
+        return {true, std::nullopt};
+    }
+    if (next.kind != TokenKind::Identifier) return {};
+
+    qsizetype cursor = importIndex + 1;
+    while (cursor + 2 < tokens.size()
+           && tokens.at(cursor + 1).text == QStringLiteral(".")
+           && tokens.at(cursor + 2).kind == TokenKind::Identifier) {
+        cursor += 2;
+    }
+    ++cursor;
+    return cursor < tokens.size()
+            && (tokens.at(cursor).text == QStringLiteral("from")
+                || tokens.at(cursor).text == QStringLiteral(","))
+        ? EsImportClassification{true, std::nullopt}
+        : EsImportClassification{};
+}
+
 } // namespace
 
 bool QmlSourcePolicy::isQmlSourcePath(const QByteArrayView path)
@@ -372,6 +408,35 @@ bool QmlSourcePolicy::isQmlSourcePath(const QByteArrayView path)
     return lower.endsWith(QByteArrayLiteral(".qml"))
         || lower.endsWith(QByteArrayLiteral(".js"))
         || lower.endsWith(QByteArrayLiteral(".mjs"));
+}
+
+QStringList QmlSourcePolicy::staticImports(const QByteArray &source)
+{
+    Lexer lexer(QString::fromUtf8(source));
+    const QVector<Token> tokens = lexer.tokens();
+    QStringList result;
+    for (qsizetype index = 0; index + 1 < tokens.size(); ++index) {
+        if (tokens.at(index).kind != TokenKind::Identifier
+            || tokens.at(index).text != QStringLiteral("import")) {
+            continue;
+        }
+        const EsImportClassification esImport = classifyEsImport(tokens, index);
+        if (esImport.unsupportedSyntax || esImport.bareSpecifier.has_value()) continue;
+        qsizetype cursor = index + 1;
+        if (tokens.at(cursor).kind != TokenKind::Identifier) {
+            continue;
+        }
+        QString module = tokens.at(cursor).text;
+        while (cursor + 2 < tokens.size()
+               && tokens.at(cursor + 1).text == QStringLiteral(".")
+               && tokens.at(cursor + 2).kind == TokenKind::Identifier) {
+            module += QLatin1Char('.') + tokens.at(cursor + 2).text;
+            cursor += 2;
+        }
+        addUnique(result, module);
+        index = cursor;
+    }
+    return result;
 }
 
 QStringList QmlSourcePolicy::violations(const QByteArray &source)
@@ -456,10 +521,15 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
         if (token.kind == TokenKind::Identifier && token.text == QStringLiteral("import")) {
             if (index + 1 < tokens.size() && tokens.at(index + 1).text == QStringLiteral("("))
                 addUnique(result, QStringLiteral("dynamic-import"));
-            else if (index + 1 < tokens.size()
-                     && tokens.at(index + 1).kind == TokenKind::String
-                     && !safeSourceUrl(tokens.at(index + 1).text))
-                addUnique(result, QStringLiteral("remote-import"));
+            else {
+                const EsImportClassification esImport =
+                    classifyEsImport(tokens, index);
+                if (esImport.unsupportedSyntax)
+                    addUnique(result, QStringLiteral("es-module-import"));
+                if (esImport.bareSpecifier.has_value()
+                    && !safeSourceUrl(*esImport.bareSpecifier))
+                    addUnique(result, QStringLiteral("remote-import"));
+            }
         }
 
         if (isAlias(qtAliases, token) && index + 1 < tokens.size()) {
@@ -502,7 +572,9 @@ QStringList QmlSourcePolicy::violations(const QByteArray &source)
             addUnique(result, QStringLiteral("loader-set-source"));
 
         if (token.kind != TokenKind::Identifier) continue;
-        if (token.text == QStringLiteral("XMLHttpRequest"))
+        if (token.text == QStringLiteral("export"))
+            addUnique(result, QStringLiteral("es-module-export"));
+        else if (token.text == QStringLiteral("XMLHttpRequest"))
             addUnique(result, QStringLiteral("raw-network"));
         else if (token.text == QStringLiteral("WorkerScript"))
             addUnique(result, QStringLiteral("worker-network"));

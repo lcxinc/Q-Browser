@@ -6,4 +6,6 @@
 
 #include <optional>
 
-[[nodiscard]] std::optional<RouteRegistry> createPilotRouteRegistry(const QUrl &mockOrigin);
+[[nodiscard]] std::optional<RouteRegistry> createPilotRouteRegistry(
+    const QUrl &mockOrigin,
+    const QString &workerAppId = QStringLiteral("com.qbrowser.pilot"));

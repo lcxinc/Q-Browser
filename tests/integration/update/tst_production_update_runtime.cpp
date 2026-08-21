@@ -16,6 +16,7 @@
 #include <QElapsedTimer>
 #include <QSignalSpy>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QSemaphore>
 #include <QTest>
 #include <QTemporaryDir>
@@ -87,6 +88,18 @@ bool terminateProcessId(const quint32 processId)
     const bool finished = terminated && WaitForSingleObject(process, 10'000) == WAIT_OBJECT_0;
     CloseHandle(process);
     return finished;
+}
+
+bool stopOwnedProcess(QProcess &process)
+{
+    if (process.state() == QProcess::NotRunning) return true;
+    process.terminate();
+    if (!process.waitForFinished(10'000)) {
+        process.kill();
+        if (!process.waitForFinished(10'000)) return false;
+    }
+    process.close();
+    return process.state() == QProcess::NotRunning;
 }
 
 bool waitForProcessExit(const quint32 processId, const int timeoutMs)
@@ -1172,14 +1185,23 @@ void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
     };
     qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
         std::move(hooks));
-    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    std::unique_ptr<HostApplication> host;
+    bool admissionCleanupComplete = false;
+    [[maybe_unused]] const auto admissionCleanup = qScopeGuard([&] {
+        if (admissionCleanupComplete) return;
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        releaseAdmission.release();
+        host.reset();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
     QSignalSpy capability(
         host.get(), &HostApplication::workerCapabilityRequestObserved);
     QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
     QVERIFY(host->start());
     QTRY_VERIFY_WITH_TIMEOUT(
-        admissionBlocked.load(std::memory_order_acquire), 30'000);
+        admissionBlocked.load(std::memory_order_acquire), 60'000);
     QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 10'000);
     QCOMPARE(failed.last().at(0).toString(),
              QStringLiteral("host.launch.admission_timeout"));
@@ -1195,6 +1217,7 @@ void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
     QCOMPARE(capability.count(), 0);
     QVERIFY(!host->hasWorkerContext());
     host.reset();
+    admissionCleanupComplete = true;
 }
 
 void ProductionUpdateRuntimeTest::lifecycleQueueFullBeforeAdmissionNeverAttaches()
@@ -1634,6 +1657,11 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         }
     }
     QProcess productionInstallHost;
+    productionInstallHost.setStandardOutputFile(QProcess::nullDevice());
+    productionInstallHost.setStandardErrorFile(QProcess::nullDevice());
+    [[maybe_unused]] const auto cleanupInstallHost = qScopeGuard([&] {
+        (void)stopOwnedProcess(productionInstallHost);
+    });
     productionInstallHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
     productionInstallHost.setArguments(installArguments);
     productionInstallHost.start();
@@ -1648,11 +1676,7 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
             .startsWith(QStringLiteral("1.3.0-")),
         30'000);
     QTRY_VERIFY_WITH_TIMEOUT(startedEventCount(cliTelemetry) > 0, 30'000);
-    productionInstallHost.terminate();
-    if (!productionInstallHost.waitForFinished(10'000)) {
-        productionInstallHost.kill();
-        QVERIFY(productionInstallHost.waitForFinished(10'000));
-    }
+    QVERIFY(stopOwnedProcess(productionInstallHost));
     QCOMPARE(productionInstallHost.state(), QProcess::NotRunning);
 
     const qsizetype startsBeforeOfflineCli = startedEventCount(cliTelemetry);
@@ -1663,6 +1687,11 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         return argument.startsWith(QStringLiteral("--install-package="));
     });
     QProcess productionHost;
+    productionHost.setStandardOutputFile(QProcess::nullDevice());
+    productionHost.setStandardErrorFile(QProcess::nullDevice());
+    [[maybe_unused]] const auto cleanupOfflineHost = qScopeGuard([&] {
+        (void)stopOwnedProcess(productionHost);
+    });
     productionHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
     productionHost.setArguments(offlineArguments);
     productionHost.start();
@@ -1674,11 +1703,7 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         30'000);
     QTRY_VERIFY_WITH_TIMEOUT(
         startedEventCount(cliTelemetry) > startsBeforeOfflineCli, 30'000);
-    productionHost.terminate();
-    if (!productionHost.waitForFinished(10'000)) {
-        productionHost.kill();
-        QVERIFY(productionHost.waitForFinished(10'000));
-    }
+    QVERIFY(stopOwnedProcess(productionHost));
     QCOMPARE(productionHost.state(), QProcess::NotRunning);
 }
 

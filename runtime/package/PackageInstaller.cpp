@@ -18,6 +18,7 @@
 #include <QSet>
 #include <QTemporaryDir>
 #include <QVersionNumber>
+#include <QtEndian>
 
 #include <algorithm>
 #include <limits>
@@ -267,6 +268,37 @@ bool sourcesPassPolicy(const QVector<ArchiveFile> &files)
     });
 }
 
+bool sourceImportsAreAllowed(const QVector<ArchiveFile> &files,
+                             const QStringList &declaredImports,
+                             const QSet<QString> &allowedImports)
+{
+    return std::ranges::all_of(files, [&](const ArchiveFile &file) {
+        if (!QmlSourcePolicy::isQmlSourcePath(file.path)) return true;
+        return std::ranges::all_of(
+            QmlSourcePolicy::staticImports(file.contents),
+            [&](const QString &module) {
+                return declaredImports.contains(module)
+                    && allowedImports.contains(module);
+            });
+    });
+}
+
+bool looksLikePortableExecutable(const QByteArray &contents)
+{
+    constexpr qsizetype dosHeaderBytes = 0x40;
+    constexpr qsizetype peOffsetField = 0x3c;
+    if (contents.size() < dosHeaderBytes
+        || !contents.startsWith(QByteArrayLiteral("MZ"))) {
+        return false;
+    }
+    const quint32 peOffset = qFromLittleEndian<quint32>(
+        reinterpret_cast<const uchar *>(contents.constData() + peOffsetField));
+    return peOffset >= static_cast<quint32>(dosHeaderBytes)
+        && peOffset <= static_cast<quint32>(contents.size() - 4)
+        && QByteArrayView(contents).sliced(static_cast<qsizetype>(peOffset), 4)
+               == QByteArrayView("PE\0\0", 4);
+}
+
 bool packageMembersPassPolicy(const QVector<ArchiveFile> &files)
 {
     static const QSet<QString> forbiddenExecutableExtensions{
@@ -278,8 +310,11 @@ bool packageMembersPassPolicy(const QVector<ArchiveFile> &files)
         const QString suffix = QFileInfo(QString::fromUtf8(file.path))
                                    .suffix().toCaseFolded();
         const QByteArray &contents = file.contents;
-        const bool executableMagic = contents.startsWith("MZ")
-            || contents.startsWith(QByteArrayLiteral("\x7f" "ELF"));
+        const bool signatureMetadata =
+            file.path == QByteArrayLiteral("metadata/signature.ed25519");
+        const bool executableMagic = !signatureMetadata
+            && (looksLikePortableExecutable(contents)
+                || contents.startsWith(QByteArrayLiteral("\x7f" "ELF")));
         return forbiddenExecutableExtensions.contains(suffix) || executableMagic;
     });
 }
@@ -404,6 +439,8 @@ InstallResult PackageInstaller::verifyInstalled(
     if (!parsed.hasValue() || parsed.value().appId() != appId
         || !runtimeIsCompatible(m_policy.runtimeVersion, parsed.value().runtime())
         || !importsAreAllowed(parsed.value().imports(), m_policy.allowedImports)
+        || !sourceImportsAreAllowed(files, parsed.value().imports(),
+                                    m_policy.allowedImports)
         || !sourcesPassPolicy(files) || !packageMembersPassPolicy(files)
         || versionDirectory != parsed.value().version() + QLatin1Char('-')
                + QString::fromLatin1(content.digest().toHex())) {
@@ -580,6 +617,12 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
     }
     if (!importsAreAllowed(manifest.imports(), m_policy.allowedImports)) {
         return failure(InstallPhase::Verify,
+                       InstallError::ImportDenied,
+                       QStringLiteral("import_denied"));
+    }
+    if (!sourceImportsAreAllowed(files, manifest.imports(),
+                                 m_policy.allowedImports)) {
+        return failure(InstallPhase::Preflight,
                        InstallError::ImportDenied,
                        QStringLiteral("import_denied"));
     }

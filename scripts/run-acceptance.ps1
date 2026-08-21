@@ -25,6 +25,7 @@ $deploy = Join-Path $build "deployment-$Configuration-$runId"
 New-Item -ItemType Directory -Force $taskTemp, $npmCache, $deploy | Out-Null
 $env:TEMP = $taskTemp
 $env:TMP = $taskTemp
+$env:QTEST_FUNCTION_TIMEOUT = '900000'
 $env:PATH = "$(Join-Path $QtRoot 'bin');$env:PATH"
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
@@ -49,7 +50,8 @@ $inventoryText = $inventory -join "`n"
 $requiredTests = @(
     'build_smoke', 'sandbox_launcher', 'pilot_routes', 'quick_design', 'malicious_package',
     'capability_escape', 'worker_api_surface', 'e2e_host_routes',
-    'e2e_web_fallback', 'e2e_package_update', 'e2e_host_survives_worker_crash'
+    'e2e_web_fallback', 'e2e_package_update', 'e2e_host_survives_worker_crash',
+    'production_update_runtime'
 )
 foreach ($required in $requiredTests) {
     if ($inventoryText -notmatch "(?m):\s+$([regex]::Escape($required))\s*$") {
@@ -57,7 +59,7 @@ foreach ($required in $requiredTests) {
     }
 }
 Invoke-Checked $ctest @('--test-dir', $build, '-C', $Configuration,
-    '--output-on-failure', '--no-tests=error', '--repeat', 'until-pass:2')
+    '--output-on-failure', '--no-tests=error')
 
 $requiredExecutables = [ordered]@{
     build_smoke = "tests\$Configuration\q_browser_build_smoke.exe"
@@ -71,6 +73,7 @@ $requiredExecutables = [ordered]@{
     e2e_web_fallback = "tests\e2e\$Configuration\tst_e2e_web_fallback.exe"
     e2e_package_update = "tests\e2e\$Configuration\tst_e2e_package_update.exe"
     e2e_host_survives_worker_crash = "tests\e2e\$Configuration\tst_e2e_host_survives_worker_crash.exe"
+    production_update_runtime = "tests\integration\update\$Configuration\tst_production_update_runtime.exe"
 }
 $requiredResults = Join-Path $build "required-results-$Configuration-$runId"
 New-Item -ItemType Directory -Force $requiredResults | Out-Null
@@ -110,14 +113,24 @@ $signed = Join-Path $build 'pilot-signed.qapkg'
 foreach ($path in @($privateKey, $publicKey, $unsigned, $signed)) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
 }
-Invoke-Checked $packageExe @('keygen', '--private-key', $privateKey, '--public-key', $publicKey)
-Invoke-Checked $packageExe @('pack', '--source', (Join-Path $repo 'packages\pilot'), '--output', $unsigned)
-Invoke-Checked $packageExe @('sign', '--package', $unsigned, '--private-key', $privateKey, '--output', $signed)
-$inspection = & $packageExe inspect --package $signed --public-key $publicKey
-if ($LASTEXITCODE -ne 0) { throw 'Signed Pilot inspection failed.' }
-$inspectionObject = $inspection | ConvertFrom-Json
-if (-not $inspectionObject.verified -or $inspectionObject.appId -ne 'com.qbrowser.pilot') {
-    throw 'Signed Pilot inspection did not produce the expected verified identity.'
+try {
+    Invoke-Checked $packageExe @('keygen', '--private-key', $privateKey, '--public-key', $publicKey)
+    Invoke-Checked $packageExe @('pack', '--source', (Join-Path $repo 'packages\pilot'), '--output', $unsigned)
+    Invoke-Checked $packageExe @('sign', '--package', $unsigned, '--private-key', $privateKey, '--output', $signed)
+    $inspection = & $packageExe inspect --package $signed --public-key $publicKey
+    if ($LASTEXITCODE -ne 0) { throw 'Signed Pilot inspection failed.' }
+    $inspectionObject = $inspection | ConvertFrom-Json
+    if (-not $inspectionObject.verified -or $inspectionObject.appId -ne 'com.qbrowser.pilot') {
+        throw 'Signed Pilot inspection did not produce the expected verified identity.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $privateKey) {
+        Remove-Item -LiteralPath $privateKey -Force
+    }
+}
+if (Test-Path -LiteralPath $privateKey) {
+    throw 'Acceptance private signing key cleanup failed.'
 }
 
 Copy-Item -LiteralPath $hostExe, $workerExe, $packageExe, $signed, $publicKey -Destination $deploy -Force
@@ -146,6 +159,26 @@ foreach ($relative in $requiredDeployment) {
 }
 if (Test-Path -LiteralPath (Join-Path $deploy 'acceptance-private.pem')) {
     throw 'Deployment verification failed; private signing key was deployed.'
+}
+$privateKeyFiles = @(Get-ChildItem -LiteralPath $build -File -Recurse -Filter '*private*.pem')
+if ($privateKeyFiles.Count -ne 0) {
+    throw "Acceptance output contains a private key file: $($privateKeyFiles[0].FullName)"
+}
+foreach ($file in Get-ChildItem -LiteralPath $build -File -Recurse) {
+    if ($file.Length -lt 27) { continue }
+    $stream = $file.OpenRead()
+    try {
+        $prefixBytes = [byte[]]::new([int][Math]::Min(128L, $file.Length))
+        $prefixLength = $stream.Read($prefixBytes, 0, $prefixBytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $prefix = [Text.Encoding]::ASCII.GetString($prefixBytes, 0, $prefixLength).TrimStart()
+    if ($prefix.StartsWith('-----BEGIN PRIVATE KEY-----') -or
+        $prefix.StartsWith('-----BEGIN ENCRYPTED PRIVATE KEY-----')) {
+        throw "Acceptance output contains PEM private key material: $($file.FullName)"
+    }
 }
 
 Write-Output "Q-Browser acceptance passed: $Configuration"

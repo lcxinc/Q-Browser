@@ -53,6 +53,7 @@ void HostRoutesE2eTest::productionHostNavigatesTenPilotRoutes()
     }
     QCOMPARE(window->historyCount(), routes.size());
     QVERIFY(environment.host()->hasWorkerContext());
+    QVERIFY2(environment.shutdown(), qPrintable(environment.error()));
 }
 
 QTEST_MAIN(HostRoutesE2eTest)

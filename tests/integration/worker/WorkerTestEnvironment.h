@@ -38,6 +38,8 @@ public:
     QString sandboxTempRoot() const;
     QString runtimeRoot() const;
     QString workerExecutable() const;
+    [[nodiscard]] bool cleanup();
+    [[nodiscard]] QString cleanupError() const;
 
     struct Launch final {
         IpcSession hostSession;
@@ -70,4 +72,6 @@ private:
     std::optional<SandboxTrustBoundary> boundary_;
     QByteArray mainQml_;
     QString packageSource_;
+    QString cleanupError_;
+    bool cleaned_ = false;
 };

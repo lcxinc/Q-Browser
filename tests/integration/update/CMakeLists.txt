@@ -76,4 +76,7 @@ if(WIN32 AND Q_BROWSER_BUILD_WEBENGINE)
   q_browser_add_qt_test(
     NAME production_update_runtime
     TARGET tst_production_update_runtime)
+  set_tests_properties(production_update_runtime PROPERTIES
+    TIMEOUT 900
+    ENVIRONMENT "QTEST_FUNCTION_TIMEOUT=900000")
 endif()

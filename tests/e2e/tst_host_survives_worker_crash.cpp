@@ -63,6 +63,7 @@ void HostSurvivesWorkerCrashE2eTest::crashingCandidateRollsBackWithoutTerminatin
     QVERIFY(environment.host()->mainWindow()->navigate(
         QStringLiteral("app://pilot/dashboard")));
     QCOMPARE(environment.host()->mainWindow()->activeSurface(), HostSurfaceKind::Worker);
+    QVERIFY2(environment.shutdown(), qPrintable(environment.error()));
 }
 
 QTEST_MAIN(HostSurvivesWorkerCrashE2eTest)

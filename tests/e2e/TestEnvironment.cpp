@@ -4,9 +4,12 @@
 #include "AppContainerProfile.h"
 #include "ContentDigest.h"
 #include "HostRuntimeConfig.h"
+#include "HostWorkerSessionController.h"
+#include "MainWindow.h"
 #include "PackageStore.h"
 #include "SignatureVerifier.h"
 #include "WorkerRetirementManager.h"
+#include "WebSurface.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -17,6 +20,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QThread>
+#include <QWebEnginePage>
 
 #include <Aclapi.h>
 #include <qt_windows.h>
@@ -81,6 +85,17 @@ bool waitUntil(const std::function<bool()> &predicate, const int timeoutMs)
     }
     return predicate();
 }
+
+bool processHasExited(const quint32 processId)
+{
+    if (processId == 0) return true;
+    const HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, processId);
+    if (process == nullptr) return GetLastError() == ERROR_INVALID_PARAMETER;
+    const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+    CloseHandle(process);
+    return exited;
+}
 }
 
 TestEnvironment::TestEnvironment()
@@ -89,6 +104,7 @@ TestEnvironment::TestEnvironment()
         error_ = workerEnvironment_.error();
         return;
     }
+    appId_ = workerEnvironment_.appId();
     if (!packages_.isValid() || !trust_.isValid() || !telemetry_.isValid()) {
         error_ = QStringLiteral("e2e temporary roots are unavailable");
         return;
@@ -98,21 +114,66 @@ TestEnvironment::TestEnvironment()
 
 TestEnvironment::~TestEnvironment()
 {
+    (void)shutdown();
+}
+
+bool TestEnvironment::shutdown()
+{
+    if (shutdown_) return cleanupError_.isEmpty();
+    shutdown_ = true;
+    const quint32 workerProcessId = currentWorkerProcessId_;
+    if (host_ != nullptr && host_->mainWindow() != nullptr) {
+        WebSurface *webSurface = host_->mainWindow()->webSurface();
+        QWebEnginePage *page = webSurface != nullptr ? webSurface->page() : nullptr;
+        if (page != nullptr) {
+            page->setLifecycleState(QWebEnginePage::LifecycleState::Active);
+            page->triggerAction(QWebEnginePage::Stop);
+            page->setUrl(WebSurface::trustedErrorUrl());
+            (void)waitUntil([&] { return !page->isLoading(); }, 5'000);
+        }
+    }
     host_.reset();
-    (void)WorkerRetirementManager::instance().shutdownChecked(10'000);
+    QElapsedTimer webEngineDrain;
+    webEngineDrain.start();
+    while (webEngineDrain.elapsed() < 750) {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
+    if (!WorkerRetirementManager::instance().shutdownChecked(10'000)) {
+        cleanupError_ = QStringLiteral("worker retirement cleanup failed");
+    }
+    if (!waitUntil([&] { return processHasExited(workerProcessId); }, 5'000)) {
+        cleanupError_ = QStringLiteral("worker process remained alive after retirement");
+    }
     if (mockApi_.state() != QProcess::NotRunning) {
         mockApi_.terminate();
         if (!mockApi_.waitForFinished(5'000)) {
             mockApi_.kill();
-            (void)mockApi_.waitForFinished(5'000);
+            if (!mockApi_.waitForFinished(5'000)) {
+                cleanupError_ = QStringLiteral("mock-api process cleanup failed");
+            }
         }
     }
-    const auto profile = AppContainerProfile::deterministicName(
-        QStringLiteral("com.qbrowser.pilot"));
-    if (profile.has_value()) {
-        (void)DeleteAppContainerProfile(
-            reinterpret_cast<PCWSTR>(profile->utf16()));
+    mockApi_.close();
+    if (!packages_.remove()) {
+        cleanupError_ = QStringLiteral("package fixture cleanup failed");
+    } else {
+        packages_.setAutoRemove(false);
     }
+    if (!trust_.remove()) {
+        cleanupError_ = QStringLiteral("trust fixture cleanup failed");
+    } else {
+        trust_.setAutoRemove(false);
+    }
+    if (!telemetry_.remove()) {
+        cleanupError_ = QStringLiteral("telemetry fixture cleanup failed");
+    } else {
+        telemetry_.setAutoRemove(false);
+    }
+    if (!workerEnvironment_.cleanup()) cleanupError_ = workerEnvironment_.cleanupError();
+    if (!cleanupError_.isEmpty()) error_ = cleanupError_;
+    return cleanupError_.isEmpty();
 }
 
 bool TestEnvironment::isValid() const noexcept { return error_.isEmpty(); }
@@ -120,11 +181,27 @@ QString TestEnvironment::error() const { return error_; }
 HostApplication *TestEnvironment::host() const noexcept { return host_.get(); }
 QString TestEnvironment::mockOrigin() const { return mockOrigin_; }
 int TestEnvironment::failureCount() const noexcept { return failureCount_; }
+QString TestEnvironment::lastFailure() const { return lastFailure_; }
+int TestEnvironment::tamperCanaryCount() const noexcept { return tamperCanaryCount_; }
 quint32 TestEnvironment::currentWorkerProcessId() const noexcept
 {
     return currentWorkerProcessId_;
 }
 QStringList TestEnvironment::readyVersions() const { return readyVersions_; }
+
+QString TestEnvironment::currentVersionDirectory() const
+{
+    const ActivationStateResult state =
+        PackageStore(workerEnvironment_.packageRoot()).activationState(appId_);
+    return state.hasValue() ? state.state.current : QString{};
+}
+
+QString TestEnvironment::lastKnownGoodVersionDirectory() const
+{
+    const ActivationStateResult state =
+        PackageStore(workerEnvironment_.packageRoot()).activationState(appId_);
+    return state.hasValue() ? state.state.lastKnownGood : QString{};
+}
 
 bool TestEnvironment::prepareTrustKey()
 {
@@ -183,7 +260,7 @@ QString TestEnvironment::createPackage(const QString &version,
         if (relative == QByteArrayLiteral("manifest.json")) {
             QJsonDocument document = QJsonDocument::fromJson(contents);
             QJsonObject object = document.object();
-            object.insert(QStringLiteral("appId"), QStringLiteral("com.qbrowser.pilot"));
+            object.insert(QStringLiteral("appId"), appId_);
             object.insert(QStringLiteral("version"), version);
             contents = QJsonDocument(object).toJson(QJsonDocument::Compact);
         } else if (relative == QByteArrayLiteral("qml/Main.qml") && !mainQml.isEmpty()) {
@@ -211,7 +288,10 @@ QString TestEnvironment::createTamperedPackage(const QString &version)
     QVector<ArchiveFile> files = snapshot.files();
     for (ArchiveFile &file : files) {
         if (file.path == QByteArrayLiteral("qml/Main.qml")) {
-            file.contents.append("\n// authenticated payload changed");
+            file.contents = QByteArrayLiteral(
+                "import QtQuick\nItem { Component.onCompleted: "
+                "Runtime.invoke(\"storage\", \"get\", "
+                "{ key: \"tamper-canary\" }) }\n");
         }
     }
     const QString tampered = packages_.filePath(version + QStringLiteral("-tampered.qapkg"));
@@ -226,7 +306,7 @@ bool TestEnvironment::start(const QString &version)
     const QStringList arguments{
         QStringLiteral("--package-mode"),
         QStringLiteral("--mock-origin=") + mockOrigin_,
-        QStringLiteral("--app-id=com.qbrowser.pilot"),
+        QStringLiteral("--app-id=") + appId_,
         QStringLiteral("--trusted-public-key=") + publicKeyPath_,
         QStringLiteral("--package-store=") + workerEnvironment_.packageRoot(),
         QStringLiteral("--sandbox-temp=") + workerEnvironment_.sandboxTempRoot(),
@@ -251,19 +331,39 @@ bool TestEnvironment::start(const QString &version)
     QObject::connect(host_.get(), &HostApplication::updateLifecycleFailed,
                      host_.get(), [this](const QString &stableError) {
         ++failureCount_;
+        lastFailure_ = stableError;
         error_ = stableError;
+    });
+    QObject::connect(host_.get(), &HostApplication::workerCapabilityRequestObserved,
+                     host_.get(), [this](const QString &, const QString &,
+                                         const QVariantMap &payload) {
+        if (payload.value(QStringLiteral("key")).toString()
+            == QStringLiteral("tamper-canary")) {
+            ++tamperCanaryCount_;
+        }
     });
     if (!host_->start()) {
         error_ = QStringLiteral("production Host did not start");
         return false;
     }
+    HostWorkerSessionController *controller = host_->workerSessionController();
+    if (controller == nullptr) {
+        error_ = QStringLiteral("production Host session controller is unavailable");
+        return false;
+    }
+    QObject::connect(controller, &HostWorkerSessionController::heartbeatObserved,
+                     host_.get(), [this] { ++heartbeatCount_; });
     if (!waitForReady(version)) {
         if (error_.isEmpty()) error_ = QStringLiteral("production Worker did not become ready");
         return false;
     }
+    if (!waitUntil([&] { return heartbeatCount_ > 0; }, 10'000)) {
+        error_ = QStringLiteral("production Worker did not become responsive");
+        return false;
+    }
     PackageStore store(workerEnvironment_.packageRoot());
     if (!waitUntil([&] {
-            return !store.activationState(QStringLiteral("com.qbrowser.pilot"))
+            return !store.activationState(appId_)
                         .state.lastKnownGood.isEmpty();
         }, 10'000)) {
         error_ = QStringLiteral("initial package was not marked last-known-good");
