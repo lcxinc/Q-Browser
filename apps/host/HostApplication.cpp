@@ -16,6 +16,7 @@
 #include "WebSurface.h"
 
 #include <QPointer>
+#include <QRegularExpression>
 #include <QThread>
 #include <QTimer>
 
@@ -25,6 +26,30 @@
 namespace
 {
 constexpr qsizetype MaximumPendingLifecycleOperations = 512;
+
+QString pilotRouteTemplate(const QString &route)
+{
+    static const QHash<QString, QString> literals{
+        {QStringLiteral("/login"), QStringLiteral("/login")},
+        {QStringLiteral("/dashboard"), QStringLiteral("/dashboard")},
+        {QStringLiteral("/orders"), QStringLiteral("/orders")},
+        {QStringLiteral("/customers"), QStringLiteral("/customers")},
+        {QStringLiteral("/files"), QStringLiteral("/files")},
+        {QStringLiteral("/settings"), QStringLiteral("/settings")},
+    };
+    const auto literal = literals.constFind(route);
+    if (literal != literals.cend()) return *literal;
+    static const QRegularExpression order(
+        QStringLiteral(R"(^/orders/[^/]+$)"));
+    static const QRegularExpression orderEdit(
+        QStringLiteral(R"(^/orders/[^/]+/edit$)"));
+    static const QRegularExpression customer(
+        QStringLiteral(R"(^/customers/[^/]+$)"));
+    if (orderEdit.match(route).hasMatch()) return QStringLiteral("/orders/:id/edit");
+    if (order.match(route).hasMatch()) return QStringLiteral("/orders/:id");
+    if (customer.match(route).hasMatch()) return QStringLiteral("/customers/:id");
+    return {};
+}
 
 class HostLifecycleRuntime final : public QObject
 {
@@ -400,6 +425,18 @@ bool HostApplication::start()
                 (void)enqueueLifecycle([key](UpdateLifecycleCoordinator &coordinator) {
                     (void)coordinator.heartbeat(key);
                 });
+            });
+    connect(workerSessionController_.get(),
+            &HostWorkerSessionController::routeLoadAcknowledged,
+            this, [this](const QString &route) {
+                const QString routeTemplate = pilotRouteTemplate(route);
+                if (routeTemplate.isEmpty()) return;
+                const qsizetype pending = workerSessionController_ != nullptr
+                    ? workerSessionController_->pendingRouteLoadCount() : -1;
+                (void)enqueueLifecycle(
+                    [routeTemplate, pending](UpdateLifecycleCoordinator &coordinator) {
+                        coordinator.recordRouteLoadAcknowledged(routeTemplate, pending);
+                    });
             });
     connect(workerSessionController_.get(),
             &HostWorkerSessionController::capabilityRequestObserved,

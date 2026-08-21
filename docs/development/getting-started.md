@@ -58,24 +58,31 @@ unprotected state path.
 ```powershell
 $deploy = (Resolve-Path build\release-deploy).Path
 $state = Join-Path (Resolve-Path build).Path 'manual-deployed-smoke'
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 `
+  -PrepareManualState $state
 $store = Join-Path $state 'package-store'
 $sandbox = Join-Path $state 'sandbox-temp'
 $telemetry = Join-Path $state 'telemetry'
-New-Item -ItemType Directory -Force $store,$sandbox,$telemetry | Out-Null
-$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-foreach ($directory in @($store,$sandbox,$telemetry)) {
-  & "$env:SystemRoot\System32\icacls.exe" $directory /inheritance:r `
-    /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F'
-  if ($LASTEXITCODE -ne 0) { throw "ACL protection failed: $directory" }
-}
 
 $mockOut = Join-Path $state 'mock.stdout'
 $mockErr = Join-Path $state 'mock.stderr'
 $mock = Start-Process node.exe -ArgumentList 'src/server.ts' `
   -WorkingDirectory tools\mock-api -WindowStyle Hidden -PassThru `
   -RedirectStandardOutput $mockOut -RedirectStandardError $mockErr
-do { Start-Sleep -Milliseconds 100 } until (Test-Path $mockOut)
-$origin = (Get-Content $mockOut -First 1 | ConvertFrom-Json).origin
+$origin = $null
+$mockWait = [Diagnostics.Stopwatch]::StartNew()
+do {
+  Start-Sleep -Milliseconds 100
+  $mock.Refresh()
+  if ($mock.HasExited) { throw "Mock API exited early: $($mock.ExitCode)" }
+  if (Test-Path $mockOut) {
+    try { $origin = (Get-Content $mockOut -First 1 | ConvertFrom-Json).origin }
+    catch { $origin = $null }
+  }
+  if ($mockWait.ElapsedMilliseconds -ge 15000) {
+    throw 'Mock API did not publish a valid nonempty loopback origin within 15 seconds.'
+  }
+} until ($origin -match '^http://127\.0\.0\.1:[1-9][0-9]*$')
 $env:PATH = "$deploy\host;$env:SystemRoot\System32;$env:SystemRoot"
 
 $common = @('--package-mode',"--mock-origin=$origin",'--app-id=com.qbrowser.pilot',
@@ -87,6 +94,22 @@ $common = @('--package-mode',"--mock-origin=$origin",'--app-id=com.qbrowser.pilo
 function ConvertTo-LaunchArguments([string[]]$Values) {
   return (($Values | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' ')
 }
+function Stop-DeployedHost([Diagnostics.Process]$Process) {
+  Add-Type -AssemblyName UIAutomationClient
+  Add-Type -AssemblyName UIAutomationTypes
+  $condition = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $Process.Id)
+  $window = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    [System.Windows.Automation.TreeScope]::Children, $condition)
+  if ($null -eq $window) { throw 'The exact deployed Host window is unavailable.' }
+  $pattern = [System.Windows.Automation.WindowPattern]$window.GetCurrentPattern(
+    [System.Windows.Automation.WindowPattern]::Pattern)
+  $pattern.Close()
+  [void]$Process.WaitForExit(60000)
+  if (-not $Process.HasExited -or $Process.ExitCode -ne 0) {
+    throw 'The deployed Host did not complete checked cleanup.'
+  }
+}
 $pilot = "$deploy\packages\com.qbrowser.pilot-1.0.0.qapkg"
 $appProcess = Start-Process "$deploy\host\qbrowser-host.exe" `
   -ArgumentList (ConvertTo-LaunchArguments ($common + "--install-package=$pilot")) `
@@ -97,7 +120,7 @@ Close that Host before an offline restart. Offline startup omits
 `--install-package` and re-verifies the selected installed binding:
 
 ```powershell
-$appProcess.CloseMainWindow(); $appProcess.WaitForExit(15000)
+Stop-DeployedHost $appProcess
 $appProcess = Start-Process "$deploy\host\qbrowser-host.exe" `
   -ArgumentList (ConvertTo-LaunchArguments $common) -PassThru
 ```
@@ -111,7 +134,7 @@ $candidate = (Resolve-Path build\candidate\com.qbrowser.pilot-1.1.0.qapkg).Path
 & "$deploy\host\qbrowser-package.exe" inspect --package $candidate `
   --public-key "$deploy\trust\dev-public.pem"
 if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed.' }
-$appProcess.CloseMainWindow(); $appProcess.WaitForExit(15000)
+Stop-DeployedHost $appProcess
 $appProcess = Start-Process "$deploy\host\qbrowser-host.exe" `
   -ArgumentList (ConvertTo-LaunchArguments ($common + "--install-package=$candidate")) `
   -PassThru
@@ -135,5 +158,13 @@ reverified previous/LKG binding:
 Get-Content "$telemetry\events.jsonl" | Select-String '"phase":"rollback","code":"recovered"'
 ```
 
-Close the Host and mock process when finished. Do not delete or edit candidate,
-activation, version, or telemetry files while either process is running.
+Close only the processes retained by this session and require complete cleanup:
+
+```powershell
+Stop-DeployedHost $appProcess
+if (-not $mock.HasExited) { Stop-Process -Id $mock.Id }
+if (-not $mock.WaitForExit(10000)) { throw 'The owned mock API did not exit.' }
+```
+
+Do not delete or edit candidate, activation, version, or telemetry files while
+either process is running.

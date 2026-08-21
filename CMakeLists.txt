@@ -10,6 +10,14 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+# The release inventory is itself a signed operational control.  Make MSVC
+# derive PE metadata from the linked content instead of the wall clock so two
+# clean builds of the same revision have identical deployment hashes.
+if(MSVC)
+  add_compile_options($<$<CONFIG:Release>:/Brepro>)
+  add_link_options($<$<CONFIG:Release>:/Brepro>)
+endif()
+
 include(CTest)
 include(InstallRequiredSystemLibraries)
 

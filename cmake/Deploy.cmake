@@ -275,7 +275,8 @@ foreach(runtime_subdirectory IN ITEMS host runtime)
   q_browser_require_glob("OpenSSL Crypto runtime" "${runtime_subdirectory}/libcrypto-3*.dll")
   q_browser_require_glob("OpenSSL TLS runtime" "${runtime_subdirectory}/libssl-3*.dll")
   foreach(msvc_runtime IN ITEMS vcruntime140.dll vcruntime140_1.dll
-      msvcp140.dll msvcp140_1.dll)
+      msvcp140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll
+      msvcp140_codecvt_ids.dll concrt140.dll)
     q_browser_require_file("${runtime_subdirectory}/${msvc_runtime}")
   endforeach()
 endforeach()
@@ -404,19 +405,35 @@ function Get-PeImports([string]$path) {
 }
 
 $missing = [Collections.Generic.List[string]]::new()
+$osDlls = [Collections.Generic.HashSet[string]]::new(
+  [StringComparer]::OrdinalIgnoreCase)
+foreach ($name in @('advapi32.dll','authz.dll','bcrypt.dll','bthprops.cpl',
+  'cfgmgr32.dll','comctl32.dll','comdlg32.dll','crypt32.dll','cryptbase.dll',
+  'd3d9.dll','d3d11.dll','d3d12.dll','dcomp.dll','dbghelp.dll','dhcpcsvc.dll',
+  'dnsapi.dll','dwrite.dll','dwmapi.dll','dxgi.dll','fontsub.dll','gdi32.dll',
+  'hid.dll','icuuc.dll','imagehlp.dll','imm32.dll','iphlpapi.dll',
+  'kernel32.dll','mpr.dll','msasn1.dll','ncrypt.dll','netapi32.dll','normaliz.dll',
+  'ntdll.dll','ole32.dll','oleaut32.dll','pdh.dll','powrprof.dll','propsys.dll','psapi.dll',
+  'rpcrt4.dll','secur32.dll','setupapi.dll','shell32.dll','shlwapi.dll',
+  'mf.dll','mfplat.dll','mfreadwrite.dll','mmdevapi.dll','msvcrt.dll','urlmon.dll',
+  'user32.dll','userenv.dll','uiautomationcore.dll','uxtheme.dll','version.dll',
+  'winhttp.dll','winmm.dll','winspool.drv','wintrust.dll','winusb.dll','wlanapi.dll',
+  'ws2_32.dll','wtsapi32.dll')) {
+  [void]$osDlls.Add($name)
+}
 foreach ($closureName in @('host', 'runtime')) {
   $closureRoot = Join-Path $root $closureName
   $images = @(Get-ChildItem -LiteralPath $closureRoot -Recurse -File |
     Where-Object { $_.Extension -in @('.exe', '.dll') })
-  $deployed = @{}
-  foreach ($image in $images) { $deployed[$image.Name] = $true }
   foreach ($image in $images) {
     foreach ($import in @(Get-PeImports $image.FullName)) {
-      if ($deployed.ContainsKey($import)) { continue }
-      $systemImport = Join-Path $env:SystemRoot "System32\$import"
+      $besideImporter = Join-Path $image.DirectoryName $import
+      $closureDirect = Join-Path $closureRoot $import
+      if ((Test-Path -LiteralPath $besideImporter -PathType Leaf) -or
+          (Test-Path -LiteralPath $closureDirect -PathType Leaf)) { continue }
       if ($import.StartsWith('api-ms-win-', [StringComparison]::OrdinalIgnoreCase) -or
           $import.StartsWith('ext-ms-win-', [StringComparison]::OrdinalIgnoreCase) -or
-          (Test-Path -LiteralPath $systemImport -PathType Leaf)) {
+          $osDlls.Contains($import)) {
         continue
       }
       $missing.Add("$closureName/$($image.Name) -> $import")
@@ -443,11 +460,46 @@ foreach(relative_path IN LISTS deployed_files)
       OR lower_path MATCHES "\\.(cpp|cxx|cc|h|hpp|pdb|ilk|obj|lib|exp)$")
     q_browser_deploy_fail("forbidden test, source, symbol, or private-key asset: ${normalized_path}")
   endif()
-  file(READ "${Q_BROWSER_DEPLOY_DIR}/${relative_path}" prefix LIMIT 8192)
-  if(prefix MATCHES "(^|[\r\n])[ \t]*-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
-    q_browser_deploy_fail("private key material found in ${normalized_path}")
+  file(SIZE "${Q_BROWSER_DEPLOY_DIR}/${relative_path}" deployed_size)
+  if(deployed_size GREATER 536870912)
+    q_browser_deploy_fail("deployment file exceeds 512 MiB scan policy: ${normalized_path}")
   endif()
 endforeach()
+
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+  "Q_BROWSER_DEPLOY_VERIFY_ROOT=${Q_BROWSER_DEPLOY_DIR}"
+  "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+  -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command [=[
+$ErrorActionPreference = 'Stop'
+$root = [IO.Path]::GetFullPath($env:Q_BROWSER_DEPLOY_VERIFY_ROOT)
+$pattern = [regex]::new('(?m)^[ \t]*-----BEGIN ([A-Z0-9 ]+)-----',
+  [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Force -File) {
+  $reader = [IO.StreamReader]::new($file.FullName, [Text.Encoding]::ASCII,
+    $false, 65536)
+  try {
+    $buffer = [char[]]::new(65536)
+    $carry = ''
+    while (($count = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+      $text = $carry + [string]::new($buffer, 0, $count)
+      foreach ($match in $pattern.Matches($text)) {
+        $relative = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+        if ($relative -ne 'trust/dev-public.pem' -or
+            $match.Groups[1].Value -ne 'PUBLIC KEY') {
+          throw "forbidden PEM material found in $relative"
+        }
+      }
+      $carry = if ($text.Length -gt 128) { $text.Substring($text.Length - 128) }
+        else { $text }
+    }
+  }
+  finally { $reader.Dispose() }
+}
+]=]
+  RESULT_VARIABLE pem_result OUTPUT_VARIABLE pem_output ERROR_VARIABLE pem_error)
+if(NOT pem_result EQUAL 0)
+  q_browser_deploy_fail("complete PEM scan rejected: ${pem_output}${pem_error}")
+endif()
 
 file(READ "${Q_BROWSER_DEPLOY_DIR}/SHA-256SUMS" recorded_inventory)
 q_browser_canonical_inventory(expected_inventory)

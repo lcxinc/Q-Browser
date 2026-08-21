@@ -107,6 +107,8 @@ public:
         WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction workerAdmissionFailed(
         WorkerAttemptKey key);
+    void recordRouteLoadAcknowledged(const QString &routeTemplate,
+                                     qsizetype pendingRouteLoads) const;
     void beginHostShutdown() noexcept;
 
     [[nodiscard]] std::optional<WorkerAttemptKey> currentAttemptKey() const noexcept;
@@ -134,7 +136,8 @@ private:
     void record(SafeEventPhase phase,
                 SafeEventCode code,
                 qint64 durationMs,
-                const SafeMetrics &metrics = {}) const;
+                const SafeMetrics &metrics = {},
+                const QString &routeTemplate = QStringLiteral("/")) const;
 
     QString appId_;
     PackageStore &store_;

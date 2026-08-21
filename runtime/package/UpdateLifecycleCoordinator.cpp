@@ -453,15 +453,31 @@ bool UpdateLifecycleCoordinator::failedClosed() const noexcept
     return failedClosed_;
 }
 
+void UpdateLifecycleCoordinator::recordRouteLoadAcknowledged(
+    const QString &routeTemplate, const qsizetype pendingRouteLoads) const
+{
+    static const QStringList allowedTemplates{
+        QStringLiteral("/login"), QStringLiteral("/dashboard"),
+        QStringLiteral("/orders"), QStringLiteral("/orders/:id"),
+        QStringLiteral("/orders/:id/edit"), QStringLiteral("/customers"),
+        QStringLiteral("/customers/:id"), QStringLiteral("/files"),
+        QStringLiteral("/settings")};
+    if (pendingRouteLoads != 0 || !allowedTemplates.contains(routeTemplate)) return;
+    record(SafeEventPhase::Worker, SafeEventCode::Completed, 0,
+           {{SafeMetric::QueueDepth, static_cast<double>(pendingRouteLoads)}},
+           routeTemplate);
+}
+
 void UpdateLifecycleCoordinator::record(
     const SafeEventPhase phase,
     const SafeEventCode code,
     const qint64 durationMs,
-    const SafeMetrics &metrics) const
+    const SafeMetrics &metrics,
+    const QString &routeTemplate) const
 {
     if (recorder_ == nullptr || currentVersion_.isEmpty()) return;
     const SafeEventResult event = SafeEvent::create(
         clock_.utcNowMilliseconds(), appId_, currentVersion_, phase, code, durationMs,
-        QStringLiteral("/"), metrics);
+        routeTemplate, metrics);
     if (event.hasValue()) (void)recorder_->record(event.value());
 }

@@ -16,7 +16,43 @@ private slots:
     void marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg();
     void wallClockJumpsDoNotAffectHealthAndHealthyCommitsOnce();
     void staleAdmissionFailureDoesNotPoisonCurrentAttempt();
+    void recordsBoundedRouteAcknowledgementWithEmptyPendingQueue();
 };
+
+void UpdateLifecycleTest::recordsBoundedRouteAcknowledgementWithEmptyPendingQueue()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, updateInstallPolicy());
+    const QString telemetry = temporary.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    EventRecorder recorder({telemetry, QStringLiteral("events.jsonl"), 64 * 1024, 1, 64});
+    QVector<UpdateLaunchRequest> launches;
+    ManualLifecycleClock clock;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {1'000, 300},
+        [&](const UpdateLaunchRequest &request) { launches.push_back(request); return true; },
+        clock.source(), &recorder);
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("route-ack"), QStringLiteral("1.0.0"),
+        keys.value().privateKeyPem);
+    QVERIFY(coordinator.installAndLaunch(package).succeeded());
+    coordinator.recordRouteLoadAcknowledged(QStringLiteral("/orders/:id"), 0);
+    coordinator.recordRouteLoadAcknowledged(QStringLiteral("/orders/secret-id"), 0);
+    coordinator.recordRouteLoadAcknowledged(QStringLiteral("/orders"), 1);
+    QVERIFY(recorder.flush(5'000));
+    QFile events(QDir(telemetry).filePath(QStringLiteral("events.jsonl")));
+    QVERIFY(events.open(QIODevice::ReadOnly));
+    const QByteArray data = events.readAll();
+    QVERIFY(data.contains("\"phase\":\"worker\",\"code\":\"completed\""));
+    QVERIFY(data.contains("\"routeTemplate\":\"/orders/:id\""));
+    QVERIFY(data.contains("\"metrics\":{\"queueDepth\":0}"));
+    QVERIFY(!data.contains("secret-id"));
+    QVERIFY(!data.contains("\"queueDepth\":1"));
+}
 
 void UpdateLifecycleTest::staleAdmissionFailureDoesNotPoisonCurrentAttempt()
 {

@@ -11,6 +11,42 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+if (-not ('QBrowser.Task18.FileIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace QBrowser.Task18 {
+  public static class FileIdentity {
+    [StructLayout(LayoutKind.Sequential)] struct Info {
+      public uint attributes; public System.Runtime.InteropServices.ComTypes.FILETIME creation;
+      public System.Runtime.InteropServices.ComTypes.FILETIME access;
+      public System.Runtime.InteropServices.ComTypes.FILETIME write;
+      public uint volume; public uint sizeHigh; public uint sizeLow; public uint links;
+      public uint indexHigh; public uint indexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    public static string Read(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      using (var handle = CreateFileW(native, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        Info info; if (!GetFileInformationByHandle(handle, out info))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        return info.volume.ToString("x8") + ":" + info.indexHigh.ToString("x8") + info.indexLow.ToString("x8");
+      }
+    }
+  }
+}
+'@
+}
+
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repoBuild = [IO.Path]::GetFullPath((Join-Path $repo 'build'))
 $defaultOutput = [IO.Path]::GetFullPath((Join-Path $repoBuild 'release-package'))
@@ -52,11 +88,7 @@ function Assert-NoReparseAncestor([string]$Path) {
 }
 
 function Get-PathIdentity([string]$Path) {
-    $text = & "$env:SystemRoot\System32\fsutil.exe" file queryfileid $Path 2>&1
-    if ($LASTEXITCODE -ne 0 -or ($text -join "`n") -notmatch '0x[0-9a-fA-F]+') {
-        throw "Cannot pin filesystem identity: $Path"
-    }
-    return $Matches[0].ToLowerInvariant()
+    return [QBrowser.Task18.FileIdentity]::Read($Path)
 }
 
 function New-OwnedDirectory([string]$Path) {
@@ -96,7 +128,9 @@ function Remove-OwnedTree([string]$Path, [string]$ExactAllowedPath) {
         }
         $entryIdentities[$entry.FullName] = Get-PathIdentity $entry.FullName
     }
-    foreach ($file in @($entries | Where-Object { -not $_.PSIsContainer } |
+    foreach ($file in @($entries | Where-Object {
+            -not $_.PSIsContainer -and
+            -not $_.FullName.Equals($marker, [StringComparison]::OrdinalIgnoreCase) } |
             Sort-Object { $_.FullName.Length } -Descending)) {
         if ((Get-PathIdentity $full) -ne $identity) {
             throw "Owned cleanup root identity changed: $full"
@@ -142,6 +176,10 @@ function Remove-OwnedTree([string]$Path, [string]$ExactAllowedPath) {
     if ((Get-PathIdentity $full) -ne $identity) {
         throw "Owned cleanup root identity changed before removal: $full"
     }
+    if ((Get-PathIdentity $marker) -ne $entryIdentities[$marker]) {
+        throw "Owned cleanup marker identity changed: $marker"
+    }
+    Remove-Item -LiteralPath $marker -Force -ErrorAction Stop
     Remove-Item -LiteralPath $full -Force
 }
 
@@ -152,11 +190,52 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
 
 function Protect-Path([string]$Path, [switch]$Container) {
     Assert-NoReparseAncestor $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($Container -and -not $item.PSIsContainer) { throw "Expected directory: $Path" }
+    if (-not $Container -and $item.PSIsContainer) { throw "Expected file: $Path" }
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $currentName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $grant = if ($Container) { "${currentName}:(OI)(CI)F" } else { "${currentName}:F" }
-    $systemGrant = if ($Container) { '*S-1-5-18:(OI)(CI)F' } else { '*S-1-5-18:F' }
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $existingAcl = Get-Acl -LiteralPath $Path
+    $trustedSids = @($current.Value, $system.Value)
+    $identities = @($existingAcl.GetAccessRules($true, $false,
+            [Security.Principal.SecurityIdentifier]) | Where-Object {
+                $_.AccessControlType -eq 'Allow' -and
+                $_.IdentityReference.Value -notin $trustedSids } |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    foreach ($identity in $identities) {
+        Invoke-Checked "$env:SystemRoot\System32\icacls.exe" @(
+            $Path, '/remove:g', "*$identity")
+    }
+    $grants = if ($Container) {
+        @("${currentName}:(OI)(CI)F", '*S-1-5-18:(OI)(CI)F')
+    } else { @("${currentName}:F", '*S-1-5-18:F') }
+    Invoke-Checked "$env:SystemRoot\System32\icacls.exe" `
+        (@($Path, '/inheritance:r', '/grant:r') + $grants)
     Invoke-Checked "$env:SystemRoot\System32\icacls.exe" @(
-        $Path, '/inheritance:r', '/grant:r', $grant, $systemGrant)
+        $Path, '/setowner', $currentName)
+    $verified = Get-Acl -LiteralPath $Path
+    $allowed = @($current.Value, $system.Value)
+    $ownerSid = ([Security.Principal.NTAccount]$verified.Owner).Translate(
+        [Security.Principal.SecurityIdentifier]
+    ).Value
+    if (-not $verified.AreAccessRulesProtected -or
+        $ownerSid -ne $current.Value -or
+        @($verified.GetAccessRules($true, $true,
+            [Security.Principal.SecurityIdentifier]) | Where-Object {
+                $_.AccessControlType -eq 'Allow' -and
+                $_.IdentityReference.Value -notin $allowed }).Count -ne 0) {
+        throw "ACL sanitization failed: $Path"
+    }
+}
+
+function Assert-PlainTree([string]$Path) {
+    Assert-NoReparseAncestor $Path
+    foreach ($entry in Get-ChildItem -LiteralPath $Path -Recurse -Force) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Reparse member is forbidden: $($entry.FullName)"
+        }
+    }
 }
 
 Assert-ChildPath $build $repoBuild 'BuildDirectory'
@@ -178,6 +257,7 @@ if (-not (Test-Path -LiteralPath $packageCli -PathType Leaf)) {
 Write-Warning 'DEVELOPMENT ONLY: this command uses ignored local signing authority below .qbrowser-dev\signing. Never use it for production or copy private signing material into build or deployment output.'
 New-Item -ItemType Directory -Force $keys | Out-Null
 Protect-Path $keys -Container
+Assert-PlainTree $keys
 $privateKey = Join-Path $keys 'private.pem'
 $publicKey = Join-Path $keys 'public.pem'
 if ((Test-Path -LiteralPath $privateKey) -xor (Test-Path -LiteralPath $publicKey)) {
@@ -189,6 +269,7 @@ if (-not (Test-Path -LiteralPath $privateKey)) {
 }
 Protect-Path $privateKey
 Protect-Path $publicKey
+Assert-PlainTree $keys
 
 $temporaryRoot = Join-Path $repoBuild ('.task18-package-' + [Guid]::NewGuid().ToString('N'))
 New-OwnedDirectory $temporaryRoot

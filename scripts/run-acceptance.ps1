@@ -166,16 +166,22 @@ if ($privateKeyFiles.Count -ne 0) {
 }
 foreach ($file in Get-ChildItem -LiteralPath $build -File -Recurse) {
     if ($file.Length -lt 27) { continue }
-    $stream = $file.OpenRead()
+    $reader = [IO.StreamReader]::new($file.FullName, [Text.Encoding]::ASCII,
+        $false, 65536)
     try {
-        $prefixBytes = [byte[]]::new([int][Math]::Min(128L, $file.Length))
-        $prefixLength = $stream.Read($prefixBytes, 0, $prefixBytes.Length)
+        $buffer = [char[]]::new(65536); $carry = ''; $found = $false
+        while (($count = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $text = $carry + [string]::new($buffer, 0, $count)
+            if ($text -match '(?m)^[ \t]*-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----') {
+                $found = $true; break
+            }
+            $carry = if ($text.Length -gt 128) {
+                $text.Substring($text.Length - 128)
+            } else { $text }
+        }
     }
-    finally {
-        $stream.Dispose()
-    }
-    $prefix = [Text.Encoding]::ASCII.GetString($prefixBytes, 0, $prefixLength).TrimStart()
-    if ($prefix -match '^\s*-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----') {
+    finally { $reader.Dispose() }
+    if ($found) {
         throw "Acceptance output contains PEM private key material: $($file.FullName)"
     }
 }
