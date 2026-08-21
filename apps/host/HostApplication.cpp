@@ -273,10 +273,19 @@ bool HostApplication::initializePackageRuntime()
                 });
         },
         [guard](const WorkerAttemptKey key, const QString &stableError) {
-            if (!guard) return;
+            QPointer<HostApplication> localGuard = guard;
+            if (!localGuard) return;
             const QString error = stableError.isEmpty()
                 ? QStringLiteral("host.launch.failed") : stableError;
-            emit guard->updateLifecycleFailed(error);
+            emit localGuard->updateLifecycleFailed(error);
+            if (!localGuard) return;
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto hooks = qbrowser_host_testing::
+                installedPackageWorkerLauncherTestHooks();
+            if (hooks.afterFailureSignalBeforeLifecycleEnqueue) {
+                hooks.afterFailureSignalBeforeLifecycleEnqueue();
+            }
+#endif
             const bool cleanupFailure = error == QStringLiteral(
                     "host.launch.temp_cleanup_failed")
                 || error == QStringLiteral("host.launch.process_wait_failed")
@@ -286,7 +295,7 @@ bool HostApplication::initializePackageRuntime()
                 || error.startsWith(QStringLiteral("sandbox.acl."));
             const bool admissionFailure = error.startsWith(
                 QStringLiteral("host.launch.admission_"));
-            (void)guard->enqueueLifecycle(
+            (void)localGuard->enqueueLifecycle(
                 [key, cleanupFailure, admissionFailure](
                     UpdateLifecycleCoordinator &coordinator) {
                     if (cleanupFailure) {
