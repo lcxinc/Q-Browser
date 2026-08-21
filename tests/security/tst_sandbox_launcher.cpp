@@ -578,7 +578,27 @@ private slots:
     void dynamicQtCoreHelperLoadsInsideLpacWithMinimalRuntimeClosure();
     void closeWaitTimeoutRetainsAllOwnershipForRetry();
     void closeAclRestoreFailureRetainsGrantForRetry();
+    void duplicatedWaitHandleSurvivesProcessCloseAndReportsThreeStates();
 };
+
+void SandboxLauncherTest::duplicatedWaitHandleSurvivesProcessCloseAndReportsThreeStates()
+{
+    auto fixture = makeSandboxProcessCloseFixture();
+    QVERIFY(fixture.has_value());
+    auto observer = fixture->process.duplicateWaitHandle();
+    QVERIFY2(observer.value.has_value(), qPrintable(observer.errorCode));
+    QCOMPARE(observer.value->wait(0), SandboxProcessWaitResult::Timeout);
+
+    fixture->process.requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    const auto closed = fixture->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+    QVERIFY(!fixture->process.isValid());
+    QCOMPARE(observer.value->wait(5'000), SandboxProcessWaitResult::Finished);
+
+    SandboxProcessWaitHandle invalid;
+    QCOMPARE(invalid.wait(0), SandboxProcessWaitResult::Error);
+    deleteProfileIfPresent(fixture->profileName);
+}
 
 void SandboxLauncherTest::closeWaitTimeoutRetainsAllOwnershipForRetry()
 {

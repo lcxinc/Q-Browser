@@ -3,9 +3,11 @@
 #include "EventRecorder.h"
 #include "HostWorkerSessionController.h"
 #include "InstalledPackageWorkerLauncher.h"
+#include "InstalledPackageWorkerLauncherTestHooks.h"
 #include "MainWindow.h"
 #include "PackageInstaller.h"
 #include "PackageStore.h"
+#include "RuntimePackageAuthority.h"
 #include "SandboxTrustBoundary.h"
 #include "UpdateLifecycleCoordinator.h"
 
@@ -27,12 +29,10 @@ constexpr qsizetype MaximumPendingLifecycleOperations = 512;
 class HostLifecycleRuntime final : public QObject
 {
 public:
-    HostLifecycleRuntime(std::shared_ptr<PackageStore> store,
-                         std::shared_ptr<PackageInstaller> installer,
+    HostLifecycleRuntime(std::shared_ptr<RuntimePackageAuthority> authority,
                          std::unique_ptr<EventRecorder> recorder,
                          std::unique_ptr<UpdateLifecycleCoordinator> coordinator)
-        : store_(std::move(store))
-        , installer_(std::move(installer))
+        : authority_(std::move(authority))
         , recorder_(std::move(recorder))
         , coordinator_(std::move(coordinator))
     {
@@ -78,8 +78,7 @@ public:
     }
 
 private:
-    std::shared_ptr<PackageStore> store_;
-    std::shared_ptr<PackageInstaller> installer_;
+    std::shared_ptr<RuntimePackageAuthority> authority_;
     std::unique_ptr<EventRecorder> recorder_;
     std::unique_ptr<UpdateLifecycleCoordinator> coordinator_;
     std::atomic<qsizetype> pending_{0};
@@ -202,22 +201,46 @@ bool HostApplication::initializePackageRuntime()
         return false;
     }
 
-    auto store = std::make_shared<PackageStore>(runtimeConfig_->packageStoreRoot());
     InstallPolicy installPolicy;
     installPolicy.expectedAppId = runtimeConfig_->appId();
     installPolicy.runtimeVersion = QStringLiteral("1.2.0");
     installPolicy.allowedImports = {QStringLiteral("QtQuick"),
                                     QStringLiteral("Company.Design")};
     installPolicy.preflight = [](const Manifest &, const QString &) { return true; };
-    auto installer = std::make_shared<PackageInstaller>(
-        *store, runtimeConfig_->trustedPublicKeyPem(), std::move(installPolicy));
+    auto authority = std::make_shared<RuntimePackageAuthority>(
+        runtimeConfig_->packageStoreRoot(),
+        runtimeConfig_->trustedPublicKeyPem(), std::move(installPolicy));
 
     QPointer<HostApplication> guard(this);
     installedPackageLauncher_ = std::make_unique<InstalledPackageWorkerLauncher>(
         std::move(*boundary.value), runtimeConfig_->workerExecutable(),
         runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
-        [installer](const QString &appId, const ActivationBinding &binding) {
-            return installer->reverifyInstalledVersion(appId, binding);
+        [authority](const QString &appId, const ActivationBinding &binding) {
+            return authority->reverifyInstalledVersion(appId, binding);
+        },
+        [guard](const UpdateLaunchRequest &request,
+                InstalledPackageWorkerLauncher::AdmissionCompletion complete) {
+            if (!guard || !complete) return false;
+            return guard->enqueueLifecycle(
+                [request, complete = std::move(complete)](
+                    UpdateLifecycleCoordinator &coordinator) mutable {
+#ifdef Q_BROWSER_HOST_TESTING
+                    const auto hooks = qbrowser_host_testing::
+                        installedPackageWorkerLauncherTestHooks();
+                    if (hooks.beforeAdmissionDecision) {
+                        hooks.beforeAdmissionDecision(request);
+                    }
+#endif
+                    const UpdateLifecycleAction action =
+                        coordinator.admitAuthenticatedWorker(
+                            request.key, request.expectedActivation);
+                    const bool accepted = action == UpdateLifecycleAction::None;
+                    complete({accepted,
+                              accepted
+                                  ? QString{}
+                                  : QStringLiteral(
+                                        "host.launch.admission_rejected")});
+                });
         },
         [guard](std::unique_ptr<IpcSession> session,
                 std::unique_ptr<WorkerSurface> surface,
@@ -258,10 +281,15 @@ bool HostApplication::initializePackageRuntime()
                 || error.startsWith(QStringLiteral("sandbox.process."))
                 || error.startsWith(QStringLiteral("sandbox.job."))
                 || error.startsWith(QStringLiteral("sandbox.acl."));
+            const bool admissionFailure = error.startsWith(
+                QStringLiteral("host.launch.admission_"));
             (void)guard->enqueueLifecycle(
-                [key, cleanupFailure](UpdateLifecycleCoordinator &coordinator) {
+                [key, cleanupFailure, admissionFailure](
+                    UpdateLifecycleCoordinator &coordinator) {
                     if (cleanupFailure) {
                         (void)coordinator.workerCleanupFailed(key);
+                    } else if (admissionFailure) {
+                        (void)coordinator.workerAdmissionFailed(key);
                     } else {
                         (void)coordinator.workerExited(
                             key, WorkerExitReason::StartupFailure);
@@ -286,7 +314,7 @@ bool HostApplication::initializePackageRuntime()
 
     QPointer<InstalledPackageWorkerLauncher> launcher(installedPackageLauncher_.get());
     auto coordinator = std::make_unique<UpdateLifecycleCoordinator>(
-        runtimeConfig_->appId(), *store, *installer,
+        runtimeConfig_->appId(), authority->store(), authority->installer(),
         WorkerSupervisionPolicy{runtimeConfig_->healthWindowMs(),
                                 runtimeConfig_->heartbeatTimeoutMs()},
         [launcher](const UpdateLaunchRequest &request) {
@@ -304,7 +332,7 @@ bool HostApplication::initializePackageRuntime()
     });
 
     auto *const runtime = new HostLifecycleRuntime(
-        std::move(store), std::move(installer), std::move(recorder),
+        std::move(authority), std::move(recorder),
         std::move(coordinator));
     auto *const lifecycleThread = new QThread;
     lifecycleThread->setObjectName(QStringLiteral("host-update-lifecycle"));
@@ -407,26 +435,6 @@ HostApplication::attachWorkerContext(HostWorkerAttachContext context)
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
     attachedWorkerKey_ = context.supervisionKey;
-    if (attachedWorkerKey_.has_value()) {
-        const WorkerAttemptKey key = *attachedWorkerKey_;
-        QPointer<HostApplication> guard(this);
-        if (!enqueueLifecycle([guard, key](UpdateLifecycleCoordinator &coordinator) {
-                const UpdateLifecycleAction action =
-                    coordinator.authenticatedHandshake(key);
-                if ((action == UpdateLifecycleAction::FailedClosed
-                     || action == UpdateLifecycleAction::IgnoredStaleAttempt)
-                    && guard) {
-                    QMetaObject::invokeMethod(guard, [guard] {
-                        if (guard) guard->detachWorkerContext(QStringLiteral(
-                            "host.worker_context.supervision_rejected"));
-                    }, Qt::QueuedConnection);
-                }
-            })) {
-            detachWorkerContext(
-                QStringLiteral("host.worker_context.supervision_queue_full"));
-            return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-        }
-    }
     Q_ASSERT(mainWindow_->workerSurface() == surface);
     return InstalledPackageWorkerLauncher::AttachResult::Attached;
 }

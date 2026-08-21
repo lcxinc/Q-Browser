@@ -27,6 +27,12 @@ public:
         ConsumedFailure,
     };
 
+    struct AdmissionResult final
+    {
+        bool accepted = false;
+        QString stableError;
+    };
+
     using AttachCallback = std::function<AttachResult(
         std::unique_ptr<IpcSession>,
         std::unique_ptr<WorkerSurface>,
@@ -37,12 +43,16 @@ public:
     using FailureCallback = std::function<void(WorkerAttemptKey, const QString &)>;
     using BindingValidator = std::function<InstallResult(
         const QString &, const ActivationBinding &)>;
+    using AdmissionCompletion = std::function<void(AdmissionResult)>;
+    using AdmissionCallback = std::function<bool(
+        const UpdateLaunchRequest &, AdmissionCompletion)>;
 
     InstalledPackageWorkerLauncher(SandboxTrustBoundary boundary,
                                    QString workerExecutable,
                                    QString sandboxTempRoot,
                                    QUrl apiOrigin,
                                    BindingValidator validateBinding,
+                                   AdmissionCallback requestAdmission,
                                    AttachCallback attach,
                                    StopCallback stop,
                                    ExitCallback exited,
@@ -75,8 +85,12 @@ private:
     struct LaunchRetirementContext;
     struct ReadyPayload;
 
-    void completeLaunch(quint64 serial, std::shared_ptr<ReadyPayload> payload);
-    void observeProcess(std::shared_ptr<LaunchRetirementContext> context);
+    void requestAdmission(quint64 serial, std::shared_ptr<ReadyPayload> payload);
+    void completeLaunch(quint64 serial,
+                        std::shared_ptr<ReadyPayload> payload,
+                        AdmissionResult admission);
+    void observeProcess(std::shared_ptr<LaunchRetirementContext> context,
+                        SandboxProcessWaitHandle waitHandle);
     void handleRetirement(
         std::shared_ptr<LaunchRetirementContext> context,
         bool succeeded,
@@ -88,6 +102,7 @@ private:
     QString sandboxTempRoot_;
     QUrl apiOrigin_;
     BindingValidator validateBinding_;
+    AdmissionCallback requestAdmission_;
     AttachCallback attach_;
     StopCallback stop_;
     ExitCallback exited_;

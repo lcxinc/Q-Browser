@@ -4,8 +4,10 @@
 #include "MainWindow.h"
 #include "PackageInstaller.h"
 #include "PackageStore.h"
+#include "RuntimePackageAuthority.h"
 #include "UpdateTestSupport.h"
 #include "WorkerTestEnvironment.h"
+#include "WorkerRetirementManager.h"
 
 #include <QApplication>
 #include <QDir>
@@ -21,6 +23,7 @@
 #include <qt_windows.h>
 #include <Aclapi.h>
 
+#include <future>
 #include <mutex>
 
 namespace
@@ -104,15 +107,105 @@ private slots:
     void signedInstalledPackagesDriveAutomaticRealWorkerRollback();
     void activationChangedBeforeProcessLaunchNeverAdmitsStaleWorker();
     void activationChangedBeforeHandshakeNeverAdmitsStaleWorker();
+    void activationChangedAfterHandshakeBeforeAdmissionNeverAttaches();
     void destroyedLauncherRetiresHandshakeCompletedInflightLaunch();
+    void hostDestroyBeforeFirstValidationKeepsAuthorityAlive();
+    void hostDestroyBetweenValidationsKeepsAuthorityAlive();
     void tempCleanupFailureStopsAdmissionAndCanBeRetried();
+    void cleanupFailureOutlivesDestroyedHostAndAutoRecovers();
+    void repeatedLiveCancellationLeavesNoObserversOrContexts();
+    void admissionTimeoutRejectsLateAcceptedReplay();
+    void lifecycleQueueFullBeforeAdmissionNeverAttaches();
     void processWaitCleanupFailureIsFatalAndRetryable();
     void aclRestoreCleanupFailureIsFatalAndRetryable();
+    void readyHandlerCanDestroyHostWithoutUseAfterFree();
+    void retirementThreadStartFailureIsFatalAndRetryable();
+    void checkedShutdownWaitsForInflightLaunchRegistration();
 };
 
 namespace
 {
-void runActivationAdmissionRace(const bool activateAfterProcessStart)
+enum class ActivationRacePoint
+{
+    BeforeProcessLaunch,
+    BeforeHandshake,
+    BeforeAdmission,
+};
+
+void runHostDestroyDuringValidation(const bool beforeFirstValidation)
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("authority-lifetime"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+
+    QSemaphore entered;
+    QSemaphore release;
+    std::atomic_bool barrierEntered = false;
+    const auto barrier = [&](const UpdateLaunchRequest &) {
+        barrierEntered.store(true, std::memory_order_release);
+        entered.release();
+        release.acquire();
+    };
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    if (beforeFirstValidation) {
+        hooks.beforeBindingValidation = barrier;
+    } else {
+        hooks.afterBindingValidationBeforeProcessLaunch = barrier;
+    }
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    const qsizetype liveBefore = RuntimePackageAuthority::liveCountForTesting();
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        barrierEntered.load(std::memory_order_acquire), 30'000);
+    QVERIFY(entered.tryAcquire());
+    QCOMPARE(RuntimePackageAuthority::liveCountForTesting(), liveBefore + 1);
+    host.reset();
+    QCOMPARE(RuntimePackageAuthority::liveCountForTesting(), liveBefore + 1);
+    if (beforeFirstValidation) QTest::qWait(2'000);
+    release.release();
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    QTRY_COMPARE_WITH_TIMEOUT(
+        RuntimePackageAuthority::liveCountForTesting(), liveBefore, 10'000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
+}
+
+void runActivationAdmissionRace(const ActivationRacePoint racePoint)
 {
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
@@ -129,8 +222,13 @@ void runActivationAdmissionRace(const bool activateAfterProcessStart)
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
-    const QByteArray qml = QByteArrayLiteral(
-        "import QtQuick\nItem { width: 320; height: 200 }");
+    const QByteArray qml = racePoint == ActivationRacePoint::BeforeAdmission
+        ? QByteArrayLiteral(
+              "import QtQuick\nItem { width: 320; height: 200; "
+              "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", "
+              "{ kind: \"staleAdmission\" }) }")
+        : QByteArrayLiteral(
+              "import QtQuick\nItem { width: 320; height: 200 }");
     const QString packageA = updateSignedPackage(
         temporary, QStringLiteral("binding-a"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem, false, qml, environment.appId());
@@ -156,9 +254,8 @@ void runActivationAdmissionRace(const bool activateAfterProcessStart)
     std::atomic_bool activationSucceeded = false;
     std::mutex activationResultMutex;
     QString activationStableError;
-    const auto activateB = [&](const UpdateLaunchRequest &request) {
-        if (request.packageVersion != QStringLiteral("1.0.0")
-            || activatedB.exchange(true)) return;
+    const auto activateB = [&] {
+        if (activatedB.exchange(true)) return;
         const InstallResult installed = competingInstaller.install(packageB);
         {
             std::lock_guard lock(activationResultMutex);
@@ -168,10 +265,21 @@ void runActivationAdmissionRace(const bool activateAfterProcessStart)
         activationFinished.store(true);
     };
     qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
-    if (activateAfterProcessStart) {
-        hooks.afterProcessStartBeforeHandshake = activateB;
-    } else {
-        hooks.afterBindingValidationBeforeProcessLaunch = activateB;
+    const auto activateForRequest = [&](const UpdateLaunchRequest &request) {
+        if (request.packageVersion == QStringLiteral("1.0.0")) activateB();
+    };
+    switch (racePoint) {
+    case ActivationRacePoint::BeforeProcessLaunch:
+        hooks.afterBindingValidationBeforeProcessLaunch = activateForRequest;
+        break;
+    case ActivationRacePoint::BeforeHandshake:
+        hooks.afterProcessStartBeforeHandshake = activateForRequest;
+        break;
+    case ActivationRacePoint::BeforeAdmission:
+        hooks.afterHandshakeBeforeCompletionQueued = [&](const quint32) {
+            activateB();
+        };
+        break;
     }
     qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
         std::move(hooks));
@@ -194,6 +302,8 @@ void runActivationAdmissionRace(const bool activateAfterProcessStart)
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
     QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QSignalSpy capability(
+        host.get(), &HostApplication::workerCapabilityRequestObserved);
     QVERIFY(host->start());
     QTRY_VERIFY_WITH_TIMEOUT(activatedB.load(), 30'000);
     QTRY_VERIFY_WITH_TIMEOUT(activationFinished.load(), 30'000);
@@ -207,6 +317,8 @@ void runActivationAdmissionRace(const bool activateAfterProcessStart)
 
     qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
     QCOMPARE(ready.count(), 0);
+    QCOMPARE(capability.count(), 0);
+    QVERIFY(!host->hasWorkerContext());
     const ActivationState stateAfterRejection = competingStore.activationState(
         environment.appId()).state;
     QVERIFY(stateAfterRejection.current.startsWith(QStringLiteral("1.1.0-")));
@@ -289,14 +401,29 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
 }
 }
 
+void ProductionUpdateRuntimeTest::hostDestroyBeforeFirstValidationKeepsAuthorityAlive()
+{
+    runHostDestroyDuringValidation(true);
+}
+
+void ProductionUpdateRuntimeTest::hostDestroyBetweenValidationsKeepsAuthorityAlive()
+{
+    runHostDestroyDuringValidation(false);
+}
+
 void ProductionUpdateRuntimeTest::activationChangedBeforeProcessLaunchNeverAdmitsStaleWorker()
 {
-    runActivationAdmissionRace(false);
+    runActivationAdmissionRace(ActivationRacePoint::BeforeProcessLaunch);
 }
 
 void ProductionUpdateRuntimeTest::activationChangedBeforeHandshakeNeverAdmitsStaleWorker()
 {
-    runActivationAdmissionRace(true);
+    runActivationAdmissionRace(ActivationRacePoint::BeforeHandshake);
+}
+
+void ProductionUpdateRuntimeTest::activationChangedAfterHandshakeBeforeAdmissionNeverAttaches()
+{
+    runActivationAdmissionRace(ActivationRacePoint::BeforeAdmission);
 }
 
 void ProductionUpdateRuntimeTest::processWaitCleanupFailureIsFatalAndRetryable()
@@ -460,6 +587,523 @@ void ProductionUpdateRuntimeTest::tempCleanupFailureStopsAdmissionAndCanBeRetrie
     host.reset();
     QVERIFY(QFile::remove(marker));
     QVERIFY(QDir().rmdir(competitor));
+}
+
+void ProductionUpdateRuntimeTest::cleanupFailureOutlivesDestroyedHostAndAutoRecovers()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("manager-outlives-host"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    const QString persistentPackage = updateSignedPackage(
+        temporary, QStringLiteral("manager-persistent"),
+        QStringLiteral("1.1.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    QVERIFY(!persistentPackage.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QVERIFY(host->start());
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 30'000);
+    const quint32 pid = ready.first().at(5).toUInt();
+
+    QSemaphore releaseFirstFailure;
+    std::atomic_int cleanupAttempts = 0;
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.failWorkerTempCleanup = [&](const QString &) {
+        const int attempt = cleanupAttempts.fetch_add(1) + 1;
+        if (attempt == 1) {
+            releaseFirstFailure.acquire();
+            return true;
+        }
+        return false;
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    QVERIFY(terminateProcessId(pid));
+    QTRY_COMPARE_WITH_TIMEOUT(cleanupAttempts.load(), 1, 10'000);
+
+    QElapsedTimer destruction;
+    destruction.start();
+    host.reset();
+    QVERIFY(destruction.elapsed() < 100);
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    releaseFirstFailure.release();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+    const QString workers = QDir(environment.sandboxTempRoot()).filePath(
+        QStringLiteral("workers"));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(workers).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
+
+    QStringList persistentArguments = arguments;
+    for (QString &argument : persistentArguments) {
+        if (argument.startsWith(QStringLiteral("--install-package="))) {
+            argument = QStringLiteral("--install-package=") + persistentPackage;
+        }
+    }
+    HostRuntimeConfigResult persistentParsed =
+        HostRuntimeConfig::fromArguments(persistentArguments);
+    QVERIFY(persistentParsed.value.has_value());
+    auto persistentHost = std::make_unique<HostApplication>(
+        std::move(*persistentParsed.value));
+    QSignalSpy persistentReady(
+        persistentHost.get(), &HostApplication::packageWorkerReady);
+    QVERIFY(persistentHost->start());
+    QTRY_COMPARE_WITH_TIMEOUT(persistentReady.count(), 1, 30'000);
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks persistentHooks;
+    persistentHooks.failWorkerTempCleanup = [](const QString &) { return true; };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(persistentHooks));
+    QVERIFY(terminateProcessId(persistentReady.first().at(5).toUInt()));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        WorkerRetirementManager::instance().status().fatal, qsizetype(1), 10'000);
+    destruction.restart();
+    persistentHost.reset();
+    QVERIFY(destruction.elapsed() < 100);
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    QVERIFY(WorkerRetirementManager::instance().retryFatal());
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(workers).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
+}
+
+void ProductionUpdateRuntimeTest::repeatedLiveCancellationLeavesNoObserversOrContexts()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    QStringList packages;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        packages.push_back(updateSignedPackage(
+            temporary,
+            QStringLiteral("cancel-repeat-%1").arg(iteration),
+            QStringLiteral("1.%1.0").arg(iteration),
+            keys.value().privateKeyPem, false,
+            QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+            environment.appId()));
+        QVERIFY(!packages.back().isEmpty());
+    }
+    const qsizetype contextsBefore =
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts();
+    const qsizetype observersBefore =
+        qbrowser_host_testing::installedPackageWorkerActiveObservers();
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        const QStringList arguments{
+            QStringLiteral("--package-mode"),
+            QStringLiteral("--app-id=") + environment.appId(),
+            QStringLiteral("--trusted-public-key=") + publicKey,
+            QStringLiteral("--package-store=") + environment.packageRoot(),
+            QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+            QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+            QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+            QStringLiteral("--telemetry-directory=") + telemetry,
+            QStringLiteral("--install-package=") + packages.at(iteration),
+            QStringLiteral("--heartbeat-timeout-ms=30000"),
+        };
+        HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+        QVERIFY(parsed.value.has_value());
+        auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+        QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+        QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+        QVERIFY(host->start());
+        QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1 || !failed.isEmpty(), 30'000);
+        QVERIFY2(ready.count() == 1,
+                 failed.isEmpty()
+                     ? "worker did not become ready"
+                     : qPrintable(failed.last().at(0).toString()));
+        const quint32 pid = ready.first().at(5).toUInt();
+        QElapsedTimer destruction;
+        destruction.start();
+        host.reset();
+        QVERIFY(destruction.elapsed() < 100);
+        QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+        QVERIFY(waitForProcessExit(pid, 10'000));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qbrowser_host_testing::installedPackageWorkerActiveObservers(),
+            observersBefore, 10'000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+            contextsBefore, 10'000);
+    }
+}
+
+void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("admission-timeout"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral(
+            "import QtQuick\nItem { width: 320; height: 200; "
+            "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", "
+            "{ kind: \"lateAdmission\" }) }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+    QSemaphore releaseAdmission;
+    std::atomic_bool admissionBlocked = false;
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.beforeAdmissionDecision = [&](const UpdateLaunchRequest &) {
+        admissionBlocked.store(true, std::memory_order_release);
+        releaseAdmission.acquire();
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy capability(
+        host.get(), &HostApplication::workerCapabilityRequestObserved);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        admissionBlocked.load(std::memory_order_acquire), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 10'000);
+    QCOMPARE(failed.last().at(0).toString(),
+             QStringLiteral("host.launch.admission_timeout"));
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(capability.count(), 0);
+    QVERIFY(!host->hasWorkerContext());
+
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    releaseAdmission.release();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QTest::qWait(500);
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(capability.count(), 0);
+    QVERIFY(!host->hasWorkerContext());
+    host.reset();
+}
+
+void ProductionUpdateRuntimeTest::lifecycleQueueFullBeforeAdmissionNeverAttaches()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("admission-queue-full"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral(
+            "import QtQuick\nItem { width: 320; height: 200; "
+            "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", "
+            "{ kind: \"queueFullAdmission\" }) }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+    HostApplication *hostPointer = nullptr;
+    std::atomic_bool queueHookInvoked = false;
+    std::atomic_bool queueMutationSucceeded = false;
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.afterHandshakeBeforeCompletionQueued = [&](const quint32) {
+        queueHookInvoked.store(true, std::memory_order_release);
+        if (hostPointer == nullptr) return;
+        queueMutationSucceeded.store(QMetaObject::invokeMethod(
+            hostPointer,
+            [hostPointer] {
+                hostPointer->forceLifecycleQueueFullForTesting(true);
+            }, Qt::BlockingQueuedConnection), std::memory_order_release);
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    hostPointer = host.get();
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy capability(
+        host.get(), &HostApplication::workerCapabilityRequestObserved);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 30'000);
+    QVERIFY(queueHookInvoked.load(std::memory_order_acquire));
+    QVERIFY(queueMutationSucceeded.load(std::memory_order_acquire));
+    QCOMPARE(failed.last().at(0).toString(),
+             QStringLiteral("host.launch.admission_unavailable"));
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(capability.count(), 0);
+    QVERIFY(!host->hasWorkerContext());
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    host.reset();
+}
+
+void ProductionUpdateRuntimeTest::readyHandlerCanDestroyHostWithoutUseAfterFree()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("ready-destroy"), QStringLiteral("1.0.0"),
+        keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+
+    const qsizetype contextsBefore =
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts();
+    const qsizetype observersBefore =
+        qbrowser_host_testing::installedPackageWorkerActiveObservers();
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    std::atomic_bool destroyedFromReady = false;
+    std::atomic<quint32> processId = 0;
+    connect(host.get(), &HostApplication::packageWorkerReady, this,
+            [&](const QString &, const QString &, const QString &,
+                const quint64, const quint64, const quint32 pid) {
+        processId.store(pid, std::memory_order_release);
+        host.reset();
+        destroyedFromReady.store(true, std::memory_order_release);
+    });
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        destroyedFromReady.load(std::memory_order_acquire) || !failed.isEmpty(),
+        30'000);
+    QVERIFY2(destroyedFromReady.load(std::memory_order_acquire),
+             failed.isEmpty()
+                 ? "worker did not become ready"
+                 : qPrintable(failed.last().at(0).toString()));
+    QVERIFY(processId.load(std::memory_order_acquire) != 0);
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(waitForProcessExit(processId.load(std::memory_order_acquire), 10'000));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerActiveObservers(),
+        observersBefore, 10'000);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore, 10'000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
+}
+
+void ProductionUpdateRuntimeTest::retirementThreadStartFailureIsFatalAndRetryable()
+{
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+    std::atomic_int completions = 0;
+    std::atomic_bool firstCompletionSucceeded = true;
+    std::mutex errorMutex;
+    QString firstError;
+    qbrowser_host_testing::failNextWorkerRetirementThreadStartForTesting();
+    const WorkerRetirementManager::Ticket ticket =
+        WorkerRetirementManager::instance().retire(
+            [] { return WorkerRetirementAttemptResult{true, {}}; },
+            [&](const bool succeeded, const QString &stableError) {
+                const int completion = completions.fetch_add(1) + 1;
+                if (completion == 1) {
+                    firstCompletionSucceeded.store(
+                        succeeded, std::memory_order_release);
+                    std::lock_guard lock(errorMutex);
+                    firstError = stableError;
+                }
+            });
+    QVERIFY(ticket != 0);
+    QTRY_COMPARE_WITH_TIMEOUT(completions.load(), 1, 5'000);
+    QVERIFY(!firstCompletionSucceeded.load(std::memory_order_acquire));
+    const WorkerRetirementStatus failed =
+        WorkerRetirementManager::instance().status();
+    QCOMPARE(failed.fatal, 1);
+    QCOMPARE(failed.activeThreads, 0);
+    {
+        std::lock_guard lock(errorMutex);
+        QCOMPARE(firstError,
+                 QStringLiteral("host.launch.retirement_thread_unavailable"));
+    }
+    QVERIFY(WorkerRetirementManager::instance().retryFatal());
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QCOMPARE(completions.load(), 2);
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+}
+
+void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistration()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectTrustKey(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("checked-shutdown"), QStringLiteral("1.0.0"),
+        keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+    };
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    QVERIFY(parsed.value.has_value());
+
+    QSemaphore releaseValidation;
+    std::atomic_bool validationBlocked = false;
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.beforeBindingValidation = [&](const UpdateLaunchRequest &) {
+        validationBlocked.store(true, std::memory_order_release);
+        releaseValidation.acquire();
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        validationBlocked.load(std::memory_order_acquire), 30'000);
+    host.reset();
+
+    auto shutdown = std::async(std::launch::async, [] {
+        return WorkerRetirementManager::instance().shutdownChecked(10'000);
+    });
+    const bool returnedBeforeLaunchFinished =
+        shutdown.wait_for(std::chrono::milliseconds(250))
+        == std::future_status::ready;
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    releaseValidation.release();
+    const bool shutdownSucceeded = shutdown.get();
+
+    QVERIFY(!returnedBeforeLaunchFinished);
+    QVERIFY(shutdownSucceeded);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
 }
 
 void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorkerRollback()

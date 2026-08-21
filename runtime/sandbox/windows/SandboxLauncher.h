@@ -30,6 +30,33 @@ void resetSandboxProcessTestHooks();
 }
 #endif
 
+enum class SandboxProcessWaitResult
+{
+    Finished,
+    Timeout,
+    Error,
+};
+
+class SandboxProcessWaitHandle final
+{
+public:
+    SandboxProcessWaitHandle() noexcept = default;
+    ~SandboxProcessWaitHandle();
+
+    SandboxProcessWaitHandle(const SandboxProcessWaitHandle &) = delete;
+    SandboxProcessWaitHandle &operator=(const SandboxProcessWaitHandle &) = delete;
+    SandboxProcessWaitHandle(SandboxProcessWaitHandle &&other) noexcept;
+    SandboxProcessWaitHandle &operator=(SandboxProcessWaitHandle &&other) noexcept;
+
+    [[nodiscard]] SandboxProcessWaitResult wait(int timeoutMs) const noexcept;
+
+private:
+    friend class SandboxProcess;
+    explicit SandboxProcessWaitHandle(HANDLE handle) noexcept;
+
+    HANDLE handle_ = nullptr;
+};
+
 class SandboxProcess final
 {
 public:
@@ -46,6 +73,8 @@ public:
     [[nodiscard]] HANDLE nativeProcessHandle() const noexcept;
     [[nodiscard]] DWORD processId() const noexcept;
     [[nodiscard]] QString appContainerSid() const;
+    [[nodiscard]] SandboxValueResult<SandboxProcessWaitHandle>
+        duplicateWaitHandle() const noexcept;
     bool waitForFinished(int timeoutMs) const noexcept;
     [[nodiscard]] DWORD exitCode() const noexcept;
     void requestTerminateNoWait(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;

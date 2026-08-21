@@ -360,6 +360,44 @@ const SandboxProcessTestHooks &sandboxProcessTestHooks()
 }
 #endif
 
+SandboxProcessWaitHandle::SandboxProcessWaitHandle(HANDLE handle) noexcept
+    : handle_(handle)
+{
+}
+
+SandboxProcessWaitHandle::~SandboxProcessWaitHandle()
+{
+    if (validHandle(handle_)) (void)CloseHandle(handle_);
+}
+
+SandboxProcessWaitHandle::SandboxProcessWaitHandle(
+    SandboxProcessWaitHandle &&other) noexcept
+    : handle_(std::exchange(other.handle_, nullptr))
+{
+}
+
+SandboxProcessWaitHandle &SandboxProcessWaitHandle::operator=(
+    SandboxProcessWaitHandle &&other) noexcept
+{
+    if (this != &other) {
+        if (validHandle(handle_)) (void)CloseHandle(handle_);
+        handle_ = std::exchange(other.handle_, nullptr);
+    }
+    return *this;
+}
+
+SandboxProcessWaitResult SandboxProcessWaitHandle::wait(
+    const int timeoutMs) const noexcept
+{
+    if (!validHandle(handle_) || timeoutMs < 0)
+        return SandboxProcessWaitResult::Error;
+    const DWORD waited = WaitForSingleObject(
+        handle_, static_cast<DWORD>(timeoutMs));
+    if (waited == WAIT_OBJECT_0) return SandboxProcessWaitResult::Finished;
+    if (waited == WAIT_TIMEOUT) return SandboxProcessWaitResult::Timeout;
+    return SandboxProcessWaitResult::Error;
+}
+
 SandboxProcess::~SandboxProcess()
 {
     closeBestEffort();
@@ -437,6 +475,28 @@ QString SandboxProcess::appContainerSid() const
 {
     std::lock_guard lock(mutex_);
     return appContainerSid_;
+}
+
+SandboxValueResult<SandboxProcessWaitHandle>
+SandboxProcess::duplicateWaitHandle() const noexcept
+{
+    HANDLE duplicate = nullptr;
+    {
+        std::lock_guard lock(mutex_);
+        if (!validHandle(process_)) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.invalid"),
+                    SandboxNativeError::win32(ERROR_INVALID_HANDLE)};
+        }
+        if (!DuplicateHandle(GetCurrentProcess(), process_,
+                             GetCurrentProcess(), &duplicate,
+                             SYNCHRONIZE, FALSE, 0)) {
+            return {std::nullopt,
+                    QStringLiteral("sandbox.process.wait_duplicate_failed"),
+                    SandboxNativeError::win32(GetLastError())};
+        }
+    }
+    return {SandboxProcessWaitHandle(duplicate), {}, {}};
 }
 
 bool SandboxProcess::waitForFinished(const int timeoutMs) const noexcept

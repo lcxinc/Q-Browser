@@ -11,6 +11,10 @@ add_library(q_browser_host STATIC
   InstalledPackageWorkerLauncher.h
   InstalledPackageWorkerLauncherTestHooks.cpp
   InstalledPackageWorkerLauncherTestHooks.h
+  RuntimePackageAuthority.cpp
+  RuntimePackageAuthority.h
+  WorkerRetirementManager.cpp
+  WorkerRetirementManager.h
   HostWorkerSessionController.cpp
   HostWorkerSessionController.h
   HostWorkerSessionIo.cpp

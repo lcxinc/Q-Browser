@@ -837,12 +837,10 @@ void UnifiedNavigationTest::failedWorkerContextAttachmentConsumesSurfaceExactlyO
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
 
-    const auto runFailure = [&](const bool failLifecycleAdmission) {
+    const auto runFailure = [&] {
         auto launch = environment.launch(
-            failLifecycleAdmission ? QStringLiteral("queue-failure")
-                                   : QStringLiteral("session-failure"),
-            failLifecycleAdmission ? QStringLiteral("queue-failure")
-                                   : QStringLiteral("session-failure"),
+            QStringLiteral("session-failure"),
+            QStringLiteral("session-failure"),
             100);
         QVERIFY2(launch.has_value(), qPrintable(environment.error()));
         QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
@@ -864,19 +862,11 @@ void UnifiedNavigationTest::failedWorkerContextAttachmentConsumesSurfaceExactlyO
 
         HostApplication application(server.origin());
         QVERIFY(application.start());
-        application.forceLifecycleQueueFullForTesting(failLifecycleAdmission);
         HostWorkerAttachContext context;
-        if (failLifecycleAdmission) {
-            context.session = std::make_unique<IpcSession>(
-                std::move(launch->hostSession));
-            context.supervisionKey = WorkerAttemptKey{
-                WorkerActivationId{1}, WorkerAttemptId{105}};
-        } else {
-            context.session = std::make_unique<IpcSession>(
-                WinPipeTransport{}, IpcRole::Host,
-                HostLaunchContext{QStringLiteral("invalid"),
-                                  QStringLiteral("com.qbrowser.pilot")});
-        }
+        context.session = std::make_unique<IpcSession>(
+            WinPipeTransport{}, IpcRole::Host,
+            HostLaunchContext{QStringLiteral("invalid"),
+                              QStringLiteral("com.qbrowser.pilot")});
         context.surface = std::move(surface);
         context.processLifetime = process;
         context.stopProcess = [process] {
@@ -894,8 +884,7 @@ void UnifiedNavigationTest::failedWorkerContextAttachmentConsumesSurfaceExactlyO
         application.mainWindow()->close();
     };
 
-    runFailure(false);
-    runFailure(true);
+    runFailure();
 }
 
 void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()

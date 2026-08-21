@@ -96,11 +96,16 @@ public:
     [[nodiscard]] UpdateLifecycleResult startOffline();
     [[nodiscard]] UpdateLifecycleAction authenticatedHandshake(
         WorkerAttemptKey key);
+    [[nodiscard]] UpdateLifecycleAction admitAuthenticatedWorker(
+        WorkerAttemptKey key,
+        const ActivationBinding &expectedBinding);
     [[nodiscard]] UpdateLifecycleAction heartbeat(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction checkHealth(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction workerExited(WorkerAttemptKey key,
                                                      WorkerExitReason reason);
     [[nodiscard]] UpdateLifecycleAction workerCleanupFailed(
+        WorkerAttemptKey key);
+    [[nodiscard]] UpdateLifecycleAction workerAdmissionFailed(
         WorkerAttemptKey key);
     void beginHostShutdown() noexcept;
 

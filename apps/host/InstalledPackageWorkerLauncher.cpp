@@ -1,6 +1,7 @@
 #include "InstalledPackageWorkerLauncher.h"
 
 #include "InstalledPackageWorkerLauncherTestHooks.h"
+#include "WorkerRetirementManager.h"
 
 #include "WindowsStableIo.h"
 #include "WorkerSurface.h"
@@ -11,14 +12,21 @@
 #include <QDirIterator>
 #include <QPointer>
 #include <QThread>
+#include <QTimer>
 #include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <utility>
 
 namespace
 {
+#ifdef Q_BROWSER_HOST_TESTING
+std::atomic<qsizetype> liveRetirementContexts{0};
+std::atomic<qsizetype> activeObservers{0};
+#endif
+
 struct ExpectedMessage final
 {
     bool succeeded = false;
@@ -202,6 +210,21 @@ bool cleanupOwnedWorkerTemp(
 
 }
 
+#ifdef Q_BROWSER_HOST_TESTING
+namespace qbrowser_host_testing
+{
+qsizetype installedPackageWorkerLiveRetirementContexts()
+{
+    return liveRetirementContexts.load(std::memory_order_acquire);
+}
+
+qsizetype installedPackageWorkerActiveObservers()
+{
+    return activeObservers.load(std::memory_order_acquire);
+}
+}
+#endif
+
 struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     : std::enable_shared_from_this<LaunchRetirementContext>
 {
@@ -209,16 +232,34 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     quint64 serial = 0;
     std::unique_ptr<IpcSession> session;
     std::shared_ptr<SandboxProcess> process;
+    std::optional<SandboxProcessWaitHandle> observerHandle;
     std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree;
     QString tempDirectory;
     QString windowHandle;
     std::function<void(std::shared_ptr<LaunchRetirementContext>, bool,
                        const QString &)> retired;
     std::atomic_bool launching{true};
-    std::atomic_bool retirementStarted{false};
+    std::atomic_bool retirementSubmitted{false};
     std::atomic_bool attached{false};
     std::atomic_bool fatalCleanupObserved{false};
+    std::atomic_bool observationFailed{false};
+    std::mutex launchMutex;
+    std::condition_variable launchChanged;
     std::mutex resourceMutex;
+
+    LaunchRetirementContext()
+    {
+#ifdef Q_BROWSER_HOST_TESTING
+        liveRetirementContexts.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    }
+
+    ~LaunchRetirementContext()
+    {
+#ifdef Q_BROWSER_HOST_TESTING
+        liveRetirementContexts.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+    }
 
     void requestTerminate() noexcept
     {
@@ -229,69 +270,81 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
 
     void launchFinished() noexcept
     {
-        launching.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(launchMutex);
+            launching.store(false, std::memory_order_release);
+        }
+        launchChanged.notify_all();
+    }
+
+    WorkerRetirementAttemptResult attemptRetirement()
+    {
+        {
+            std::unique_lock lock(launchMutex);
+            launchChanged.wait(lock, [this] {
+                return !launching.load(std::memory_order_acquire);
+            });
+        }
+        std::shared_ptr<SandboxProcess> ownedProcess;
+        std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
+            ownedTempTree;
+        QString ownedTempDirectory;
+        {
+            std::lock_guard lock(resourceMutex);
+            session.reset();
+            observerHandle.reset();
+            ownedProcess = process;
+            ownedTempTree = tempTree;
+            ownedTempDirectory = tempDirectory;
+        }
+        QString error;
+        if (ownedProcess != nullptr) {
+            ownedProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+            const auto closed = ownedProcess->close();
+            if (!closed.value.has_value()) {
+                error = closed.errorCode.isEmpty()
+                    ? QStringLiteral("host.launch.process_cleanup_failed")
+                    : closed.errorCode;
+            }
+        }
+        if (error.isEmpty() && ownedTempTree != nullptr
+            && !cleanupOwnedWorkerTemp(ownedTempDirectory, *ownedTempTree)) {
+            error = QStringLiteral("host.launch.temp_cleanup_failed");
+        }
+        if (!error.isEmpty()) return {false, error};
+        {
+            std::lock_guard lock(resourceMutex);
+            process.reset();
+            tempTree.reset();
+            tempDirectory.clear();
+        }
+        return {true, {}};
+    }
+
+    void submitRetirement()
+    {
+        bool expected = false;
+        if (!retirementSubmitted.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) return;
+        const auto self = shared_from_this();
+        const std::weak_ptr<LaunchRetirementContext> weak = self;
+        const auto ticket = WorkerRetirementManager::instance().retire(
+            [self] { return self->attemptRetirement(); },
+            [weak](const bool succeeded, const QString &stableError) {
+                const auto context = weak.lock();
+                if (context != nullptr && context->retired) {
+                    context->retired(context, succeeded, stableError);
+                }
+            });
+        if (ticket == 0 && retired) {
+            retired(self, false,
+                    QStringLiteral("host.launch.retirement_unavailable"));
+        }
     }
 
     void retireAsync()
     {
-        bool expected = false;
-        if (!retirementStarted.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) return;
-        auto self = shared_from_this();
-        QThread *const thread = QThread::create([self] {
-            while (self->launching.load(std::memory_order_acquire)) {
-                QThread::msleep(1);
-            }
-            std::shared_ptr<SandboxProcess> process;
-            std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
-                tempTree;
-            QString tempDirectory;
-            {
-                std::lock_guard lock(self->resourceMutex);
-                self->session.reset();
-                process = self->process;
-                tempTree = self->tempTree;
-                tempDirectory = self->tempDirectory;
-            }
-            QString error;
-            if (process != nullptr) {
-                if (process->nativeProcessHandle() != nullptr) {
-                    process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
-                    if (!process->waitForFinished(5'000)) {
-                        error = QStringLiteral("host.launch.process_wait_failed");
-                    }
-                }
-                if (error.isEmpty()) {
-                    const auto closed = process->close();
-                    if (!closed.value.has_value()) {
-                        error = closed.errorCode.isEmpty()
-                            ? QStringLiteral("host.launch.process_cleanup_failed")
-                            : closed.errorCode;
-                    }
-                }
-            }
-            if (error.isEmpty() && tempTree != nullptr
-                && !cleanupOwnedWorkerTemp(tempDirectory, *tempTree)) {
-                error = QStringLiteral("host.launch.temp_cleanup_failed");
-            }
-            const bool succeeded = error.isEmpty();
-            if (succeeded) {
-                std::lock_guard lock(self->resourceMutex);
-                self->process.reset();
-                self->tempTree.reset();
-                self->tempDirectory.clear();
-            }
-            if (self->retired) self->retired(self, succeeded, error);
-        });
-        QObject::connect(thread, &QThread::finished,
-                         thread, &QObject::deleteLater);
-        thread->start();
-    }
-
-    void retryAsync()
-    {
-        retirementStarted.store(false, std::memory_order_release);
-        retireAsync();
+        submitRetirement();
     }
 };
 
@@ -299,11 +352,14 @@ struct InstalledPackageWorkerLauncher::ReadyPayload final
 {
     ~ReadyPayload()
     {
-        if (!consumed && context != nullptr) context->retireAsync();
+        if (!consumed.load(std::memory_order_acquire) && context != nullptr)
+            context->retireAsync();
     }
 
     std::shared_ptr<LaunchRetirementContext> context;
-    bool consumed = false;
+    std::atomic_bool consumed{false};
+    std::atomic_bool admissionResolved{false};
+    QPointer<QTimer> admissionTimer;
 };
 
 InstalledPackageWorkerLauncher::InstalledPackageWorkerLauncher(
@@ -312,6 +368,7 @@ InstalledPackageWorkerLauncher::InstalledPackageWorkerLauncher(
     QString sandboxTempRoot,
     QUrl apiOrigin,
     BindingValidator validateBinding,
+    AdmissionCallback requestAdmission,
     AttachCallback attach,
     StopCallback stop,
     ExitCallback exited,
@@ -323,6 +380,7 @@ InstalledPackageWorkerLauncher::InstalledPackageWorkerLauncher(
     , sandboxTempRoot_(std::move(sandboxTempRoot))
     , apiOrigin_(std::move(apiOrigin))
     , validateBinding_(std::move(validateBinding))
+    , requestAdmission_(std::move(requestAdmission))
     , attach_(std::move(attach))
     , stop_(std::move(stop))
     , exited_(std::move(exited))
@@ -332,7 +390,8 @@ InstalledPackageWorkerLauncher::InstalledPackageWorkerLauncher(
         || sandboxTempRoot_.isEmpty() || !apiOrigin_.isValid()
         || apiOrigin_.scheme() != QStringLiteral("http")
         || apiOrigin_.host() != QStringLiteral("127.0.0.1")
-        || apiOrigin_.port() <= 0 || !validateBinding_ || !attach_ || !stop_ || !exited_
+        || apiOrigin_.port() <= 0 || !validateBinding_ || !requestAdmission_
+        || !attach_ || !stop_ || !exited_
         || !failed_) {
         accepting_ = false;
     }
@@ -446,6 +505,13 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 return;
             }
             WinPipeTransport hostPipe = pair.takeHost();
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto beforeValidationHooks =
+                qbrowser_host_testing::installedPackageWorkerLauncherTestHooks();
+            if (beforeValidationHooks.beforeBindingValidation) {
+                beforeValidationHooks.beforeBindingValidation(request);
+            }
+#endif
             const InstallResult prelaunch = validateBinding(
                 request.appId, request.expectedActivation);
             if (!matchesValidatedActivation(request, prelaunch)) {
@@ -475,9 +541,26 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 return;
             }
             {
-                std::lock_guard lock(context->resourceMutex);
-                context->process = std::make_shared<SandboxProcess>(
+                auto process = std::make_shared<SandboxProcess>(
                     std::move(*launched.process));
+                auto observer = process->duplicateWaitHandle();
+                if (!observer.value.has_value()) {
+                    const QString error = observer.errorCode.isEmpty()
+                        ? QStringLiteral("host.launch.process_observer_failed")
+                        : observer.errorCode;
+                    {
+                        std::lock_guard lock(context->resourceMutex);
+                        context->process = std::move(process);
+                    }
+                    if (guard) QMetaObject::invokeMethod(
+                        guard, [guard, key = request.key, error] {
+                            if (guard) guard->fail(key, error);
+                        }, Qt::QueuedConnection);
+                    return;
+                }
+                std::lock_guard lock(context->resourceMutex);
+                context->process = std::move(process);
+                context->observerHandle = std::move(*observer.value);
             }
 #ifdef Q_BROWSER_HOST_TESTING
             const auto processHooks =
@@ -531,7 +614,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             if (guard) QMetaObject::invokeMethod(
                 guard,
                 [guard, launchSerial, payload] {
-                    if (guard) guard->completeLaunch(launchSerial, payload);
+                    if (guard) guard->requestAdmission(launchSerial, payload);
                 },
                 Qt::QueuedConnection);
         });
@@ -540,15 +623,91 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     return true;
 }
 
-void InstalledPackageWorkerLauncher::completeLaunch(
+void InstalledPackageWorkerLauncher::requestAdmission(
     const quint64 serial,
     std::shared_ptr<ReadyPayload> payload)
 {
+    if (!accepting_ || serial != serial_ || payload == nullptr
+        || payload->context == nullptr) {
+        return;
+    }
+    auto *const timeout = new QTimer(this);
+    timeout->setSingleShot(true);
+    payload->admissionTimer = timeout;
+    QPointer<InstalledPackageWorkerLauncher> guard(this);
+    const std::weak_ptr<ReadyPayload> weakPayload = payload;
+    connect(timeout, &QTimer::timeout, this,
+            [guard, serial, weakPayload] {
+        const auto retained = weakPayload.lock();
+        if (guard && retained != nullptr) {
+            guard->completeLaunch(
+                serial, retained,
+                {false, QStringLiteral("host.launch.admission_timeout")});
+        }
+    });
+    timeout->start(5'000);
+    const bool queued = requestAdmission_(
+        payload->context->request,
+        [guard, serial, payload](AdmissionResult admission) mutable {
+            if (!guard) return;
+            (void)QMetaObject::invokeMethod(
+                guard,
+                [guard, serial, payload,
+                 admission = std::move(admission)]() mutable {
+                    if (guard) guard->completeLaunch(
+                        serial, payload, std::move(admission));
+                }, Qt::QueuedConnection);
+        });
+    if (!queued) {
+        completeLaunch(
+            serial, std::move(payload),
+            {false, QStringLiteral("host.launch.admission_unavailable")});
+    }
+}
+
+void InstalledPackageWorkerLauncher::completeLaunch(
+    const quint64 serial,
+    std::shared_ptr<ReadyPayload> payload,
+    AdmissionResult admission)
+{
     const std::shared_ptr<LaunchRetirementContext> context =
         payload != nullptr ? payload->context : nullptr;
+    if (payload == nullptr
+        || payload->admissionResolved.exchange(
+            true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (payload->admissionTimer) {
+        payload->admissionTimer->stop();
+        payload->admissionTimer->deleteLater();
+        payload->admissionTimer = nullptr;
+    }
+    if (!admission.accepted) {
+        if (context != nullptr) context->retireAsync();
+        fail(context != nullptr ? context->request.key : WorkerAttemptKey{},
+             admission.stableError.isEmpty()
+                 ? QStringLiteral("host.launch.admission_rejected")
+                 : admission.stableError);
+        return;
+    }
     if (!accepting_ || serial != serial_ || payload == nullptr
         || context == nullptr || context->process == nullptr
         || context->session == nullptr) {
+        return;
+    }
+    std::optional<SandboxProcessWaitHandle> observerHandle;
+    {
+        std::lock_guard lock(context->resourceMutex);
+        if (context->observerHandle.has_value()) {
+            observerHandle.emplace(std::move(*context->observerHandle));
+            context->observerHandle.reset();
+        }
+    }
+    if (!observerHandle.has_value()) {
+        context->observationFailed.store(true, std::memory_order_release);
+        context->retireAsync();
+        fail(context->request.key,
+             QStringLiteral("host.launch.process_observer_failed"));
         return;
     }
     std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
@@ -566,33 +725,53 @@ void InstalledPackageWorkerLauncher::completeLaunch(
         fail(context->request.key, QStringLiteral("host.launch.attach_failed"));
         return;
     }
-    payload->consumed = true;
+    payload->consumed.store(true, std::memory_order_release);
     context->attached.store(true, std::memory_order_release);
     inflight_.erase(serial);
     currentProcess_ = context->process;
     currentRetirement_ = context;
     currentKey_ = context->request.key;
     expectedStop_.reset();
-    emit ready(context->request.appId, context->request.packageVersion,
-               context->request.packageDirectory,
-               context->request.key.activation.value,
-               context->request.key.attempt.value,
-               context->process->processId());
-    observeProcess(context);
+    const QString readyAppId = context->request.appId;
+    const QString readyVersion = context->request.packageVersion;
+    const QString readyDirectory = context->request.packageDirectory;
+    const quint64 readyActivation = context->request.key.activation.value;
+    const quint64 readyAttempt = context->request.key.attempt.value;
+    const quint32 readyProcessId = context->process->processId();
+    observeProcess(context, std::move(*observerHandle));
+    emit ready(readyAppId, readyVersion, readyDirectory,
+               readyActivation, readyAttempt, readyProcessId);
 }
 
 void InstalledPackageWorkerLauncher::observeProcess(
-    std::shared_ptr<LaunchRetirementContext> context)
+    std::shared_ptr<LaunchRetirementContext> context,
+    SandboxProcessWaitHandle waitHandle)
 {
+#ifdef Q_BROWSER_HOST_TESTING
+    activeObservers.fetch_add(1, std::memory_order_acq_rel);
+#endif
     QThread *const observer = QThread::create(
-        [context = std::move(context)] {
-            std::shared_ptr<SandboxProcess> process;
+        [context = std::move(context),
+         waitHandle = std::move(waitHandle)]() mutable {
+#ifdef Q_BROWSER_HOST_TESTING
+            struct ObserverCount final
             {
-                std::lock_guard lock(context->resourceMutex);
-                process = context->process;
-            }
-            if (process != nullptr) {
-                while (!process->waitForFinished(100)) {}
+                ~ObserverCount()
+                {
+                    activeObservers.fetch_sub(1, std::memory_order_acq_rel);
+                }
+            } observerCount;
+            static_cast<void>(observerCount);
+#endif
+            for (;;) {
+                const SandboxProcessWaitResult waited = waitHandle.wait(100);
+                if (waited == SandboxProcessWaitResult::Finished) break;
+                if (waited == SandboxProcessWaitResult::Error) {
+                    context->observationFailed.store(
+                        true, std::memory_order_release);
+                    context->requestTerminate();
+                    break;
+                }
             }
             context->retireAsync();
     });
@@ -637,9 +816,15 @@ void InstalledPackageWorkerLauncher::handleRetirement(
     }
     if (wasAttached
         && !context->fatalCleanupObserved.load(std::memory_order_acquire)) {
-        if (!expected) emit unexpectedExit(
-            key.activation.value, key.attempt.value);
-        exited_(key, expected || context->serial != serial_);
+        if (context->observationFailed.load(std::memory_order_acquire)) {
+            accepting_ = false;
+            pendingRequest_.reset();
+            fail(key, QStringLiteral("host.launch.process_observer_failed"));
+        } else {
+            if (!expected) emit unexpectedExit(
+                key.activation.value, key.attempt.value);
+            exited_(key, expected || context->serial != serial_);
+        }
         expectedStop_.reset();
     }
     if (accepting_ && inflight_.empty() && currentProcess_ == nullptr
@@ -686,10 +871,7 @@ bool InstalledPackageWorkerLauncher::isAccepting() const noexcept
 #ifdef Q_BROWSER_HOST_TESTING
 bool InstalledPackageWorkerLauncher::retryFatalCleanupForTesting()
 {
-    if (fatalCleanup_.empty()) return false;
-    const auto failures = fatalCleanup_;
-    for (const auto &context : failures) context->retryAsync();
-    return true;
+    return WorkerRetirementManager::instance().retryFatal();
 }
 #endif
 

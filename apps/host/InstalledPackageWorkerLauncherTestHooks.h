@@ -13,10 +13,13 @@ namespace qbrowser_host_testing
 struct InstalledPackageWorkerLauncherTestHooks final
 {
     std::function<void(const UpdateLaunchRequest &)>
+        beforeBindingValidation;
+    std::function<void(const UpdateLaunchRequest &)>
         afterBindingValidationBeforeProcessLaunch;
     std::function<void(const UpdateLaunchRequest &)>
         afterProcessStartBeforeHandshake;
     std::function<void(quint32)> afterHandshakeBeforeCompletionQueued;
+    std::function<void(const UpdateLaunchRequest &)> beforeAdmissionDecision;
     std::function<bool(const QString &)> failWorkerTempCleanup;
 };
 
@@ -25,6 +28,8 @@ void setInstalledPackageWorkerLauncherTestHooks(
 void resetInstalledPackageWorkerLauncherTestHooks();
 [[nodiscard]] InstalledPackageWorkerLauncherTestHooks
 installedPackageWorkerLauncherTestHooks();
+[[nodiscard]] qsizetype installedPackageWorkerLiveRetirementContexts();
+[[nodiscard]] qsizetype installedPackageWorkerActiveObservers();
 }
 
 #endif

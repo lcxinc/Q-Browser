@@ -249,6 +249,20 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
     return UpdateLifecycleAction::None;
 }
 
+UpdateLifecycleAction UpdateLifecycleCoordinator::admitAuthenticatedWorker(
+    const WorkerAttemptKey key,
+    const ActivationBinding &expectedBinding)
+{
+    if (!currentKey_.has_value() || key != *currentKey_) {
+        return UpdateLifecycleAction::IgnoredStaleAttempt;
+    }
+    if (!currentBinding_.has_value()
+        || *currentBinding_ != expectedBinding) {
+        return enterFailedClosed();
+    }
+    return authenticatedHandshake(key);
+}
+
 UpdateLifecycleAction UpdateLifecycleCoordinator::heartbeat(
     const WorkerAttemptKey key)
 {
@@ -291,6 +305,13 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::workerExited(
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::workerCleanupFailed(
+    const WorkerAttemptKey key)
+{
+    Q_UNUSED(key);
+    return enterFailedClosed();
+}
+
+UpdateLifecycleAction UpdateLifecycleCoordinator::workerAdmissionFailed(
     const WorkerAttemptKey key)
 {
     Q_UNUSED(key);
