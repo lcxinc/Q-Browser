@@ -6,8 +6,11 @@
 #include "WorkerSurface.h"
 
 #include <QLabel>
+#include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QScopedValueRollback>
 #include <QStackedWidget>
+#include <QThread>
 #include <QVBoxLayout>
 #include <QVariantMap>
 #include <QWebEnginePage>
@@ -85,7 +88,27 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
             [this] { (void)goBack(); });
     connect(navigationBar_, &NavigationBar::forwardRequested, this,
             [this] { (void)goForward(); });
+    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
+            this, [this] { (void)shutdown(); });
     updateNavigationState();
+}
+
+bool MainWindow::shutdown()
+{
+    if (shutdown_) return shutdownSucceeded_;
+    shutdown_ = true;
+    hide();
+    QElapsedTimer windowDrain;
+    windowDrain.start();
+    while (windowDrain.elapsed() < 250) {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
+    if (webSurface_ != nullptr) {
+        shutdownSucceeded_ = webSurface_->shutdown();
+    }
+    return shutdownSucceeded_;
 }
 
 bool MainWindow::navigate(const QStringView input)

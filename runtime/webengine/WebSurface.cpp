@@ -5,7 +5,9 @@
 #include <QApplication>
 #include <QByteArrayView>
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QProcess>
+#include <QThread>
 #include <QVBoxLayout>
 #include <QWebEngineCertificateError>
 #include <QWebEngineDownloadRequest>
@@ -19,6 +21,10 @@
 #include <QWebEngineSettings>
 #include <QWebEngineView>
 
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
+
 #include <functional>
 #include <utility>
 
@@ -28,6 +34,21 @@ static void initializeHostResources()
 }
 
 namespace {
+
+bool processHasExited(const qint64 processId)
+{
+    if (processId <= 0) return true;
+#ifdef Q_OS_WIN
+    const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE,
+                                       static_cast<DWORD>(processId));
+    if (process == nullptr) return GetLastError() == ERROR_INVALID_PARAMETER;
+    const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+    CloseHandle(process);
+    return exited;
+#else
+    return false;
+#endif
+}
 
 bool disablesSandbox(const QString &argument)
 {
@@ -201,12 +222,47 @@ WebSurface::WebSurface(const QUrl &mockOrigin, QWidget *parent)
 
 WebSurface::~WebSurface()
 {
+    if (!shutdown_) {
+        if (view_) view_->setPage(nullptr);
+        if (profile_) profile_->setUrlRequestInterceptor(nullptr);
+    }
+}
+
+bool WebSurface::shutdown()
+{
+    if (shutdown_) return shutdownSucceeded_;
+    shutdown_ = true;
+    configurationValid_ = false;
+    if (page_) {
+        page_->triggerAction(QWebEnginePage::Stop);
+    }
     if (view_) {
+        view_->hide();
         view_->setPage(nullptr);
+        view_.reset();
+    }
+    qint64 rendererProcessId = 0;
+    if (page_) {
+        rendererProcessId = page_->renderProcessPid();
+        page_->setVisible(false);
+        page_->setLifecycleState(QWebEnginePage::LifecycleState::Discarded);
+        QElapsedTimer rendererShutdown;
+        rendererShutdown.start();
+        while (!processHasExited(rendererProcessId)
+               && rendererShutdown.elapsed() < 5'000) {
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(10);
+        }
+        shutdownSucceeded_ = processHasExited(rendererProcessId);
+        page_.reset();
     }
     if (profile_) {
         profile_->setUrlRequestInterceptor(nullptr);
+        profile_.reset();
     }
+    interceptor_.reset();
+    return shutdownSucceeded_;
 }
 
 QUrl WebSurface::trustedErrorUrl()

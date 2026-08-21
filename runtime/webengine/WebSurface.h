@@ -29,6 +29,7 @@ public:
 
     [[nodiscard]] bool isConfigurationValid() const noexcept;
     [[nodiscard]] bool navigate(const QUrl &url);
+    [[nodiscard]] bool shutdown();
     [[nodiscard]] QUrl currentUrl() const;
     [[nodiscard]] QWebEngineProfile *profile() const noexcept;
     [[nodiscard]] QWebEnginePage *page() const noexcept;
@@ -51,4 +52,6 @@ private:
     std::unique_ptr<QWebEngineView> view_;
     bool configurationValid_ = false;
     bool loadingTrustedError_ = false;
+    bool shutdown_ = false;
+    bool shutdownSucceeded_ = true;
 };

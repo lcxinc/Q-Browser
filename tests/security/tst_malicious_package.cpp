@@ -14,13 +14,13 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QtEndian>
-#include <QScopeGuard>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #include <Aclapi.h>
 #endif
 
+#include <algorithm>
 #include <iterator>
 #include <optional>
 
@@ -152,38 +152,158 @@ QByteArray minimalPeImage()
     return image;
 }
 
-void restoreWritableFiles(const QString &root)
+bool isWithinTestOwnedRoot(const QString &root, const QString &candidate)
 {
-    QDirIterator iterator(root,
-                          QDir::Files | QDir::Hidden | QDir::System
-                              | QDir::NoSymLinks,
-                          QDirIterator::Subdirectories);
-    while (iterator.hasNext()) {
-        const QString path = iterator.next();
+    const QString cleanRoot = QDir::fromNativeSeparators(
+        QDir::cleanPath(QFileInfo(root).absoluteFilePath()));
+    const QString cleanCandidate =
+        QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(candidate).absoluteFilePath()));
 #ifdef Q_OS_WIN
-        QString native = QDir::toNativeSeparators(path);
-        if (!native.startsWith(QStringLiteral("\\\\?\\"))) {
-            native = native.startsWith(QStringLiteral("\\\\"))
-                ? QStringLiteral("\\\\?\\UNC\\") + native.sliced(2)
-                : QStringLiteral("\\\\?\\") + native;
-        }
-        (void)SetNamedSecurityInfoW(
-            reinterpret_cast<LPWSTR>(native.data()), SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            nullptr, nullptr, nullptr, nullptr);
-        const DWORD attributes = GetFileAttributesW(
-            reinterpret_cast<LPCWSTR>(native.utf16()));
-        if (attributes != INVALID_FILE_ATTRIBUTES) {
-            (void)SetFileAttributesW(
-                reinterpret_cast<LPCWSTR>(native.utf16()),
-                attributes & ~FILE_ATTRIBUTE_READONLY);
-        }
+    const Qt::CaseSensitivity sensitivity = Qt::CaseInsensitive;
 #else
-        (void)QFile::setPermissions(
-            path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    const Qt::CaseSensitivity sensitivity = Qt::CaseSensitive;
 #endif
-    }
+    return cleanCandidate.compare(cleanRoot, sensitivity) == 0
+        || cleanCandidate.startsWith(cleanRoot + QLatin1Char('/'), sensitivity);
 }
+
+bool restoreWritableEntry(const QString &path, QString *error)
+{
+#ifdef Q_OS_WIN
+    QString native = QDir::toNativeSeparators(path);
+    if (!native.startsWith(QStringLiteral("\\\\?\\"))) {
+        native = native.startsWith(QStringLiteral("\\\\"))
+            ? QStringLiteral("\\\\?\\UNC\\") + native.sliced(2)
+            : QStringLiteral("\\\\?\\") + native;
+    }
+    const DWORD aclResult = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(native.data()), SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, nullptr, nullptr);
+    if (aclResult != ERROR_SUCCESS) {
+        if (error != nullptr) {
+            *error = QStringLiteral("ACL restore failed for %1: %2")
+                         .arg(path).arg(aclResult);
+        }
+        return false;
+    }
+    const auto *nativePath = reinterpret_cast<LPCWSTR>(native.utf16());
+    const DWORD attributes = GetFileAttributesW(nativePath);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (error != nullptr) {
+            *error = QStringLiteral("attribute read failed for %1: %2")
+                         .arg(path).arg(GetLastError());
+        }
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_READONLY) != 0U
+        && SetFileAttributesW(nativePath,
+                              attributes & ~FILE_ATTRIBUTE_READONLY) == FALSE) {
+        if (error != nullptr) {
+            *error = QStringLiteral("attribute restore failed for %1: %2")
+                         .arg(path).arg(GetLastError());
+        }
+        return false;
+    }
+#else
+    if (!QFile::setPermissions(
+            path, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                | QFileDevice::ExeOwner)) {
+        if (error != nullptr) {
+            *error = QStringLiteral("permissions restore failed for %1").arg(path);
+        }
+        return false;
+    }
+#endif
+    return true;
+}
+
+class TestOwnedTemporaryDir final : public QTemporaryDir
+{
+public:
+    TestOwnedTemporaryDir()
+        : ownedRoot_(QDir::fromNativeSeparators(
+              QDir::cleanPath(QFileInfo(path()).absoluteFilePath())))
+    {
+    }
+
+    ~TestOwnedTemporaryDir()
+    {
+        if (!cleaned_ && QFileInfo::exists(ownedRoot_)) {
+            (void)cleanup();
+        }
+    }
+
+    bool cleanup()
+    {
+        if (cleaned_) return cleanupError_.isEmpty();
+        cleanupError_.clear();
+        if (!isValid() || ownedRoot_.isEmpty()
+            || QDir::fromNativeSeparators(
+                   QDir::cleanPath(QFileInfo(path()).absoluteFilePath())) != ownedRoot_
+            || QFileInfo(ownedRoot_).fileName().startsWith(
+                   QStringLiteral("tst_malicious_package-")) == false) {
+            cleanupError_ = QStringLiteral("temporary root ownership validation failed: %1")
+                                .arg(ownedRoot_);
+            return false;
+        }
+        if (!QFileInfo::exists(ownedRoot_)) {
+            cleaned_ = true;
+            setAutoRemove(false);
+            return true;
+        }
+
+        QStringList paths{ownedRoot_};
+        QDirIterator iterator(
+            ownedRoot_,
+            QDir::AllEntries | QDir::Hidden | QDir::System
+                | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+            QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString entry = iterator.next();
+            if (!isWithinTestOwnedRoot(ownedRoot_, entry)) {
+                cleanupError_ = QStringLiteral("temporary entry escaped owned root: %1")
+                                    .arg(entry);
+                return false;
+            }
+            paths.push_back(entry);
+        }
+        std::sort(paths.begin(), paths.end(), [](const QString &left,
+                                                 const QString &right) {
+            return left.count(QLatin1Char('/')) > right.count(QLatin1Char('/'))
+                || (left.count(QLatin1Char('/')) == right.count(QLatin1Char('/'))
+                    && left.size() > right.size());
+        });
+        bool restored = true;
+        for (const QString &entry : paths) {
+            QString entryError;
+            if (!restoreWritableEntry(entry, &entryError)) {
+                restored = false;
+                if (cleanupError_.isEmpty()) cleanupError_ = entryError;
+            }
+        }
+        const bool removed = QDir(ownedRoot_).removeRecursively();
+        if (!removed || QFileInfo::exists(ownedRoot_)) {
+            if (cleanupError_.isEmpty()) {
+                cleanupError_ = QStringLiteral("temporary root removal failed: %1")
+                                    .arg(ownedRoot_);
+            }
+            return false;
+        }
+        cleaned_ = true;
+        setAutoRemove(false);
+        return restored;
+    }
+
+    QString cleanupError() const { return cleanupError_; }
+    QString ownedRoot() const { return ownedRoot_; }
+
+private:
+    QString ownedRoot_;
+    QString cleanupError_;
+    bool cleaned_ = false;
+};
 
 QByteArray manifest(const QString &version,
                     const QStringList &imports = {QStringLiteral("QtQuick")})
@@ -250,14 +370,13 @@ private slots:
     void rejectsNativeCodeForbiddenImportsAndRemoteSources();
     void rejectsSourceImportsMissingFromSignedManifest();
     void distinguishesBenignMzAssetFromRenamedPe();
+    void removesImmutableTestOwnedRoot();
 };
 
 void MaliciousPackageTest::rejectsWrongKeyAndSignedPayloadTamper()
 {
-    QTemporaryDir temporary;
+    TestOwnedTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
-        [&] { restoreWritableFiles(temporary.path()); });
     const auto trusted = SignatureVerifier::generateKeyPair();
     const auto attacker = SignatureVerifier::generateKeyPair();
     QVERIFY(trusted.hasValue());
@@ -286,14 +405,13 @@ void MaliciousPackageTest::rejectsWrongKeyAndSignedPayloadTamper()
     QVERIFY(!mutation.succeeded());
     QCOMPARE(mutation.error, InstallError::SignatureInvalid);
     QVERIFY(store.resolveCurrent(QStringLiteral("company.security")).path.isEmpty());
+    QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
 }
 
 void MaliciousPackageTest::rejectsZipSlipCanonicalCollisionAndResourceBombs()
 {
-    QTemporaryDir temporary;
+    TestOwnedTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
-        [&] { restoreWritableFiles(temporary.path()); });
     ArchiveLimits limits;
     limits.maximumEntries = 2;
     limits.maximumEntryBytes = 2;
@@ -364,14 +482,13 @@ void MaliciousPackageTest::rejectsZipSlipCanonicalCollisionAndResourceBombs()
         QCOMPARE(installed.error, InstallError::ArchiveInvalid);
         QVERIFY(store.resolveCurrent(QStringLiteral("company.security")).path.isEmpty());
     }
+    QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
 }
 
 void MaliciousPackageTest::rejectsNativeCodeForbiddenImportsAndRemoteSources()
 {
-    QTemporaryDir temporary;
+    TestOwnedTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
-        [&] { restoreWritableFiles(temporary.path()); });
     const auto keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
@@ -418,14 +535,13 @@ void MaliciousPackageTest::rejectsNativeCodeForbiddenImportsAndRemoteSources()
     const InstallResult remote = installer.install(remotePackage);
     QVERIFY(!remote.succeeded());
     QCOMPARE(remote.error, InstallError::PreflightRejected);
+    QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
 }
 
 void MaliciousPackageTest::rejectsSourceImportsMissingFromSignedManifest()
 {
-    QTemporaryDir temporary;
+    TestOwnedTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
-        [&] { restoreWritableFiles(temporary.path()); });
     const auto keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
@@ -470,14 +586,13 @@ void MaliciousPackageTest::rejectsSourceImportsMissingFromSignedManifest()
         QCOMPARE(store.resolveCurrent(QStringLiteral("company.security")).path,
                  expectedCurrent);
     }
+    QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
 }
 
 void MaliciousPackageTest::distinguishesBenignMzAssetFromRenamedPe()
 {
-    QTemporaryDir temporary;
+    TestOwnedTemporaryDir temporary;
     QVERIFY(temporary.isValid());
-    [[maybe_unused]] const auto writableCleanup = qScopeGuard(
-        [&] { restoreWritableFiles(temporary.path()); });
     const auto keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
@@ -500,6 +615,27 @@ void MaliciousPackageTest::distinguishesBenignMzAssetFromRenamedPe()
     QVERIFY(!renamedResult.succeeded());
     QCOMPARE(renamedResult.error, InstallError::PreflightRejected);
     QCOMPARE(store.resolveCurrent(QStringLiteral("company.security")).path, current);
+    QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
+}
+
+void MaliciousPackageTest::removesImmutableTestOwnedRoot()
+{
+    QString testOwnedRoot;
+    {
+        TestOwnedTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        testOwnedRoot = temporary.path();
+        const auto keys = SignatureVerifier::generateKeyPair();
+        QVERIFY(keys.hasValue());
+        PackageStore store(temporary.filePath(QStringLiteral("store")));
+        PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+        const QString package = signedPackage(
+            temporary, QStringLiteral("4.0.0"), keys.value().privateKeyPem);
+        QVERIFY(!package.isEmpty());
+        QVERIFY(installer.install(package).succeeded());
+        QVERIFY2(temporary.cleanup(), qPrintable(temporary.cleanupError()));
+    }
+    QVERIFY2(!QFileInfo::exists(testOwnedRoot), qPrintable(testOwnedRoot));
 }
 
 QTEST_MAIN(MaliciousPackageTest)

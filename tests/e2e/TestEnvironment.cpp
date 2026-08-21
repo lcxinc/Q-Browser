@@ -9,7 +9,6 @@
 #include "PackageStore.h"
 #include "SignatureVerifier.h"
 #include "WorkerRetirementManager.h"
-#include "WebSurface.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -20,11 +19,12 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QThread>
-#include <QWebEnginePage>
 
 #include <Aclapi.h>
 #include <qt_windows.h>
 #include <userenv.h>
+
+#include <limits>
 
 namespace {
 bool writeNewFile(const QString &path, const QByteArray &bytes)
@@ -96,6 +96,61 @@ bool processHasExited(const quint32 processId)
     CloseHandle(process);
     return exited;
 }
+
+bool stopOwnedProcess(QProcess &process, QString *error)
+{
+    if (process.state() == QProcess::NotRunning) return true;
+    const qint64 processId = process.processId();
+    if (processId <= 0 || processId > std::numeric_limits<DWORD>::max()) {
+        if (error != nullptr) {
+            *error = QStringLiteral("mock-api has no valid owned process id");
+        }
+        return false;
+    }
+    const HANDLE ownedProcess = OpenProcess(
+        SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE, static_cast<DWORD>(processId));
+    if (ownedProcess == nullptr) {
+        const DWORD openError = GetLastError();
+        if (openError == ERROR_INVALID_PARAMETER) return true;
+        if (error != nullptr) {
+            *error = QStringLiteral("mock-api process handle open failed: %1")
+                         .arg(openError);
+        }
+        return false;
+    }
+
+    process.terminate();
+    if (process.waitForFinished(5'000)
+        && WaitForSingleObject(ownedProcess, 0) == WAIT_OBJECT_0) {
+        CloseHandle(ownedProcess);
+        return true;
+    }
+    if (WaitForSingleObject(ownedProcess, 0) != WAIT_OBJECT_0) {
+        if (TerminateProcess(ownedProcess, ERROR_PROCESS_ABORTED) == FALSE) {
+            const DWORD terminationError = GetLastError();
+            if (WaitForSingleObject(ownedProcess, 0) != WAIT_OBJECT_0) {
+                CloseHandle(ownedProcess);
+                if (error != nullptr) {
+                    *error = QStringLiteral("mock-api native termination failed: %1")
+                                 .arg(terminationError);
+                }
+                return false;
+            }
+        }
+    }
+    const DWORD waitResult = WaitForSingleObject(ownedProcess, 10'000);
+    CloseHandle(ownedProcess);
+    if (waitResult != WAIT_OBJECT_0) {
+        if (error != nullptr) {
+            *error = QStringLiteral("mock-api owned process did not exit: %1")
+                         .arg(waitResult);
+        }
+        return false;
+    }
+    (void)process.waitForFinished(1'000);
+    return true;
+}
 }
 
 TestEnvironment::TestEnvironment()
@@ -123,13 +178,8 @@ bool TestEnvironment::shutdown()
     shutdown_ = true;
     const quint32 workerProcessId = currentWorkerProcessId_;
     if (host_ != nullptr && host_->mainWindow() != nullptr) {
-        WebSurface *webSurface = host_->mainWindow()->webSurface();
-        QWebEnginePage *page = webSurface != nullptr ? webSurface->page() : nullptr;
-        if (page != nullptr) {
-            page->setLifecycleState(QWebEnginePage::LifecycleState::Active);
-            page->triggerAction(QWebEnginePage::Stop);
-            page->setUrl(WebSurface::trustedErrorUrl());
-            (void)waitUntil([&] { return !page->isLoading(); }, 5'000);
+        if (!host_->mainWindow()->shutdown()) {
+            cleanupError_ = QStringLiteral("WebEngine renderer cleanup failed");
         }
     }
     host_.reset();
@@ -146,14 +196,9 @@ bool TestEnvironment::shutdown()
     if (!waitUntil([&] { return processHasExited(workerProcessId); }, 5'000)) {
         cleanupError_ = QStringLiteral("worker process remained alive after retirement");
     }
-    if (mockApi_.state() != QProcess::NotRunning) {
-        mockApi_.terminate();
-        if (!mockApi_.waitForFinished(5'000)) {
-            mockApi_.kill();
-            if (!mockApi_.waitForFinished(5'000)) {
-                cleanupError_ = QStringLiteral("mock-api process cleanup failed");
-            }
-        }
+    QString mockApiCleanupError;
+    if (!stopOwnedProcess(mockApi_, &mockApiCleanupError)) {
+        cleanupError_ = mockApiCleanupError;
     }
     mockApi_.close();
     if (!packages_.remove()) {
