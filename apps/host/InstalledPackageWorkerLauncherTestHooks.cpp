@@ -32,6 +32,18 @@ installedPackageWorkerLauncherTestHooks()
     std::lock_guard lock(hooksMutex);
     return currentHooks;
 }
+
+bool consumeLaunchThreadStartFailureForTesting()
+{
+    std::lock_guard lock(hooksMutex);
+    return std::exchange(currentHooks.failLaunchThreadStart, false);
+}
+
+bool consumeObserverThreadStartFailureForTesting()
+{
+    std::lock_guard lock(hooksMutex);
+    return std::exchange(currentHooks.failObserverThreadStart, false);
+}
 }
 
 #endif

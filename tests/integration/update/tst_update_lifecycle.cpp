@@ -15,7 +15,53 @@ class UpdateLifecycleTest final : public QObject
 private slots:
     void marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg();
     void wallClockJumpsDoNotAffectHealthAndHealthyCommitsOnce();
+    void staleAdmissionFailureDoesNotPoisonCurrentAttempt();
 };
+
+void UpdateLifecycleTest::staleAdmissionFailureDoesNotPoisonCurrentAttempt()
+{
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem,
+                               updateInstallPolicy());
+    QVector<UpdateLaunchRequest> launches;
+    ManualLifecycleClock clock;
+    UpdateLifecycleCoordinator coordinator(
+        QStringLiteral("company.pilot"), store, installer, {1'000, 300},
+        [&](const UpdateLaunchRequest &request) {
+            launches.push_back(request);
+            return true;
+        }, clock.source());
+
+    const QString packageA = updateSignedPackage(
+        temporary, QStringLiteral("stale-admission-a"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem);
+    const QString packageB = updateSignedPackage(
+        temporary, QStringLiteral("stale-admission-b"),
+        QStringLiteral("1.1.0"), keys.value().privateKeyPem);
+    QVERIFY(!packageA.isEmpty());
+    QVERIFY(!packageB.isEmpty());
+
+    clock.set(0);
+    QVERIFY(coordinator.installAndLaunch(packageA).succeeded());
+    const WorkerAttemptKey keyA = launches.back().key;
+    clock.set(1);
+    QVERIFY(coordinator.installAndLaunch(packageB).succeeded());
+    const WorkerAttemptKey keyB = launches.back().key;
+    QVERIFY(keyA != keyB);
+    const ActivationState stateB = store.activationState(
+        QStringLiteral("company.pilot")).state;
+
+    QCOMPARE(coordinator.workerAdmissionFailed(keyA),
+             UpdateLifecycleAction::IgnoredStaleAttempt);
+    QVERIFY(!coordinator.failedClosed());
+    QCOMPARE(coordinator.currentAttemptKey(), std::optional{keyB});
+    QCOMPARE(store.activationState(QStringLiteral("company.pilot")).state,
+             stateB);
+}
 
 void UpdateLifecycleTest::wallClockJumpsDoNotAffectHealthAndHealthyCommitsOnce()
 {

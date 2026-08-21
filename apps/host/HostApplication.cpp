@@ -228,18 +228,21 @@ bool HostApplication::initializePackageRuntime()
                     const auto hooks = qbrowser_host_testing::
                         installedPackageWorkerLauncherTestHooks();
                     if (hooks.beforeAdmissionDecision) {
-                        hooks.beforeAdmissionDecision(request);
+                        hooks.beforeAdmissionDecision(request, coordinator);
                     }
 #endif
                     const UpdateLifecycleAction action =
                         coordinator.admitAuthenticatedWorker(
                             request.key, request.expectedActivation);
                     const bool accepted = action == UpdateLifecycleAction::None;
+                    const bool ignoredStale = action
+                        == UpdateLifecycleAction::IgnoredStaleAttempt;
                     complete({accepted,
-                              accepted
+                              accepted || ignoredStale
                                   ? QString{}
                                   : QStringLiteral(
-                                        "host.launch.admission_rejected")});
+                                        "host.launch.admission_rejected"),
+                              ignoredStale});
                 });
         },
         [guard](std::unique_ptr<IpcSession> session,

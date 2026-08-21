@@ -19,8 +19,12 @@ struct InstalledPackageWorkerLauncherTestHooks final
     std::function<void(const UpdateLaunchRequest &)>
         afterProcessStartBeforeHandshake;
     std::function<void(quint32)> afterHandshakeBeforeCompletionQueued;
-    std::function<void(const UpdateLaunchRequest &)> beforeAdmissionDecision;
+    std::function<void(const UpdateLaunchRequest &,
+                       UpdateLifecycleCoordinator &)>
+        beforeAdmissionDecision;
     std::function<bool(const QString &)> failWorkerTempCleanup;
+    bool failLaunchThreadStart = false;
+    bool failObserverThreadStart = false;
 };
 
 void setInstalledPackageWorkerLauncherTestHooks(
@@ -28,7 +32,10 @@ void setInstalledPackageWorkerLauncherTestHooks(
 void resetInstalledPackageWorkerLauncherTestHooks();
 [[nodiscard]] InstalledPackageWorkerLauncherTestHooks
 installedPackageWorkerLauncherTestHooks();
+[[nodiscard]] bool consumeLaunchThreadStartFailureForTesting();
+[[nodiscard]] bool consumeObserverThreadStartFailureForTesting();
 [[nodiscard]] qsizetype installedPackageWorkerLiveRetirementContexts();
+[[nodiscard]] qsizetype installedPackageWorkerActiveLaunchThreads();
 [[nodiscard]] qsizetype installedPackageWorkerActiveObservers();
 }
 

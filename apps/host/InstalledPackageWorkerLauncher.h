@@ -31,6 +31,7 @@ public:
     {
         bool accepted = false;
         QString stableError;
+        bool ignoredStale = false;
     };
 
     using AttachCallback = std::function<AttachResult(
@@ -83,14 +84,16 @@ signals:
 
 private:
     struct LaunchRetirementContext;
+    struct ObserverStartGate;
     struct ReadyPayload;
 
     void requestAdmission(quint64 serial, std::shared_ptr<ReadyPayload> payload);
     void completeLaunch(quint64 serial,
                         std::shared_ptr<ReadyPayload> payload,
                         AdmissionResult admission);
-    void observeProcess(std::shared_ptr<LaunchRetirementContext> context,
-                        SandboxProcessWaitHandle waitHandle);
+    [[nodiscard]] std::shared_ptr<ObserverStartGate> observeProcess(
+        std::shared_ptr<LaunchRetirementContext> context,
+        SandboxProcessWaitHandle waitHandle);
     void handleRetirement(
         std::shared_ptr<LaunchRetirementContext> context,
         bool succeeded,

@@ -11,21 +11,56 @@
 #include <QFileInfo>
 #include <QDirIterator>
 #include <QPointer>
-#include <QThread>
 #include <QTimer>
 #include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
+#include <semaphore>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 namespace
 {
 #ifdef Q_BROWSER_HOST_TESTING
 std::atomic<qsizetype> liveRetirementContexts{0};
+std::atomic<qsizetype> activeLaunchThreads{0};
 std::atomic<qsizetype> activeObservers{0};
 #endif
+
+enum class LauncherThreadRole
+{
+    Launch,
+    Observer,
+};
+
+template<typename Task>
+bool startDetachedLauncherThread(const LauncherThreadRole role,
+                                 Task &&task) noexcept
+{
+    try {
+#ifdef Q_BROWSER_HOST_TESTING
+        const bool injectFailure = role == LauncherThreadRole::Launch
+            ? qbrowser_host_testing::
+                  consumeLaunchThreadStartFailureForTesting()
+            : qbrowser_host_testing::
+                  consumeObserverThreadStartFailureForTesting();
+        if (injectFailure) {
+            throw std::system_error(std::make_error_code(
+                std::errc::resource_unavailable_try_again));
+        }
+#else
+        Q_UNUSED(role);
+#endif
+        std::thread(std::forward<Task>(task)).detach();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 
 struct ExpectedMessage final
 {
@@ -222,6 +257,11 @@ qsizetype installedPackageWorkerActiveObservers()
 {
     return activeObservers.load(std::memory_order_acquire);
 }
+
+qsizetype installedPackageWorkerActiveLaunchThreads()
+{
+    return activeLaunchThreads.load(std::memory_order_acquire);
+}
 }
 #endif
 
@@ -281,9 +321,13 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     {
         {
             std::unique_lock lock(launchMutex);
-            launchChanged.wait(lock, [this] {
-                return !launching.load(std::memory_order_acquire);
-            });
+            if (!launchChanged.wait_for(
+                    lock, std::chrono::seconds(2), [this] {
+                        return !launching.load(std::memory_order_acquire);
+                    })) {
+                return {false,
+                        QStringLiteral("host.launch.retirement_wait_timeout")};
+            }
         }
         std::shared_ptr<SandboxProcess> ownedProcess;
         std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
@@ -346,6 +390,11 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     {
         submitRetirement();
     }
+};
+
+struct InstalledPackageWorkerLauncher::ObserverStartGate final
+{
+    std::binary_semaphore released{0};
 };
 
 struct InstalledPackageWorkerLauncher::ReadyPayload final
@@ -486,10 +535,21 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                               : configured.errorCode);
         return false;
     }
-    QThread *const thread = QThread::create(
+    auto launchTask =
         [guard, context, request, nonce, launchSerial,
          validateBinding = validateBinding_,
          config = std::move(*configured.value)]() mutable {
+#ifdef Q_BROWSER_HOST_TESTING
+            struct LaunchThreadCount final
+            {
+                ~LaunchThreadCount()
+                {
+                    activeLaunchThreads.fetch_sub(1,
+                                                  std::memory_order_acq_rel);
+                }
+            } launchThreadCount;
+            static_cast<void>(launchThreadCount);
+#endif
             struct LaunchFinished final
             {
                 std::shared_ptr<LaunchRetirementContext> context;
@@ -617,9 +677,21 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     if (guard) guard->requestAdmission(launchSerial, payload);
                 },
                 Qt::QueuedConnection);
-        });
-    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-    thread->start();
+        };
+#ifdef Q_BROWSER_HOST_TESTING
+    activeLaunchThreads.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    if (!startDetachedLauncherThread(LauncherThreadRole::Launch,
+                                     std::move(launchTask))) {
+#ifdef Q_BROWSER_HOST_TESTING
+        activeLaunchThreads.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+        context->launchFinished();
+        context->retireAsync();
+        fail(request.key,
+             QStringLiteral("host.launch.launch_thread_unavailable"));
+        return false;
+    }
     return true;
 }
 
@@ -684,6 +756,7 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     }
     if (!admission.accepted) {
         if (context != nullptr) context->retireAsync();
+        if (admission.ignoredStale) return;
         fail(context != nullptr ? context->request.key : WorkerAttemptKey{},
              admission.stableError.isEmpty()
                  ? QStringLiteral("host.launch.admission_rejected")
@@ -710,6 +783,9 @@ void InstalledPackageWorkerLauncher::completeLaunch(
              QStringLiteral("host.launch.process_observer_failed"));
         return;
     }
+    const std::shared_ptr<ObserverStartGate> observerGate = observeProcess(
+        context, std::move(*observerHandle));
+    if (observerGate == nullptr) return;
     std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
         context->windowHandle, context->process->nativeProcessHandle(),
         context->request.key.attempt));
@@ -722,6 +798,8 @@ void InstalledPackageWorkerLauncher::completeLaunch(
         || attach_(std::move(session), std::move(surface),
                    context->process, context->request.key)
             != AttachResult::Attached) {
+        observerGate->released.release();
+        context->retireAsync();
         fail(context->request.key, QStringLiteral("host.launch.attach_failed"));
         return;
     }
@@ -738,21 +816,23 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     const quint64 readyActivation = context->request.key.activation.value;
     const quint64 readyAttempt = context->request.key.attempt.value;
     const quint32 readyProcessId = context->process->processId();
-    observeProcess(context, std::move(*observerHandle));
+    observerGate->released.release();
     emit ready(readyAppId, readyVersion, readyDirectory,
                readyActivation, readyAttempt, readyProcessId);
 }
 
-void InstalledPackageWorkerLauncher::observeProcess(
+std::shared_ptr<InstalledPackageWorkerLauncher::ObserverStartGate>
+InstalledPackageWorkerLauncher::observeProcess(
     std::shared_ptr<LaunchRetirementContext> context,
     SandboxProcessWaitHandle waitHandle)
 {
+    auto gate = std::make_shared<ObserverStartGate>();
 #ifdef Q_BROWSER_HOST_TESTING
     activeObservers.fetch_add(1, std::memory_order_acq_rel);
 #endif
-    QThread *const observer = QThread::create(
-        [context = std::move(context),
-         waitHandle = std::move(waitHandle)]() mutable {
+    auto observerTask =
+        [context,
+         waitHandle = std::move(waitHandle), gate]() mutable {
 #ifdef Q_BROWSER_HOST_TESTING
             struct ObserverCount final
             {
@@ -763,6 +843,7 @@ void InstalledPackageWorkerLauncher::observeProcess(
             } observerCount;
             static_cast<void>(observerCount);
 #endif
+            gate->released.acquire();
             for (;;) {
                 const SandboxProcessWaitResult waited = waitHandle.wait(100);
                 if (waited == SandboxProcessWaitResult::Finished) break;
@@ -774,9 +855,20 @@ void InstalledPackageWorkerLauncher::observeProcess(
                 }
             }
             context->retireAsync();
-    });
-    connect(observer, &QThread::finished, observer, &QObject::deleteLater);
-    observer->start();
+        };
+    if (!startDetachedLauncherThread(LauncherThreadRole::Observer,
+                                     std::move(observerTask))) {
+#ifdef Q_BROWSER_HOST_TESTING
+        activeObservers.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+        context->observationFailed.store(true, std::memory_order_release);
+        context->requestTerminate();
+        context->retireAsync();
+        fail(context->request.key,
+             QStringLiteral("host.launch.observer_thread_unavailable"));
+        return {};
+    }
+    return gate;
 }
 
 void InstalledPackageWorkerLauncher::handleRetirement(

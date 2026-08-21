@@ -314,7 +314,9 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::workerCleanupFailed(
 UpdateLifecycleAction UpdateLifecycleCoordinator::workerAdmissionFailed(
     const WorkerAttemptKey key)
 {
-    Q_UNUSED(key);
+    if (!currentKey_.has_value() || key != *currentKey_) {
+        return UpdateLifecycleAction::IgnoredStaleAttempt;
+    }
     return enterFailedClosed();
 }
 

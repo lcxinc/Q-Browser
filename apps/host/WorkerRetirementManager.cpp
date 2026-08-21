@@ -51,16 +51,14 @@ struct WorkerRetirementManager::Record final
 
 WorkerRetirementManager &WorkerRetirementManager::instance()
 {
-    static WorkerRetirementManager manager;
-    return manager;
+    // Cleanup threads are deliberately detached so the manager must outlive all
+    // static destruction. The OS reclaims this process-lifetime object if a
+    // checked shutdown times out, while in-flight cleanup retains its state.
+    static WorkerRetirementManager *const manager = new WorkerRetirementManager;
+    return *manager;
 }
 
-WorkerRetirementManager::~WorkerRetirementManager()
-{
-    std::unique_lock lock(mutex_);
-    shuttingDown_ = true;
-    changed_.wait(lock, [this] { return activeThreads_ == 0; });
-}
+WorkerRetirementManager::~WorkerRetirementManager() = default;
 
 WorkerRetirementManager::Ticket WorkerRetirementManager::retire(
     Attempt attempt,
