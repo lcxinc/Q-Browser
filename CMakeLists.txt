@@ -11,6 +11,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 include(CTest)
+include(InstallRequiredSystemLibraries)
 
 option(Q_BROWSER_BUILD_WEBENGINE "Build the WebEngine fallback surface" ON)
 
@@ -22,6 +23,22 @@ add_subdirectory(runtime)
 add_subdirectory(qml)
 add_subdirectory(apps)
 add_subdirectory(tools/package-cli)
+
+install(TARGETS
+    qbrowser-worker
+    qbrowser-package
+  RUNTIME DESTINATION .
+  COMPONENT Runtime)
+if(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+  install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+    DESTINATION .
+    COMPONENT Runtime)
+endif()
+if(TARGET qbrowser-host)
+  install(TARGETS qbrowser-host
+    RUNTIME DESTINATION .
+    COMPONENT Runtime)
+endif()
 
 if(BUILD_TESTING)
   add_subdirectory(tests)

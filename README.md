@@ -1,6 +1,10 @@
 # Q-Browser
 
-Q-Browser is a Windows-first hybrid application runtime. The current repository scope is the reproducible C++20/Qt and TypeScript build-and-test skeleton for the approved secure QML pilot. Host, worker, package, broker, WebEngine, design-system, pilot-page, and migration-tool behavior will be added incrementally under test.
+Q-Browser is a Windows-first hybrid application runtime. A trusted Qt Host
+routes signed package QML to an independent LPAC Worker, brokers capabilities,
+provides an isolated WebEngine fallback, and recovers failed updates to a
+last-known-good version. The repository includes the ten-route Pilot, package
+CLI, HTML/CSS migrator, security tests, and repeatable Release deployment.
 
 ## Audited Windows toolchain
 
@@ -59,6 +63,33 @@ Each workspace is registered automatically when its directory and
 never point at a workspace that does not exist yet.
 
 `npm test --prefix tools` becomes applicable when the first TypeScript source project adds its Vitest suite.
+
+## Full acceptance and Release deployment
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-acceptance.ps1 `
+  -Configuration Release
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Clean
+```
+
+The deployment is written to `build\release-deploy` using CMake install and
+`windeployqt`, then checked against a canonical sorted `SHA-256SUMS`. It
+contains Host, Worker, package CLI, Qt/OpenSSL/WebEngine runtime closure, a
+signed Pilot package, the development public key, and operating documentation.
+The Host/CLI closure is under `host`; the separate immutable LPAC Worker
+closure is under `runtime`.
+Private keys, tests, fixtures, source, symbols, and test-hook binaries are
+rejected. A rerun without `-Clean` verifies rather than overwrites the output.
+
+The bundled trust root is **development-only**. Its private key remains below
+ignored `.qbrowser-dev\signing` state and must never be copied into deployment
+or promoted to production.
+
+Start with [runtime architecture](docs/architecture/runtime.md), the
+[package format](docs/package-spec/qapkg-v1.md), [Windows sandbox](docs/security/windows-sandbox.md),
+and [developer setup](docs/development/getting-started.md). Operations guidance
+covers [updates and rollback](docs/operations/update-rollback.md) and
+[safe diagnostics](docs/operations/diagnostics.md).
 
 ## Generated directories
 
