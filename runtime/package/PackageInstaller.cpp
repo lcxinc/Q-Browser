@@ -267,6 +267,23 @@ bool sourcesPassPolicy(const QVector<ArchiveFile> &files)
     });
 }
 
+bool packageMembersPassPolicy(const QVector<ArchiveFile> &files)
+{
+    static const QSet<QString> forbiddenExecutableExtensions{
+        QStringLiteral("com"), QStringLiteral("cpl"), QStringLiteral("dll"),
+        QStringLiteral("drv"), QStringLiteral("dylib"), QStringLiteral("exe"),
+        QStringLiteral("ocx"), QStringLiteral("scr"), QStringLiteral("so"),
+        QStringLiteral("sys")};
+    return std::ranges::none_of(files, [](const ArchiveFile &file) {
+        const QString suffix = QFileInfo(QString::fromUtf8(file.path))
+                                   .suffix().toCaseFolded();
+        const QByteArray &contents = file.contents;
+        const bool executableMagic = contents.startsWith("MZ")
+            || contents.startsWith(QByteArrayLiteral("\x7f" "ELF"));
+        return forbiddenExecutableExtensions.contains(suffix) || executableMagic;
+    });
+}
+
 std::optional<QString> authenticatedManifestAppId(
     const QString &packagePath,
     const QByteArray &trustedPublicKeyPem,
@@ -387,7 +404,7 @@ InstallResult PackageInstaller::verifyInstalled(
     if (!parsed.hasValue() || parsed.value().appId() != appId
         || !runtimeIsCompatible(m_policy.runtimeVersion, parsed.value().runtime())
         || !importsAreAllowed(parsed.value().imports(), m_policy.allowedImports)
-        || !sourcesPassPolicy(files)
+        || !sourcesPassPolicy(files) || !packageMembersPassPolicy(files)
         || versionDirectory != parsed.value().version() + QLatin1Char('-')
                + QString::fromLatin1(content.digest().toHex())) {
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
@@ -566,7 +583,7 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
                        InstallError::ImportDenied,
                        QStringLiteral("import_denied"));
     }
-    if (!sourcesPassPolicy(files)) {
+    if (!sourcesPassPolicy(files) || !packageMembersPassPolicy(files)) {
         return failure(InstallPhase::Preflight,
                        InstallError::PreflightRejected,
                        QStringLiteral("source_policy_rejected"));

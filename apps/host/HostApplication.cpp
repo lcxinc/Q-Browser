@@ -205,6 +205,7 @@ bool HostApplication::initializePackageRuntime()
     installPolicy.expectedAppId = runtimeConfig_->appId();
     installPolicy.runtimeVersion = QStringLiteral("1.2.0");
     installPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                    QStringLiteral("QtQuick.Layouts"),
                                     QStringLiteral("Company.Design")};
     installPolicy.preflight = [](const Manifest &, const QString &) { return true; };
     auto authority = std::make_shared<RuntimePackageAuthority>(
