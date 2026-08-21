@@ -33,3 +33,10 @@ Development verification is covered by the Release acceptance command in
 [getting started](../development/getting-started.md). Production rollout and
 key ceremony are explicit MVP non-goals; design those processes separately
 before using a non-development trust root.
+
+The exact deployed install, offline restart, signed-update inspection, and
+double-crash recovery commands are in [getting started](../development/getting-started.md).
+Rollback is automatic: operators must not edit `activation.json`. Confirm that
+`current` names the reverified LKG version and telemetry records
+`phase=rollback`, `code=recovered`; then preserve the signed candidate, public
+key, manifest, and read-only telemetry for diagnosis.

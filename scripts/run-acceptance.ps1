@@ -175,8 +175,7 @@ foreach ($file in Get-ChildItem -LiteralPath $build -File -Recurse) {
         $stream.Dispose()
     }
     $prefix = [Text.Encoding]::ASCII.GetString($prefixBytes, 0, $prefixLength).TrimStart()
-    if ($prefix.StartsWith('-----BEGIN PRIVATE KEY-----') -or
-        $prefix.StartsWith('-----BEGIN ENCRYPTED PRIVATE KEY-----')) {
+    if ($prefix -match '^\s*-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----') {
         throw "Acceptance output contains PEM private key material: $($file.FullName)"
     }
 }

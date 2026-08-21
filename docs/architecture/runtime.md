@@ -7,7 +7,8 @@ and supervises recovery. Package QML is loaded only by an independent Worker.
 The portable deployment also separates the Host/CLI dependency closure under
 `host` from the immutable LPAC Worker closure under `runtime`; the sandbox
 therefore never treats the Host application directory as a Worker-approved
-root.
+root. WebEngine exists only in the Host closure; it is forbidden from the
+Worker closure. Both closures carry their own Qt/OpenSSL/MSVC dependencies.
 
 ```text
 user -> Host/Router -> trusted WebEngine surface
@@ -39,6 +40,13 @@ overwriting verified bytes. The worker is admitted only while its captured
 activation binding still matches the selected version. Startup failure,
 heartbeat loss, or a crash loop causes recovery to a reverified previous/LKG
 binding. See [update and rollback](../operations/update-rollback.md).
+
+Release publication follows the same one-way authority boundary: CMake
+assembles a unique protected staging tree, mandatory signature/identity and
+closure checks run there, deployment-only UI/WebEngine/update/rollback
+acceptance runs there, and only then is the whole tree moved atomically to the
+final name. A failure never leaves a final authoritative directory. Existing
+releases are verified read-only and require a canonical acceptance attestation.
 
 Trust boundaries are deliberately asymmetric:
 

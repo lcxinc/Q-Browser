@@ -55,14 +55,15 @@ Important permission values are allowlists, not grants of ambient OS access:
 ## Reference commands
 
 ```powershell
-qbrowser-package pack --source packages\pilot --output pilot.unsigned.qapkg
-qbrowser-package sign --package pilot.unsigned.qapkg `
-  --private-key .qbrowser-dev\signing\private.pem `
-  --output com.qbrowser.pilot-1.0.0.qapkg
-qbrowser-package inspect --package com.qbrowser.pilot-1.0.0.qapkg `
-  --public-key .qbrowser-dev\signing\public.pem
+powershell -ExecutionPolicy Bypass -File scripts\create-dev-package.ps1 `
+  -Configuration Release -Clean
+build\release\tools\package-cli\Release\qbrowser-package.exe inspect `
+  --package build\release-package\com.qbrowser.pilot-1.0.0.qapkg `
+  --public-key build\release-package\dev-public.pem
 ```
 
 `inspect` succeeds only when archive structure, manifest, content digest,
 public key, and Ed25519 signature all verify. Do not infer trust from a ZIP
-tool, filename, or digest alone.
+tool, filename, or digest alone. The development script keeps private signing
+material in the exact ignored, protected `.qbrowser-dev\signing` directory and
+must never be used as a production key ceremony.

@@ -23,10 +23,8 @@ function(q_browser_require_glob description pattern)
 endfunction()
 
 function(q_browser_canonical_inventory output_variable)
-  file(GLOB_RECURSE inventory_files
-    LIST_DIRECTORIES false
-    RELATIVE "${Q_BROWSER_DEPLOY_DIR}"
-    "${Q_BROWSER_DEPLOY_DIR}/*")
+  file(GLOB_RECURSE inventory_files LIST_DIRECTORIES false
+    RELATIVE "${Q_BROWSER_DEPLOY_DIR}" "${Q_BROWSER_DEPLOY_DIR}/*")
   list(REMOVE_ITEM inventory_files "SHA-256SUMS")
   list(SORT inventory_files)
   set(inventory "")
@@ -45,22 +43,14 @@ endif()
 cmake_path(ABSOLUTE_PATH Q_BROWSER_DEPLOY_DIR NORMALIZE)
 
 if(Q_BROWSER_DEPLOY_MODE STREQUAL "ASSEMBLE")
-  foreach(required_variable IN ITEMS
-      Q_BROWSER_REPO_ROOT
-      Q_BROWSER_QT_ROOT
-      Q_BROWSER_OPENSSL_ROOT
-      Q_BROWSER_PACKAGE_FILE
-      Q_BROWSER_PUBLIC_KEY)
+  foreach(required_variable IN ITEMS Q_BROWSER_REPO_ROOT Q_BROWSER_QT_ROOT
+      Q_BROWSER_OPENSSL_ROOT Q_BROWSER_PACKAGE_FILE Q_BROWSER_PUBLIC_KEY)
     if(NOT DEFINED ${required_variable} OR "${${required_variable}}" STREQUAL "")
       q_browser_deploy_fail("${required_variable} is required for assembly")
     endif()
   endforeach()
-  foreach(path_variable IN ITEMS
-      Q_BROWSER_REPO_ROOT
-      Q_BROWSER_QT_ROOT
-      Q_BROWSER_OPENSSL_ROOT
-      Q_BROWSER_PACKAGE_FILE
-      Q_BROWSER_PUBLIC_KEY)
+  foreach(path_variable IN ITEMS Q_BROWSER_REPO_ROOT Q_BROWSER_QT_ROOT
+      Q_BROWSER_OPENSSL_ROOT Q_BROWSER_PACKAGE_FILE Q_BROWSER_PUBLIC_KEY)
     cmake_path(ABSOLUTE_PATH ${path_variable} NORMALIZE)
   endforeach()
   if(NOT IS_DIRECTORY "${Q_BROWSER_DEPLOY_DIR}")
@@ -68,8 +58,8 @@ if(Q_BROWSER_DEPLOY_MODE STREQUAL "ASSEMBLE")
   endif()
   set(host_directory "${Q_BROWSER_DEPLOY_DIR}/host")
   set(runtime_directory "${Q_BROWSER_DEPLOY_DIR}/runtime")
-  foreach(installed_executable IN ITEMS
-      qbrowser-host.exe qbrowser-worker.exe qbrowser-package.exe)
+  foreach(installed_executable IN ITEMS qbrowser-host.exe qbrowser-worker.exe
+      qbrowser-package.exe)
     q_browser_require_file("host/${installed_executable}")
   endforeach()
   file(MAKE_DIRECTORY "${runtime_directory}")
@@ -80,99 +70,100 @@ if(Q_BROWSER_DEPLOY_MODE STREQUAL "ASSEMBLE")
   if(NOT EXISTS "${windeployqt}")
     q_browser_deploy_fail("windeployqt is unavailable: ${windeployqt}")
   endif()
-  execute_process(
-    COMMAND "${windeployqt}" --help
-    RESULT_VARIABLE help_result
-    OUTPUT_VARIABLE help_output
-    ERROR_VARIABLE help_error)
+  execute_process(COMMAND "${windeployqt}" --help RESULT_VARIABLE help_result
+    OUTPUT_VARIABLE help_output ERROR_VARIABLE help_error)
   if(NOT help_result EQUAL 0)
     q_browser_deploy_fail("windeployqt --help failed: ${help_error}")
   endif()
-  set(webengine_arguments)
+  set(host_webengine_arguments)
   if(help_output MATCHES "(^|[\r\n ]+)--webengine([\r\n ]+|$)")
-    list(APPEND webengine_arguments --webengine)
-    message(STATUS "Using windeployqt --webengine")
+    list(APPEND host_webengine_arguments --webengine)
   else()
-    # Qt 6.11 removed the legacy --webengine umbrella switch. These explicit
-    # module switches are its supported equivalent; the verifier still
-    # requires the complete helper/resource/locales closure.
-    list(APPEND webengine_arguments
+    list(APPEND host_webengine_arguments
       -webenginecore -webenginequick -webenginewidgets)
-    message(STATUS
-      "windeployqt has no --webengine switch; using explicit WebEngine modules")
   endif()
-  foreach(deploy_pair IN ITEMS
-      "host|${host_directory}/qbrowser-host.exe"
-      "runtime|${runtime_directory}/qbrowser-worker.exe")
-    string(REPLACE "|" ";" deploy_parts "${deploy_pair}")
-    list(GET deploy_parts 0 deploy_subdirectory)
-    list(GET deploy_parts 1 deploy_executable)
-    execute_process(
-      COMMAND "${windeployqt}"
-        --release
-        --force
-        --compiler-runtime
-        --force-openssl
-        --skip-plugin-types qmltooling
-        --exclude-plugins qtposition_nmea
-        --translations en
-        --qmldir "${Q_BROWSER_REPO_ROOT}/qml"
-        ${webengine_arguments}
-        --dir "${Q_BROWSER_DEPLOY_DIR}/${deploy_subdirectory}"
-        "${deploy_executable}"
-      RESULT_VARIABLE deploy_result
-      OUTPUT_VARIABLE deploy_output
-      ERROR_VARIABLE deploy_error)
-    if(NOT deploy_result EQUAL 0)
-      q_browser_deploy_fail(
-        "windeployqt failed for ${deploy_subdirectory} (${deploy_result}): ${deploy_output}\n${deploy_error}")
+  execute_process(COMMAND "${windeployqt}" --release --force
+    --compiler-runtime --force-openssl --skip-plugin-types qmltooling
+    --exclude-plugins qtposition_nmea --translations en
+    --qmldir "${Q_BROWSER_REPO_ROOT}/qml" ${host_webengine_arguments}
+    --dir "${host_directory}" "${host_directory}/qbrowser-host.exe"
+    RESULT_VARIABLE host_deploy_result OUTPUT_VARIABLE host_deploy_output
+    ERROR_VARIABLE host_deploy_error)
+  if(NOT host_deploy_result EQUAL 0)
+    q_browser_deploy_fail("windeployqt host failure: ${host_deploy_output}\n${host_deploy_error}")
+  endif()
+  # Qt 6.11's windeployqt WebEngine traversal omits this direct import of
+  # Qt6WebEngineQuick.dll. Keep the host PE closure complete explicitly.
+  foreach(host_qt_runtime IN ITEMS Qt6WebChannelQuick.dll)
+    if(NOT EXISTS "${Q_BROWSER_QT_ROOT}/bin/${host_qt_runtime}")
+      q_browser_deploy_fail("missing Qt host runtime: ${host_qt_runtime}")
     endif()
+    file(COPY_FILE "${Q_BROWSER_QT_ROOT}/bin/${host_qt_runtime}"
+      "${host_directory}/${host_qt_runtime}" ONLY_IF_DIFFERENT)
   endforeach()
+  execute_process(COMMAND "${windeployqt}" --release --force
+    --compiler-runtime --force-openssl --skip-plugin-types qmltooling
+    --exclude-plugins qtposition_nmea --translations en
+    --qmldir "${Q_BROWSER_REPO_ROOT}/qml"
+    --no-webenginecore --no-webenginequick --no-webenginewidgets
+    --dir "${runtime_directory}" "${runtime_directory}/qbrowser-worker.exe"
+    RESULT_VARIABLE worker_deploy_result OUTPUT_VARIABLE worker_deploy_output
+    ERROR_VARIABLE worker_deploy_error)
+  if(NOT worker_deploy_result EQUAL 0)
+    q_browser_deploy_fail("windeployqt runtime failure: ${worker_deploy_output}\n${worker_deploy_error}")
+  endif()
   file(REMOVE "${host_directory}/qbrowser-worker.exe")
 
-  file(MAKE_DIRECTORY
-    "${Q_BROWSER_DEPLOY_DIR}/packages"
+  file(GLOB msvc_runtime_files LIST_DIRECTORIES false
+    "${host_directory}/vcruntime140*.dll" "${host_directory}/msvcp140*.dll"
+    "${host_directory}/concrt140*.dll")
+  foreach(msvc_runtime IN LISTS msvc_runtime_files)
+    cmake_path(GET msvc_runtime FILENAME runtime_name)
+    file(COPY_FILE "${msvc_runtime}" "${runtime_directory}/${runtime_name}"
+      ONLY_IF_DIFFERENT)
+  endforeach()
+
+  file(MAKE_DIRECTORY "${Q_BROWSER_DEPLOY_DIR}/packages"
     "${Q_BROWSER_DEPLOY_DIR}/trust")
   file(COPY_FILE "${Q_BROWSER_PACKAGE_FILE}"
     "${Q_BROWSER_DEPLOY_DIR}/packages/com.qbrowser.pilot-1.0.0.qapkg"
     ONLY_IF_DIFFERENT)
   file(COPY_FILE "${Q_BROWSER_PUBLIC_KEY}"
-    "${Q_BROWSER_DEPLOY_DIR}/trust/dev-public.pem"
-    ONLY_IF_DIFFERENT)
-  if(EXISTS "${Q_BROWSER_OPENSSL_ROOT}/bin/libcrypto-3-x64.dll")
-    file(COPY_FILE "${Q_BROWSER_OPENSSL_ROOT}/bin/libcrypto-3-x64.dll"
-      "${host_directory}/libcrypto-3-x64.dll" ONLY_IF_DIFFERENT)
-    file(COPY_FILE "${Q_BROWSER_OPENSSL_ROOT}/bin/libcrypto-3-x64.dll"
-      "${runtime_directory}/libcrypto-3-x64.dll" ONLY_IF_DIFFERENT)
-  endif()
-  if(EXISTS "${Q_BROWSER_OPENSSL_ROOT}/bin/libssl-3-x64.dll")
-    file(COPY_FILE "${Q_BROWSER_OPENSSL_ROOT}/bin/libssl-3-x64.dll"
-      "${host_directory}/libssl-3-x64.dll" ONLY_IF_DIFFERENT)
-    file(COPY_FILE "${Q_BROWSER_OPENSSL_ROOT}/bin/libssl-3-x64.dll"
-      "${runtime_directory}/libssl-3-x64.dll" ONLY_IF_DIFFERENT)
-  endif()
-
-  foreach(document IN ITEMS
-      architecture/runtime.md
-      package-spec/qapkg-v1.md
-      security/threat-model.md
-      security/windows-sandbox.md
-      development/getting-started.md
-      development/migrator.md
-      operations/update-rollback.md
-      operations/diagnostics.md)
+    "${Q_BROWSER_DEPLOY_DIR}/trust/dev-public.pem" ONLY_IF_DIFFERENT)
+  foreach(openssl_dll IN ITEMS libcrypto-3-x64.dll libssl-3-x64.dll)
+    if(NOT EXISTS "${Q_BROWSER_OPENSSL_ROOT}/bin/${openssl_dll}")
+      q_browser_deploy_fail("missing OpenSSL runtime: ${openssl_dll}")
+    endif()
+    foreach(runtime_root IN ITEMS "${host_directory}" "${runtime_directory}")
+      file(COPY_FILE "${Q_BROWSER_OPENSSL_ROOT}/bin/${openssl_dll}"
+        "${runtime_root}/${openssl_dll}" ONLY_IF_DIFFERENT)
+    endforeach()
+  endforeach()
+  foreach(document IN ITEMS architecture/runtime.md package-spec/qapkg-v1.md
+      security/threat-model.md security/windows-sandbox.md
+      development/getting-started.md development/migrator.md
+      operations/update-rollback.md operations/diagnostics.md)
     cmake_path(GET document PARENT_PATH document_parent)
     file(MAKE_DIRECTORY "${Q_BROWSER_DEPLOY_DIR}/docs/${document_parent}")
     file(COPY_FILE "${Q_BROWSER_REPO_ROOT}/docs/${document}"
       "${Q_BROWSER_DEPLOY_DIR}/docs/${document}" ONLY_IF_DIFFERENT)
   endforeach()
-
+  file(WRITE "${Q_BROWSER_DEPLOY_DIR}/.qbrowser-release-root"
+    "Q-BROWSER TASK18 RELEASE v1\n")
   q_browser_canonical_inventory(generated_inventory)
   file(WRITE "${Q_BROWSER_DEPLOY_DIR}/SHA-256SUMS" "${generated_inventory}")
-  set(Q_BROWSER_PACKAGE_CLI "${host_directory}/qbrowser-package.exe")
-  set(Q_BROWSER_PUBLIC_KEY "${Q_BROWSER_DEPLOY_DIR}/trust/dev-public.pem")
-  set(Q_BROWSER_DEPLOY_MODE VERIFY)
-elseif(NOT Q_BROWSER_DEPLOY_MODE STREQUAL "VERIFY")
+  message(STATUS "Q-Browser deployment assembled: ${Q_BROWSER_DEPLOY_DIR}")
+  return()
+elseif(Q_BROWSER_DEPLOY_MODE STREQUAL "SEAL")
+  q_browser_require_file("release-attestation.json")
+  q_browser_canonical_inventory(generated_inventory)
+  file(WRITE "${Q_BROWSER_DEPLOY_DIR}/SHA-256SUMS" "${generated_inventory}")
+  set(require_attestation TRUE)
+elseif(Q_BROWSER_DEPLOY_MODE STREQUAL "VERIFY")
+  set(require_attestation TRUE)
+elseif(Q_BROWSER_DEPLOY_MODE STREQUAL "PREVERIFY")
+  set(require_attestation FALSE)
+else()
   q_browser_deploy_fail("unknown mode: ${Q_BROWSER_DEPLOY_MODE}")
 endif()
 
@@ -180,59 +171,269 @@ if(NOT IS_DIRECTORY "${Q_BROWSER_DEPLOY_DIR}")
   q_browser_deploy_fail("deployment directory does not exist: ${Q_BROWSER_DEPLOY_DIR}")
 endif()
 
-foreach(required_file IN ITEMS
-    host/qbrowser-host.exe
-    host/qbrowser-package.exe
-    runtime/qbrowser-worker.exe
-    packages/com.qbrowser.pilot-1.0.0.qapkg
-    trust/dev-public.pem
-    host/platforms/qwindows.dll
-    host/resources/icudtl.dat
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+  "Q_BROWSER_DEPLOY_VERIFY_ROOT=${Q_BROWSER_DEPLOY_DIR}"
+  "PSModulePath=$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/Modules"
+  "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+  -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command [=[
+$ErrorActionPreference = 'Stop'
+$root = [IO.Path]::GetFullPath($env:Q_BROWSER_DEPLOY_VERIFY_ROOT)
+function Assert-Plain([string]$path) {
+  $item = Get-Item -LiteralPath $path -Force
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "reparse point rejected: $path"
+  }
+}
+$cursor = Get-Item -LiteralPath $root -Force
+while ($null -ne $cursor) { Assert-Plain $cursor.FullName; $cursor = $cursor.Parent }
+foreach ($item in Get-ChildItem -LiteralPath $root -Force -Recurse) {
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "reparse point rejected: $($item.FullName)"
+  }
+}
+$trusted = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+  'S-1-5-18', 'S-1-5-32-544')
+$writeMask = [long]([Security.AccessControl.FileSystemRights]::WriteData) -bor
+  [long]([Security.AccessControl.FileSystemRights]::AppendData) -bor
+  [long]([Security.AccessControl.FileSystemRights]::CreateFiles) -bor
+  [long]([Security.AccessControl.FileSystemRights]::CreateDirectories) -bor
+  [long]([Security.AccessControl.FileSystemRights]::WriteAttributes) -bor
+  [long]([Security.AccessControl.FileSystemRights]::WriteExtendedAttributes) -bor
+  [long]([Security.AccessControl.FileSystemRights]::Delete) -bor
+  [long]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+  [long]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+  [long]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+$sensitive = @($root, (Join-Path $root 'host'), (Join-Path $root 'runtime'),
+  (Join-Path $root 'packages'), (Join-Path $root 'trust'),
+  (Join-Path $root 'packages\com.qbrowser.pilot-1.0.0.qapkg'),
+  (Join-Path $root 'trust\dev-public.pem'), (Join-Path $root 'SHA-256SUMS'))
+if (Test-Path -LiteralPath (Join-Path $root 'release-attestation.json')) {
+  $sensitive += Join-Path $root 'release-attestation.json'
+}
+foreach ($path in $sensitive) {
+  $acl = Get-Acl -LiteralPath $path
+  $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+    [Security.Principal.SecurityIdentifier]).Value
+  if ($owner -notin $trusted -or -not $acl.AreAccessRulesProtected) {
+    throw "unprotected owner/DACL: $path"
+  }
+  foreach ($rule in $acl.GetAccessRules($true, $true,
+      [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq
+          [Security.AccessControl.AccessControlType]::Allow -and
+        $rule.IdentityReference.Value -notin $trusted -and
+        (([long]$rule.FileSystemRights -band $writeMask) -ne 0)) {
+      throw "untrusted writable ACE: $path"
+    }
+  }
+}
+]=]
+  RESULT_VARIABLE security_result OUTPUT_VARIABLE security_output
+  ERROR_VARIABLE security_error)
+if(NOT security_result EQUAL 0)
+  q_browser_deploy_fail("path/ACL boundary rejected: ${security_output}${security_error}")
+endif()
+
+foreach(required_file IN ITEMS .qbrowser-release-root host/qbrowser-host.exe
+    host/qbrowser-package.exe runtime/qbrowser-worker.exe
+    packages/com.qbrowser.pilot-1.0.0.qapkg trust/dev-public.pem
+    host/platforms/qwindows.dll host/resources/icudtl.dat
     host/resources/qtwebengine_resources.pak
     host/resources/qtwebengine_resources_100p.pak
     host/resources/qtwebengine_resources_200p.pak
     host/resources/qtwebengine_devtools_resources.pak
     host/resources/v8_context_snapshot.bin
     host/translations/qtwebengine_locales/en-US.pak
-    host/qml/QtQuick/qtquick2plugin.dll
-    host/tls/qopensslbackend.dll
-    host/tls/qschannelbackend.dll
-    runtime/platforms/qwindows.dll
-    runtime/resources/icudtl.dat
-    runtime/resources/qtwebengine_resources.pak
-    runtime/resources/qtwebengine_resources_100p.pak
-    runtime/resources/qtwebengine_resources_200p.pak
-    runtime/resources/qtwebengine_devtools_resources.pak
-    runtime/resources/v8_context_snapshot.bin
-    runtime/translations/qtwebengine_locales/en-US.pak
-    runtime/qml/QtQuick/qtquick2plugin.dll
-    runtime/tls/qopensslbackend.dll
-    runtime/tls/qschannelbackend.dll
-    docs/architecture/runtime.md
-    docs/package-spec/qapkg-v1.md
-    docs/security/threat-model.md
-    docs/security/windows-sandbox.md
-    docs/development/getting-started.md
-    docs/development/migrator.md
-    docs/operations/update-rollback.md
-    docs/operations/diagnostics.md
-    SHA-256SUMS)
+    host/qml/QtQuick/qtquick2plugin.dll host/tls/qopensslbackend.dll
+    host/tls/qschannelbackend.dll runtime/platforms/qwindows.dll
+    runtime/qml/QtQuick/qtquick2plugin.dll runtime/tls/qopensslbackend.dll
+    runtime/tls/qschannelbackend.dll docs/architecture/runtime.md
+    docs/package-spec/qapkg-v1.md docs/security/threat-model.md
+    docs/security/windows-sandbox.md docs/development/getting-started.md
+    docs/development/migrator.md docs/operations/update-rollback.md
+    docs/operations/diagnostics.md SHA-256SUMS)
   q_browser_require_file("${required_file}")
 endforeach()
+if(require_attestation)
+  q_browser_require_file("release-attestation.json")
+  file(READ "${Q_BROWSER_DEPLOY_DIR}/release-attestation.json" attestation)
+  set(expected_attestation
+    "{\"schema\":1,\"deploymentOnlyE2E\":true,\"routeCount\":10,\"webEngine\":\"deployed\",\"signedUpdate\":\"1.1.0\",\"rollback\":\"1.0.0\"}\n")
+  if(NOT attestation STREQUAL expected_attestation)
+    q_browser_deploy_fail("release acceptance attestation is missing or invalid")
+  endif()
+endif()
+file(READ "${Q_BROWSER_DEPLOY_DIR}/.qbrowser-release-root" ownership_marker)
+if(NOT ownership_marker STREQUAL "Q-BROWSER TASK18 RELEASE v1\n")
+  q_browser_deploy_fail("release ownership marker is invalid")
+endif()
 
 foreach(runtime_subdirectory IN ITEMS host runtime)
-  q_browser_require_glob("Qt Core runtime" "${runtime_subdirectory}/Qt6Core.dll")
-  q_browser_require_glob("Qt Quick runtime" "${runtime_subdirectory}/Qt6Quick.dll")
-  q_browser_require_glob("Qt WebEngine runtime" "${runtime_subdirectory}/Qt6WebEngineCore.dll")
-  q_browser_require_glob("Qt WebEngine helper" "${runtime_subdirectory}/QtWebEngineProcess.exe")
+  foreach(qt_module IN ITEMS Core Gui Quick Network)
+    q_browser_require_file("${runtime_subdirectory}/Qt6${qt_module}.dll")
+  endforeach()
   q_browser_require_glob("OpenSSL Crypto runtime" "${runtime_subdirectory}/libcrypto-3*.dll")
   q_browser_require_glob("OpenSSL TLS runtime" "${runtime_subdirectory}/libssl-3*.dll")
+  foreach(msvc_runtime IN ITEMS vcruntime140.dll vcruntime140_1.dll
+      msvcp140.dll msvcp140_1.dll)
+    q_browser_require_file("${runtime_subdirectory}/${msvc_runtime}")
+  endforeach()
 endforeach()
+q_browser_require_file("host/Qt6WebEngineCore.dll")
+q_browser_require_file("host/Qt6WebChannelQuick.dll")
+q_browser_require_file("host/QtWebEngineProcess.exe")
+file(GLOB_RECURSE forbidden_worker_webengine LIST_DIRECTORIES false
+  "${Q_BROWSER_DEPLOY_DIR}/runtime/*WebEngine*"
+  "${Q_BROWSER_DEPLOY_DIR}/runtime/*webengine*")
+if(forbidden_worker_webengine)
+  q_browser_deploy_fail("Worker closure contains forbidden WebEngine assets")
+endif()
 
-file(GLOB_RECURSE deployed_files
-  LIST_DIRECTORIES false
-  RELATIVE "${Q_BROWSER_DEPLOY_DIR}"
-  "${Q_BROWSER_DEPLOY_DIR}/*")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+  "Q_BROWSER_DEPLOY_VERIFY_ROOT=${Q_BROWSER_DEPLOY_DIR}"
+  "PSModulePath=$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/Modules"
+  "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+  -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command [=[
+$ErrorActionPreference = 'Stop'
+$root = [IO.Path]::GetFullPath($env:Q_BROWSER_DEPLOY_VERIFY_ROOT)
+
+function Get-U16([byte[]]$bytes, [int]$offset) {
+  if ($offset -lt 0 -or $offset + 2 -gt $bytes.Length) {
+    throw "truncated PE uint16 at $offset"
+  }
+  return [BitConverter]::ToUInt16($bytes, $offset)
+}
+function Get-U32([byte[]]$bytes, [int]$offset) {
+  if ($offset -lt 0 -or $offset + 4 -gt $bytes.Length) {
+    throw "truncated PE uint32 at $offset"
+  }
+  return [BitConverter]::ToUInt32($bytes, $offset)
+}
+function Get-AsciiZ([byte[]]$bytes, [int]$offset) {
+  if ($offset -lt 0 -or $offset -ge $bytes.Length) {
+    throw "invalid PE string offset $offset"
+  }
+  $end = $offset
+  while ($end -lt $bytes.Length -and $bytes[$end] -ne 0) { ++$end }
+  if ($end -eq $bytes.Length) { throw "unterminated PE import string" }
+  return [Text.Encoding]::ASCII.GetString($bytes, $offset, $end - $offset)
+}
+function Get-PeImports([string]$path) {
+  $bytes = [IO.File]::ReadAllBytes($path)
+  if ($bytes.Length -lt 64 -or (Get-U16 $bytes 0) -ne 0x5a4d) {
+    throw "invalid PE image: $path"
+  }
+  $pe = [int](Get-U32 $bytes 0x3c)
+  if ($pe + 24 -gt $bytes.Length -or (Get-U32 $bytes $pe) -ne 0x00004550) {
+    throw "invalid PE signature: $path"
+  }
+  $sectionCount = [int](Get-U16 $bytes ($pe + 6))
+  $optionalSize = [int](Get-U16 $bytes ($pe + 20))
+  $optional = $pe + 24
+  $magic = Get-U16 $bytes $optional
+  if ($magic -eq 0x20b) { $directory = $optional + 112 }
+  elseif ($magic -eq 0x10b) { $directory = $optional + 96 }
+  else { throw "unsupported PE optional header: $path" }
+  if ($optional + $optionalSize -gt $bytes.Length -or
+      $directory + (14 * 8) -gt $optional + $optionalSize) {
+    throw "truncated PE optional header: $path"
+  }
+  $sections = @()
+  $sectionTable = $optional + $optionalSize
+  for ($index = 0; $index -lt $sectionCount; ++$index) {
+    $entry = $sectionTable + ($index * 40)
+    $sections += [pscustomobject]@{
+      VirtualSize = [uint32](Get-U32 $bytes ($entry + 8))
+      VirtualAddress = [uint32](Get-U32 $bytes ($entry + 12))
+      RawSize = [uint32](Get-U32 $bytes ($entry + 16))
+      RawAddress = [uint32](Get-U32 $bytes ($entry + 20))
+    }
+  }
+  $toOffset = {
+    param([uint32]$rva)
+    foreach ($section in $sections) {
+      $span = [Math]::Max([uint64]$section.VirtualSize,
+        [uint64]$section.RawSize)
+      if ([uint64]$rva -ge [uint64]$section.VirtualAddress -and
+          [uint64]$rva -lt [uint64]$section.VirtualAddress + $span) {
+        $raw = [uint64]$section.RawAddress +
+          ([uint64]$rva - [uint64]$section.VirtualAddress)
+        if ($raw -ge [uint64]$bytes.Length) {
+          throw "PE RVA maps outside image: $path"
+        }
+        return [int]$raw
+      }
+    }
+    if ([uint64]$rva -lt [uint64]$optional) { return [int]$rva }
+    throw "unmapped PE RVA $rva in $path"
+  }
+  $imports = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase)
+  $importRva = [uint32](Get-U32 $bytes ($directory + 8))
+  if ($importRva -ne 0) {
+    $descriptor = & $toOffset $importRva
+    while ($true) {
+      $originalThunk = Get-U32 $bytes $descriptor
+      $nameRva = [uint32](Get-U32 $bytes ($descriptor + 12))
+      $firstThunk = Get-U32 $bytes ($descriptor + 16)
+      if ($originalThunk -eq 0 -and $nameRva -eq 0 -and $firstThunk -eq 0) {
+        break
+      }
+      if ($nameRva -eq 0) { throw "PE import without a name: $path" }
+      [void]$imports.Add((Get-AsciiZ $bytes (& $toOffset $nameRva)))
+      $descriptor += 20
+    }
+  }
+  $delayRva = [uint32](Get-U32 $bytes ($directory + (13 * 8)))
+  if ($delayRva -ne 0) {
+    $descriptor = & $toOffset $delayRva
+    while ($true) {
+      $attributes = Get-U32 $bytes $descriptor
+      $nameRva = [uint32](Get-U32 $bytes ($descriptor + 4))
+      $iat = Get-U32 $bytes ($descriptor + 12)
+      if ($attributes -eq 0 -and $nameRva -eq 0 -and $iat -eq 0) { break }
+      if (($attributes -band 1) -eq 0) {
+        throw "non-RVA delay import is unsupported: $path"
+      }
+      if ($nameRva -eq 0) { throw "PE delay import without a name: $path" }
+      [void]$imports.Add((Get-AsciiZ $bytes (& $toOffset $nameRva)))
+      $descriptor += 32
+    }
+  }
+  return @($imports)
+}
+
+$missing = [Collections.Generic.List[string]]::new()
+foreach ($closureName in @('host', 'runtime')) {
+  $closureRoot = Join-Path $root $closureName
+  $images = @(Get-ChildItem -LiteralPath $closureRoot -Recurse -File |
+    Where-Object { $_.Extension -in @('.exe', '.dll') })
+  $deployed = @{}
+  foreach ($image in $images) { $deployed[$image.Name] = $true }
+  foreach ($image in $images) {
+    foreach ($import in @(Get-PeImports $image.FullName)) {
+      if ($deployed.ContainsKey($import)) { continue }
+      $systemImport = Join-Path $env:SystemRoot "System32\$import"
+      if ($import.StartsWith('api-ms-win-', [StringComparison]::OrdinalIgnoreCase) -or
+          $import.StartsWith('ext-ms-win-', [StringComparison]::OrdinalIgnoreCase) -or
+          (Test-Path -LiteralPath $systemImport -PathType Leaf)) {
+        continue
+      }
+      $missing.Add("$closureName/$($image.Name) -> $import")
+    }
+  }
+}
+if ($missing.Count -ne 0) {
+  throw "missing PE dependencies: $($missing -join '; ')"
+}
+]=]
+  RESULT_VARIABLE pe_result OUTPUT_VARIABLE pe_output ERROR_VARIABLE pe_error)
+if(NOT pe_result EQUAL 0)
+  q_browser_deploy_fail("PE dependency closure rejected: ${pe_output}${pe_error}")
+endif()
+
+file(GLOB_RECURSE deployed_files LIST_DIRECTORIES false
+  RELATIVE "${Q_BROWSER_DEPLOY_DIR}" "${Q_BROWSER_DEPLOY_DIR}/*")
 foreach(relative_path IN LISTS deployed_files)
   string(REPLACE "\\" "/" normalized_path "${relative_path}")
   string(TOLOWER "${normalized_path}" lower_path)
@@ -242,8 +443,8 @@ foreach(relative_path IN LISTS deployed_files)
       OR lower_path MATCHES "\\.(cpp|cxx|cc|h|hpp|pdb|ilk|obj|lib|exp)$")
     q_browser_deploy_fail("forbidden test, source, symbol, or private-key asset: ${normalized_path}")
   endif()
-  file(READ "${Q_BROWSER_DEPLOY_DIR}/${relative_path}" prefix LIMIT 256)
-  if(prefix MATCHES "-----BEGIN (ENCRYPTED )?PRIVATE KEY-----")
+  file(READ "${Q_BROWSER_DEPLOY_DIR}/${relative_path}" prefix LIMIT 8192)
+  if(prefix MATCHES "(^|[\r\n])[ \t]*-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
     q_browser_deploy_fail("private key material found in ${normalized_path}")
   endif()
 endforeach()
@@ -253,20 +454,14 @@ q_browser_canonical_inventory(expected_inventory)
 if(NOT recorded_inventory STREQUAL expected_inventory)
   q_browser_deploy_fail("SHA-256SUMS does not match the canonical sorted inventory")
 endif()
-
-if(DEFINED Q_BROWSER_PACKAGE_CLI AND DEFINED Q_BROWSER_PUBLIC_KEY)
-  execute_process(
-    COMMAND "${Q_BROWSER_PACKAGE_CLI}" inspect
-      --package "${Q_BROWSER_DEPLOY_DIR}/packages/com.qbrowser.pilot-1.0.0.qapkg"
-      --public-key "${Q_BROWSER_PUBLIC_KEY}"
-    RESULT_VARIABLE inspect_result
-    OUTPUT_VARIABLE inspect_output
-    ERROR_VARIABLE inspect_error)
-  if(NOT inspect_result EQUAL 0
-      OR NOT inspect_output MATCHES "\"verified\":true"
-      OR NOT inspect_output MATCHES "\"appId\":\"com.qbrowser.pilot\"")
-    q_browser_deploy_fail("Pilot signature inspection failed: ${inspect_error}")
-  endif()
+execute_process(COMMAND "${Q_BROWSER_DEPLOY_DIR}/host/qbrowser-package.exe" inspect
+  --package "${Q_BROWSER_DEPLOY_DIR}/packages/com.qbrowser.pilot-1.0.0.qapkg"
+  --public-key "${Q_BROWSER_DEPLOY_DIR}/trust/dev-public.pem"
+  RESULT_VARIABLE inspect_result OUTPUT_VARIABLE inspect_output
+  ERROR_VARIABLE inspect_error)
+if(NOT inspect_result EQUAL 0 OR NOT inspect_output MATCHES "\"verified\":true"
+    OR NOT inspect_output MATCHES "\"appId\":\"com.qbrowser.pilot\""
+    OR NOT inspect_output MATCHES "\"version\":\"1.0.0\"")
+  q_browser_deploy_fail("Pilot signature/identity inspection failed: ${inspect_error}")
 endif()
-
 message(STATUS "Q-Browser deployment verified: ${Q_BROWSER_DEPLOY_DIR}")

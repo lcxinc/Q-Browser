@@ -48,21 +48,16 @@ The equivalent checked-in presets are:
 & 'E:\DevEnv\qt\Tools\CMake_64\bin\ctest.exe' --preset dev-debug
 ```
 
-Initialize and verify the TypeScript solution workspace with:
+Install and verify the locked TypeScript workspaces with lifecycle scripts disabled:
 
 ```powershell
-npm install --prefix tools --no-audit --no-fund
-npm run build --prefix tools
-npm run lint --prefix tools
+npm.cmd ci --ignore-scripts --prefix tools
+npm.cmd run build --ignore-scripts --prefix tools
+npm.cmd test --ignore-scripts --prefix tools
 ```
 
-`tools/package.json` reserves the `mock-api` and `migrator` npm workspaces.
-Each workspace is registered automatically when its directory and
-`package.json` are created. Add its TypeScript project to the root
-`tools/tsconfig.json` `references` array in that same change; references must
-never point at a workspace that does not exist yet.
-
-`npm test --prefix tools` becomes applicable when the first TypeScript source project adds its Vitest suite.
+The checked-in `mock-api` and `migrator` workspaces are both built and tested
+by that command. See the [migrator guide](docs/development/migrator.md).
 
 ## Full acceptance and Release deployment
 
@@ -72,8 +67,10 @@ powershell -ExecutionPolicy Bypass -File scripts\run-acceptance.ps1 `
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Clean
 ```
 
-The deployment is written to `build\release-deploy` using CMake install and
-`windeployqt`, then checked against a canonical sorted `SHA-256SUMS`. It
+The deployment is published atomically to `build\release-deploy` only after
+deployment-only UI, update, double-crash rollback, and optional full acceptance
+pass. CMake install and `windeployqt` build the image, which is checked against
+a canonical sorted `SHA-256SUMS`. It
 contains Host, Worker, package CLI, Qt/OpenSSL/WebEngine runtime closure, a
 signed Pilot package, the development public key, and operating documentation.
 The Host/CLI closure is under `host`; the separate immutable LPAC Worker
@@ -81,13 +78,14 @@ closure is under `runtime`.
 Private keys, tests, fixtures, source, symbols, and test-hook binaries are
 rejected. A rerun without `-Clean` verifies rather than overwrites the output.
 
-The bundled trust root is **development-only**. Its private key remains below
-ignored `.qbrowser-dev\signing` state and must never be copied into deployment
-or promoted to production.
+The bundled trust root is **development-only**. Local signing authority remains
+under the ignored, protected `.qbrowser-dev\signing` directory and must never
+be copied into build/deployment output or promoted to production.
 
 Start with [runtime architecture](docs/architecture/runtime.md), the
 [package format](docs/package-spec/qapkg-v1.md), [Windows sandbox](docs/security/windows-sandbox.md),
-and [developer setup](docs/development/getting-started.md). Operations guidance
+the [threat model](docs/security/threat-model.md), and
+[developer setup](docs/development/getting-started.md). Operations guidance
 covers [updates and rollback](docs/operations/update-rollback.md) and
 [safe diagnostics](docs/operations/diagnostics.md).
 
@@ -101,13 +99,15 @@ Do not commit generated output or runtime state.
 
 ## Package signing CLI
 
-`qbrowser-package` provides a stable four-command development workflow:
+`qbrowser-package` provides pack, sign, inspect, and key-generation primitives.
+Use the guarded development workflow rather than handling key paths manually:
 
 ```powershell
-qbrowser-package keygen --private-key keys/dev/private.pem --public-key keys/dev/public.pem
-qbrowser-package pack --source path/to/package-tree --output unsigned.qapkg
-qbrowser-package sign --package unsigned.qapkg --private-key keys/dev/private.pem --output signed.qapkg
-qbrowser-package inspect --package signed.qapkg --public-key keys/dev/public.pem
+powershell -ExecutionPolicy Bypass -File scripts\create-dev-package.ps1 `
+  -Configuration Release -Clean
+build\release\tools\package-cli\Release\qbrowser-package.exe inspect `
+  --package build\release-package\com.qbrowser.pilot-1.0.0.qapkg `
+  --public-key build\release-package\dev-public.pem
 ```
 
 `pack` writes a deterministic archive and canonical lowercase payload digest.

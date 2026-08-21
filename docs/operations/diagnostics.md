@@ -12,8 +12,6 @@ $deploy = (Resolve-Path build\release-deploy).Path
 & 'E:\DevEnv\qt\Tools\CMake_64\bin\cmake.exe' `
   "-DQ_BROWSER_DEPLOY_MODE=VERIFY" `
   "-DQ_BROWSER_DEPLOY_DIR=$deploy" `
-  "-DQ_BROWSER_PACKAGE_CLI=$deploy\host\qbrowser-package.exe" `
-  "-DQ_BROWSER_PUBLIC_KEY=$deploy\trust\dev-public.pem" `
   -P cmake\Deploy.cmake
 ```
 

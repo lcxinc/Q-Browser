@@ -14,7 +14,9 @@ the complete predicate before launch. The Worker executable must match a
 captured runtime file exactly; files added after capture receive no authority.
 The Release image deploys the Host/CLI and Worker closures to distinct
 directories because the Host application directory is intentionally rejected
-as an approved Worker runtime root.
+as an approved Worker runtime root. WebEngine modules, resources, and helper
+process are Host-only; the Worker closure contains Qt Quick/Network/QML,
+OpenSSL, and complete MSVC runtime dependencies but no WebEngine surface.
 
 The LPAC receives non-inherited read/execute access only to captured runtime
 objects, read-only/non-execute access to the selected verified package, and
@@ -38,3 +40,7 @@ make malicious UI trustworthy, prevent all denial of service, or replace
 capability checks. Windows ACL inheritance and enterprise policy vary, so every
 production image must rerun the real token, loader-handshake, sentinel,
 network, file, process, and cleanup tests; do not weaken or skip a failed gate.
+The deployment root, runtime, package, trust, manifest, and attestation paths
+use protected Host/SYSTEM-only write ACLs. Verification is read-only, rejects
+every symlink/junction/reparse ancestor or member, and never repairs an unsafe
+image in place.
