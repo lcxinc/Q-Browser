@@ -1640,6 +1640,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
             .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
         10'000);
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
     QTest::qWait(500);
     QCOMPARE(ready.count(), readyBeforeShutdownRace);
 
