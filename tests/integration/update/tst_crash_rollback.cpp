@@ -17,9 +17,49 @@ class CrashRollbackTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void protectedLongPathTemporaryCleanupLeavesNoResidue();
     void commitsRollbackBeforeLaunchingRecoveredRealLpacWorker();
     void concurrentActivationBeforeRestartFailsClosedWithoutLaunchingStalePackage();
 };
+
+void CrashRollbackTest::protectedLongPathTemporaryCleanupLeavesNoResidue()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Protected long-path cleanup is Windows-specific");
+#else
+    auto temporary = std::make_unique<UpdateTemporaryDir>();
+    QVERIFY(temporary->isValid());
+    const QString ownedRoot = temporary->path();
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+
+    QString storeRelative;
+    while (temporary->filePath(storeRelative + QStringLiteral("store")).size()
+           < 190) {
+        storeRelative += QStringLiteral("cleanup-segment/");
+    }
+    {
+        PackageStore store(
+            temporary->filePath(storeRelative + QStringLiteral("store")));
+        PackageInstaller installer(store, keys.value().publicKeyPem,
+                                   updateInstallPolicy());
+        const InstallResult installed = installer.install(updateSignedPackage(
+            *temporary, QStringLiteral("cleanup"), QStringLiteral("1.0.0"),
+            keys.value().privateKeyPem));
+        QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+        const QString protectedContent = QDir(installed.path).filePath(
+            QStringLiteral("metadata/content.sha256"));
+        QVERIFY2(protectedContent.size() > MAX_PATH,
+                 qPrintable(QStringLiteral("test path was not long enough: %1")
+                                .arg(protectedContent.size())));
+    }
+
+    temporary.reset();
+    QVERIFY2(!QFileInfo::exists(ownedRoot),
+             qPrintable(QStringLiteral("protected temporary root remained: %1")
+                            .arg(ownedRoot)));
+#endif
+}
 
 void CrashRollbackTest::concurrentActivationBeforeRestartFailsClosedWithoutLaunchingStalePackage()
 {

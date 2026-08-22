@@ -57,6 +57,11 @@ public:
         while (iterator.hasNext()) paths.push_back(iterator.next());
         for (const QString &entry : paths) {
             QString native = QDir::toNativeSeparators(entry);
+            if (!native.startsWith(QStringLiteral("\\\\?\\"))) {
+                native = native.startsWith(QStringLiteral("\\\\"))
+                    ? QStringLiteral("\\\\?\\UNC\\") + native.sliced(2)
+                    : QStringLiteral("\\\\?\\") + native;
+            }
             (void)SetNamedSecurityInfoW(
                 reinterpret_cast<LPWSTR>(native.data()), SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
