@@ -55,6 +55,7 @@ QString storagePath(const QString &rootDirectory, const QString &identity)
 
 constexpr qsizetype maximumExistingStorageObjects = 8192;
 constexpr qint64 maximumLockBytes = 64 * 1024;
+constexpr int concurrentUpdateLockTimeoutMilliseconds = 10'000;
 
 bool validStorageObjectName(const QString &name, bool &lockFile)
 {
@@ -694,7 +695,7 @@ BrokerResult StorageBroker::invoke(const QString &operation,
     const QString path = storagePath(rootDirectory_, context.appIdentity);
     QLockFile lock(path + QStringLiteral(".lock"));
     lock.setStaleLockTime(30000);
-    if (!lock.tryLock(1000) || !rootIsStable()) {
+    if (!lock.tryLock(concurrentUpdateLockTimeoutMilliseconds) || !rootIsStable()) {
         return BrokerResult::failure(QStringLiteral("storage.busy"),
                                      QStringLiteral("Storage is busy."));
     }

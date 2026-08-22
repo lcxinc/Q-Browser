@@ -541,8 +541,10 @@ void StorageBrokerTest::serializesConcurrentQuotaUpdates()
                               setPayload(QStringLiteral("right"), 2),
                               context);
     });
-    QVERIFY(left.get().ok);
-    QVERIFY(right.get().ok);
+    const BrokerResult leftResult = left.get();
+    const BrokerResult rightResult = right.get();
+    QVERIFY2(leftResult.ok, qPrintable(leftResult.errorCode));
+    QVERIFY2(rightResult.ok, qPrintable(rightResult.errorCode));
     QVERIFY(broker->invoke(QStringLiteral("get"), keyPayload(QStringLiteral("left")), context).ok);
     QVERIFY(broker->invoke(QStringLiteral("get"), keyPayload(QStringLiteral("right")), context).ok);
 }
