@@ -46,6 +46,7 @@ public:
     [[nodiscard]] const QStringList &immutableRuntimeRoots() const noexcept;
     [[nodiscard]] const QString &workerExecutable() const noexcept;
     [[nodiscard]] const QString &telemetryDirectory() const noexcept;
+    [[nodiscard]] const QString &storageDirectory() const noexcept;
     [[nodiscard]] const std::optional<QString> &installPackage() const noexcept;
     [[nodiscard]] qint64 healthWindowMs() const noexcept;
     [[nodiscard]] qint64 heartbeatTimeoutMs() const noexcept;
@@ -65,6 +66,7 @@ private:
     QStringList immutableRuntimeRoots_;
     QString workerExecutable_;
     QString telemetryDirectory_;
+    QString storageDirectory_;
     std::optional<QString> installPackage_;
     qint64 healthWindowMs_ = 10'000;
     qint64 heartbeatTimeoutMs_ = 2'000;

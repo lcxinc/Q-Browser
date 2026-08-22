@@ -167,6 +167,309 @@ namespace QBrowser.Task18 {
     public void Terminate(uint code) { if (!IsAlive || !TerminateProcess(handle, code)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
     public void Dispose() { handle.Dispose(); }
   }
+  public static class NativeAutomation {
+    const int InputMouse = 0, InputKeyboard = 1;
+    const uint KeyUp = 0x0002, Unicode = 0x0004;
+    const uint LeftDown = 0x0002, LeftUp = 0x0004;
+    const uint SrcCopy = 0x00CC0020;
+    const uint WmCommand = 0x0111, WmClose = 0x0010, WmSetText = 0x000C;
+    const uint BmClick = 0x00F5;
+    const int IdOk = 1, IdCancel = 2, GaRoot = 2;
+    [StructLayout(LayoutKind.Sequential)] struct Point { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)] struct Rect { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct MouseInput {
+      public int dx, dy; public uint mouseData, flags, time; public IntPtr extra;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct KeyboardInput {
+      public ushort virtualKey, scan; public uint flags, time; public IntPtr extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] struct InputUnion {
+      [FieldOffset(0)] public MouseInput mouse;
+      [FieldOffset(0)] public KeyboardInput keyboard;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Input {
+      public int type; public InputUnion value;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct GuiThreadInfo {
+      public uint size, flags; public IntPtr active, focus, capture, menuOwner,
+        moveSize, caret; public Rect caretRect;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct BitmapInfoHeader {
+      public uint size; public int width, height; public ushort planes, bitCount;
+      public uint compression, imageSize; public int xPels, yPels;
+      public uint used, important;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct BitmapInfo {
+      public BitmapInfoHeader header; public uint colors;
+    }
+    delegate bool EnumWindow(IntPtr window, IntPtr parameter);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(
+      IntPtr parent, EnumWindow callback, IntPtr parameter);
+    [DllImport("user32.dll")] static extern bool EnumWindows(
+      EnumWindow callback, IntPtr parameter);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(
+      IntPtr window, out uint processId);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsChild(IntPtr parent, IntPtr child);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr SetActiveWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr window);
+    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(
+      uint first, uint second, bool attach);
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(
+      uint thread, ref GuiThreadInfo information);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(
+      IntPtr window, ref Point point);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(
+      uint count, Input[] inputs, int size);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(
+      IntPtr window, System.Text.StringBuilder value, int maximum);
+    [DllImport("user32.dll")] static extern bool PostMessageW(
+      IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageW(
+      IntPtr window, uint message, IntPtr wParam, string lParam);
+    [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr dialog, int id);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr window, IntPtr dc);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SetClipboardData(
+      uint format, IntPtr memory);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GlobalAlloc(
+      uint flags, UIntPtr bytes);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalFree(IntPtr memory);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(
+      IntPtr dc, int width, int height);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr value);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr destination,
+      int x, int y, int width, int height, IntPtr source, int sourceX, int sourceY,
+      uint operation);
+    [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bitmap,
+      uint start, uint lines, byte[] bits, ref BitmapInfo information, uint usage);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr value);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+
+    static bool Send(Input[] inputs) {
+      return inputs.Length > 0 && SendInput((uint)inputs.Length, inputs,
+        Marshal.SizeOf(typeof(Input))) == inputs.Length;
+    }
+    public static IntPtr FindWorkerWindow(IntPtr host, int processId) {
+      IntPtr found = IntPtr.Zero;
+      EnumChildWindows(host, delegate(IntPtr candidate, IntPtr ignored) {
+        uint pid; GetWindowThreadProcessId(candidate, out pid);
+        Rect rect;
+        if (pid == (uint)processId && IsWindowVisible(candidate)
+            && GetClientRect(candidate, out rect)
+            && rect.right - rect.left >= 900 && rect.bottom - rect.top >= 600) {
+          found = candidate; return false;
+        }
+        return true;
+      }, IntPtr.Zero);
+      return found;
+    }
+    public static bool FocusWorker(IntPtr worker) {
+      if (worker == IntPtr.Zero || !IsWindow(worker)) return false;
+      IntPtr host = GetAncestor(worker, GaRoot);
+      IntPtr foreground = GetForegroundWindow();
+      uint ignored, current = GetCurrentThreadId();
+      uint foregroundThread = foreground == IntPtr.Zero ? 0
+        : GetWindowThreadProcessId(foreground, out ignored);
+      uint workerThread = GetWindowThreadProcessId(worker, out ignored);
+      bool attachedForeground = foregroundThread != 0 && foregroundThread != current
+        && AttachThreadInput(current, foregroundThread, true);
+      bool attachedWorker = workerThread != 0 && workerThread != current
+        && AttachThreadInput(current, workerThread, true);
+      BringWindowToTop(host); SetForegroundWindow(host); SetActiveWindow(host);
+      SetFocus(worker);
+      if (attachedWorker) AttachThreadInput(current, workerThread, false);
+      if (attachedForeground) AttachThreadInput(current, foregroundThread, false);
+      GuiThreadInfo information = new GuiThreadInfo();
+      information.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
+      return GetAncestor(GetForegroundWindow(), GaRoot) == host
+        && workerThread != 0 && GetGUIThreadInfo(workerThread, ref information)
+        && information.focus != IntPtr.Zero
+        && (information.focus == worker || IsChild(worker, information.focus));
+    }
+    public static bool Click(IntPtr worker, int x, int y) {
+      if (!FocusWorker(worker)) return false;
+      Point point = new Point(); point.x = x; point.y = y;
+      if (!ClientToScreen(worker, ref point) || !SetCursorPos(point.x, point.y)) return false;
+      Input down = new Input(); down.type = InputMouse; down.value.mouse.flags = LeftDown;
+      Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
+      return Send(new Input[] { down, up });
+    }
+    public static bool SendUnicodeText(IntPtr worker, string text) {
+      foreach (char character in text) {
+        if (!FocusWorker(worker)) return false;
+        Input down = new Input(); down.type = InputKeyboard;
+        down.value.keyboard.scan = character; down.value.keyboard.flags = Unicode;
+        Input up = down; up.value.keyboard.flags = Unicode | KeyUp;
+        if (!Send(new Input[] { down, up })) return false;
+        System.Threading.Thread.Sleep(5);
+      }
+      return true;
+    }
+    public static bool SendKey(IntPtr worker, ushort key) {
+      if (!FocusWorker(worker)) return false;
+      Input down = new Input(); down.type = InputKeyboard;
+      down.value.keyboard.virtualKey = key;
+      Input up = down; up.value.keyboard.flags = KeyUp;
+      return Send(new Input[] { down, up });
+    }
+    static bool IsDialog(IntPtr window, int processId) {
+      uint pid; GetWindowThreadProcessId(window, out pid);
+      System.Text.StringBuilder name = new System.Text.StringBuilder(32);
+      return pid == (uint)processId && IsWindowVisible(window)
+        && GetClassNameW(window, name, name.Capacity) > 0
+        && name.ToString() == "#32770";
+    }
+    public static IntPtr FindFileDialog(int processId) {
+      IntPtr found = IntPtr.Zero;
+      EnumWindows(delegate(IntPtr candidate, IntPtr ignored) {
+        if (IsDialog(candidate, processId)) { found = candidate; return false; }
+        return true;
+      }, IntPtr.Zero);
+      return found;
+    }
+    public static int CancelFileDialogs(int processId) {
+      int count = 0;
+      EnumWindows(delegate(IntPtr candidate, IntPtr ignored) {
+        if (IsDialog(candidate, processId)) {
+          count++;
+          PostMessageW(candidate, WmCommand, new IntPtr(IdCancel), IntPtr.Zero);
+          PostMessageW(candidate, WmClose, IntPtr.Zero, IntPtr.Zero);
+        }
+        return true;
+      }, IntPtr.Zero);
+      return count;
+    }
+    public static int FileDialogCount(int processId) {
+      int count = 0;
+      EnumWindows(delegate(IntPtr candidate, IntPtr ignored) {
+        if (IsDialog(candidate, processId)) count++;
+        return true;
+      }, IntPtr.Zero);
+      return count;
+    }
+    public static bool AcceptFileDialog(int processId, string path) {
+      IntPtr dialog = FindFileDialog(processId);
+      if (dialog == IntPtr.Zero || !SetForegroundWindow(dialog)) return false;
+      // Alt+N selects the native file-name editor regardless of locale.
+      Input altDown = new Input(); altDown.type = InputKeyboard;
+      altDown.value.keyboard.virtualKey = 0x12;
+      Input nDown = new Input(); nDown.type = InputKeyboard;
+      nDown.value.keyboard.virtualKey = 0x4e;
+      Input nUp = nDown; nUp.value.keyboard.flags = KeyUp;
+      Input altUp = altDown; altUp.value.keyboard.flags = KeyUp;
+      if (!Send(new Input[] { altDown, nDown, nUp, altUp })) return false;
+      System.Threading.Thread.Sleep(100);
+      uint ignored; uint thread = GetWindowThreadProcessId(dialog, out ignored);
+      GuiThreadInfo information = new GuiThreadInfo();
+      information.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
+      if (!GetGUIThreadInfo(thread, ref information) || information.focus == IntPtr.Zero)
+        return false;
+      if (SendMessageW(information.focus, WmSetText, IntPtr.Zero, path) == IntPtr.Zero)
+        return false;
+      IntPtr outer = GetAncestor(information.focus, GaRoot);
+      IntPtr accept = GetDlgItem(outer, IdOk);
+      return accept != IntPtr.Zero
+        && PostMessageW(accept, BmClick, IntPtr.Zero, IntPtr.Zero);
+    }
+    public static byte[] CaptureClient(IntPtr window) {
+      Rect rect; if (!GetClientRect(window, out rect)) return null;
+      int width = rect.right - rect.left, height = rect.bottom - rect.top;
+      if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return null;
+      IntPtr source = GetDC(window), memory = IntPtr.Zero, bitmap = IntPtr.Zero,
+        previous = IntPtr.Zero;
+      try {
+        if (source == IntPtr.Zero) return null;
+        memory = CreateCompatibleDC(source);
+        bitmap = CreateCompatibleBitmap(source, width, height);
+        if (memory == IntPtr.Zero || bitmap == IntPtr.Zero) return null;
+        previous = SelectObject(memory, bitmap);
+        if (!BitBlt(memory, 0, 0, width, height, source, 0, 0, SrcCopy)) return null;
+        BitmapInfo information = new BitmapInfo();
+        information.header.size = (uint)Marshal.SizeOf(typeof(BitmapInfoHeader));
+        information.header.width = width; information.header.height = -height;
+        information.header.planes = 1; information.header.bitCount = 32;
+        byte[] bytes = new byte[checked(width * height * 4)];
+        return GetDIBits(memory, bitmap, 0, (uint)height, bytes,
+          ref information, 0) == height ? bytes : null;
+      } finally {
+        if (previous != IntPtr.Zero && memory != IntPtr.Zero) SelectObject(memory, previous);
+        if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+        if (memory != IntPtr.Zero) DeleteDC(memory);
+        if (source != IntPtr.Zero) ReleaseDC(window, source);
+      }
+    }
+    public static int DifferentPixels(byte[] before, byte[] after) {
+      if (before == null || after == null || before.Length != after.Length) return -1;
+      int different = 0;
+      for (int index = 0; index < before.Length; index += 16) {
+        if (before[index] != after[index] || before[index + 1] != after[index + 1]
+            || before[index + 2] != after[index + 2]) different++;
+      }
+      return different;
+    }
+    public static bool IsBluePixel(IntPtr window, int x, int y) {
+      IntPtr dc = GetDC(window);
+      if (dc == IntPtr.Zero) return false;
+      try {
+        uint color = GetPixel(dc, x, y);
+        if (color == 0xffffffff) return false;
+        int red = (int)(color & 0xff), green = (int)((color >> 8) & 0xff),
+          blue = (int)((color >> 16) & 0xff);
+        return blue > 140 && red < 100 && green < 150;
+      } finally { ReleaseDC(window, dc); }
+    }
+    public static int DarkPixels(IntPtr window, int x, int y, int width, int height) {
+      IntPtr dc = GetDC(window); if (dc == IntPtr.Zero) return -1;
+      try {
+        int dark = 0;
+        for (int row = y; row < y + height; row++) {
+          for (int column = x; column < x + width; column++) {
+            uint color = GetPixel(dc, column, row);
+            if (color != 0xffffffff && (color & 0xff) < 100
+                && ((color >> 8) & 0xff) < 100
+                && ((color >> 16) & 0xff) < 100) dark++;
+          }
+        }
+        return dark;
+      } finally { ReleaseDC(window, dc); }
+    }
+    public static bool SetClipboardText(string text) {
+      if (text == null || !OpenClipboard(IntPtr.Zero)) return false;
+      IntPtr memory = IntPtr.Zero;
+      try {
+        if (!EmptyClipboard()) return false;
+        byte[] bytes = System.Text.Encoding.Unicode.GetBytes(text + "\0");
+        memory = GlobalAlloc(0x0002, new UIntPtr((uint)bytes.Length));
+        if (memory == IntPtr.Zero) return false;
+        IntPtr target = GlobalLock(memory);
+        if (target == IntPtr.Zero) return false;
+        try { Marshal.Copy(bytes, 0, target, bytes.Length); }
+        finally { GlobalUnlock(memory); }
+        if (SetClipboardData(13, memory) == IntPtr.Zero) return false;
+        memory = IntPtr.Zero;
+        return true;
+      } finally {
+        if (memory != IntPtr.Zero) GlobalFree(memory);
+        CloseClipboard();
+      }
+    }
+  }
 }
 '@
 }
@@ -826,7 +1129,7 @@ if (-not [string]::IsNullOrWhiteSpace($PrepareManualState)) {
     New-Item -ItemType Directory -Path $manualState -Force | Out-Null
     Protect-Path $manualState -Container
     Assert-PlainTree $manualState
-    foreach ($name in @('package-store','sandbox-temp','telemetry')) {
+    foreach ($name in @('package-store','sandbox-temp','telemetry','storage')) {
         $directory = Join-Path $manualState $name
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         Protect-Path $directory -Container
@@ -891,7 +1194,8 @@ try {
     $env:QTEST_FUNCTION_TIMEOUT = '900000'
     $env:MSBUILDDISABLENODEREUSE = '1'
 
-function New-SignedUpdatePackage([string]$Version, [string]$Destination) {
+function New-SignedUpdatePackage([string]$Version, [string]$Destination,
+        [string]$MainQml = '', [switch]$ClipboardReadWithGesture) {
     $packageWork = Join-Path $taskTemp "package-work-$Version"
     $source = Join-Path $packageWork 'source'
     New-Item -ItemType Directory -Path $packageWork | Out-Null
@@ -907,8 +1211,15 @@ function New-SignedUpdatePackage([string]$Version, [string]$Destination) {
     $manifestPath = Join-Path $source 'manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $manifest.version = $Version
+    if ($ClipboardReadWithGesture) {
+        $manifest.permissions.clipboardRead = 'user-gesture'
+    }
     [IO.File]::WriteAllText($manifestPath,
         ($manifest | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+    if (-not [string]::IsNullOrEmpty($MainQml)) {
+        [IO.File]::WriteAllText((Join-Path $source 'qml\Main.qml'), $MainQml,
+            [Text.UTF8Encoding]::new($false))
+    }
     # The task temp ancestor is deny-delete leased. Let qbrowser-package own the
     # exact unleased child root it uses for atomic output staging, separate from
     # its immutable source-tree root.
@@ -992,7 +1303,8 @@ function Wait-DeployedWorker([string[]]$ExcludedIdentities = @()) {
 }
 
 function Start-DeployedHost([string]$MockOrigin, [string]$Store,
-        [string]$Sandbox, [string]$Telemetry, [string]$InstallPackage,
+        [string]$Sandbox, [string]$Telemetry, [string]$Storage,
+        [string]$InstallPackage,
         [int]$HealthWindowMs) {
     $arguments = @('--package-mode', "--mock-origin=$MockOrigin",
         '--app-id=com.qbrowser.pilot',
@@ -1000,7 +1312,8 @@ function Start-DeployedHost([string]$MockOrigin, [string]$Store,
         "--package-store=$Store", "--sandbox-temp=$Sandbox",
         "--runtime-root=$(Join-Path $staging 'runtime')",
         "--worker-executable=$(Join-Path $staging 'runtime\qbrowser-worker.exe')",
-        "--telemetry-directory=$Telemetry", "--health-window-ms=$HealthWindowMs",
+        "--telemetry-directory=$Telemetry", "--storage-directory=$Storage",
+        "--health-window-ms=$HealthWindowMs",
         '--heartbeat-timeout-ms=10000')
     if (-not [string]::IsNullOrEmpty($InstallPackage)) {
         $arguments += "--install-package=$InstallPackage"
@@ -1019,6 +1332,268 @@ function Wait-Telemetry([string]$Telemetry, [string]$Pattern, [int]$TimeoutMs = 
     Wait-Until { (Test-Path -LiteralPath $file -PathType Leaf) -and
         (Get-Content -LiteralPath $file -Raw) -match $Pattern } $TimeoutMs `
         "Telemetry did not contain required event: $Pattern"
+}
+
+function Wait-MockRequest([string]$MockOutput, [string]$Method,
+        [string]$Target, [int]$TimeoutMs = 15000) {
+    Wait-Until {
+        if (-not (Test-Path -LiteralPath $MockOutput -PathType Leaf)) {
+            return $false
+        }
+        foreach ($line in Get-Content -LiteralPath $MockOutput -ErrorAction SilentlyContinue) {
+            try { $message = $line | ConvertFrom-Json } catch { continue }
+            if ($null -ne $message.request -and
+                [string]$message.request.method -eq $Method -and
+                [string]$message.request.target -eq $Target) {
+                return $true
+            }
+        }
+        return $false
+    } $TimeoutMs "Mock API did not observe exact request: $Method $Target"
+}
+
+function Get-MockRequestCount([string]$MockOutput, [string]$Method,
+        [string]$Target) {
+    if (-not (Test-Path -LiteralPath $MockOutput -PathType Leaf)) { return 0 }
+    $count = 0
+    foreach ($line in Get-Content -LiteralPath $MockOutput -ErrorAction SilentlyContinue) {
+        try { $message = $line | ConvertFrom-Json } catch { continue }
+        if ($null -ne $message.request -and
+            [string]$message.request.method -eq $Method -and
+            [string]$message.request.target -eq $Target) {
+            ++$count
+        }
+    }
+    return $count
+}
+
+function Wait-MockRequestAfter([string]$MockOutput, [string]$Method,
+        [string]$Target, [int]$Before, [int]$TimeoutMs = 15000) {
+    Wait-Until {
+        (Get-MockRequestCount $MockOutput $Method $Target) -gt $Before
+    } $TimeoutMs "Mock API did not observe a new exact request: $Method $Target"
+}
+
+function Get-RouteAckCount([string]$Telemetry, [string]$Template) {
+    $eventFile = Join-Path $Telemetry 'events.jsonl'
+    if (-not (Test-Path -LiteralPath $eventFile -PathType Leaf)) { return 0 }
+    $pattern = '"phase":"worker","code":"completed".*' +
+        '"routeTemplate":"' + [regex]::Escape($Template) + '".*"queueDepth":0'
+    return @([regex]::Matches((Get-Content -LiteralPath $eventFile -Raw),
+        $pattern)).Count
+}
+
+function New-DeployedHostAutomation([Diagnostics.Process]$Process) {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    $Process.Refresh()
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle(
+        [IntPtr]$Process.MainWindowHandle)
+    if ($null -eq $root) { throw 'Windows UI Automation could not open the Host window.' }
+    $editCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+    $address = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+        $editCondition)
+    $goCondition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, 'Go'))
+    $go = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+        $goCondition)
+    if ($null -eq $address -or $null -eq $go) {
+        throw 'Host navigation controls are unavailable to Windows UI Automation.'
+    }
+    return [pscustomobject]@{
+        Root = $root
+        Address = [System.Windows.Automation.ValuePattern]$address.GetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern)
+        Go = [System.Windows.Automation.InvokePattern]$go.GetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern)
+    }
+}
+
+function Invoke-DeployedNavigation($Automation, [string]$Route,
+        [string]$Telemetry, [string]$Template) {
+    $before = Get-RouteAckCount $Telemetry $Template
+    $Automation.Address.SetValue($Route)
+    $Automation.Go.Invoke()
+    Wait-Until { $Automation.Address.Current.Value -eq $Route } 10000 `
+        "Host address did not accept route $Route"
+    Wait-Until { (Get-RouteAckCount $Telemetry $Template) -gt $before } 15000 `
+        "Worker did not acknowledge normalized route with pending=0: $Route"
+}
+
+function Get-DeployedWorkerWindow([Diagnostics.Process]$Host, $Worker) {
+    $script:deployedWorkerWindow = [IntPtr]::Zero
+    Wait-Until {
+        $Host.Refresh()
+        $candidate = [QBrowser.Task18.NativeAutomation]::FindWorkerWindow(
+            [IntPtr]$Host.MainWindowHandle, [int]$Worker.ProcessId)
+        if ($candidate -eq [IntPtr]::Zero) { return $false }
+        $script:deployedWorkerWindow = $candidate
+        return $true
+    } 10000 'The deployed Worker native child window was not found.'
+    return $script:deployedWorkerWindow
+}
+
+function Get-StorageValue([string]$Storage, [string]$Key) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Storage -File -Filter '*.json' `
+            -ErrorAction SilentlyContinue)) {
+        try { $values = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json }
+        catch { continue }
+        $property = $values.PSObject.Properties[$Key]
+        if ($null -ne $property) { return [string]$property.Value }
+    }
+    return $null
+}
+
+function Wait-StorageValue([string]$Storage, [string]$Key, [string]$Expected,
+        [int]$TimeoutMs = 15000) {
+    Wait-Until { (Get-StorageValue $Storage $Key) -eq $Expected } $TimeoutMs `
+        "Storage did not persist exact value: $Key=$Expected"
+}
+
+function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$Host,
+        $Worker, [string]$Telemetry, [string]$MockOutput, [string]$Storage,
+        [string]$SelectedFile) {
+    $automation = New-DeployedHostAutomation $Host
+    $window = Get-DeployedWorkerWindow $Host $Worker
+
+    $loginBefore = Get-MockRequestCount $MockOutput 'POST' '/api/login'
+    $dashboardBefore = Get-MockRequestCount $MockOutput 'GET' '/api/dashboard'
+    Invoke-DeployedNavigation $automation 'app://pilot/login' $Telemetry '/login'
+    $focused = $false
+    1..3 | ForEach-Object {
+        if (-not $focused) {
+            $focused = [QBrowser.Task18.NativeAutomation]::Click($window, 550, 308)
+        }
+    }
+    if (-not $focused -or
+        -not [QBrowser.Task18.NativeAutomation]::SendUnicodeText(
+            $window, 'pilot@example.com') -or
+        -not [QBrowser.Task18.NativeAutomation]::SendKey($window, 0x09) -or
+        -not [QBrowser.Task18.NativeAutomation]::SendUnicodeText(
+            $window, 'pilot-pass') -or
+        -not [QBrowser.Task18.NativeAutomation]::SendKey($window, 0x09) -or
+        -not [QBrowser.Task18.NativeAutomation]::SendKey($window, 0x0d)) {
+        throw 'Real deployed login keyboard automation failed.'
+    }
+    Wait-MockRequestAfter $MockOutput 'POST' '/api/login' $loginBefore
+    Wait-MockRequestAfter $MockOutput 'GET' '/api/dashboard' $dashboardBefore
+    Write-Output 'DEPLOYMENT_BUSINESS_LOGIN=PASS realInput=1 successor=/dashboard'
+
+    $orderGetBefore = Get-MockRequestCount $MockOutput 'GET' '/api/orders/ORD-1001'
+    $orderPatchBefore = Get-MockRequestCount $MockOutput 'PATCH' '/api/orders/ORD-1001'
+    Invoke-DeployedNavigation $automation 'app://pilot/orders/ORD-1001' `
+        $Telemetry '/orders/:id'
+    Wait-MockRequestAfter $MockOutput 'GET' '/api/orders/ORD-1001' $orderGetBefore
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::DarkPixels($window, 340, 610, 95, 48) `
+            -ge 30
+    } 10000 'Loaded order did not enable the processing mutation control.'
+    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 383, 634)) {
+        throw 'Real deployed order mutation click failed.'
+    }
+    Wait-MockRequestAfter $MockOutput 'PATCH' '/api/orders/ORD-1001' $orderPatchBefore
+    Write-Output 'DEPLOYMENT_BUSINESS_ORDER=PASS GET=>PATCH status=processing'
+
+    $customersBefore = Get-MockRequestCount $MockOutput 'GET' `
+        '/api/customers?page=1&pageSize=20&query='
+    $customerBefore = Get-MockRequestCount $MockOutput 'GET' '/api/customers/CUS-001'
+    Invoke-DeployedNavigation $automation 'app://pilot/customers' $Telemetry '/customers'
+    Wait-MockRequestAfter $MockOutput 'GET' `
+        '/api/customers?page=1&pageSize=20&query=' $customersBefore
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::DarkPixels($window, 520, 130, 300, 90) `
+            -ge 30
+    } 10000 'Loaded customer list did not render a selectable entity.'
+    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 650, 170) -or
+        -not [QBrowser.Task18.NativeAutomation]::Click($window, 900, 634)) {
+        throw 'Real deployed customer successor clicks failed.'
+    }
+    Wait-MockRequestAfter $MockOutput 'GET' '/api/customers/CUS-001' $customerBefore
+    Wait-Until { (Get-RouteAckCount $Telemetry '/customers/:id') -gt 0 } 15000 `
+        'Customer list response was not consumed into the detail successor route.'
+    Write-Output 'DEPLOYMENT_BUSINESS_CUSTOMERS=PASS list=>detail CUS-001'
+
+    Invoke-DeployedNavigation $automation 'app://pilot/settings' $Telemetry '/settings'
+    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 432, 140)) {
+        throw 'Real deployed dark-theme click failed.'
+    }
+    Wait-StorageValue $Storage 'theme' 'dark'
+    Write-Output 'DEPLOYMENT_BUSINESS_STORAGE_SET=PASS theme=dark'
+
+    Invoke-DeployedNavigation $automation 'app://pilot/files' $Telemetry '/files'
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::IsBluePixel($window, 280, 127)
+    } 10000 'Deployed file control did not render.'
+    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 312, 127)) {
+        throw 'Real deployed file cancel click failed.'
+    }
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -gt 0
+    } 5000 'Native file cancel dialog did not open.'
+    if ([QBrowser.Task18.NativeAutomation]::CancelFileDialogs($Host.Id) -le 0) {
+        throw 'Native file cancel dialog was not cancelled.'
+    }
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -eq 0
+    } 5000 'Native file cancel dialog remained open.'
+    $beforeFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
+    if ($null -eq $beforeFile -or
+        -not [QBrowser.Task18.NativeAutomation]::Click($window, 312, 127)) {
+        throw 'Real deployed file success click failed.'
+    }
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -gt 0
+    } 5000 'Native file success dialog did not open.'
+    if (-not [QBrowser.Task18.NativeAutomation]::AcceptFileDialog(
+            $Host.Id, $SelectedFile)) {
+        throw 'Native file success dialog automation failed.'
+    }
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -eq 0
+    } 5000 'Native file success dialog remained open.'
+    Wait-Until {
+        $afterFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
+        [QBrowser.Task18.NativeAutomation]::DifferentPixels(
+            $beforeFile, $afterFile) -gt 2000
+    } 10000 'Pilot QML did not consume the selected file metadata response.'
+    Write-Output 'DEPLOYMENT_BUSINESS_FILE=PASS cancel=1 success=1 consumed=1'
+}
+
+function Assert-DeployedStoragePersistence([Diagnostics.Process]$Host, $Worker,
+        [string]$Telemetry, [string]$Storage) {
+    $automation = New-DeployedHostAutomation $Host
+    $window = Get-DeployedWorkerWindow $Host $Worker
+    Invoke-DeployedNavigation $automation 'app://pilot/settings' $Telemetry '/settings'
+    # Light is enabled only after the restarted Worker consumes the persisted
+    # dark value. One non-retried side-effect click must persist the successor.
+    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 328, 140)) {
+        throw 'Real deployed persisted-theme successor click failed.'
+    }
+    Wait-StorageValue $Storage 'theme' 'light'
+    Write-Output 'DEPLOYMENT_BUSINESS_STORAGE_RESTART=PASS dark=>restart=>light'
+}
+
+function Invoke-DeployedClipboardAcceptance([Diagnostics.Process]$Host, $Worker,
+        [string]$Storage) {
+    $window = Get-DeployedWorkerWindow $Host $Worker
+    Wait-StorageValue $Storage 'clipboard-no-gesture' 'clipboard.gesture_required'
+    Wait-StorageValue $Storage 'clipboard-undeclared' 'capability.denied'
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::IsBluePixel($window, 550, 360)
+    } 10000 'Deployed clipboard gesture control did not render.'
+    if (-not [QBrowser.Task18.NativeAutomation]::SetClipboardText('gesture-canary') -or
+        -not [QBrowser.Task18.NativeAutomation]::Click($window, 550, 360)) {
+        throw 'Real deployed clipboard gesture input failed.'
+    }
+    Wait-StorageValue $Storage 'clipboard-gesture' `
+        'first-ok:clipboard.gesture_required'
+    Write-Output 'DEPLOYMENT_BUSINESS_CLIPBOARD=PASS expired=denied undeclared=denied gesture=once replay=denied'
 }
 
 function Stop-OwnedHost([Diagnostics.Process]$Process) {
@@ -1277,6 +1852,7 @@ function Invoke-DeploymentOnlyE2E {
     $mock = $null
     $initialHostProcess = $null
     $secondHost = $null
+    $thirdHost = $null
     $ownedPids = [Collections.Generic.HashSet[int]]::new()
     $workerPath = Join-Path $staging 'runtime\qbrowser-worker.exe'
     $webEnginePath = Join-Path $staging 'host\QtWebEngineProcess.exe'
@@ -1317,16 +1893,18 @@ function Invoke-DeploymentOnlyE2E {
         $store = Join-Path $state 'package-store'
         $sandbox = Join-Path $state 'sandbox-temp'
         $telemetry = Join-Path $state 'telemetry'
-        New-Item -ItemType Directory -Path $store, $sandbox, $telemetry | Out-Null
+        $storage = Join-Path $state 'storage'
+        New-Item -ItemType Directory -Path $store, $sandbox, $telemetry, $storage | Out-Null
         Protect-Path $store -Container
         Protect-Path $sandbox -Container
         Protect-Path $telemetry -Container
+        Protect-Path $storage -Container
         $minimalPath = "$(Join-Path $staging 'host');$env:SystemRoot\System32;$env:SystemRoot"
         $env:PATH = $minimalPath
         $pilot = Join-Path $staging 'packages\com.qbrowser.pilot-1.0.0.qapkg'
         $deployAclRoots = @((Join-Path $staging 'runtime'), (Join-Path $staging 'packages'))
         $deployAclBefore = Get-AclTreeSnapshot $deployAclRoots
-        $initialHostProcess = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $pilot 1000
+        $initialHostProcess = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $storage $pilot 1000
         [void]$ownedPids.Add($initialHostProcess.Id)
         $worker = Wait-DeployedWorker
         [void]$ownedPids.Add([int]$worker.ProcessId)
@@ -1335,6 +1913,12 @@ function Invoke-DeploymentOnlyE2E {
             throw 'LPAC Worker command line contains an implicit source runtime path.'
         }
         Wait-Telemetry $telemetry '"packageVersion":"1\.0\.0","phase":"health","code":"healthy"' 30000
+        $selectedFile = Join-Path $taskTemp 'deployment-selected-pilot-note.txt'
+        [IO.File]::WriteAllText($selectedFile, 'pilot-file',
+            [Text.UTF8Encoding]::new($false))
+        Protect-Path $selectedFile
+        Invoke-DeployedPilotBusinessAcceptance $initialHostProcess $worker `
+            $telemetry $mockOut $storage $selectedFile
         1..10 | ForEach-Object {
             Invoke-DeployedRouteAcceptance $initialHostProcess $telemetry `
                 -NegativeWorker $worker
@@ -1356,7 +1940,7 @@ function Invoke-DeploymentOnlyE2E {
         New-SignedUpdatePackage '1.1.0' $update
         Protect-Path $update
         $env:PATH = "C:\polluted-does-not-exist;$minimalPath"
-        $secondHost = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $update 60000
+        $secondHost = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $storage $update 60000
         [void]$ownedPids.Add($secondHost.Id)
         $firstUpdateWorker = Wait-DeployedWorker
         [void]$ownedPids.Add([int]$firstUpdateWorker.ProcessId)
@@ -1403,7 +1987,16 @@ function Invoke-DeploymentOnlyE2E {
         if (@(Get-DeployedProcesses 'qbrowser-worker.exe' $workerPath).Count -ne 1) {
             throw 'Recovered 1.0.0 Worker was not stable before route acceptance.'
         }
+        Assert-DeployedStoragePersistence $secondHost $recoveryWorker $telemetry $storage
         Invoke-DeployedRouteAcceptance $secondHost $telemetry
+        foreach ($request in @(
+                [pscustomobject]@{ Method = 'GET'; Target = '/api/dashboard' }
+                [pscustomobject]@{ Method = 'GET'; Target = '/api/orders/ORD-1001' }
+                [pscustomobject]@{ Method = 'GET'; Target = '/api/customers?page=1&pageSize=20&query=' }
+                [pscustomobject]@{ Method = 'GET'; Target = '/api/customers/CUS-001' })) {
+            Wait-MockRequest $mockOut $request.Method $request.Target
+            Write-Output "DEPLOYMENT_CAPABILITY_NETWORK=$($request.Method) $($request.Target)"
+        }
         Stop-OwnedHost $secondHost
         if ($secondHost.ExitCode -ne 0) {
             throw "Updated deployed Host cleanup exited $($secondHost.ExitCode)."
@@ -1412,10 +2005,93 @@ function Invoke-DeploymentOnlyE2E {
             @(Get-DeployedProcesses 'qbrowser-worker.exe' $workerPath).Count -eq 0 -and
             @(Get-DeployedProcesses 'QtWebEngineProcess.exe' $webEnginePath).Count -eq 0
         } 20000 'Deployed Worker/WebEngine processes remained after acceptance.'
+        $clipboardQml = @'
+import QtQuick
+Rectangle {
+    id: root
+    width: 1100; height: 720
+    color: "#f8fafc"
+    property string noGestureId: ""
+    property string noGestureStoreId: ""
+    property string undeclaredId: ""
+    property string undeclaredStoreId: ""
+    property string firstId: ""
+    property string replayId: ""
+    property bool ready: false
+    property bool firstOk: false
+    Timer {
+        interval: 1500; running: true; repeat: false
+        onTriggered: root.noGestureId = Runtime.invoke("clipboard", "read", {})
+    }
+    Rectangle {
+        anchors.centerIn: parent
+        width: 240; height: 96; radius: 8
+        color: root.ready ? "#2563eb" : "#64748b"
+        MouseArea {
+            anchors.fill: parent
+            enabled: root.ready
+            onClicked: root.firstId = Runtime.invoke("clipboard", "read", {})
+        }
+    }
+    Connections {
+        target: Runtime
+        function onCapabilityFinished(id, response) {
+            if (id === root.noGestureId) {
+                root.noGestureStoreId = Runtime.invoke("storage", "set", {
+                    key: "clipboard-no-gesture", value: response.error.code
+                })
+            } else if (id === root.noGestureStoreId) {
+                root.undeclaredId = Runtime.invoke("clipboard", "write", {
+                    text: "must-not-write"
+                })
+            } else if (id === root.undeclaredId) {
+                root.undeclaredStoreId = Runtime.invoke("storage", "set", {
+                    key: "clipboard-undeclared", value: response.error.code
+                })
+            } else if (id === root.undeclaredStoreId) {
+                root.ready = response.ok === true
+            } else if (id === root.firstId) {
+                root.firstOk = response.ok === true
+                    && response.result !== undefined
+                    && response.result.text === "gesture-canary"
+                root.replayId = Runtime.invoke("clipboard", "read", {})
+            } else if (id === root.replayId) {
+                Runtime.invoke("storage", "set", {
+                    key: "clipboard-gesture",
+                    value: (root.firstOk ? "first-ok:" : "first-failed:")
+                        + response.error.code
+                })
+            }
+        }
+    }
+}
+'@
+        $clipboardPackage = Join-Path $candidateRoot `
+            'com.qbrowser.pilot-1.2.0-clipboard.qapkg'
+        New-SignedUpdatePackage '1.2.0' $clipboardPackage `
+            -MainQml $clipboardQml -ClipboardReadWithGesture
+        Protect-Path $clipboardPackage
+        $thirdHost = Start-DeployedHost $script:mockOrigin $store $sandbox `
+            $telemetry $storage $clipboardPackage 1000
+        [void]$ownedPids.Add($thirdHost.Id)
+        $clipboardWorker = Wait-DeployedWorker @(
+            $firstUpdateWorker.Identity, $restartedWorker.Identity,
+            $recoveryWorker.Identity)
+        [void]$ownedPids.Add([int]$clipboardWorker.ProcessId)
+        Wait-Telemetry $telemetry `
+            '"packageVersion":"1\.2\.0","phase":"health","code":"healthy"' 30000
+        Invoke-DeployedClipboardAcceptance $thirdHost $clipboardWorker $storage
+        Stop-OwnedHost $thirdHost
+        if ($thirdHost.ExitCode -ne 0) {
+            throw "Clipboard deployed Host cleanup exited $($thirdHost.ExitCode)."
+        }
+        Wait-Until {
+            @(Get-DeployedProcesses 'qbrowser-worker.exe' $workerPath).Count -eq 0
+        } 15000 'Clipboard deployed Worker remained after acceptance.'
         Assert-AclLeaseRestored $deployAclBefore $deployAclRoots 'Updated Host deployment'
         Assert-AclLeaseRestored $storeAclBefore @($store) 'Updated Host package store' `
             -AllowAdditional -IgnoreActivationLockLifecycle
-        Write-Output 'DEPLOYMENT_E2E_OK routes=10 webEngine=deployed update=1.1.0 rollback=1.0.0 paths=minimal+polluted'
+        Write-Output 'DEPLOYMENT_E2E_OK routes=10 networkReads=4 business=login+order+customers+storage+file+clipboard webEngine=deployed update=1.1.0 rollback=1.0.0 paths=minimal+polluted'
     }
     catch {
         Write-Output "DEPLOYMENT_E2E_FAILURE=$($_.Exception.Message)"
@@ -1440,7 +2116,7 @@ function Invoke-DeploymentOnlyE2E {
                     "Owned child process remained: $($owned.ProcessId)"
             }
         }
-        foreach ($process in @($secondHost, $initialHostProcess, $mock)) {
+        foreach ($process in @($thirdHost, $secondHost, $initialHostProcess, $mock)) {
             if ($null -ne $process -and -not $process.HasExited -and
                 $ownedPids.Contains($process.Id)) {
                 Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

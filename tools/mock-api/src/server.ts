@@ -24,6 +24,7 @@ const KEEP_ALIVE_TIMEOUT_MS = 1_000;
 
 export interface StartMockApiOptions {
   requestTimeoutMs?: number;
+  onRequest?: (request: Readonly<{ method: string; target: string }>) => void;
 }
 
 export interface RunningMockApi {
@@ -249,6 +250,7 @@ export async function startMockApi(
     fixtures: createPilotFixtures(),
     helpHtml,
     onProtocolRejection: (connection) => protocolRejections.add(connection),
+    onRequest: options.onRequest,
   });
 
   let closePromise: Promise<void> | undefined;
@@ -264,7 +266,11 @@ export async function startMockApi(
 }
 
 async function runFromCommandLine(): Promise<void> {
-  const api = await startMockApi();
+  const api = await startMockApi({
+    onRequest: (request) => {
+      process.stdout.write(`${JSON.stringify({ request })}\n`);
+    },
+  });
   process.stdout.write(`${JSON.stringify({ origin: api.origin })}\n`);
   let closing = false;
   const stop = () => {

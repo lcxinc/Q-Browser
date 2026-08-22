@@ -13,9 +13,11 @@
 #include <optional>
 
 class HostWorkerSessionIo;
+class HostCapabilityRuntime;
 class IpcSession;
 class MainWindow;
 class QThread;
+struct BrokerResult;
 
 enum class HostWorkerSessionState { Detached, Running, ShuttingDown, Failed };
 Q_DECLARE_METATYPE(HostWorkerSessionState)
@@ -32,8 +34,13 @@ public:
     [[nodiscard]] HostWorkerSessionState state() const noexcept;
     [[nodiscard]] QString lastErrorCode() const;
     [[nodiscard]] qsizetype pendingRouteLoadCount() const noexcept;
+    [[nodiscard]] qsizetype pendingCapabilityCount() const noexcept;
     [[nodiscard]] bool hasIoThread() const noexcept;
     [[nodiscard]] bool ioThreadRunning() const noexcept;
+    void setCapabilityRuntime(HostCapabilityRuntime *runtime) noexcept;
+    void completeCapability(quint64 generation,
+                            const QString &requestId,
+                            const BrokerResult &result);
 
 signals:
     void failed(const QString &errorCode);
@@ -42,6 +49,10 @@ signals:
     void capabilityRequestObserved(const QString &capability,
                                    const QString &operation,
                                    const QVariantMap &payload);
+    void capabilityResponseQueued(const QString &requestId,
+                                  bool ok,
+                                  const QString &errorCode);
+    void capabilityResponseSent(const QString &requestId);
 
 private:
     struct OutboundCommand final {
@@ -50,6 +61,7 @@ private:
         QString route;
         bool trackedRouteLoad = false;
         bool resumePollingAfter = false;
+        QString capabilityRequestId;
     };
 
     void handleHostWorkerRoute(const QString &packageId,
@@ -61,6 +73,11 @@ private:
                                  const QString &route);
     void handleRouteLoadResponse(quint64 generation,
                                  const QString &requestId,
+                                 const QJsonObject &payload);
+    void handleCapabilityRequest(quint64 generation,
+                                 const QString &requestId,
+                                 const QString &capability,
+                                 const QString &operation,
                                  const QJsonObject &payload);
     void handleCommandFinished(quint64 generation,
                                quint64 commandId,
@@ -83,10 +100,12 @@ private:
 
     MainWindow *window_ = nullptr;
     QPointer<HostWorkerSessionIo> io_;
+    QPointer<HostCapabilityRuntime> capabilityRuntime_;
     QThread *ioThread_ = nullptr;
     std::unique_ptr<IpcSession> pendingSession_;
     QQueue<OutboundCommand> outbound_;
     std::optional<OutboundCommand> activeCommand_;
+    QString activeCapabilityRequestId_;
     QHash<QString, QString> pendingRouteLoads_;
     HostWorkerSessionState state_ = HostWorkerSessionState::Detached;
     HostWorkerSessionState cleanupFinalState_ = HostWorkerSessionState::Detached;

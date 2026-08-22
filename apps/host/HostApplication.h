@@ -17,6 +17,7 @@
 
 class MainWindow;
 class HostWorkerSessionController;
+class HostCapabilityRuntime;
 class WorkerSurface;
 class UpdateLifecycleCoordinator;
 class QTimer;
@@ -27,6 +28,8 @@ struct HostWorkerAttachContext final
     std::unique_ptr<IpcSession> session;
     std::unique_ptr<WorkerSurface> surface;
     std::shared_ptr<void> processLifetime;
+    ManifestPermissions permissions;
+    quint32 processId = 0;
     std::function<void()> stopProcess;
     std::optional<WorkerAttemptKey> supervisionKey;
 };
@@ -78,6 +81,7 @@ private:
     QUrl mockOrigin_;
     std::unique_ptr<MainWindow> mainWindow_;
     std::unique_ptr<HostWorkerSessionController> workerSessionController_;
+    std::shared_ptr<HostCapabilityRuntime> capabilityRuntime_;
     std::shared_ptr<void> workerProcessLifetime_;
     std::function<void()> stopWorkerProcess_;
     std::unique_ptr<InstalledPackageWorkerLauncher> installedPackageLauncher_;

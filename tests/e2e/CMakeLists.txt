@@ -10,7 +10,8 @@ foreach(q_browser_e2e_test IN ITEMS
     host_routes
     web_fallback
     package_update
-    host_survives_worker_crash)
+    host_survives_worker_crash
+    pilot_capabilities)
   add_executable(tst_e2e_${q_browser_e2e_test}
     tst_${q_browser_e2e_test}.cpp
     ${q_browser_e2e_support})

@@ -328,7 +328,15 @@ void PackageInstallerTest::installsReverifiesAndActivatesEntryBeyondWindowsMaxPa
     QVERIFY(temporary.isValid());
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
-    const QString storeRoot = temporary.filePath(QString(112, QLatin1Char('s')));
+    // Keep the final installed entry safely beyond MAX_PATH without making the
+    // fixture depend on the caller's TEMP prefix length.  Very long acceptance
+    // build roots otherwise pushed Qt's own QLockFile cleanup onto a different
+    // path-length boundary before this test reached the extended-path assertion.
+    constexpr qsizetype targetStoreRootLength = 136;
+    const qsizetype storePadding = std::max<qsizetype>(
+        8, targetStoreRootLength - temporary.path().size() - 1);
+    const QString storeRoot = temporary.filePath(
+        QString(storePadding, QLatin1Char('s')));
     PackageStore store(storeRoot);
     PackageInstaller installer(store, keys.value().publicKeyPem, policy());
     const QString entryPoint = QStringLiteral("qml/")

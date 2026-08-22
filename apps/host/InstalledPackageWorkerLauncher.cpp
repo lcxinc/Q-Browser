@@ -8,6 +8,7 @@
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QDirIterator>
 #include <QPointer>
@@ -18,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <semaphore>
 #include <system_error>
 #include <thread>
@@ -36,6 +38,37 @@ enum class LauncherThreadRole
     Launch,
     Observer,
 };
+
+void recordLauncherValidationFailure(const char *stage,
+                                     const UpdateLaunchRequest &request,
+                                     const InstallResult &validated)
+{
+    if (!qEnvironmentVariableIsSet("Q_BROWSER_HOST_DIAGNOSTIC_PHASES")) return;
+    const bool bindingMatches = validated.activationBinding.has_value()
+        && *validated.activationBinding == request.expectedActivation;
+    const QByteArray line = QStringLiteral(
+        "qbrowser-host launcher: stale_activation.%1 succeeded=%2 phase=%3 "
+        "error=%4 binding=%5 app=%6 version=%7 entry=%8 path=%9\n")
+        .arg(QString::fromLatin1(stage))
+        .arg(validated.succeeded() ? 1 : 0)
+        .arg(static_cast<int>(validated.phase))
+        .arg(validated.stableError)
+        .arg(bindingMatches ? 1 : 0)
+        .arg(validated.appId == request.appId ? 1 : 0)
+        .arg(validated.version == request.packageVersion ? 1 : 0)
+        .arg(validated.entryPoint == request.entryPoint ? 1 : 0)
+        .arg(QFileInfo(validated.path).canonicalFilePath().compare(
+                 QFileInfo(request.packageDirectory).canonicalFilePath(),
+                 Qt::CaseInsensitive) == 0 ? 1 : 0)
+        .toUtf8();
+    QFile standardError;
+    if (!standardError.open(stderr, QIODevice::WriteOnly,
+                            QFileDevice::DontCloseHandle)) {
+        return;
+    }
+    (void)standardError.write(line);
+    (void)standardError.flush();
+}
 
 template<typename Task>
 bool startDetachedLauncherThread(const LauncherThreadRole role,
@@ -285,6 +318,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     std::atomic_bool attached{false};
     std::atomic_bool fatalCleanupObserved{false};
     std::atomic_bool observationFailed{false};
+    std::atomic<DWORD> observedExitCode{STILL_ACTIVE};
     std::mutex launchMutex;
     std::condition_variable launchChanged;
     std::mutex resourceMutex;
@@ -408,6 +442,7 @@ struct InstalledPackageWorkerLauncher::ReadyPayload final
     }
 
     std::shared_ptr<LaunchRetirementContext> context;
+    ManifestPermissions permissions;
     std::atomic_bool consumed{false};
     std::atomic_bool admissionResolved{false};
     QPointer<QTimer> admissionTimer;
@@ -577,6 +612,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             const InstallResult prelaunch = validateBinding(
                 request.appId, request.expectedActivation);
             if (!matchesValidatedActivation(request, prelaunch)) {
+                recordLauncherValidationFailure("prelaunch", request,
+                                                prelaunch);
                 if (guard) QMetaObject::invokeMethod(
                     guard, [guard, key = request.key] {
                         if (guard) guard->fail(
@@ -660,6 +697,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             const InstallResult admitted = validateBinding(
                 request.appId, request.expectedActivation);
             if (!matchesValidatedActivation(request, admitted)) {
+                recordLauncherValidationFailure("posthandshake", request,
+                                                admitted);
                 if (guard) QMetaObject::invokeMethod(
                     guard, [guard, key = request.key] {
                         if (guard) guard->fail(
@@ -667,6 +706,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     }, Qt::QueuedConnection);
                 return;
             }
+            payload->permissions = admitted.permissions;
             context->windowHandle = surface.windowHandle;
 #ifdef Q_BROWSER_HOST_TESTING
             const auto handshakeHooks =
@@ -801,7 +841,7 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     }
     if (surface == nullptr
         || attach_(std::move(session), std::move(surface),
-                   context->process, context->request.key)
+                   context->process, payload->permissions, context->request.key)
             != AttachResult::Attached) {
         observerGate->released.release();
         context->retireAsync();
@@ -851,7 +891,15 @@ InstalledPackageWorkerLauncher::observeProcess(
             gate->released.acquire();
             for (;;) {
                 const SandboxProcessWaitResult waited = waitHandle.wait(100);
-                if (waited == SandboxProcessWaitResult::Finished) break;
+                if (waited == SandboxProcessWaitResult::Finished) {
+                    std::lock_guard lock(context->resourceMutex);
+                    if (context->process != nullptr) {
+                        context->observedExitCode.store(
+                            context->process->exitCode(),
+                            std::memory_order_release);
+                    }
+                    break;
+                }
                 if (waited == SandboxProcessWaitResult::Error) {
                     context->observationFailed.store(
                         true, std::memory_order_release);
@@ -918,8 +966,23 @@ void InstalledPackageWorkerLauncher::handleRetirement(
             pendingRequest_.reset();
             fail(key, QStringLiteral("host.launch.process_observer_failed"));
         } else {
-            if (!expected) emit unexpectedExit(
-                key.activation.value, key.attempt.value);
+            if (!expected) {
+                QFile standardError;
+                if (qEnvironmentVariableIsSet(
+                        "Q_BROWSER_HOST_DIAGNOSTIC_PHASES")
+                    && standardError.open(stderr, QIODevice::WriteOnly,
+                                          QFileDevice::DontCloseHandle)) {
+                    const QByteArray line = QStringLiteral(
+                        "qbrowser-host worker exited unexpectedly: code=0x%1\n")
+                        .arg(context->observedExitCode.load(
+                                 std::memory_order_acquire),
+                             8, 16, QLatin1Char('0'))
+                        .toUtf8();
+                    (void)standardError.write(line);
+                    (void)standardError.flush();
+                }
+                emit unexpectedExit(key.activation.value, key.attempt.value);
+            }
             exited_(key, expected || context->serial != serial_);
         }
         expectedStop_.reset();

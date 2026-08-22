@@ -1,16 +1,21 @@
 #include "HostApplication.h"
+#include "HostCapabilityRuntime.h"
 #include "MainWindow.h"
 #include "NavigationBar.h"
 #include "HostWorkerSessionController.h"
 #include "HostWorkerSessionTestHooks.h"
 #include "ProtocolMessage.h"
 #include "RouteRegistry.h"
+#include "SignatureVerifier.h"
 #include "WebSurface.h"
 #include "WorkerSurface.h"
 #include "WorkerTestEnvironment.h"
+#include "WorkerRetirementManager.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
+#include <QDir>
+#include <QFile>
 #include <QHostAddress>
 #include <QLineEdit>
 #include <QSignalSpy>
@@ -21,10 +26,12 @@
 #include <QTest>
 #include <QThread>
 #include <QTimer>
+#include <QTemporaryDir>
 #include <QToolButton>
 #include <QWebEnginePage>
 
 #ifdef Q_OS_WIN
+#include <Aclapi.h>
 #include <qt_windows.h>
 #endif
 
@@ -40,6 +47,48 @@ DWORD processHandleCount()
 {
     DWORD count = 0;
     return GetProcessHandleCount(GetCurrentProcess(), &count) ? count : 0;
+}
+
+bool protectTrustKey(const QString &path)
+{
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD queried = GetNamedSecurityInfoW(
+        const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+        SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+        &owner, nullptr, nullptr, nullptr, &descriptor);
+    if (queried != ERROR_SUCCESS || descriptor == nullptr || owner == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return false;
+    }
+    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD systemBytes = sizeof(systemBuffer);
+    if (CreateWellKnownSid(WinLocalSystemSid, nullptr, systemBuffer,
+                           &systemBytes) == FALSE) {
+        LocalFree(descriptor);
+        return false;
+    }
+    EXPLICIT_ACCESSW entries[2]{};
+    for (EXPLICIT_ACCESSW &entry : entries) {
+        entry.grfAccessPermissions = GENERIC_ALL;
+        entry.grfAccessMode = GRANT_ACCESS;
+        entry.grfInheritance = NO_INHERITANCE;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    }
+    entries[0].Trustee.ptstrName = static_cast<LPWSTR>(owner);
+    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(systemBuffer);
+    PACL dacl = nullptr;
+    const DWORD aclResult = SetEntriesInAclW(2, entries, nullptr, &dacl);
+    const DWORD applied = aclResult == ERROR_SUCCESS
+        ? SetNamedSecurityInfoW(
+              const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+              SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr, nullptr, dacl, nullptr)
+        : aclResult;
+    if (dacl != nullptr) LocalFree(dacl);
+    LocalFree(descriptor);
+    return applied == ERROR_SUCCESS;
 }
 #endif
 
@@ -179,6 +228,7 @@ private slots:
     void failedWorkerContextAttachmentConsumesSurfaceExactlyOnce();
     void hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation();
     void stalledWorkerReaderNeverBlocksTheGuiThread();
+    void capabilityPendingKeepsHeartbeatAndBoundsSecondRequest();
     void gracefulShutdownCleansIoBeforeReattach();
     void failedSessionCanReattachBeforeOldCallbacksDrain();
     void reattachAfterIoThreadFinishedBeforeGuiCleanup();
@@ -543,6 +593,98 @@ void UnifiedNavigationTest::stalledWorkerReaderNeverBlocksTheGuiThread()
     QVERIFY(writerFinished.load());
 }
 
+void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondRequest()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+
+    QTcpServer silentServer;
+    QVERIFY(silentServer.listen(QHostAddress::LocalHost));
+    const QUrl origin(QStringLiteral("http://127.0.0.1:%1/")
+                          .arg(silentServer.serverPort()));
+    ManifestPermissions permissions;
+    permissions.network.hosts = {QStringLiteral("127.0.0.1")};
+    permissions.network.methods = {QStringLiteral("GET")};
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    QString error;
+    auto runtime = HostCapabilityRuntime::create(
+        QStringLiteral("com.qbrowser.pilot"), permissions, origin, storage.path(),
+        0, 0, 0, &error);
+    QVERIFY2(runtime != nullptr, qPrintable(error));
+    auto cleanup = qScopeGuard([&] {
+        controller.setCapabilityRuntime(nullptr);
+        HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+        if (sessions.has_value() && sessions->worker != nullptr)
+            sessions->worker->close();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    connect(runtime.get(), &HostCapabilityRuntime::completed, &controller,
+            &HostWorkerSessionController::completeCapability,
+            Qt::QueuedConnection);
+    controller.setCapabilityRuntime(runtime.get());
+    QVERIFY(controller.attach(std::move(sessions->host)));
+    QSignalSpy heartbeats(&controller,
+                          &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(heartbeats.isValid());
+
+    const auto slow = ProtocolMessage::request(
+        QStringLiteral("slow"), QStringLiteral("network"),
+        QStringLiteral("request"),
+        QJsonObject{{QStringLiteral("method"), QStringLiteral("GET")},
+                    {QStringLiteral("url"),
+                     origin.resolved(QUrl(QStringLiteral("api/dashboard")))
+                         .toString(QUrl::FullyEncoded)},
+                    {QStringLiteral("bodyBase64"), QString{}}});
+    QVERIFY(slow.has_value());
+    QVERIFY(sessions->worker->sendRequest(
+        slow->requestId(), QStringLiteral("network"), QStringLiteral("request"),
+        slow->payload().value(QStringLiteral("payload")).toObject(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.pendingCapabilityCount(), qsizetype(1),
+                              3000);
+    QVERIFY(sessions->worker->send(ProtocolMessage::heartbeat(), 1000));
+    const auto second = ProtocolMessage::request(
+        QStringLiteral("second"), QStringLiteral("storage"),
+        QStringLiteral("get"), QJsonObject{{QStringLiteral("key"),
+                                             QStringLiteral("bounded")}});
+    QVERIFY(second.has_value());
+    QVERIFY(sessions->worker->sendRequest(
+        second->requestId(), QStringLiteral("storage"), QStringLiteral("get"),
+        second->payload().value(QStringLiteral("payload")).toObject(), 1000));
+    QTRY_VERIFY_WITH_TIMEOUT(heartbeats.count() > 0, 3000);
+
+    std::optional<ProtocolMessage> busy;
+    QTRY_VERIFY_WITH_TIMEOUT(([&] {
+        const SessionReceiveResult received = sessions->worker->poll(0);
+        if (received.status == SessionStatus::MessageReady
+            && received.message.has_value()
+            && received.message->type() == ProtocolType::Response
+            && received.message->requestId() == QStringLiteral("second")) {
+            busy = *received.message;
+        }
+        return busy.has_value();
+    })(), 3000);
+    QVERIFY(!busy->payload().value(QStringLiteral("ok")).toBool(true));
+    QCOMPARE(busy->payload().value(QStringLiteral("error")).toObject()
+                 .value(QStringLiteral("code")).toString(),
+             QStringLiteral("capability.busy"));
+    QCOMPARE(controller.pendingCapabilityCount(), qsizetype(1));
+
+    controller.setCapabilityRuntime(nullptr);
+    HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+    sessions->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Failed,
+                              3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+    cleanup.dismiss();
+}
+
 void UnifiedNavigationTest::gracefulShutdownCleansIoBeforeReattach()
 {
     HelpServer server;
@@ -820,7 +962,44 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     QVERIFY(surface != nullptr);
     WorkerSurface *const surfacePointer = surface.get();
 
-    HostApplication application(server.origin());
+    QTemporaryDir authority;
+    QTemporaryDir trust;
+    QVERIFY(authority.isValid());
+    QVERIFY(trust.isValid());
+    const QString store = authority.filePath(QStringLiteral("store"));
+    const QString sandbox = authority.filePath(QStringLiteral("sandbox"));
+    const QString telemetry = authority.filePath(QStringLiteral("telemetry"));
+    const QString storage = authority.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(store));
+    QVERIFY(QDir().mkpath(sandbox));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trust.filePath(QStringLiteral("trusted.pem"));
+    QFile keyFile(publicKey);
+    QVERIFY(keyFile.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+    QCOMPARE(keyFile.write(keys.value().publicKeyPem),
+             keys.value().publicKeyPem.size());
+    keyFile.close();
+#ifdef Q_OS_WIN
+    QVERIFY(protectTrustKey(publicKey));
+#endif
+    const HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments({
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--mock-origin=")
+            + server.origin().toString(QUrl::FullyEncoded),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + store,
+        QStringLiteral("--sandbox-temp=") + sandbox,
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--storage-directory=") + storage,
+    });
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    HostApplication application(std::move(*parsed.value));
     QVERIFY(application.start());
     HostWorkerAttachContext context;
     context.session = std::make_unique<IpcSession>(std::move(launch->hostSession));

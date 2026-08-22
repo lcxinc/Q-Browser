@@ -133,11 +133,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
             packageMode = true;
             continue;
         }
-        static constexpr std::array<QStringView, 11> names{
+        static constexpr std::array<QStringView, 12> names{
             u"mock-origin", u"app-id", u"trusted-public-key", u"package-store",
             u"sandbox-temp", u"runtime-root", u"worker-executable",
             u"telemetry-directory", u"install-package", u"health-window-ms",
-            u"heartbeat-timeout-ms"};
+            u"heartbeat-timeout-ms", u"storage-directory"};
         bool recognized = false;
         for (const QStringView name : names) {
             const QString value = argumentValue(argument, name);
@@ -196,9 +196,14 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
                                QStringLiteral("package-store"),
                                QStringLiteral("sandbox-temp"),
                                QStringLiteral("worker-executable"),
-                               QStringLiteral("telemetry-directory")};
+                               QStringLiteral("telemetry-directory"),
+                               QStringLiteral("storage-directory")};
     for (const QString &name : required) {
         if (!singleValues.contains(name)) {
+            if (name == QStringLiteral("storage-directory")) {
+                return failure(HostRuntimeConfigError::MissingArgument,
+                               QStringLiteral("host.config.missing_storage_directory"));
+            }
             return failure(HostRuntimeConfigError::MissingArgument,
                            QStringLiteral("host.config.missing_argument"));
         }
@@ -265,8 +270,10 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         singleValues.value(QStringLiteral("worker-executable")), false);
     const auto telemetry = safeExistingPath(
         singleValues.value(QStringLiteral("telemetry-directory")), true);
+    const auto storage = safeExistingPath(
+        singleValues.value(QStringLiteral("storage-directory")), true);
     if (!store.has_value() || !sandboxTemp.has_value() || !worker.has_value()
-        || !telemetry.has_value()) {
+        || !telemetry.has_value() || !storage.has_value()) {
         return failure(HostRuntimeConfigError::UnsafePath,
                        QStringLiteral("host.config.unsafe_path"));
     }
@@ -274,6 +281,7 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
     config.sandboxTempRoot_ = *sandboxTemp;
     config.workerExecutable_ = *worker;
     config.telemetryDirectory_ = *telemetry;
+    config.storageDirectory_ = *storage;
     for (const QString &runtimeRoot : runtimeRoots) {
         const auto root = safeExistingPath(runtimeRoot, true);
         if (!root.has_value()) {
@@ -283,7 +291,7 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         config.immutableRuntimeRoots_.push_back(*root);
     }
     QStringList boundaryRoots{config.packageStoreRoot_, config.sandboxTempRoot_,
-                              config.telemetryDirectory_};
+                              config.telemetryDirectory_, config.storageDirectory_};
     boundaryRoots.append(config.immutableRuntimeRoots_);
     for (qsizetype left = 0; left < boundaryRoots.size(); ++left) {
         for (qsizetype right = left + 1; right < boundaryRoots.size(); ++right) {
@@ -294,6 +302,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         }
     }
     if (overlaps(config.telemetryDirectory_,
+                 QFileInfo(*keyPath).absolutePath())) {
+        return failure(HostRuntimeConfigError::OverlappingRoots,
+                       QStringLiteral("host.config.overlapping_roots"));
+    }
+    if (overlaps(config.storageDirectory_,
                  QFileInfo(*keyPath).absolutePath())) {
         return failure(HostRuntimeConfigError::OverlappingRoots,
                        QStringLiteral("host.config.overlapping_roots"));
@@ -320,6 +333,11 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
                            QStringLiteral("host.config.unsafe_install_package"));
         }
         if (overlaps(config.telemetryDirectory_,
+                     QFileInfo(*package).absolutePath())) {
+            return failure(HostRuntimeConfigError::OverlappingRoots,
+                           QStringLiteral("host.config.overlapping_roots"));
+        }
+        if (overlaps(config.storageDirectory_,
                      QFileInfo(*package).absolutePath())) {
             return failure(HostRuntimeConfigError::OverlappingRoots,
                            QStringLiteral("host.config.overlapping_roots"));
@@ -377,6 +395,10 @@ const QString &HostRuntimeConfig::workerExecutable() const noexcept
 const QString &HostRuntimeConfig::telemetryDirectory() const noexcept
 {
     return telemetryDirectory_;
+}
+const QString &HostRuntimeConfig::storageDirectory() const noexcept
+{
+    return storageDirectory_;
 }
 const std::optional<QString> &HostRuntimeConfig::installPackage() const noexcept
 {

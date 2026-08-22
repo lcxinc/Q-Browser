@@ -54,7 +54,7 @@ package and public key.
 
 ## Manual deployed Host smoke
 
-The following commands create three distinct protected state roots and start
+The following commands create four distinct protected state roots and start
 the mock API. Do not substitute a source-build Host, Worker, Qt directory, or
 unprotected state path.
 
@@ -68,6 +68,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 `
 $store = Join-Path $state 'package-store'
 $sandbox = Join-Path $state 'sandbox-temp'
 $telemetry = Join-Path $state 'telemetry'
+$storage = Join-Path $state 'storage'
 
 $mockOut = Join-Path $state 'mock.stdout'
 $mockErr = Join-Path $state 'mock.stderr'
@@ -94,7 +95,8 @@ $common = @('--package-mode',"--mock-origin=$origin",'--app-id=com.qbrowser.pilo
   "--trusted-public-key=$deploy\trust\dev-public.pem","--package-store=$store",
   "--sandbox-temp=$sandbox","--runtime-root=$deploy\runtime",
   "--worker-executable=$deploy\runtime\qbrowser-worker.exe",
-  "--telemetry-directory=$telemetry",'--health-window-ms=2000',
+  "--telemetry-directory=$telemetry","--storage-directory=$storage",
+  '--health-window-ms=2000',
   '--heartbeat-timeout-ms=10000')
 function ConvertTo-LaunchArguments([string[]]$Values) {
   return (($Values | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' ')

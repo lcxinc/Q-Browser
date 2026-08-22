@@ -159,7 +159,7 @@ InstallResult failure(const InstallPhase phase,
                       const InstallError error,
                       const QString &stableError)
 {
-    return {phase, error, stableError, {}, {}, {}};
+    return {phase, error, stableError, {}, {}, {}, {}, {}, std::nullopt};
 }
 
 const ArchiveFile *findFile(const QVector<ArchiveFile> &files, const QByteArray &path)
@@ -461,7 +461,7 @@ InstallResult PackageInstaller::verifyInstalled(
 #endif
     return {InstallPhase::Complete, InstallError::None, {}, appId,
             parsed.value().version(), root, parsed.value().entryPoint(),
-            std::nullopt};
+            parsed.value().permissions(), std::nullopt};
 }
 
 InstallResult PackageInstaller::reverifyInstalledVersion(

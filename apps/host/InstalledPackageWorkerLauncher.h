@@ -38,6 +38,7 @@ public:
         std::unique_ptr<IpcSession>,
         std::unique_ptr<WorkerSurface>,
         std::shared_ptr<SandboxProcess>,
+        ManifestPermissions,
         WorkerAttemptKey)>;
     using StopCallback = std::function<void()>;
     using ExitCallback = std::function<void(WorkerAttemptKey, bool)>;

@@ -335,6 +335,7 @@ export interface RouteHandlerOptions {
   fixtures: PilotFixtures;
   helpHtml: string;
   onProtocolRejection: (connection: IncomingMessage["socket"]) => void;
+  onRequest?: (request: Readonly<{ method: string; target: string }>) => void;
 }
 
 function rawHeaderValues(request: IncomingMessage, expectedName: string): string[] {
@@ -489,6 +490,7 @@ export function createRouteHandler({
   fixtures,
   helpHtml,
   onProtocolRejection,
+  onRequest,
 }: RouteHandlerOptions) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const connection = request.socket;
@@ -501,6 +503,7 @@ export function createRouteHandler({
       const url = new URL(request.url, expectedOrigin);
       const path = url.pathname;
       validateRequestBodyPolicy(request, path);
+      onRequest?.({ method: request.method, target: `${path}${url.search}` });
 
       if (path === "/api/login") {
         if (!assertMethod(request, response, "POST")) return;

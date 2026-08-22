@@ -49,6 +49,7 @@ struct InstallResult final
     QString version;
     QString path;
     QString entryPoint;
+    ManifestPermissions permissions;
     std::optional<ActivationBinding> activationBinding;
 
     [[nodiscard]] bool succeeded() const noexcept

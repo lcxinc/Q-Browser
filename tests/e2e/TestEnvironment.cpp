@@ -86,6 +86,32 @@ bool waitUntil(const std::function<bool()> &predicate, const int timeoutMs)
     return predicate();
 }
 
+bool telemetryContainsCode(const QString &directory, const QByteArray &code)
+{
+    QFile events(QDir(directory).filePath(QStringLiteral("events.jsonl")));
+    if (!events.open(QIODevice::ReadOnly)) return false;
+    return events.readAll().contains(QByteArrayLiteral("\"code\":\"")
+                                     + code + QByteArrayLiteral("\""));
+}
+
+bool telemetryContainsHealthyVersion(const QString &directory,
+                                     const QString &version)
+{
+    QFile events(QDir(directory).filePath(QStringLiteral("events.jsonl")));
+    if (!events.open(QIODevice::ReadOnly)) return false;
+    while (!events.atEnd()) {
+        const QJsonObject event = QJsonDocument::fromJson(events.readLine()).object();
+        if (event.value(QStringLiteral("packageVersion")).toString() == version
+            && event.value(QStringLiteral("phase")).toString()
+                   == QStringLiteral("health")
+            && event.value(QStringLiteral("code")).toString()
+                   == QStringLiteral("healthy")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool processHasExited(const quint32 processId)
 {
     if (processId == 0) return true;
@@ -160,7 +186,8 @@ TestEnvironment::TestEnvironment()
         return;
     }
     appId_ = workerEnvironment_.appId();
-    if (!packages_.isValid() || !trust_.isValid() || !telemetry_.isValid()) {
+    if (!packages_.isValid() || !trust_.isValid() || !telemetry_.isValid()
+        || !storage_.isValid()) {
         error_ = QStringLiteral("e2e temporary roots are unavailable");
         return;
     }
@@ -216,6 +243,11 @@ bool TestEnvironment::shutdown()
     } else {
         telemetry_.setAutoRemove(false);
     }
+    if (!storage_.remove()) {
+        cleanupError_ = QStringLiteral("storage fixture cleanup failed");
+    } else {
+        storage_.setAutoRemove(false);
+    }
     if (!workerEnvironment_.cleanup()) cleanupError_ = workerEnvironment_.cleanupError();
     if (!cleanupError_.isEmpty()) error_ = cleanupError_;
     return cleanupError_.isEmpty();
@@ -225,6 +257,23 @@ bool TestEnvironment::isValid() const noexcept { return error_.isEmpty(); }
 QString TestEnvironment::error() const { return error_; }
 HostApplication *TestEnvironment::host() const noexcept { return host_.get(); }
 QString TestEnvironment::mockOrigin() const { return mockOrigin_; }
+
+bool TestEnvironment::waitForMockRequest(const QString &method,
+                                         const QString &target,
+                                         const int timeoutMs)
+{
+    const QString expected = method + u' ' + target;
+    return waitUntil([&] {
+        while (mockApi_.canReadLine()) {
+            const QJsonObject event = QJsonDocument::fromJson(mockApi_.readLine()).object();
+            const QJsonObject request = event.value(QStringLiteral("request")).toObject();
+            const QString observed = request.value(QStringLiteral("method")).toString()
+                + u' ' + request.value(QStringLiteral("target")).toString();
+            if (observed != QStringLiteral(" ")) mockRequests_.append(observed);
+        }
+        return mockRequests_.contains(expected);
+    }, timeoutMs);
+}
 int TestEnvironment::failureCount() const noexcept { return failureCount_; }
 QString TestEnvironment::lastFailure() const { return lastFailure_; }
 int TestEnvironment::tamperCanaryCount() const noexcept { return tamperCanaryCount_; }
@@ -289,7 +338,8 @@ bool TestEnvironment::startMockApi()
 }
 
 QString TestEnvironment::createPackage(const QString &version,
-                                       const QByteArray &mainQml)
+                                       const QByteArray &mainQml,
+                                       const bool clipboardReadWithGesture)
 {
     const QString source = QDir(QString::fromUtf8(Q_BROWSER_SOURCE_DIR))
                                .filePath(QStringLiteral("packages/pilot"));
@@ -307,6 +357,13 @@ QString TestEnvironment::createPackage(const QString &version,
             QJsonObject object = document.object();
             object.insert(QStringLiteral("appId"), appId_);
             object.insert(QStringLiteral("version"), version);
+            if (clipboardReadWithGesture) {
+                QJsonObject permissions = object.value(
+                    QStringLiteral("permissions")).toObject();
+                permissions.insert(QStringLiteral("clipboardRead"),
+                                   QStringLiteral("user-gesture"));
+                object.insert(QStringLiteral("permissions"), permissions);
+            }
             contents = QJsonDocument(object).toJson(QJsonDocument::Compact);
         } else if (relative == QByteArrayLiteral("qml/Main.qml") && !mainQml.isEmpty()) {
             contents = mainQml;
@@ -358,6 +415,7 @@ bool TestEnvironment::start(const QString &version)
         QStringLiteral("--runtime-root=") + workerEnvironment_.runtimeRoot(),
         QStringLiteral("--worker-executable=") + workerEnvironment_.workerExecutable(),
         QStringLiteral("--telemetry-directory=") + telemetry_.path(),
+        QStringLiteral("--storage-directory=") + storage_.path(),
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--health-window-ms=2000"),
         // Package fixture creation is synchronous in this test harness and can
@@ -409,12 +467,20 @@ bool TestEnvironment::start(const QString &version)
         error_ = QStringLiteral("production Worker did not become responsive");
         return false;
     }
-    PackageStore store(workerEnvironment_.packageRoot());
+    // The healthy telemetry record is emitted only after the lifecycle lane
+    // commits last-known-good. Polling activation.json here would repeatedly
+    // acquire the same cross-process lock and can starve that commit.
     if (!waitUntil([&] {
-            return !store.activationState(appId_)
-                        .state.lastKnownGood.isEmpty();
+            return telemetryContainsCode(telemetry_.path(),
+                                         QByteArrayLiteral("healthy"));
         }, 10'000)) {
         error_ = QStringLiteral("initial package was not marked last-known-good");
+        return false;
+    }
+    const ActivationStateResult healthyState =
+        PackageStore(workerEnvironment_.packageRoot()).activationState(appId_);
+    if (!healthyState.hasValue() || healthyState.state.lastKnownGood.isEmpty()) {
+        error_ = QStringLiteral("initial package healthy state was unavailable");
         return false;
     }
     error_.clear();
@@ -429,6 +495,14 @@ bool TestEnvironment::install(const QString &packagePath)
 bool TestEnvironment::waitForReady(const QString &version, const int timeoutMs)
 {
     return waitUntil([&] { return readyVersions_.contains(version); }, timeoutMs);
+}
+
+bool TestEnvironment::waitForHealthyVersion(const QString &version,
+                                            const int timeoutMs)
+{
+    return waitUntil([&] {
+        return telemetryContainsHealthyVersion(telemetry_.path(), version);
+    }, timeoutMs);
 }
 
 bool TestEnvironment::waitForFailure(const int previousCount, const int timeoutMs)

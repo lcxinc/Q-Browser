@@ -5,6 +5,8 @@ endif()
 add_library(q_browser_host STATIC
   HostApplication.cpp
   HostApplication.h
+  HostCapabilityRuntime.cpp
+  HostCapabilityRuntime.h
   HostRuntimeConfig.cpp
   HostRuntimeConfig.h
   InstalledPackageWorkerLauncher.cpp
@@ -33,6 +35,7 @@ target_include_directories(q_browser_host
 target_link_libraries(q_browser_host
   PUBLIC
     q_browser_ipc
+    q_browser_broker
     q_browser_package
     q_browser_router
     q_browser_sandbox

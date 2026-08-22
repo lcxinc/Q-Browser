@@ -18,12 +18,11 @@ void PackageUpdateE2eTest::signedUpdateActivatesAndTamperNeverExecutes()
     QVERIFY(!update.isEmpty());
     QVERIFY(environment.install(update));
     QVERIFY(environment.waitForReady(QStringLiteral("1.1.0")));
-    QTRY_VERIFY_WITH_TIMEOUT(
-        environment.currentVersionDirectory().startsWith(QStringLiteral("1.1.0-"))
-        && environment.lastKnownGoodVersionDirectory().startsWith(
-            QStringLiteral("1.1.0-")), 10'000);
+    QVERIFY(environment.waitForHealthyVersion(QStringLiteral("1.1.0")));
     const QString expectedCurrent = environment.currentVersionDirectory();
     const QString expectedLastKnownGood = environment.lastKnownGoodVersionDirectory();
+    QVERIFY(expectedCurrent.startsWith(QStringLiteral("1.1.0-")));
+    QVERIFY(expectedLastKnownGood.startsWith(QStringLiteral("1.1.0-")));
 
     const int failures = environment.failureCount();
     const QString tampered = environment.createTamperedPackage(QStringLiteral("1.2.0"));

@@ -85,6 +85,25 @@ bool WorkerSurface::isValid()
     return refreshValidity();
 }
 
+bool WorkerSurface::focusNativeWindow()
+{
+    if (!refreshValidity()) return false;
+    if (container_ != nullptr) container_->setFocus(Qt::OtherFocusReason);
+    const DWORD hostThreadId = GetCurrentThreadId();
+    const bool needsAttach = hostThreadId != guiThreadId_;
+    const bool attached = !needsAttach
+        || AttachThreadInput(hostThreadId, guiThreadId_, TRUE) != FALSE;
+    bool focused = false;
+    if (attached) {
+        const HWND workerWindow = reinterpret_cast<HWND>(windowId_);
+        (void)SetFocus(workerWindow);
+        focused = GetFocus() == workerWindow;
+    }
+    if (attached && needsAttach)
+        (void)AttachThreadInput(hostThreadId, guiThreadId_, FALSE);
+    return focused;
+}
+
 WId WorkerSurface::nativeWindowId() const noexcept { return windowId_; }
 WorkerAttemptId WorkerSurface::attemptId() const noexcept { return attemptId_; }
 
@@ -119,18 +138,7 @@ void WorkerSurface::invalidate()
 void WorkerSurface::focusInEvent(QFocusEvent *event)
 {
     QWidget::focusInEvent(event);
-    if (!refreshValidity()) return;
-    if (container_ != nullptr) container_->setFocus(event->reason());
-    const DWORD hostThreadId = GetCurrentThreadId();
-    const bool needsAttach = hostThreadId != guiThreadId_;
-    const bool attached = !needsAttach
-        || AttachThreadInput(hostThreadId, guiThreadId_, TRUE) != FALSE;
-    if (attached) {
-        (void)SetFocus(reinterpret_cast<HWND>(windowId_));
-        if (needsAttach) {
-            (void)AttachThreadInput(hostThreadId, guiThreadId_, FALSE);
-        }
-    }
+    (void)focusNativeWindow();
 }
 
 void WorkerSurface::resizeEvent(QResizeEvent *event)

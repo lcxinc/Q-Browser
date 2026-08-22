@@ -185,7 +185,8 @@ $requiredTests = @(
     'build_smoke', 'sandbox_launcher', 'pilot_routes', 'quick_design', 'malicious_package',
     'capability_escape', 'worker_api_surface', 'e2e_host_routes',
     'e2e_web_fallback', 'e2e_package_update', 'e2e_host_survives_worker_crash',
-    'production_update_runtime'
+    'e2e_pilot_capabilities', 'production_update_runtime',
+    'host_capability_runtime'
 )
 foreach ($required in $requiredTests) {
     if ($inventoryText -notmatch "(?m):\s+$([regex]::Escape($required))\s*$") {
@@ -207,7 +208,9 @@ $requiredExecutables = [ordered]@{
     e2e_web_fallback = "tests\e2e\$Configuration\tst_e2e_web_fallback.exe"
     e2e_package_update = "tests\e2e\$Configuration\tst_e2e_package_update.exe"
     e2e_host_survives_worker_crash = "tests\e2e\$Configuration\tst_e2e_host_survives_worker_crash.exe"
+    e2e_pilot_capabilities = "tests\e2e\$Configuration\tst_e2e_pilot_capabilities.exe"
     production_update_runtime = "tests\integration\update\$Configuration\tst_production_update_runtime.exe"
+    host_capability_runtime = "tests\unit\host\$Configuration\tst_host_capability_runtime.exe"
 }
 $requiredResults = Join-Path $build "required-results-$Configuration-$runId"
 New-Item -ItemType Directory -Force $requiredResults | Out-Null

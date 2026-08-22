@@ -139,20 +139,11 @@ void HostWorkerSessionIo::pollSession()
             return;
         case ProtocolType::Request: {
             const QJsonObject requestPayload = message.payload();
-            emit capabilityRequestObserved(
-                generation_,
+            emit capabilityRequested(
+                generation_, message.requestId(),
                 requestPayload.value(QStringLiteral("capability")).toString(),
                 requestPayload.value(QStringLiteral("operation")).toString(),
-                requestPayload.value(QStringLiteral("payload")).toObject().toVariantMap());
-            const auto response = ProtocolMessage::errorResponse(
-                message.requestId(), QStringLiteral("capability.unhandled"),
-                QStringLiteral("No capability handler is attached."));
-            if (!response.has_value() || !session_->send(*response, sendTimeoutMs)) {
-                fail(session_->lastErrorCode().isEmpty()
-                         ? QStringLiteral("host.worker_session.response_send_failed")
-                         : session_->lastErrorCode());
-                return;
-            }
+                requestPayload.value(QStringLiteral("payload")).toObject());
             break;
         }
         case ProtocolType::Shutdown:

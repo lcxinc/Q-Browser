@@ -1,6 +1,7 @@
 #include "HostApplication.h"
 
 #include "EventRecorder.h"
+#include "HostCapabilityRuntime.h"
 #include "HostWorkerSessionController.h"
 #include "InstalledPackageWorkerLauncher.h"
 #include "InstalledPackageWorkerLauncherTestHooks.h"
@@ -17,15 +18,30 @@
 
 #include <QPointer>
 #include <QRegularExpression>
+#include <QFile>
 #include <QThread>
 #include <QTimer>
 
 #include <atomic>
+#include <cstdio>
 #include <utility>
 
 namespace
 {
 constexpr qsizetype MaximumPendingLifecycleOperations = 512;
+
+void recordHostDiagnosticPhase(const QByteArray &phase)
+{
+    if (!qEnvironmentVariableIsSet("Q_BROWSER_HOST_DIAGNOSTIC_PHASES")) return;
+    QFile standardError;
+    if (!standardError.open(stderr, QIODevice::WriteOnly,
+                            QFileDevice::DontCloseHandle)) {
+        return;
+    }
+    (void)standardError.write(QByteArrayLiteral("qbrowser-host phase: ")
+                              + phase + '\n');
+    (void)standardError.flush();
+}
 
 QString pilotRouteTemplate(const QString &route)
 {
@@ -274,6 +290,7 @@ bool HostApplication::initializePackageRuntime()
         [guard](std::unique_ptr<IpcSession> session,
                 std::unique_ptr<WorkerSurface> surface,
                 std::shared_ptr<SandboxProcess> process,
+                ManifestPermissions permissions,
                 const WorkerAttemptKey key) {
             if (!guard || process == nullptr)
                 return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
@@ -281,6 +298,8 @@ bool HostApplication::initializePackageRuntime()
             context.session = std::move(session);
             context.surface = std::move(surface);
             context.processLifetime = std::static_pointer_cast<void>(process);
+            context.permissions = std::move(permissions);
+            context.processId = process->processId();
             context.stopProcess = [process] {
                 process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
             };
@@ -386,8 +405,10 @@ bool HostApplication::initializePackageRuntime()
 
 bool HostApplication::start()
 {
+    recordHostDiagnosticPhase("start-enter");
     if (mainWindow_) {
         mainWindow_->show();
+        recordHostDiagnosticPhase("start-existing-window-shown");
         return true;
     }
     const QString routeAppId = runtimeConfig_.has_value()
@@ -396,14 +417,19 @@ bool HostApplication::start()
         ? runtimeConfig_->appId() : QStringLiteral("com.qbrowser.pilot");
     auto routes = createPilotRouteRegistry(mockOrigin_, routeAppId);
     if (!routes.has_value()) return false;
+    recordHostDiagnosticPhase("start-routes-ready");
     auto window = std::make_unique<MainWindow>(std::move(*routes), mockOrigin_);
+    recordHostDiagnosticPhase("start-main-window-created");
     if (!window->webSurface()->isConfigurationValid()) return false;
     window->resize(1100, 720);
     window->show();
+    recordHostDiagnosticPhase("start-main-window-shown");
     mainWindow_ = std::move(window);
     workerSessionController_ = std::make_unique<HostWorkerSessionController>(
         mainWindow_.get());
+    recordHostDiagnosticPhase("start-session-controller-ready");
     if (!initializePackageRuntime()) return false;
+    recordHostDiagnosticPhase("start-package-runtime-ready");
 
     connect(workerSessionController_.get(), &HostWorkerSessionController::failed,
             this, [this] {
@@ -451,6 +477,7 @@ bool HostApplication::start()
         });
     });
     updateHealthTimer_->start();
+    recordHostDiagnosticPhase("start-health-timer-ready");
 
     if (runtimeConfig_.has_value()
         && runtimeConfig_->mode() == HostRuntimeMode::Package) {
@@ -461,7 +488,9 @@ bool HostApplication::start()
             emit updateLifecycleFailed(QStringLiteral("host.runtime.start_queue_failed"));
             return false;
         }
+        recordHostDiagnosticPhase("start-package-operation-queued");
     }
+    recordHostDiagnosticPhase("start-complete");
     return true;
 }
 
@@ -477,15 +506,41 @@ HostApplication::attachWorkerContext(HostWorkerAttachContext context)
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
-        || workerProcessLifetime_ != nullptr)
+        || workerProcessLifetime_ != nullptr || !runtimeConfig_.has_value()
+        || context.session->appIdentity() != runtimeConfig_->appId())
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    WorkerSurface *const surface = context.surface.get();
-    if (!mainWindow_->attachWorkerSurface(std::move(context.surface)))
-        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    if (!workerSessionController_->attach(std::move(context.session))) {
-        mainWindow_->detachWorkerSurface();
+    QString capabilityError;
+    const quintptr workerWindowId = static_cast<quintptr>(
+        context.surface->nativeWindowId());
+    auto capabilityRuntime = HostCapabilityRuntime::create(
+        runtimeConfig_->appId(), context.permissions, runtimeConfig_->mockOrigin(),
+        runtimeConfig_->storageDirectory(), static_cast<quintptr>(mainWindow_->winId()),
+        workerWindowId, context.processId, &capabilityError);
+    if (capabilityRuntime == nullptr) {
+        emit updateLifecycleFailed(
+            capabilityError.isEmpty()
+                ? QStringLiteral("host.capability.initialization_failed")
+                : capabilityError);
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
+    connect(capabilityRuntime.get(), &HostCapabilityRuntime::completed,
+            workerSessionController_.get(),
+            &HostWorkerSessionController::completeCapability,
+            Qt::QueuedConnection);
+    workerSessionController_->setCapabilityRuntime(capabilityRuntime.get());
+    WorkerSurface *const surface = context.surface.get();
+    if (!mainWindow_->attachWorkerSurface(std::move(context.surface))) {
+        workerSessionController_->setCapabilityRuntime(nullptr);
+        HostCapabilityRuntime::retire(std::move(capabilityRuntime));
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+    if (!workerSessionController_->attach(std::move(context.session))) {
+        workerSessionController_->setCapabilityRuntime(nullptr);
+        mainWindow_->detachWorkerSurface();
+        HostCapabilityRuntime::retire(std::move(capabilityRuntime));
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+    capabilityRuntime_ = std::move(capabilityRuntime);
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
     attachedWorkerKey_ = context.supervisionKey;
@@ -502,6 +557,9 @@ void HostApplication::detachWorkerContext(const QString &reason)
             reason.isEmpty() ? QStringLiteral("host.worker_context.detached") : reason);
     }
     if (stopWorkerProcess_) stopWorkerProcess_();
+    if (workerSessionController_ != nullptr)
+        workerSessionController_->setCapabilityRuntime(nullptr);
+    HostCapabilityRuntime::retire(std::exchange(capabilityRuntime_, {}));
     if (mainWindow_ != nullptr) mainWindow_->detachWorkerSurface();
     stopWorkerProcess_ = {};
     workerProcessLifetime_.reset();

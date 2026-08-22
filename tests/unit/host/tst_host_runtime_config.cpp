@@ -125,6 +125,7 @@ struct ValidArguments final
     QString sandboxTemp;
     QString runtime;
     QString telemetry;
+    QString storage;
     QString worker;
     QString publicKey;
     QStringList values;
@@ -137,10 +138,12 @@ struct ValidArguments final
         sandboxTemp = root.filePath(QStringLiteral("sandbox-temp"));
         runtime = root.filePath(QStringLiteral("runtime"));
         telemetry = root.filePath(QStringLiteral("telemetry"));
+        storage = root.filePath(QStringLiteral("storage"));
         worker = QDir(runtime).filePath(QStringLiteral("qbrowser-worker.exe"));
         publicKey = trustRoot.filePath(QStringLiteral("trusted-public.pem"));
         if (!QDir().mkpath(store) || !QDir().mkpath(sandboxTemp)
             || !QDir().mkpath(runtime) || !QDir().mkpath(telemetry)
+            || !QDir().mkpath(storage)
             || !writeFile(worker, QByteArrayLiteral("worker"))
             || !writeFile(publicKey, keys.value().publicKeyPem)
 #ifdef Q_OS_WIN
@@ -159,6 +162,7 @@ struct ValidArguments final
             QStringLiteral("--runtime-root=") + runtime,
             QStringLiteral("--worker-executable=") + worker,
             QStringLiteral("--telemetry-directory=") + telemetry,
+            QStringLiteral("--storage-directory=") + storage,
         };
     }
 };
@@ -178,7 +182,24 @@ private slots:
     void trustKeyStableReadBlocksSwapAndGrowth();
     void rejectsOversizedMalformedAndJunctionTrustKeys();
     void rejectsNonLoopbackMockOrigin();
+    void requiresIndependentStorageRoot();
 };
+
+void HostRuntimeConfigTest::requiresIndependentStorageRoot()
+{
+    ValidArguments arguments;
+    QVERIFY(!arguments.values.isEmpty());
+    const qsizetype storageIndex = argumentIndex(
+        arguments.values, QStringLiteral("--storage-directory="));
+    QVERIFY(storageIndex >= 0);
+    arguments.values.removeAt(storageIndex);
+    const HostRuntimeConfigResult missing = HostRuntimeConfig::fromArguments(
+        arguments.values);
+    QVERIFY(!missing.value.has_value());
+    QCOMPARE(missing.error, HostRuntimeConfigError::MissingArgument);
+    QCOMPARE(missing.stableError,
+             QStringLiteral("host.config.missing_storage_directory"));
+}
 
 void HostRuntimeConfigTest::rejectsBroadWritableTrustKeyWithoutChangingPermissions()
 {
@@ -375,6 +396,8 @@ void HostRuntimeConfigTest::loadsCompletePackageAuthorityFromAbsolutePaths()
     QCOMPARE(result.value->packageStoreRoot(), QDir(arguments.store).canonicalPath());
     QCOMPARE(result.value->sandboxTempRoot(),
              QDir(arguments.sandboxTemp).canonicalPath());
+    QCOMPARE(result.value->storageDirectory(),
+             QDir(arguments.storage).canonicalPath());
     QCOMPARE(result.value->workerExecutable(),
              QFileInfo(arguments.worker).canonicalFilePath());
     QCOMPARE(result.value->immutableRuntimeRoots(),

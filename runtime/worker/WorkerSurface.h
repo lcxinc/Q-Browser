@@ -20,6 +20,7 @@ public:
     ~WorkerSurface() override;
 
     bool isValid();
+    bool focusNativeWindow();
     WId nativeWindowId() const noexcept;
     WorkerAttemptId attemptId() const noexcept;
 

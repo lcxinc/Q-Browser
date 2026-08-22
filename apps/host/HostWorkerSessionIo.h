@@ -43,10 +43,11 @@ signals:
     void sessionFailed(quint64 generation, const QString &errorCode);
     void shutdownFinished(quint64 generation);
     void heartbeatObserved(quint64 generation);
-    void capabilityRequestObserved(quint64 generation,
-                                   const QString &capability,
-                                   const QString &operation,
-                                   const QVariantMap &payload);
+    void capabilityRequested(quint64 generation,
+                             const QString &requestId,
+                             const QString &capability,
+                             const QString &operation,
+                             const QJsonObject &payload);
 
 private:
     void pollSession();

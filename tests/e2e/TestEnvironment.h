@@ -18,12 +18,18 @@ public:
     [[nodiscard]] QString error() const;
     [[nodiscard]] HostApplication *host() const noexcept;
     [[nodiscard]] QString mockOrigin() const;
+    [[nodiscard]] bool waitForMockRequest(const QString &method,
+                                          const QString &target,
+                                          int timeoutMs = 10'000);
     [[nodiscard]] QString createPackage(const QString &version,
-                                        const QByteArray &mainQml = {});
+                                        const QByteArray &mainQml = {},
+                                        bool clipboardReadWithGesture = false);
     [[nodiscard]] QString createTamperedPackage(const QString &version);
     [[nodiscard]] bool start(const QString &version = QStringLiteral("1.0.0"));
     [[nodiscard]] bool install(const QString &packagePath);
     [[nodiscard]] bool waitForReady(const QString &version, int timeoutMs = 60'000);
+    [[nodiscard]] bool waitForHealthyVersion(const QString &version,
+                                             int timeoutMs = 10'000);
     [[nodiscard]] bool waitForFailure(int previousCount, int timeoutMs = 15'000);
     [[nodiscard]] bool shutdown();
     [[nodiscard]] int failureCount() const noexcept;
@@ -43,11 +49,13 @@ private:
     QTemporaryDir packages_;
     QTemporaryDir trust_;
     QTemporaryDir telemetry_;
+    QTemporaryDir storage_;
     QProcess mockApi_;
     QByteArray privateKey_;
     QByteArray publicKey_;
     QString publicKeyPath_;
     QString mockOrigin_;
+    QStringList mockRequests_;
     QString error_;
     std::unique_ptr<HostApplication> host_;
     QStringList readyVersions_;

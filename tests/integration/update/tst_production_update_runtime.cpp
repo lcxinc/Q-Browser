@@ -16,10 +16,12 @@
 #include <QElapsedTimer>
 #include <QSignalSpy>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QScopeGuard>
 #include <QSemaphore>
 #include <QTest>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
 
 #include <qt_windows.h>
@@ -35,6 +37,17 @@ bool writeNewFile(const QString &path, const QByteArray &bytes)
     QFile file(path);
     return file.open(QIODevice::WriteOnly | QIODevice::NewOnly)
         && file.write(bytes) == bytes.size();
+}
+
+HostRuntimeConfigResult parseHostArguments(const QStringList &arguments,
+                                           const QString &storage)
+{
+    QStringList completeArguments = arguments;
+    const QString storageArgument = QStringLiteral("--storage-directory=") + storage;
+    if (!completeArguments.contains(storageArgument)) {
+        completeArguments.push_back(storageArgument);
+    }
+    return HostRuntimeConfig::fromArguments(completeArguments);
 }
 
 bool protectTrustKey(const QString &path)
@@ -90,11 +103,37 @@ bool terminateProcessId(const quint32 processId)
     return finished;
 }
 
+struct CloseWindowRequest final
+{
+    DWORD processId = 0;
+    bool posted = false;
+};
+
+BOOL CALLBACK closeOwnedTopLevelWindow(const HWND window, const LPARAM parameter)
+{
+    auto *const request = reinterpret_cast<CloseWindowRequest *>(parameter);
+    DWORD processId = 0;
+    (void)GetWindowThreadProcessId(window, &processId);
+    if (request != nullptr && processId == request->processId
+        && GetWindow(window, GW_OWNER) == nullptr
+        && PostMessageW(window, WM_CLOSE, 0, 0) != FALSE) {
+        request->posted = true;
+    }
+    return TRUE;
+}
+
 bool stopOwnedProcess(QProcess &process)
 {
     if (process.state() == QProcess::NotRunning) return true;
+    CloseWindowRequest close{static_cast<DWORD>(process.processId()), false};
+    (void)EnumWindows(closeOwnedTopLevelWindow,
+                      reinterpret_cast<LPARAM>(&close));
+    if (close.posted && process.waitForFinished(5'000)) {
+        process.close();
+        return true;
+    }
     process.terminate();
-    if (!process.waitForFinished(10'000)) {
+    if (!process.waitForFinished(5'000)) {
         process.kill();
         if (!process.waitForFinished(10'000)) return false;
     }
@@ -110,6 +149,77 @@ bool waitForProcessExit(const quint32 processId, const int timeoutMs)
         == WAIT_OBJECT_0;
     CloseHandle(process);
     return exited;
+}
+
+void recordProductionPhase(const QByteArray &phase)
+{
+    QFile file(QDir::temp().filePath(
+        QStringLiteral("qbrowser-production-update-stage.txt")));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        (void)file.write(QByteArray::number(GetTickCount64()));
+        (void)file.write(" ");
+        (void)file.write(phase);
+        (void)file.write("\n");
+    }
+}
+
+QByteArray readDiagnosticFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    QByteArray bytes = file.readAll();
+    constexpr qsizetype maximumDiagnosticBytes = 4 * 1024;
+    if (bytes.size() > maximumDiagnosticBytes)
+        bytes = bytes.last(maximumDiagnosticBytes);
+    return bytes;
+}
+
+qsizetype telemetryEventCount(const QString &directory, const QByteArray &code)
+{
+    QFile events(QDir(directory).filePath(QStringLiteral("events.jsonl")));
+    if (!events.open(QIODevice::ReadOnly)) return 0;
+    return events.readAll().count(QByteArrayLiteral("\"code\":\"")
+                                  + code + QByteArrayLiteral("\""));
+}
+
+template<typename Complete, typename Terminal>
+bool waitForExternalHost(QProcess &process,
+                         Complete complete,
+                         Terminal terminal,
+                         const int timeoutMs)
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (!complete() && !terminal()
+           && process.state() != QProcess::NotRunning
+           && elapsed.elapsed() < timeoutMs) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
+    return complete();
+}
+
+QString externalHostDiagnostic(QProcess &process,
+                               PackageStore &store,
+                               const QString &appId,
+                               const QString &telemetry,
+                               const QString &standardOutput,
+                               const QString &standardError)
+{
+    const ActivationStateResult activation = store.activationState(appId);
+    const QString current = activation.hasValue()
+        ? activation.state.current : QStringLiteral("<unavailable>");
+    const QString lastKnownGood = activation.hasValue()
+        ? activation.state.lastKnownGood : QStringLiteral("<unavailable>");
+    return QStringLiteral(
+        "state=%1 exitCode=%2 current=%3 lkg=%4 telemetry=%5 stdout=%6 stderr=%7")
+        .arg(static_cast<int>(process.state()))
+        .arg(process.state() == QProcess::NotRunning ? process.exitCode() : -1)
+        .arg(current, lastKnownGood,
+             QString::fromUtf8(readDiagnosticFile(
+                 QDir(telemetry).filePath(QStringLiteral("events.jsonl")))),
+             QString::fromUtf8(readDiagnosticFile(standardOutput)),
+             QString::fromUtf8(readDiagnosticFile(standardError)));
 }
 }
 
@@ -165,7 +275,9 @@ void runHostDestroyDuringValidation(const bool beforeFirstValidation)
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -185,7 +297,7 @@ void runHostDestroyDuringValidation(const bool beforeFirstValidation)
         QStringLiteral("--telemetry-directory=") + telemetry,
         QStringLiteral("--install-package=") + package,
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
 
     QSemaphore entered;
@@ -238,7 +350,9 @@ void runActivationAdmissionRace(const ActivationRacePoint racePoint)
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QByteArray qml = racePoint == ActivationRacePoint::BeforeAdmission
@@ -316,7 +430,7 @@ void runActivationAdmissionRace(const ActivationRacePoint racePoint)
         QStringLiteral("--health-window-ms=2000"),
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
@@ -365,7 +479,9 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -386,7 +502,7 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
@@ -433,7 +549,9 @@ void runLauncherThreadStartFailure(const bool observerFailure)
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -456,7 +574,7 @@ void runLauncherThreadStartFailure(const bool observerFailure)
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
 
     const qsizetype contextsBefore =
@@ -533,7 +651,9 @@ void runThreadStartFailureDestroyingHost(const bool observerFailure)
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -556,7 +676,7 @@ void runThreadStartFailureDestroyingHost(const bool observerFailure)
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
 
     const qsizetype authoritiesBefore = RuntimePackageAuthority::liveCountForTesting();
@@ -677,7 +797,9 @@ void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHeal
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString packageA = updateSignedPackage(
@@ -708,7 +830,7 @@ void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHeal
         QStringLiteral("--health-window-ms=500"),
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
 
     std::atomic_bool beganB = false;
@@ -745,9 +867,10 @@ void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHeal
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 30'000);
     PackageStore observedStore(environment.packageRoot());
     QTRY_VERIFY_WITH_TIMEOUT(
-        observedStore.activationState(environment.appId())
-            .state.lastKnownGood.startsWith(QStringLiteral("1.1.0-")),
+        telemetryEventCount(telemetry, QByteArrayLiteral("healthy")) >= 1,
         10'000);
+    QVERIFY(observedStore.activationState(environment.appId())
+                .state.lastKnownGood.startsWith(QStringLiteral("1.1.0-")));
 
     const bool replacementBegan = beginBSucceeded.load(std::memory_order_acquire);
     QString replacementError;
@@ -811,7 +934,9 @@ void ProductionUpdateRuntimeTest::destroyedLauncherRetiresHandshakeCompletedInfl
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -831,7 +956,7 @@ void ProductionUpdateRuntimeTest::destroyedLauncherRetiresHandshakeCompletedInfl
         QStringLiteral("--telemetry-directory=") + telemetry,
         QStringLiteral("--install-package=") + package,
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     QSemaphore releaseCompletion;
     std::atomic_bool handshakeCompleted = false;
@@ -875,7 +1000,9 @@ void ProductionUpdateRuntimeTest::tempCleanupFailureStopsAdmissionAndCanBeRetrie
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QByteArray qml = QByteArrayLiteral(
@@ -900,7 +1027,7 @@ void ProductionUpdateRuntimeTest::tempCleanupFailureStopsAdmissionAndCanBeRetrie
         QStringLiteral("--install-package=") + packageA,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
@@ -964,7 +1091,9 @@ void ProductionUpdateRuntimeTest::cleanupFailureOutlivesDestroyedHostAndAutoReco
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -991,7 +1120,7 @@ void ProductionUpdateRuntimeTest::cleanupFailureOutlivesDestroyedHostAndAutoReco
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
@@ -1036,7 +1165,7 @@ void ProductionUpdateRuntimeTest::cleanupFailureOutlivesDestroyedHostAndAutoReco
         }
     }
     HostRuntimeConfigResult persistentParsed =
-        HostRuntimeConfig::fromArguments(persistentArguments);
+        parseHostArguments(persistentArguments, storage);
     QVERIFY(persistentParsed.value.has_value());
     auto persistentHost = std::make_unique<HostApplication>(
         std::move(*persistentParsed.value));
@@ -1077,7 +1206,9 @@ void ProductionUpdateRuntimeTest::repeatedLiveCancellationLeavesNoObserversOrCon
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     QStringList packages;
@@ -1108,7 +1239,7 @@ void ProductionUpdateRuntimeTest::repeatedLiveCancellationLeavesNoObserversOrCon
             QStringLiteral("--install-package=") + packages.at(iteration),
             QStringLiteral("--heartbeat-timeout-ms=30000"),
         };
-        HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
         QVERIFY(parsed.value.has_value());
         auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
         QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
@@ -1149,7 +1280,9 @@ void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -1173,7 +1306,7 @@ void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     QSemaphore releaseAdmission;
     std::atomic_bool admissionBlocked = false;
@@ -1234,7 +1367,9 @@ void ProductionUpdateRuntimeTest::lifecycleQueueFullBeforeAdmissionNeverAttaches
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -1257,7 +1392,7 @@ void ProductionUpdateRuntimeTest::lifecycleQueueFullBeforeAdmissionNeverAttaches
         QStringLiteral("--telemetry-directory=") + telemetry,
         QStringLiteral("--install-package=") + package,
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
     HostApplication *hostPointer = nullptr;
     std::atomic_bool queueHookInvoked = false;
@@ -1308,7 +1443,9 @@ void ProductionUpdateRuntimeTest::readyHandlerCanDestroyHostWithoutUseAfterFree(
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -1329,7 +1466,7 @@ void ProductionUpdateRuntimeTest::readyHandlerCanDestroyHostWithoutUseAfterFree(
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
 
     const qsizetype contextsBefore =
@@ -1442,7 +1579,9 @@ void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistrat
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QString package = updateSignedPackage(
@@ -1462,7 +1601,7 @@ void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistrat
         QStringLiteral("--telemetry-directory=") + telemetry,
         QStringLiteral("--install-package=") + package,
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY(parsed.value.has_value());
 
     QSemaphore releaseValidation;
@@ -1501,6 +1640,18 @@ void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistrat
 void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorkerRollback()
 {
     constexpr int launchObservationTimeoutMs = 120'000;
+    constexpr int externalHostObservationTimeoutMs = 30'000;
+    (void)QFile::remove(QDir::temp().filePath(
+        QStringLiteral("qbrowser-production-update-stage.txt")));
+    (void)QFile::remove(QDir::temp().filePath(
+        QStringLiteral("production-install-host.stdout")));
+    (void)QFile::remove(QDir::temp().filePath(
+        QStringLiteral("production-install-host.stderr")));
+    (void)QFile::remove(QDir::temp().filePath(
+        QStringLiteral("production-offline-host.stdout")));
+    (void)QFile::remove(QDir::temp().filePath(
+        QStringLiteral("production-offline-host.stderr")));
+    recordProductionPhase("signed-runtime-start");
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
     UpdateTemporaryDir temporary;
@@ -1513,7 +1664,9 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QVERIFY(keys.hasValue());
     const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
     const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
     QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
     QVERIFY(protectTrustKey(publicKey));
     const QByteArray recoveredQml = QByteArrayLiteral(
@@ -1553,8 +1706,10 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         QStringLiteral("--health-window-ms=2000"),
         QStringLiteral("--heartbeat-timeout-ms=30000"),
     };
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    const qsizetype authoritiesBefore =
+        RuntimePackageAuthority::liveCountForTesting();
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
     QSignalSpy exited(host.get(), &HostApplication::packageWorkerExited);
@@ -1564,7 +1719,10 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1 || !failure.isEmpty(),
                              launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
-             failure.isEmpty() ? "" : qPrintable(failure.first().at(0).toString()));
+             failure.isEmpty()
+                 ? ""
+                 : qPrintable(QStringLiteral("initial 1.0.0 launch: ")
+                              + failure.first().at(0).toString()));
     QCOMPARE(ready.count(), 1);
 
     PackageStore observedStore(environment.packageRoot());
@@ -1582,15 +1740,20 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
              QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
                  .canonicalFilePath());
     QTRY_VERIFY_WITH_TIMEOUT(
-        observedStore.activationState(environment.appId()).state.lastKnownGood
-            == QFileInfo(readyPath(0)).fileName(),
+        telemetryEventCount(telemetry, QByteArrayLiteral("healthy")) >= 1,
         10'000);
+    QCOMPARE(observedStore.activationState(environment.appId()).state.lastKnownGood,
+             QFileInfo(readyPath(0)).fileName());
+    recordProductionPhase("initial-package-ready");
 
     QVERIFY(host->requestPackageInstall(two));
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 2 || !failure.isEmpty(),
                              launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
-             failure.isEmpty() ? "" : qPrintable(failure.last().at(0).toString()));
+             failure.isEmpty()
+                 ? ""
+                 : qPrintable(QStringLiteral("1.1.0 update launch: ")
+                              + failure.last().at(0).toString()));
     QCOMPARE(ready.count(), 2);
     QCOMPARE(readyVersion(1), QStringLiteral("1.1.0"));
     QCOMPARE(QFileInfo(readyPath(1)).canonicalFilePath(),
@@ -1599,25 +1762,33 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QVERIFY(QFileInfo::exists(readyPath(1) + QStringLiteral("/qml/Start.qml")));
     QVERIFY(!QFileInfo::exists(readyPath(1) + QStringLiteral("/qml/Main.qml")));
     QTRY_VERIFY_WITH_TIMEOUT(
-        observedStore.activationState(environment.appId()).state.lastKnownGood
-            == QFileInfo(readyPath(1)).fileName(),
+        telemetryEventCount(telemetry, QByteArrayLiteral("healthy")) >= 2,
         10'000);
+    QCOMPARE(observedStore.activationState(environment.appId()).state.lastKnownGood,
+             QFileInfo(readyPath(1)).fileName());
+    recordProductionPhase("healthy-update-ready");
 
     QVERIFY(host->requestPackageInstall(crashing));
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 3 || !failure.isEmpty(),
                              launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
-             failure.isEmpty() ? "" : qPrintable(failure.last().at(0).toString()));
+             failure.isEmpty()
+                 ? ""
+                 : qPrintable(QStringLiteral("1.2.0 crash candidate launch: ")
+                              + failure.last().at(0).toString()));
     QCOMPARE(ready.count(), 3);
     QCOMPARE(readyVersion(2), QStringLiteral("1.2.0"));
+    recordProductionPhase("crash-candidate-ready");
     QVERIFY(terminateProcessId(readyPid(2)));
     QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 1, 10'000);
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 4, launchObservationTimeoutMs);
     QCOMPARE(readyVersion(3), QStringLiteral("1.2.0"));
+    recordProductionPhase("crash-candidate-restarted");
     QVERIFY(terminateProcessId(readyPid(3)));
     QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 2, 10'000);
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 5, launchObservationTimeoutMs);
     QCOMPARE(readyVersion(4), QStringLiteral("1.1.0"));
+    recordProductionPhase("rollback-lkg-ready");
     QCOMPARE(QFileInfo(readyPath(4)).canonicalFilePath(),
              QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
                  .canonicalFilePath());
@@ -1626,12 +1797,14 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QCOMPARE(capability.last().at(1).toString(), QStringLiteral("get"));
     QCOMPARE(capability.last().at(2).toMap().value(QStringLiteral("kind")).toString(),
              QStringLiteral("lkgRecovered"));
+    recordProductionPhase("rollback-capability-observed");
     QCOMPARE(failure.count(), 0);
     QVERIFY(QCoreApplication::instance() != nullptr);
     const int readyBeforeShutdownRace = ready.count();
     const quint32 liveWorker = readyPid(4);
     QElapsedTimer destruction;
     destruction.start();
+    recordProductionPhase("in-process-host-retire-start");
     host.reset();
     QVERIFY2(destruction.elapsed() < 100,
              "Host destruction blocked on the lifecycle thread");
@@ -1642,18 +1815,17 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         10'000);
     QVERIFY(WorkerRetirementManager::instance().flush(10'000));
     QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+    QTRY_COMPARE_WITH_TIMEOUT(RuntimePackageAuthority::liveCountForTesting(),
+                              authoritiesBefore, 10'000);
+    recordProductionPhase("in-process-host-retire-complete");
     QTest::qWait(500);
     QCOMPARE(ready.count(), readyBeforeShutdownRace);
 
-    const auto startedEventCount = [](const QString &directory) {
-        QFile events(QDir(directory).filePath(QStringLiteral("events.jsonl")));
-        if (!events.open(QIODevice::ReadOnly)) return qsizetype{0};
-        return events.readAll().count(QByteArrayLiteral("\"code\":\"started\""));
-    };
     const QString cliTelemetry = telemetryRoot.filePath(
         QStringLiteral("cli-telemetry"));
     QVERIFY(QDir().mkpath(cliTelemetry));
     QStringList installArguments = arguments;
+    installArguments.push_back(QStringLiteral("--storage-directory=") + storage);
     for (QString &argument : installArguments) {
         if (argument.startsWith(QStringLiteral("--install-package="))) {
             argument = QStringLiteral("--install-package=") + cli;
@@ -1663,56 +1835,104 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         }
     }
     QProcess productionInstallHost;
-    productionInstallHost.setStandardOutputFile(QProcess::nullDevice());
-    productionInstallHost.setStandardErrorFile(QProcess::nullDevice());
+    QProcessEnvironment diagnosticEnvironment =
+        QProcessEnvironment::systemEnvironment();
+    diagnosticEnvironment.insert(
+        QStringLiteral("Q_BROWSER_HOST_DIAGNOSTIC_PHASES"),
+        QStringLiteral("1"));
+    productionInstallHost.setProcessEnvironment(diagnosticEnvironment);
+    const QString installStdout = QDir::temp().filePath(
+        QStringLiteral("production-install-host.stdout"));
+    const QString installStderr = QDir::temp().filePath(
+        QStringLiteral("production-install-host.stderr"));
+    productionInstallHost.setStandardOutputFile(installStdout);
+    productionInstallHost.setStandardErrorFile(installStderr);
     [[maybe_unused]] const auto cleanupInstallHost = qScopeGuard([&] {
         (void)stopOwnedProcess(productionInstallHost);
     });
     productionInstallHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
     productionInstallHost.setArguments(installArguments);
+    recordProductionPhase("cli-install-start");
     productionInstallHost.start();
     QVERIFY2(productionInstallHost.waitForStarted(10'000),
              qPrintable(productionInstallHost.errorString()));
-    QTRY_VERIFY_WITH_TIMEOUT(
-        QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
-            .fileName().startsWith(QStringLiteral("1.3.0-")),
-        launchObservationTimeoutMs);
-    QTRY_VERIFY_WITH_TIMEOUT(
-        observedStore.activationState(environment.appId()).state.lastKnownGood
-            .startsWith(QStringLiteral("1.3.0-")),
-        launchObservationTimeoutMs);
-    QTRY_VERIFY_WITH_TIMEOUT(startedEventCount(cliTelemetry) > 0,
-                             launchObservationTimeoutMs);
+    const auto cliHealthy = [&] {
+        return telemetryEventCount(cliTelemetry, QByteArrayLiteral("healthy")) > 0;
+    };
+    const auto cliTerminal = [&] {
+        return readDiagnosticFile(QDir(cliTelemetry).filePath(
+                   QStringLiteral("events.jsonl")))
+                   .contains(QByteArrayLiteral("\"code\":\"recovered\""))
+            || readDiagnosticFile(installStderr).contains(
+                QByteArrayLiteral("qbrowser-host lifecycle failure:"));
+    };
+    QVERIFY2(waitForExternalHost(productionInstallHost, cliHealthy, cliTerminal,
+                                 externalHostObservationTimeoutMs),
+             qPrintable(externalHostDiagnostic(
+                 productionInstallHost, observedStore, environment.appId(),
+                 cliTelemetry, installStdout, installStderr)));
+    const ActivationStateResult cliHealthyState = observedStore.activationState(
+        environment.appId());
+    QVERIFY(cliHealthyState.hasValue());
+    QVERIFY(cliHealthyState.state.current.startsWith(QStringLiteral("1.3.0-")));
+    QVERIFY(cliHealthyState.state.lastKnownGood.startsWith(
+        QStringLiteral("1.3.0-")));
+    recordProductionPhase("cli-install-healthy");
     QVERIFY(stopOwnedProcess(productionInstallHost));
     QCOMPARE(productionInstallHost.state(), QProcess::NotRunning);
+    recordProductionPhase("cli-install-stopped");
 
-    const qsizetype startsBeforeOfflineCli = startedEventCount(cliTelemetry);
-    const qint64 generationBeforeOffline = observedStore.activationState(
-        environment.appId()).state.generation;
+    const qsizetype healthyBeforeOfflineCli = telemetryEventCount(
+        cliTelemetry, QByteArrayLiteral("healthy"));
+    const ActivationStateResult beforeOffline = observedStore.activationState(
+        environment.appId());
+    QVERIFY(beforeOffline.hasValue());
+    const qint64 generationBeforeOffline = beforeOffline.state.generation;
     QStringList offlineArguments = installArguments;
     offlineArguments.removeIf([](const QString &argument) {
         return argument.startsWith(QStringLiteral("--install-package="));
     });
     QProcess productionHost;
-    productionHost.setStandardOutputFile(QProcess::nullDevice());
-    productionHost.setStandardErrorFile(QProcess::nullDevice());
+    productionHost.setProcessEnvironment(diagnosticEnvironment);
+    const QString offlineStdout = QDir::temp().filePath(
+        QStringLiteral("production-offline-host.stdout"));
+    const QString offlineStderr = QDir::temp().filePath(
+        QStringLiteral("production-offline-host.stderr"));
+    productionHost.setStandardOutputFile(offlineStdout);
+    productionHost.setStandardErrorFile(offlineStderr);
     [[maybe_unused]] const auto cleanupOfflineHost = qScopeGuard([&] {
         (void)stopOwnedProcess(productionHost);
     });
     productionHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
     productionHost.setArguments(offlineArguments);
+    recordProductionPhase("cli-offline-start");
     productionHost.start();
     QVERIFY2(productionHost.waitForStarted(10'000),
              qPrintable(productionHost.errorString()));
-    QTRY_VERIFY_WITH_TIMEOUT(
-        observedStore.activationState(environment.appId()).state.generation
-            > generationBeforeOffline,
-        launchObservationTimeoutMs);
-    QTRY_VERIFY_WITH_TIMEOUT(
-        startedEventCount(cliTelemetry) > startsBeforeOfflineCli,
-        launchObservationTimeoutMs);
+    const auto offlineReady = [&] {
+        return telemetryEventCount(cliTelemetry, QByteArrayLiteral("healthy"))
+            > healthyBeforeOfflineCli;
+    };
+    const auto offlineTerminal = [&] {
+        return readDiagnosticFile(offlineStderr).contains(
+            QByteArrayLiteral("qbrowser-host lifecycle failure:"));
+    };
+    QVERIFY2(waitForExternalHost(productionHost, offlineReady, offlineTerminal,
+                                 externalHostObservationTimeoutMs),
+             qPrintable(externalHostDiagnostic(
+                 productionHost, observedStore, environment.appId(), cliTelemetry,
+                 offlineStdout, offlineStderr)));
+    const ActivationStateResult offlineState = observedStore.activationState(
+        environment.appId());
+    QVERIFY(offlineState.hasValue());
+    QVERIFY(offlineState.state.generation > generationBeforeOffline);
+    QVERIFY(offlineState.state.current.startsWith(QStringLiteral("1.3.0-")));
+    QVERIFY(offlineState.state.lastKnownGood.startsWith(
+        QStringLiteral("1.3.0-")));
+    recordProductionPhase("cli-offline-ready");
     QVERIFY(stopOwnedProcess(productionHost));
     QCOMPARE(productionHost.state(), QProcess::NotRunning);
+    recordProductionPhase("cli-offline-stopped");
 }
 
 int main(int argc, char **argv)

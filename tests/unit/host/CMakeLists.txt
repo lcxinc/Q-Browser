@@ -12,3 +12,13 @@ endif()
 
 q_browser_enable_strict_warnings(tst_host_runtime_config)
 q_browser_add_qt_test(NAME host_runtime_config TARGET tst_host_runtime_config)
+
+add_executable(tst_host_capability_runtime tst_host_capability_runtime.cpp)
+target_link_libraries(tst_host_capability_runtime
+  PRIVATE
+    q_browser_host
+    Qt6::Network
+    Qt6::Test
+    Qt6::Widgets)
+q_browser_enable_strict_warnings(tst_host_capability_runtime)
+q_browser_add_qt_test(NAME host_capability_runtime TARGET tst_host_capability_runtime)

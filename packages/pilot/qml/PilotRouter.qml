@@ -113,10 +113,10 @@ Item {
     Component { id: loginPage; Pages.LoginPage { runtime: root.runtime; onNavigateRequested: route => root.navigate(route) } }
     Component { id: dashboardPage; Pages.DashboardPage { runtime: root.runtime; Component.onCompleted: refresh() } }
     Component { id: ordersPage; Pages.OrdersPage { runtime: root.runtime; onNavigateRequested: route => root.navigate(route); Component.onCompleted: search("", "all", 1) } }
-    Component { id: orderDetailPage; Pages.OrderDetailPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
-    Component { id: orderEditPage; Pages.OrderEditPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
+    Component { id: orderDetailPage; Pages.OrderDetailPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); onOrderIdChanged: if (orderId.length > 0) refresh() } }
+    Component { id: orderEditPage; Pages.OrderEditPage { runtime: root.runtime; orderId: root.orderId; onNavigateRequested: route => root.navigate(route); onOrderIdChanged: if (orderId.length > 0) refresh() } }
     Component { id: customersPage; Pages.CustomersPage { runtime: root.runtime; onNavigateRequested: route => root.navigate(route); Component.onCompleted: search("", 1) } }
-    Component { id: customerDetailPage; Pages.CustomerDetailPage { runtime: root.runtime; customerId: root.customerId; onNavigateRequested: route => root.navigate(route); Component.onCompleted: refresh() } }
+    Component { id: customerDetailPage; Pages.CustomerDetailPage { runtime: root.runtime; customerId: root.customerId; onNavigateRequested: route => root.navigate(route); onCustomerIdChanged: if (customerId.length > 0) refresh() } }
     Component { id: filesPage; Pages.FilesPage { runtime: root.runtime } }
     Component { id: settingsPage; Pages.SettingsPage { runtime: root.runtime; Component.onCompleted: loadSettings() } }
     Component {
