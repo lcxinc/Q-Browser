@@ -232,11 +232,12 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
     if (!currentKey_.has_value() || key != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
     }
-    const WorkerSupervisionAction timeout = supervisor_.checkHealth(key, nowMs);
-    if (timeout != WorkerSupervisionAction::None) {
-        return applySupervisionAction(timeout, nowMs);
+    if (handshakeAccepted_) {
+        const WorkerSupervisionAction timeout = supervisor_.checkHealth(key, nowMs);
+        return timeout == WorkerSupervisionAction::None
+            ? UpdateLifecycleAction::None
+            : applySupervisionAction(timeout, nowMs);
     }
-    if (handshakeAccepted_) return UpdateLifecycleAction::None;
     if (!currentBinding_.has_value()
         || !installer_.reverifyInstalledVersion(appId_, *currentBinding_)
                 .succeeded()) {

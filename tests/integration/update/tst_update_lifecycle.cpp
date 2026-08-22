@@ -264,9 +264,13 @@ void UpdateLifecycleTest::marksOnlyAuthenticatedContinuouslyHealthyVersionsAsLkg
     const WorkerAttemptKey delayedKey = coordinator.currentAttemptKey().value();
     clock.set(6'301);
     QCOMPARE(coordinator.authenticatedHandshake(delayedKey),
+             UpdateLifecycleAction::None);
+    QCOMPARE(coordinator.currentAttemptKey().value(), delayedKey);
+    clock.set(6'602);
+    QCOMPARE(coordinator.checkHealth(delayedKey),
              UpdateLifecycleAction::Restarted);
     QVERIFY(coordinator.currentAttemptKey().value() != delayedKey);
-    clock.set(6'302);
+    clock.set(6'603);
     QCOMPARE(coordinator.authenticatedHandshake(delayedKey),
              UpdateLifecycleAction::IgnoredStaleAttempt);
 }
