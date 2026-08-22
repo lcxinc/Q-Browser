@@ -5,6 +5,9 @@ param(
     [string]$BuildDirectory = '',
     [string]$OutputDirectory = '',
     [string]$KeyDirectory = '',
+    [string]$TrustedRoot = '',
+    [string]$SourceDirectory = '',
+    [switch]$ParentTrustedRootLeaseHeld,
     [switch]$Clean
 )
 
@@ -43,16 +46,51 @@ namespace QBrowser.Task18 {
       }
     }
   }
+  public sealed class DirectoryLease : IDisposable {
+    readonly SafeFileHandle handle;
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    public DirectoryLease(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      // Hold DELETE access without FILE_SHARE_DELETE so the directory cannot be
+      // renamed or replaced while security-sensitive files are in use.
+      handle = CreateFileW(native, 0x00010000, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+    }
+    public static int ProbeDenyDeleteLease(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      using (var probe = CreateFileW(native, 0x00010000, 3, IntPtr.Zero, 3,
+                                     0x02000000, IntPtr.Zero)) {
+        return probe.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+      }
+    }
+    public void Dispose() { handle.Dispose(); }
+  }
 }
 '@
 }
 
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$sourceRoot = if ([string]::IsNullOrWhiteSpace($SourceDirectory)) { $repo }
+    else { [IO.Path]::GetFullPath($SourceDirectory) }
 $repoBuild = [IO.Path]::GetFullPath((Join-Path $repo 'build'))
-$defaultOutput = [IO.Path]::GetFullPath((Join-Path $repoBuild 'release-package'))
-$defaultKeys = [IO.Path]::GetFullPath((Join-Path $repo '.qbrowser-dev\signing'))
+$localAppData = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+    $TrustedRoot = Join-Path $localAppData 'QBrowserTask18'
+}
+$trusted = [IO.Path]::GetFullPath($TrustedRoot)
+$trustedBuildRoot = Join-Path $trusted 'build'
+$trustedWorkRoot = Join-Path $trusted 'work'
+$defaultOutput = [IO.Path]::GetFullPath((Join-Path $trusted 'release-package'))
+$defaultKeys = [IO.Path]::GetFullPath((Join-Path $trusted 'signing'))
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
-    $BuildDirectory = Join-Path $repoBuild 'release'
+    $BuildDirectory = Join-Path $trustedBuildRoot 'release'
 }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory = $defaultOutput }
 if ([string]::IsNullOrWhiteSpace($KeyDirectory)) { $KeyDirectory = $defaultKeys }
@@ -229,6 +267,87 @@ function Protect-Path([string]$Path, [switch]$Container) {
     }
 }
 
+function Get-TrustedSidValues {
+    $values = @(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        'S-1-5-18', 'S-1-5-32-544')
+    try {
+        $values += ([Security.Principal.NTAccount]'NT SERVICE\TrustedInstaller').Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch {}
+    return @($values | Sort-Object -Unique)
+}
+
+function Assert-TrustedAncestorChain([string]$Path, [string]$ManagedRoot = '') {
+    $candidate = [IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $candidate)) {
+        $parent = [IO.Directory]::GetParent($candidate)
+        if ($null -eq $parent) { throw "No existing trusted ancestor for $Path" }
+        $candidate = $parent.FullName
+    }
+    $managed = if ([string]::IsNullOrWhiteSpace($ManagedRoot)) { '' }
+        else { [IO.Path]::GetFullPath($ManagedRoot).TrimEnd('\') }
+    $trustedSids = @(Get-TrustedSidValues)
+    $replaceMask = [long]([Security.AccessControl.FileSystemRights]::Delete) -bor
+        [long]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+        [long]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+        [long]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+    $writeMask = $replaceMask -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteData) -bor
+        [long]([Security.AccessControl.FileSystemRights]::AppendData) -bor
+        [long]([Security.AccessControl.FileSystemRights]::CreateFiles) -bor
+        [long]([Security.AccessControl.FileSystemRights]::CreateDirectories) -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteAttributes) -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteExtendedAttributes)
+    $item = Get-Item -LiteralPath $candidate -Force
+    while ($null -ne $item) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Trusted ancestor is a reparse point: $($item.FullName)"
+        }
+        $acl = Get-Acl -LiteralPath $item.FullName
+        $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $trustedSids) {
+            throw "Trusted ancestor has an untrusted owner: $($item.FullName)"
+        }
+        $insideManaged = -not [string]::IsNullOrEmpty($managed) -and
+            ($item.FullName.TrimEnd('\').Equals($managed,
+                [StringComparison]::OrdinalIgnoreCase) -or
+             $item.FullName.StartsWith($managed + '\',
+                [StringComparison]::OrdinalIgnoreCase))
+        if ($insideManaged -and -not $acl.AreAccessRulesProtected) {
+            throw "Managed ancestor DACL is not protected: $($item.FullName)"
+        }
+        foreach ($rule in $acl.GetAccessRules($true, $true,
+                [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne 'Allow' -or
+                $rule.IdentityReference.Value -in $trustedSids -or
+                ($rule.PropagationFlags -band
+                    [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+                continue
+            }
+            $mask = if ($insideManaged) { $writeMask } else { $replaceMask }
+            if (([long]$rule.FileSystemRights -band $mask) -ne 0) {
+                throw "Untrusted ancestor replacement/write ACE: $($item.FullName)"
+            }
+        }
+        $item = if ($item -is [IO.DirectoryInfo]) { $item.Parent } else { $item.Directory }
+    }
+}
+
+function Assert-StableTrustedPath([string]$Path, [string]$Identity) {
+    Assert-TrustedAncestorChain $Path $trusted
+    if ((Get-PathIdentity $Path) -ne $Identity) {
+        throw "Trusted path identity changed: $Path"
+    }
+}
+
+function Add-DirectoryLease([string]$Path) {
+    $lease = [QBrowser.Task18.DirectoryLease]::new($Path)
+    [void]$script:leases.Add($lease)
+    return $lease
+}
+
 function Assert-PlainTree([string]$Path) {
     Assert-NoReparseAncestor $Path
     foreach ($entry in Get-ChildItem -LiteralPath $Path -Recurse -Force) {
@@ -238,9 +357,37 @@ function Assert-PlainTree([string]$Path) {
     }
 }
 
-Assert-ChildPath $build $repoBuild 'BuildDirectory'
-Assert-ChildPath $output $repoBuild 'OutputDirectory'
-Assert-ChildPath $keys (Join-Path $repo '.qbrowser-dev') 'KeyDirectory'
+$script:leases = [Collections.Generic.List[IDisposable]]::new()
+Assert-TrustedAncestorChain $localAppData
+Assert-NoReparseAncestor $trusted
+New-Item -ItemType Directory -Path $trusted -Force | Out-Null
+foreach ($managedParent in @($trustedBuildRoot, $trustedWorkRoot)) {
+    New-Item -ItemType Directory -Path $managedParent -Force | Out-Null
+}
+$managedLeaseRoots = @($trusted, $trustedBuildRoot, $trustedWorkRoot)
+if ($ParentTrustedRootLeaseHeld) {
+    # A parent release operation already owns these roots. Probe its
+    # deny-delete leases before any ACL mutation, then use the established
+    # protected state read-only.
+    foreach ($managedRoot in $managedLeaseRoots) {
+        if ([QBrowser.Task18.DirectoryLease]::ProbeDenyDeleteLease($managedRoot) -ne 32) {
+            throw "Parent deny-delete lease is absent for $managedRoot."
+        }
+        Assert-ProtectedPath $managedRoot -Container
+    }
+    Write-Output 'PARENT_TRUSTED_ROOT_LEASE=PASS roots=3 sharingViolation=32'
+}
+else {
+    foreach ($managedRoot in $managedLeaseRoots) {
+        [void](Add-DirectoryLease $managedRoot)
+        Protect-Path $managedRoot -Container
+    }
+}
+Assert-TrustedAncestorChain $trusted $trusted
+
+Assert-ChildPath $build $trusted 'BuildDirectory'
+Assert-ChildPath $output $trusted 'OutputDirectory'
+Assert-ChildPath $keys $trusted 'KeyDirectory'
 Assert-NoReparseAncestor $build
 Assert-NoReparseAncestor $output
 Assert-NoReparseAncestor $keys
@@ -254,10 +401,13 @@ if (-not (Test-Path -LiteralPath $packageCli -PathType Leaf)) {
     throw "Package CLI is unavailable: $packageCli"
 }
 
-Write-Warning 'DEVELOPMENT ONLY: this command uses ignored local signing authority below .qbrowser-dev\signing. Never use it for production or copy private signing material into build or deployment output.'
+Write-Warning "DEVELOPMENT ONLY: this command uses local signing authority below $trusted. Never use it for production or copy private signing material into deployment output."
 New-Item -ItemType Directory -Force $keys | Out-Null
 Protect-Path $keys -Container
 Assert-PlainTree $keys
+$keyIdentity = Get-PathIdentity $keys
+$keyLease = $null
+Assert-StableTrustedPath $keys $keyIdentity
 $privateKey = Join-Path $keys 'private.pem'
 $publicKey = Join-Path $keys 'public.pem'
 if ((Test-Path -LiteralPath $privateKey) -xor (Test-Path -LiteralPath $publicKey)) {
@@ -270,14 +420,33 @@ if (-not (Test-Path -LiteralPath $privateKey)) {
 Protect-Path $privateKey
 Protect-Path $publicKey
 Assert-PlainTree $keys
+$keyLease = Add-DirectoryLease $keys
 
-$temporaryRoot = Join-Path $repoBuild ('.task18-package-' + [Guid]::NewGuid().ToString('N'))
+$temporaryRoot = Join-Path $trustedWorkRoot ('.task18-package-' + [Guid]::NewGuid().ToString('N'))
 New-OwnedDirectory $temporaryRoot
 $publishStage = $null
 Protect-Path $temporaryRoot -Container
-$buildRootIdentity = Get-PathIdentity $repoBuild
+$temporaryLease = $null
+$temporaryIdentity = Get-PathIdentity $temporaryRoot
+$buildRootIdentity = Get-PathIdentity $trustedWorkRoot
 try {
-    $source = Join-Path $repo 'packages\pilot'
+    $sourceInput = Join-Path $sourceRoot 'packages\pilot'
+    Assert-PlainTree $sourceInput
+    $source = Join-Path $temporaryRoot 'pilot-source'
+    New-Item -ItemType Directory -Path $source | Out-Null
+    foreach ($entry in Get-ChildItem -LiteralPath $sourceInput -Force -Recurse) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Pilot source contains a reparse point: $($entry.FullName)"
+        }
+        $relative = $entry.FullName.Substring($sourceInput.Length).TrimStart('\')
+        $target = Join-Path $source $relative
+        if ($entry.PSIsContainer) { [void][IO.Directory]::CreateDirectory($target) }
+        else {
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))
+            Copy-Item -LiteralPath $entry.FullName -Destination $target
+        }
+    }
+    Assert-StableTrustedPath $temporaryRoot $temporaryIdentity
     $unsignedOne = Join-Path $temporaryRoot 'pilot-1.unsigned.qapkg'
     $unsignedTwo = Join-Path $temporaryRoot 'pilot-2.unsigned.qapkg'
     $signedOne = Join-Path $temporaryRoot 'com.qbrowser.pilot-1.0.0.qapkg'
@@ -288,10 +457,26 @@ try {
         (Get-FileHash -Algorithm SHA256 -LiteralPath $unsignedTwo).Hash) {
         throw 'Deterministic pack verification failed.'
     }
+    Assert-StableTrustedPath $keys $keyIdentity
+    $keyRenameProbe = Join-Path $trusted 'signing-substitute-probe'
+    $keyRenameRejected = $false
+    try { Move-Item -LiteralPath $keys -Destination $keyRenameProbe -ErrorAction Stop }
+    catch { $keyRenameRejected = $true }
+    if (-not $keyRenameRejected -or (Get-PathIdentity $keys) -ne $keyIdentity) {
+        throw 'Protected signing authority accepted rename/replacement.'
+    }
+    # qbrowser-package opens the exact signing root with its own stable,
+    # deny-delete directory handle. Release our equivalent handle so the two
+    # exclusive mutation locks do not conflict; validate identity on both sides.
+    $keyLease.Dispose()
+    $keyLease = $null
+    Assert-StableTrustedPath $keys $keyIdentity
     Invoke-Checked $packageCli @('sign', '--package', $unsignedOne,
         '--private-key', $privateKey, '--output', $signedOne)
+    Assert-StableTrustedPath $keys $keyIdentity
     Invoke-Checked $packageCli @('sign', '--package', $unsignedTwo,
         '--private-key', $privateKey, '--output', $signedTwo)
+    Assert-StableTrustedPath $keys $keyIdentity
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $signedOne).Hash -ne
         (Get-FileHash -Algorithm SHA256 -LiteralPath $signedTwo).Hash) {
         throw 'Deterministic sign verification failed.'
@@ -303,6 +488,8 @@ try {
         $inspection.version -ne '1.0.0') {
         throw 'Signed Pilot inspection returned an unexpected identity.'
     }
+    $keyLease = Add-DirectoryLease $keys
+    Assert-StableTrustedPath $keys $keyIdentity
 
     $publishedPackage = Join-Path $output 'com.qbrowser.pilot-1.0.0.qapkg'
     $publishedPublicKey = Join-Path $output 'dev-public.pem'
@@ -323,26 +510,45 @@ try {
         }
         else { throw "Output exists and differs; inspect it before using -Clean: $output" }
     }
-    $publishStage = Join-Path $repoBuild ('.task18-package-publish-' + [Guid]::NewGuid().ToString('N'))
+    $publishStage = Join-Path $trustedWorkRoot ('.task18-package-publish-' + [Guid]::NewGuid().ToString('N'))
     New-OwnedDirectory $publishStage
     Protect-Path $publishStage -Container
+    $publishIdentity = Get-PathIdentity $publishStage
+    $publishLease = Add-DirectoryLease $publishStage
     Copy-Item -LiteralPath $signedOne -Destination (Join-Path $publishStage (Split-Path $publishedPackage -Leaf))
     Copy-Item -LiteralPath $publicKey -Destination (Join-Path $publishStage (Split-Path $publishedPublicKey -Leaf))
     Protect-Path (Join-Path $publishStage (Split-Path $publishedPackage -Leaf))
     Protect-Path (Join-Path $publishStage (Split-Path $publishedPublicKey -Leaf))
-    if ((Get-PathIdentity $repoBuild) -ne $buildRootIdentity) {
-        throw 'Repository build root identity changed before package publication.'
+    if ((Get-PathIdentity $trustedWorkRoot) -ne $buildRootIdentity) {
+        throw 'Trusted work root identity changed before package publication.'
     }
+    Assert-StableTrustedPath $keys $keyIdentity
+    Assert-StableTrustedPath $temporaryRoot $temporaryIdentity
+    Assert-StableTrustedPath $publishStage $publishIdentity
     Assert-NoReparseAncestor $output
     if (Test-Path -LiteralPath $output) {
         throw "Package output appeared during staging; refusing to overwrite: $output"
     }
+    $publishLease.Dispose()
     Move-Item -LiteralPath $publishStage -Destination $output
     $publishStage = $null
+    $outputIdentity = Get-PathIdentity $output
+    $outputLease = Add-DirectoryLease $output
+    Assert-StableTrustedPath $output $outputIdentity
+    $outputRenameProbe = Join-Path $trusted 'release-package-substitute-probe'
+    $outputRenameRejected = $false
+    try { Move-Item -LiteralPath $output -Destination $outputRenameProbe -ErrorAction Stop }
+    catch { $outputRenameRejected = $true }
+    if (-not $outputRenameRejected -or (Get-PathIdentity $output) -ne $outputIdentity) {
+        throw 'Published development package accepted rename/replacement.'
+    }
+    Write-Output 'SIGNING_PARENT_REPLACEMENT_DEFENSE=PASS key=stable publish=stable'
     Write-Output "Development package created: $publishedPackage"
     Write-Output "Development public key: $publishedPublicKey"
 }
 finally {
+    foreach ($lease in $script:leases) { $lease.Dispose() }
+    $script:leases.Clear()
     if ($null -ne $publishStage -and (Test-Path -LiteralPath $publishStage)) {
         Remove-OwnedTree $publishStage $publishStage
     }

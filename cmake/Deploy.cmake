@@ -193,6 +193,10 @@ foreach ($item in Get-ChildItem -LiteralPath $root -Force -Recurse) {
 }
 $trusted = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
   'S-1-5-18', 'S-1-5-32-544')
+try {
+  $trusted += ([Security.Principal.NTAccount]'NT SERVICE\TrustedInstaller').Translate(
+    [Security.Principal.SecurityIdentifier]).Value
+} catch {}
 $writeMask = [long]([Security.AccessControl.FileSystemRights]::WriteData) -bor
   [long]([Security.AccessControl.FileSystemRights]::AppendData) -bor
   [long]([Security.AccessControl.FileSystemRights]::CreateFiles) -bor
@@ -203,6 +207,31 @@ $writeMask = [long]([Security.AccessControl.FileSystemRights]::WriteData) -bor
   [long]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
   [long]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
   [long]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+$replaceMask = [long]([Security.AccessControl.FileSystemRights]::Delete) -bor
+  [long]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+  [long]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+  [long]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+$cursor = Get-Item -LiteralPath $root -Force
+while ($null -ne $cursor) {
+  $ancestorAcl = Get-Acl -LiteralPath $cursor.FullName
+  $ancestorOwner = ([Security.Principal.NTAccount]$ancestorAcl.Owner).Translate(
+    [Security.Principal.SecurityIdentifier]).Value
+  if ($ancestorOwner -notin $trusted) {
+    throw "untrusted ancestor owner: $($cursor.FullName)"
+  }
+  foreach ($rule in $ancestorAcl.GetAccessRules($true, $true,
+      [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq
+          [Security.AccessControl.AccessControlType]::Allow -and
+        $rule.IdentityReference.Value -notin $trusted -and
+        ($rule.PropagationFlags -band
+          [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 -and
+        (([long]$rule.FileSystemRights -band $replaceMask) -ne 0)) {
+      throw "untrusted ancestor replacement ACE: $($cursor.FullName)"
+    }
+  }
+  $cursor = $cursor.Parent
+}
 $sensitive = @($root, (Join-Path $root 'host'), (Join-Path $root 'runtime'),
   (Join-Path $root 'packages'), (Join-Path $root 'trust'),
   (Join-Path $root 'packages\com.qbrowser.pilot-1.0.0.qapkg'),

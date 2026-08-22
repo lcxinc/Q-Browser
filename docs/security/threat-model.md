@@ -24,6 +24,10 @@ Primary controls are:
 - atomic activation, health supervision, and reverified LKG rollback;
 - fail-closed reparse/identity checks, protected deployment ACLs, mandatory
   deployed-key signature verification, and atomic post-acceptance publication;
+- a non-repository `%LOCALAPPDATA%\QBrowserTask18` authority whose managed
+  ancestors have protected DACLs, stable directory leases, and no untrusted
+  delete-child/rename capability; Release inputs are copied into that root
+  before configure/build;
 - structured stable diagnostics that avoid package contents, credentials,
   private keys, arbitrary filesystem data, and raw untrusted payloads.
 
@@ -36,7 +40,8 @@ The deployment manifest detects accidental or post-publication byte changes;
 it is not a signature and cannot create trust. Verification always checks the
 Pilot package with the deployed CLI and deployed public key, including exact
 application ID and version, so regenerating `SHA-256SUMS` cannot bless package
-tampering. Reparse points are rejected in the deployment and every ancestor.
+tampering. Reparse points and untrusted ancestor replacement rights are rejected
+from the deployment through the trusted user-profile boundary.
 
 Residual risk includes defects in Windows, Qt, WebEngine, OpenSSL, the ZIP
 implementation, or the Host policy; UI deception within the Worker surface;

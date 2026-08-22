@@ -57,13 +57,16 @@ Important permission values are allowlists, not grants of ambient OS access:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create-dev-package.ps1 `
   -Configuration Release -Clean
-build\release\tools\package-cli\Release\qbrowser-package.exe inspect `
-  --package build\release-package\com.qbrowser.pilot-1.0.0.qapkg `
-  --public-key build\release-package\dev-public.pem
+$task18Root = Join-Path ([Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::LocalApplicationData)) 'QBrowserTask18'
+& "$task18Root\build\release\tools\package-cli\Release\qbrowser-package.exe" inspect `
+  --package "$task18Root\release-package\com.qbrowser.pilot-1.0.0.qapkg" `
+  --public-key "$task18Root\release-package\dev-public.pem"
 ```
 
 `inspect` succeeds only when archive structure, manifest, content digest,
 public key, and Ed25519 signature all verify. Do not infer trust from a ZIP
 tool, filename, or digest alone. The development script keeps private signing
-material in the exact ignored, protected `.qbrowser-dev\signing` directory and
+material in the exact protected, non-repository
+`%LOCALAPPDATA%\QBrowserTask18\signing` directory and
 must never be used as a production key ceremony.

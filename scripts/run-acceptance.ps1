@@ -12,7 +12,9 @@ Set-StrictMode -Version Latest
 
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
-    $BuildDirectory = Join-Path $repo "build\acceptance-$($Configuration.ToLowerInvariant())"
+    $BuildDirectory = Join-Path ([Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::LocalApplicationData)) `
+        "QBrowserTask18\build\acceptance-$($Configuration.ToLowerInvariant())"
 }
 $build = [IO.Path]::GetFullPath($BuildDirectory)
 $cmake = 'E:\DevEnv\qt\Tools\CMake_64\bin\cmake.exe'
@@ -27,6 +29,9 @@ $env:TEMP = $taskTemp
 $env:TMP = $taskTemp
 $env:QTEST_FUNCTION_TIMEOUT = '900000'
 $env:PATH = "$(Join-Path $QtRoot 'bin');$env:PATH"
+$previousMsBuildNodeReuse = [Environment]::GetEnvironmentVariable(
+    'MSBUILDDISABLENODEREUSE', 'Process')
+$env:MSBUILDDISABLENODEREUSE = '1'
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
@@ -35,6 +40,23 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     }
 }
 
+function Remove-VerifiedWorkspaceJunction([string]$Name) {
+    $link = Join-Path $repo "tools\node_modules\@q-browser\$Name"
+    if (-not (Test-Path -LiteralPath $link)) { return }
+    $item = Get-Item -LiteralPath $link -Force
+    $expected = [IO.Path]::GetFullPath((Join-Path $repo "tools\$Name"))
+    $targets = @($item.Target | ForEach-Object { [IO.Path]::GetFullPath($_) })
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $item.LinkType -ne 'Junction' -or $targets.Count -ne 1 -or
+        -not $targets[0].Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove unexpected npm workspace link: $link"
+    }
+    # Removing a junction without -Recurse removes only the link itself and
+    # cannot traverse into its already verified workspace target.
+    Remove-Item -LiteralPath $link -Force
+}
+
+try {
 Invoke-Checked $cmake @(
     '-S', $repo, '-B', $build,
     "-DCMAKE_PREFIX_PATH=$QtRoot",
@@ -42,7 +64,8 @@ Invoke-Checked $cmake @(
     '-DBUILD_TESTING=ON',
     '-DQ_BROWSER_BUILD_WEBENGINE=ON'
 )
-Invoke-Checked $cmake @('--build', $build, '--config', $Configuration, '--parallel', '2')
+Invoke-Checked $cmake @('--build', $build, '--config', $Configuration, '--parallel', '2',
+    '--', '/nr:false')
 
 $inventory = & $ctest --test-dir $build -C $Configuration -N
 if ($LASTEXITCODE -ne 0) { throw 'CTest inventory failed.' }
@@ -101,6 +124,8 @@ try {
 }
 finally {
     Pop-Location
+    Remove-VerifiedWorkspaceJunction 'migrator'
+    Remove-VerifiedWorkspaceJunction 'mock-api'
 }
 
 $packageExe = Join-Path $build "tools\package-cli\$Configuration\qbrowser-package.exe"
@@ -188,3 +213,8 @@ foreach ($file in Get-ChildItem -LiteralPath $build -File -Recurse) {
 
 Write-Output "Q-Browser acceptance passed: $Configuration"
 Write-Output "Deployment: $deploy"
+}
+finally {
+    [Environment]::SetEnvironmentVariable(
+        'MSBUILDDISABLENODEREUSE', $previousMsBuildNodeReuse, 'Process')
+}

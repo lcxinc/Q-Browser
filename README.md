@@ -67,7 +67,8 @@ powershell -ExecutionPolicy Bypass -File scripts\run-acceptance.ps1 `
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Clean
 ```
 
-The deployment is published atomically to `build\release-deploy` only after
+The deployment is published atomically to
+`%LOCALAPPDATA%\QBrowserTask18\release-deploy` only after
 deployment-only UI, update, double-crash rollback, and optional full acceptance
 pass. CMake install and `windeployqt` build the image, which is checked against
 a canonical sorted `SHA-256SUMS`. It
@@ -79,7 +80,8 @@ Private keys, tests, fixtures, source, symbols, and test-hook binaries are
 rejected. A rerun without `-Clean` verifies rather than overwrites the output.
 
 The bundled trust root is **development-only**. Local signing authority remains
-under the ignored, protected `.qbrowser-dev\signing` directory and must never
+under the protected, non-repository
+`%LOCALAPPDATA%\QBrowserTask18\signing` directory and must never
 be copied into build/deployment output or promoted to production.
 
 Start with [runtime architecture](docs/architecture/runtime.md), the
@@ -103,11 +105,13 @@ Do not commit generated output or runtime state.
 Use the guarded development workflow rather than handling key paths manually:
 
 ```powershell
+$task18Root = Join-Path ([Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::LocalApplicationData)) 'QBrowserTask18'
 powershell -ExecutionPolicy Bypass -File scripts\create-dev-package.ps1 `
   -Configuration Release -Clean
-build\release\tools\package-cli\Release\qbrowser-package.exe inspect `
-  --package build\release-package\com.qbrowser.pilot-1.0.0.qapkg `
-  --public-key build\release-package\dev-public.pem
+& "$task18Root\build\release\tools\package-cli\Release\qbrowser-package.exe" inspect `
+  --package "$task18Root\release-package\com.qbrowser.pilot-1.0.0.qapkg" `
+  --public-key "$task18Root\release-package\dev-public.pem"
 ```
 
 `pack` writes a deterministic archive and canonical lowercase payload digest.

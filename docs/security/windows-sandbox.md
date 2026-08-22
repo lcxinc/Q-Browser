@@ -40,7 +40,10 @@ make malicious UI trustworthy, prevent all denial of service, or replace
 capability checks. Windows ACL inheritance and enterprise policy vary, so every
 production image must rerun the real token, loader-handshake, sentinel,
 network, file, process, and cleanup tests; do not weaken or skip a failed gate.
-The deployment root, runtime, package, trust, manifest, and attestation paths
-use protected Host/SYSTEM-only write ACLs. Verification is read-only, rejects
+The authoritative deployment under `%LOCALAPPDATA%\QBrowserTask18`, its runtime,
+package, trust, manifest, and attestation paths use protected Host/SYSTEM-only
+write ACLs. Parent replacement/delete-child rights are checked as well as leaf
+ACLs, and build/sign/publish hold stable no-delete directory handles.
+Verification is read-only, rejects
 every symlink/junction/reparse ancestor or member, and never repairs an unsafe
 image in place.

@@ -5,6 +5,7 @@ param(
     [string]$CMake = 'E:\DevEnv\qt\Tools\CMake_64\bin\cmake.exe',
     [string]$BuildDirectory = '',
     [string]$DeploymentDirectory = '',
+    [string]$TrustedRoot = '',
     [switch]$Clean,
     [bool]$RunAcceptance = $true,
     [string]$PrepareManualState = '',
@@ -64,15 +65,76 @@ namespace QBrowser.Task18 {
     public static void Suspend(int processId) { Apply(processId, true); }
     public static void Resume(int processId) { Apply(processId, false); }
   }
+  public sealed class DirectoryLease : IDisposable {
+    readonly SafeFileHandle handle;
+    public DirectoryLease(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      // Holding DELETE access while deliberately omitting FILE_SHARE_DELETE makes
+      // later rename/delete opens conflict for the lifetime of this handle.
+      handle = CreateFileW(native, 0x00010000, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    public static int ProbeDenyDeleteLease(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      using (var probe = CreateFileW(native, 0x00010000, 3, IntPtr.Zero, 3,
+                                     0x02000000, IntPtr.Zero)) {
+        return probe.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+      }
+    }
+    public void Dispose() { handle.Dispose(); }
+  }
+  public sealed class ProcessLease : IDisposable {
+    readonly SafeFileHandle handle;
+    public int ProcessId { get; private set; }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern SafeFileHandle OpenProcess(
+      uint access, bool inherit, int processId);
+    [DllImport("kernel32.dll")] static extern uint GetProcessId(SafeFileHandle handle);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(
+      SafeFileHandle handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(
+      SafeFileHandle handle, uint exitCode);
+    [DllImport("ntdll.dll")] static extern int NtSuspendProcess(SafeFileHandle handle);
+    [DllImport("ntdll.dll")] static extern int NtResumeProcess(SafeFileHandle handle);
+    public ProcessLease(int processId) {
+      handle = OpenProcess(0x00100000 | 0x0800 | 0x1000 | 0x0001, false, processId);
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+      ProcessId = checked((int)GetProcessId(handle));
+      if (ProcessId != processId) throw new Win32Exception("Process identity changed");
+    }
+    public bool IsAlive { get { return WaitForSingleObject(handle, 0) == 0x102; } }
+    public void Suspend() { if (!IsAlive || NtSuspendProcess(handle) != 0) throw new Win32Exception("Suspend failed"); }
+    public void Resume() { if (IsAlive && NtResumeProcess(handle) != 0) throw new Win32Exception("Resume failed"); }
+    public void Terminate(uint code) { if (!IsAlive || !TerminateProcess(handle, code)) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    public void Dispose() { handle.Dispose(); }
+  }
 }
 '@
 }
 
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repoBuild = [IO.Path]::GetFullPath((Join-Path $repo 'build'))
-$defaultBuild = [IO.Path]::GetFullPath((Join-Path $repoBuild 'release'))
-$defaultDeployment = [IO.Path]::GetFullPath((Join-Path $repoBuild 'release-deploy'))
-$packageOutput = [IO.Path]::GetFullPath((Join-Path $repoBuild 'release-package'))
+$localAppData = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+    $TrustedRoot = Join-Path $localAppData 'QBrowserTask18'
+}
+$trusted = [IO.Path]::GetFullPath($TrustedRoot)
+$trustedBuildRoot = Join-Path $trusted 'build'
+$trustedWorkRoot = Join-Path $trusted 'work'
+$trustedControlRoot = Join-Path $trusted 'control'
+$sourceStage = Join-Path $trustedWorkRoot '.task18-release-source'
+$defaultBuild = [IO.Path]::GetFullPath((Join-Path $trustedBuildRoot 'release'))
+$defaultAcceptanceBuild = [IO.Path]::GetFullPath(
+    (Join-Path $trustedBuildRoot 'release-acceptance'))
+$defaultDeployment = [IO.Path]::GetFullPath((Join-Path $trusted 'release-deploy'))
+$packageOutput = [IO.Path]::GetFullPath((Join-Path $trusted 'release-package'))
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) { $BuildDirectory = $defaultBuild }
 if ([string]::IsNullOrWhiteSpace($DeploymentDirectory)) {
     $DeploymentDirectory = $defaultDeployment
@@ -110,6 +172,35 @@ function Assert-NoReparseAncestor([string]$Path) {
 
 function Get-PathIdentity([string]$Path) {
     return [QBrowser.Task18.FileIdentity]::Read($Path)
+}
+
+function Get-ProcessEnvironmentState([string]$Name) {
+    return [pscustomobject]@{
+        Exists = Test-Path -LiteralPath "Env:$Name"
+        Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    }
+}
+
+function Clear-ProcessEnvironmentValue([string]$Name) {
+    # On this .NET runtime SetEnvironmentVariable(name, $null, Process) leaves
+    # a present empty variable. Qt tests presence for its sandbox kill switch,
+    # so use the environment provider to remove the entry from the native block.
+    Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+}
+
+function Restore-ProcessEnvironmentState([string]$Name, $State) {
+    if ($State.Exists) {
+        [Environment]::SetEnvironmentVariable($Name, [string]$State.Value, 'Process')
+    }
+    else { Clear-ProcessEnvironmentValue $Name }
+}
+
+function Test-ProcessEnvironmentState([string]$Name, $State) {
+    $exists = Test-Path -LiteralPath "Env:$Name"
+    if ($exists -ne [bool]$State.Exists) { return $false }
+    if (-not $exists) { return $true }
+    return [Environment]::GetEnvironmentVariable($Name, 'Process') -ceq
+        [string]$State.Value
 }
 
 function New-OwnedDirectory([string]$Path) {
@@ -233,6 +324,61 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-TrackedBuild([string[]]$Arguments) {
+    $quoted = ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    $process = Start-Process -FilePath $CMake -ArgumentList $quoted `
+        -NoNewWindow -PassThru
+    $descendantIds = [Collections.Generic.HashSet[int]]::new()
+    [void]$descendantIds.Add($process.Id)
+    $ownedMsBuild = @{}
+    do {
+        $process.Refresh()
+        $all = @(Get-CimInstance Win32_Process)
+        $changed = $true
+        while ($changed) {
+            $changed = $false
+            foreach ($candidate in $all) {
+                if ($descendantIds.Contains([int]$candidate.ParentProcessId) -and
+                    $descendantIds.Add([int]$candidate.ProcessId)) {
+                    $changed = $true
+                }
+            }
+        }
+        foreach ($candidate in $all | Where-Object {
+                $_.Name -ieq 'MSBuild.exe' -and
+                $descendantIds.Contains([int]$_.ProcessId) }) {
+            $identity = "$([int]$candidate.ProcessId)|$($candidate.CreationDate.ToUniversalTime().Ticks)"
+            $ownedMsBuild[$identity] = $true
+        }
+        if (-not $process.HasExited) { Start-Sleep -Milliseconds 100 }
+    } while (-not $process.HasExited)
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "$CMake build failed with exit code $($process.ExitCode)"
+    }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $remaining = @()
+        foreach ($identity in $ownedMsBuild.Keys) {
+            $parts = $identity -split '\|'
+            $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($parts[0])" `
+                -ErrorAction SilentlyContinue
+            if ($null -ne $current -and
+                $current.CreationDate.ToUniversalTime().Ticks -eq [long]$parts[1]) {
+                $remaining += $identity
+            }
+        }
+        if ($remaining.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    } while ($timer.ElapsedMilliseconds -lt 30000)
+    if ($remaining.Count -ne 0) {
+        throw "Owned MSBuild nodes survived /nr:false: $($remaining -join ',')"
+    }
+    Write-Output "MSBUILD_NODE_REUSE_DISABLED=PASS ownedNodes=$($ownedMsBuild.Count) residue=0"
+}
+
 function Protect-Path([string]$Path, [switch]$Container) {
     Assert-NoReparseAncestor $Path
     $item = Get-Item -LiteralPath $Path -Force
@@ -289,12 +435,132 @@ function Assert-ProtectedPath([string]$Path) {
     }
 }
 
+function Get-TrustedSidValues {
+    $values = @(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        'S-1-5-18', 'S-1-5-32-544')
+    try {
+        $values += ([Security.Principal.NTAccount]'NT SERVICE\TrustedInstaller').Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch {}
+    return @($values | Sort-Object -Unique)
+}
+
+function Assert-TrustedAncestorChain([string]$Path, [string]$ManagedRoot = '') {
+    $candidate = [IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $candidate)) {
+        $parent = [IO.Directory]::GetParent($candidate)
+        if ($null -eq $parent) { throw "No existing trusted ancestor for $Path" }
+        $candidate = $parent.FullName
+    }
+    $managed = if ([string]::IsNullOrWhiteSpace($ManagedRoot)) { '' }
+        else { [IO.Path]::GetFullPath($ManagedRoot).TrimEnd('\') }
+    $trustedSids = @(Get-TrustedSidValues)
+    $replaceMask = [long]([Security.AccessControl.FileSystemRights]::Delete) -bor
+        [long]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+        [long]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+        [long]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+    $writeMask = $replaceMask -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteData) -bor
+        [long]([Security.AccessControl.FileSystemRights]::AppendData) -bor
+        [long]([Security.AccessControl.FileSystemRights]::CreateFiles) -bor
+        [long]([Security.AccessControl.FileSystemRights]::CreateDirectories) -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteAttributes) -bor
+        [long]([Security.AccessControl.FileSystemRights]::WriteExtendedAttributes)
+    $item = Get-Item -LiteralPath $candidate -Force
+    while ($null -ne $item) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Trusted ancestor is a reparse point: $($item.FullName)"
+        }
+        $acl = Get-Acl -LiteralPath $item.FullName
+        $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $trustedSids) {
+            throw "Trusted ancestor has an untrusted owner: $($item.FullName)"
+        }
+        $insideManaged = -not [string]::IsNullOrEmpty($managed) -and
+            ($item.FullName.TrimEnd('\').Equals($managed,
+                [StringComparison]::OrdinalIgnoreCase) -or
+             $item.FullName.StartsWith($managed + '\',
+                [StringComparison]::OrdinalIgnoreCase))
+        if ($insideManaged -and -not $acl.AreAccessRulesProtected) {
+            throw "Managed ancestor DACL is not protected: $($item.FullName)"
+        }
+        foreach ($rule in $acl.GetAccessRules($true, $true,
+                [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne 'Allow' -or
+                $rule.IdentityReference.Value -in $trustedSids -or
+                ($rule.PropagationFlags -band
+                    [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+                continue
+            }
+            $effectiveMask = if ($insideManaged) { $writeMask } else { $replaceMask }
+            if (([long]$rule.FileSystemRights -band $effectiveMask) -ne 0) {
+                throw "Untrusted ancestor replacement/write ACE: $($item.FullName)"
+            }
+        }
+        $item = if ($item -is [IO.DirectoryInfo]) { $item.Parent } else { $item.Directory }
+    }
+}
+
+function Assert-StableTrustedPath([string]$Path, [string]$Identity) {
+    Assert-TrustedAncestorChain $Path $trusted
+    if ((Get-PathIdentity $Path) -ne $Identity) {
+        throw "Trusted path identity changed: $Path"
+    }
+}
+
+function New-DirectoryLease([string]$Path) {
+    $lease = [QBrowser.Task18.DirectoryLease]::new($Path)
+    [void]$script:operationLeases.Add($lease)
+    return $lease
+}
+
+function Dispose-OperationLeases {
+    for ($index = $script:operationLeases.Count - 1; $index -ge 0; --$index) {
+        $script:operationLeases[$index].Dispose()
+    }
+    $script:operationLeases.Clear()
+}
+
 function Assert-PlainTree([string]$Path) {
     Assert-NoReparseAncestor $Path
     foreach ($entry in Get-ChildItem -LiteralPath $Path -Recurse -Force) {
         if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Reparse member is forbidden: $($entry.FullName)"
         }
+    }
+}
+
+function New-TrustedSourceSnapshot([string]$Destination) {
+    New-OwnedDirectory $Destination
+    Protect-Path $Destination -Container
+    $lease = New-DirectoryLease $Destination
+    $files = @(& git -C $repo ls-files)
+    if ($LASTEXITCODE -ne 0 -or $files.Count -eq 0) {
+        throw 'Unable to enumerate tracked Release source inputs.'
+    }
+    foreach ($relative in $files) {
+        if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
+            throw "Unsafe tracked source path: $relative"
+        }
+        $source = Join-Path $repo $relative
+        $sourceItem = Get-Item -LiteralPath $source -Force
+        if ($sourceItem.PSIsContainer -or
+            ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Tracked Release source is not a plain file: $relative"
+        }
+        $target = Join-Path $Destination $relative
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))
+        Copy-Item -LiteralPath $source -Destination $target
+    }
+    Protect-Path $Destination -Container
+    Assert-PlainTree $Destination
+    Assert-TrustedAncestorChain $Destination $trusted
+    return [pscustomobject]@{
+        Lease = $lease
+        Identity = Get-PathIdentity $Destination
+        Count = $files.Count
     }
 }
 
@@ -316,6 +582,14 @@ function Test-PrivatePem([string]$Path) {
     finally { $reader.Dispose() }
 }
 
+function Get-RawSecurityDescriptorHex([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $bytes = $acl.GetSecurityDescriptorBinaryForm()
+    # BitConverter is available in Windows PowerShell 5.1/.NET Framework;
+    # Convert.ToHexString is not.
+    return [BitConverter]::ToString($bytes).Replace('-', '')
+}
+
 function Get-DeploymentSnapshot([string]$Root) {
     $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
     $items = @((Get-Item -LiteralPath $rootPath -Force)) +
@@ -327,7 +601,7 @@ function Get-DeploymentSnapshot([string]$Root) {
             '.'
         }
         else { $item.FullName.Substring($rootPath.Length + 1).Replace('\', '/') }
-        $acl = (Get-Acl -LiteralPath $item.FullName).Sddl
+        $acl = Get-RawSecurityDescriptorHex $item.FullName
         if ($item.PSIsContainer) { "D|$relative|$acl" }
         else {
             $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash
@@ -346,10 +620,74 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs, [string]$Failure) 
     throw $Failure
 }
 
+$script:operationLeases = [Collections.Generic.List[IDisposable]]::new()
+$script:workerLeases = [Collections.Generic.List[IDisposable]]::new()
+Assert-ChildPath $build $trusted 'BuildDirectory'
+Assert-ChildPath $deployment $trusted 'DeploymentDirectory'
+Assert-NoReparseAncestor $build
+Assert-NoReparseAncestor $deployment
+if ($build.Equals($deployment, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'BuildDirectory and DeploymentDirectory must be distinct.'
+}
+if ($Clean -and
+    (-not $build.Equals($defaultBuild, [StringComparison]::OrdinalIgnoreCase) -or
+     -not $deployment.Equals($defaultDeployment, [StringComparison]::OrdinalIgnoreCase))) {
+    throw '-Clean is restricted to the exact trusted Task18 build/release paths.'
+}
+
+$deployScript = Join-Path $trustedControlRoot 'Deploy.cmake'
+if ((Test-Path -LiteralPath $deployment) -and -not $Clean) {
+    # Verification of an authoritative release is deliberately read-only. In
+    # particular, do not call Protect-Path/icacls here: an already accepted
+    # deployment must either pass exactly as published or fail closed.
+    if (-not (Test-Path -LiteralPath $deployScript -PathType Leaf)) {
+        throw "Trusted deployment verifier is missing: $deployScript"
+    }
+    Assert-NoReparseAncestor $trusted
+    Assert-ProtectedPath $trusted
+    Assert-ProtectedPath $trustedControlRoot
+    Assert-ProtectedPath $deployScript
+    Assert-TrustedAncestorChain $deployment $trusted
+    [void](New-DirectoryLease $trusted)
+    [void](New-DirectoryLease $trustedControlRoot)
+    $deploymentIdentity = Get-PathIdentity $deployment
+    $deploymentLease = New-DirectoryLease $deployment
+    $before = Get-DeploymentSnapshot $deployment
+    $verifierBefore = "$(Get-PathIdentity $deployScript)|" +
+        "$(Get-RawSecurityDescriptorHex $deployScript)|" +
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $deployScript).Hash
+    Invoke-Checked $CMake @('-DQ_BROWSER_DEPLOY_MODE=VERIFY',
+        "-DQ_BROWSER_DEPLOY_DIR=$deployment", '-P', $deployScript)
+    $after = Get-DeploymentSnapshot $deployment
+    $verifierAfter = "$(Get-PathIdentity $deployScript)|" +
+        "$(Get-RawSecurityDescriptorHex $deployScript)|" +
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $deployScript).Hash
+    if ($before -ne $after -or $verifierBefore -ne $verifierAfter) {
+        throw 'Read-only deployment verification changed deployment/verifier hash or ACL state.'
+    }
+    Assert-StableTrustedPath $deployment $deploymentIdentity
+    Write-Output "Verified existing accepted deployment without mutation: $deployment"
+    Dispose-OperationLeases
+    return
+}
+
+Assert-TrustedAncestorChain $localAppData
+Assert-NoReparseAncestor $trusted
+New-Item -ItemType Directory -Path $trusted -Force | Out-Null
+[void](New-DirectoryLease $trusted)
+Protect-Path $trusted -Container
+foreach ($managedParent in @($trustedBuildRoot, $trustedWorkRoot, $trustedControlRoot)) {
+    New-Item -ItemType Directory -Path $managedParent -Force | Out-Null
+    [void](New-DirectoryLease $managedParent)
+    Protect-Path $managedParent -Container
+}
+Assert-TrustedAncestorChain $trusted $trusted
+$trustedIdentity = Get-PathIdentity $trusted
+
 if (-not [string]::IsNullOrWhiteSpace($PrepareManualState)) {
     $manualState = [IO.Path]::GetFullPath($PrepareManualState)
     $expectedManualState = [IO.Path]::GetFullPath(
-        (Join-Path $repoBuild 'manual-deployed-smoke'))
+        (Join-Path $trusted 'manual-deployed-smoke'))
     if (-not $manualState.Equals($expectedManualState,
             [StringComparison]::OrdinalIgnoreCase)) {
         throw "Manual state is restricted to $expectedManualState"
@@ -364,72 +702,71 @@ if (-not [string]::IsNullOrWhiteSpace($PrepareManualState)) {
         Protect-Path $directory -Container
     }
     Assert-PlainTree $manualState
+    Assert-TrustedAncestorChain $manualState $trusted
     Write-Output "Protected manual deployment state prepared: $manualState"
-    return
-}
-
-Assert-ChildPath $build $repoBuild 'BuildDirectory'
-Assert-ChildPath $deployment $repoBuild 'DeploymentDirectory'
-Assert-NoReparseAncestor $build
-Assert-NoReparseAncestor $deployment
-if ($build.Equals($deployment, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'BuildDirectory and DeploymentDirectory must be distinct.'
-}
-if ($Clean -and
-    (-not $build.Equals($defaultBuild, [StringComparison]::OrdinalIgnoreCase) -or
-     -not $deployment.Equals($defaultDeployment, [StringComparison]::OrdinalIgnoreCase))) {
-    throw '-Clean is restricted to the exact repository Task18 build/release paths.'
-}
-
-$deployScript = Join-Path $repo 'cmake\Deploy.cmake'
-if ((Test-Path -LiteralPath $deployment) -and -not $Clean) {
-    $before = Get-DeploymentSnapshot $deployment
-    Invoke-Checked $CMake @('-DQ_BROWSER_DEPLOY_MODE=VERIFY',
-        "-DQ_BROWSER_DEPLOY_DIR=$deployment", '-P', $deployScript)
-    $after = Get-DeploymentSnapshot $deployment
-    if ($before -ne $after) { throw 'Read-only deployment verification changed hash or ACL state.' }
-    Write-Output "Verified existing accepted deployment without mutation: $deployment"
+    Dispose-OperationLeases
     return
 }
 
 if ($Clean) {
     Remove-OwnedTree $build $defaultBuild
+    Remove-OwnedTree $defaultAcceptanceBuild $defaultAcceptanceBuild
     Remove-OwnedTree $deployment $defaultDeployment '.qbrowser-release-root' $releaseMarkerText
     Remove-OwnedTree $packageOutput $packageOutput
+    Remove-OwnedTree $sourceStage $sourceStage
 }
 elseif (Test-Path -LiteralPath $build) {
     throw "Build output already exists; inspect it before using -Clean: $build"
 }
 
 $runId = [Guid]::NewGuid().ToString('N')
-$taskTemp = Join-Path $repoBuild ".task18-release-temp-$runId"
-$staging = Join-Path $repoBuild ".task18-release-deploy-$runId"
-New-OwnedDirectory $taskTemp
-New-OwnedDirectory $staging
-Protect-Path $taskTemp -Container
-Protect-Path $staging -Container
+$taskTemp = Join-Path $trustedWorkRoot ".task18-release-temp-$runId"
+$staging = Join-Path $trustedWorkRoot ".task18-release-deploy-$runId"
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
 $previousPath = $env:PATH
-$previousSourceDateEpoch = [Environment]::GetEnvironmentVariable(
-    'SOURCE_DATE_EPOCH', 'Process')
+$previousSourceDateEpoch = Get-ProcessEnvironmentState 'SOURCE_DATE_EPOCH'
 $loaderEnvironmentNames = @('QML_IMPORT_PATH','QML2_IMPORT_PATH','QT_PLUGIN_PATH',
-    'QT_QPA_PLATFORM_PLUGIN_PATH','QTWEBENGINEPROCESS_PATH','OPENSSL_CONF',
-    'OPENSSL_MODULES','QTDIR','QT_ROOT_DIR','Qt6_DIR','CMAKE_PREFIX_PATH')
+    'QT_QPA_PLATFORM_PLUGIN_PATH','QTWEBENGINEPROCESS_PATH',
+    'QTWEBENGINE_RESOURCES_PATH','QTWEBENGINE_LOCALES_PATH',
+    'QTWEBENGINE_DICTIONARIES_PATH','QTWEBENGINE_CHROMIUM_FLAGS',
+    'QTWEBENGINE_DISABLE_SANDBOX','QTWEBENGINE_REMOTE_DEBUGGING',
+    'OPENSSL_CONF','OPENSSL_MODULES','QTDIR',
+    'QT_ROOT_DIR','Qt6_DIR','CMAKE_PREFIX_PATH')
 $previousLoaderEnvironment = @{}
 foreach ($name in $loaderEnvironmentNames) {
-    $previousLoaderEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    $previousLoaderEnvironment[$name] = Get-ProcessEnvironmentState $name
 }
-$node = (Get-Command node.exe -ErrorAction Stop).Source
-$env:TEMP = $taskTemp
-$env:TMP = $taskTemp
-$env:SOURCE_DATE_EPOCH = '946684800'
-$env:QTEST_FUNCTION_TIMEOUT = '900000'
+$previousMsBuildNodeReuse = Get-ProcessEnvironmentState 'MSBUILDDISABLENODEREUSE'
+$primaryFailure = $null
+try {
+    New-OwnedDirectory $taskTemp
+    New-OwnedDirectory $staging
+    Protect-Path $taskTemp -Container
+    Protect-Path $staging -Container
+    $taskTempLease = New-DirectoryLease $taskTemp
+    $stagingLease = New-DirectoryLease $staging
+    $taskTempIdentity = Get-PathIdentity $taskTemp
+    $stagingIdentity = Get-PathIdentity $staging
+    # Release configure/build, the deployment-only E2E, and the production
+    # acceptance suite must all run independently of caller-controlled Qt/OpenSSL
+    # loader state. Keep the exact caller snapshot above and restore it in finally.
+    foreach ($name in $loaderEnvironmentNames) {
+        Clear-ProcessEnvironmentValue $name
+    }
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    $env:TEMP = $taskTemp
+    $env:TMP = $taskTemp
+    $env:SOURCE_DATE_EPOCH = '946684800'
+    $env:QTEST_FUNCTION_TIMEOUT = '900000'
+    $env:MSBUILDDISABLENODEREUSE = '1'
 
 function New-SignedUpdatePackage([string]$Version, [string]$Destination) {
-    $source = Join-Path $taskTemp "package-source-$Version"
+    $packageWork = Join-Path $taskTemp "package-work-$Version"
+    $source = Join-Path $packageWork 'source'
+    New-Item -ItemType Directory -Path $packageWork | Out-Null
     New-Item -ItemType Directory -Path $source | Out-Null
-    $pilotSource = Join-Path $repo 'packages\pilot'
+    $pilotSource = Join-Path $sourceStage 'packages\pilot'
     Assert-PlainTree $pilotSource
     foreach ($entry in Get-ChildItem -LiteralPath $pilotSource -Force) {
         if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -442,9 +779,12 @@ function New-SignedUpdatePackage([string]$Version, [string]$Destination) {
     $manifest.version = $Version
     [IO.File]::WriteAllText($manifestPath,
         ($manifest | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
-    $unsigned = Join-Path $taskTemp "$Version.unsigned.qapkg"
+    # The task temp ancestor is deny-delete leased. Let qbrowser-package own the
+    # exact unleased child root it uses for atomic output staging, separate from
+    # its immutable source-tree root.
+    $unsigned = Join-Path $packageWork "$Version.unsigned.qapkg"
     $cli = Join-Path $staging 'host\qbrowser-package.exe'
-    $privateKey = Join-Path $repo '.qbrowser-dev\signing\private.pem'
+    $privateKey = Join-Path $trusted 'signing\private.pem'
     Invoke-Checked $cli @('pack', '--source', $source, '--output', $unsigned)
     Invoke-Checked $cli @('sign', '--package', $unsigned, '--private-key',
         $privateKey, '--output', $Destination)
@@ -474,13 +814,48 @@ function Get-DeployedProcesses([string]$Name, [string]$ExpectedPath) {
         })
 }
 
-function Wait-DeployedWorker([int[]]$Excluded = @()) {
+function Get-DeployedWorkerIdentity($Process) {
+    return "$([int]$Process.ProcessId)|$($Process.CreationDate.ToUniversalTime().Ticks)"
+}
+
+function Assert-CurrentDeployedWorker($Worker) {
+    if ($null -eq $Worker -or -not $Worker.Lease.IsAlive) {
+        throw 'Bound deployed Worker process is no longer alive.'
+    }
+    $expected = Join-Path $staging 'runtime\qbrowser-worker.exe'
+    $current = @(Get-DeployedProcesses 'qbrowser-worker.exe' $expected)
+    $matches = @($current | Where-Object {
+        (Get-DeployedWorkerIdentity $_) -eq $Worker.Identity })
+    if ($current.Count -ne 1 -or $matches.Count -ne 1) {
+        throw 'Bound deployed Worker is no longer the unique current generation.'
+    }
+}
+
+function Wait-DeployedWorker([string[]]$ExcludedIdentities = @()) {
     $expected = Join-Path $staging 'runtime\qbrowser-worker.exe'
     $script:observedWorker = $null
     Wait-Until {
         $candidate = @(Get-DeployedProcesses 'qbrowser-worker.exe' $expected |
-            Where-Object { [int]$_.ProcessId -notin $Excluded }) | Select-Object -First 1
-        if ($null -ne $candidate) { $script:observedWorker = $candidate; return $true }
+            Where-Object { (Get-DeployedWorkerIdentity $_) -notin $ExcludedIdentities }) |
+            Sort-Object CreationDate -Descending | Select-Object -First 1
+        if ($null -ne $candidate) {
+            $lease = $null
+            try {
+                $lease = [QBrowser.Task18.ProcessLease]::new([int]$candidate.ProcessId)
+                $bound = [pscustomobject]@{
+                    ProcessId = [int]$candidate.ProcessId
+                    CommandLine = [string]$candidate.CommandLine
+                    CreationDate = $candidate.CreationDate
+                    Identity = Get-DeployedWorkerIdentity $candidate
+                    Lease = $lease
+                }
+                Assert-CurrentDeployedWorker $bound
+                [void]$script:workerLeases.Add($lease)
+                $script:observedWorker = $bound
+                return $true
+            }
+            catch { if ($null -ne $lease) { $lease.Dispose() }; return $false }
+        }
         return $false
     } 30000 'The deployed LPAC Worker did not start from the staged runtime.'
     return $script:observedWorker
@@ -557,7 +932,7 @@ function Get-AclTreeSnapshot([string[]]$Roots) {
                 @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force |
                     Sort-Object FullName)) {
             $relative = $item.FullName.Substring($rootFull.Length).TrimStart('\').Replace('\','/')
-            "$rootFull|$relative|$((Get-Acl -LiteralPath $item.FullName).Sddl)"
+            "$rootFull|$relative|$(Get-RawSecurityDescriptorHex $item.FullName)"
         }
     }
     return ($lines -join "`n")
@@ -595,9 +970,28 @@ function Assert-AclLeaseRestored([string]$Before, [string[]]$Roots, [string]$Lab
 }
 
 function Invoke-DeployedRouteAcceptance([Diagnostics.Process]$AppProcess,
-        [string]$Telemetry, [int]$NegativeWorkerPid = 0) {
+        [string]$Telemetry, $NegativeWorker = $null) {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
+    if (-not ('QBrowser.Task18.AsyncAutomation' -as [type])) {
+        Add-Type -ReferencedAssemblies @(
+            [System.Windows.Automation.AutomationElement].Assembly.Location,
+            [System.Windows.Automation.InvokePattern].Assembly.Location,
+            [System.Windows.Automation.AutomationPattern].Assembly.Location) -TypeDefinition @'
+using System.Threading.Tasks;
+using System.Windows.Automation;
+namespace QBrowser.Task18 {
+  public static class AsyncAutomation {
+    public static Task InvokeAsync(AutomationElement element) {
+      return Task.Run(() => {
+        var pattern = (InvokePattern)element.GetCurrentPattern(InvokePattern.Pattern);
+        pattern.Invoke();
+      });
+    }
+  }
+}
+'@
+    }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle(
         [IntPtr]$AppProcess.MainWindowHandle)
     if ($null -eq $root) { throw 'Windows UI Automation could not open the Host window.' }
@@ -635,24 +1029,27 @@ function Invoke-DeployedRouteAcceptance([Diagnostics.Process]$AppProcess,
         'app://pilot/files'='/files'; 'app://pilot/settings'='/settings'
     }
     $eventFile = Join-Path $Telemetry 'events.jsonl'
-    if ($NegativeWorkerPid -gt 0) {
+    if ($null -ne $NegativeWorker) {
         $negativeRoute = 'app://pilot/settings'
         $negativePattern = '"phase":"worker","code":"completed".*' +
             '"routeTemplate":"/settings".*"queueDepth":0'
         $before = if (Test-Path $eventFile) {
             @([regex]::Matches((Get-Content $eventFile -Raw), $negativePattern)).Count
         } else { 0 }
-        [QBrowser.Task18.ProcessControl]::Suspend($NegativeWorkerPid)
+        Assert-CurrentDeployedWorker $NegativeWorker
+        $NegativeWorker.Lease.Suspend()
         $missingAckDetected = $false
+        $invokeTask = $null
         try {
             try {
-                $value.SetValue($negativeRoute); $invoke.Invoke()
+                $value.SetValue($negativeRoute)
+                $invokeTask = [QBrowser.Task18.AsyncAutomation]::InvokeAsync($go)
                 try {
                     Wait-Until {
                         (Test-Path $eventFile) -and
                         @([regex]::Matches((Get-Content $eventFile -Raw), $negativePattern)).Count `
                             -gt $before
-                    } 6000 'Injected ignored route produced no acknowledgement.'
+                    } 2000 'Injected ignored route produced no acknowledgement.'
                 }
                 catch { $missingAckDetected = $true }
             }
@@ -663,10 +1060,27 @@ function Invoke-DeployedRouteAcceptance([Diagnostics.Process]$AppProcess,
                 $missingAckDetected = $true
             }
         }
-        finally { [QBrowser.Task18.ProcessControl]::Resume($NegativeWorkerPid) }
+        finally {
+            if (-not $NegativeWorker.Lease.IsAlive) {
+                throw 'Negative ACK Worker generation restarted during injection.'
+            }
+            $NegativeWorker.Lease.Resume()
+            Assert-CurrentDeployedWorker $NegativeWorker
+            if ($null -ne $invokeTask -and -not $invokeTask.Wait(10000)) {
+                throw 'Negative ACK UI Automation invocation did not finish after resume.'
+            }
+            if ($null -ne $invokeTask -and $invokeTask.IsFaulted) {
+                throw $invokeTask.Exception
+            }
+        }
         if (-not $missingAckDetected) {
             throw 'Negative route injection was incorrectly accepted.'
         }
+        Wait-Until {
+            (Test-Path $eventFile) -and
+            @([regex]::Matches((Get-Content $eventFile -Raw), $negativePattern)).Count `
+                -gt $before
+        } 15000 'Resumed Worker did not drain the negative route generation.'
         Write-Output 'DEPLOYMENT_ROUTE_NEGATIVE=PASS ignoredWorkerAck=rejected'
         return
     }
@@ -709,10 +1123,18 @@ function Invoke-DeployedRouteAcceptance([Diagnostics.Process]$AppProcess,
         15000 'The WebEngine route did not start the deployed helper.'
     $helper = @(Get-DeployedProcesses 'QtWebEngineProcess.exe' $helperPath)
     foreach ($process in $helper) {
+        Write-Output "DEPLOYED_WEBENGINE_COMMANDLINE=$($process.CommandLine)"
         if ($process.CommandLine -match [regex]::Escape((Join-Path $repo 'packages') + '\') -or
             $process.CommandLine -match [regex]::Escape($build + '\') -or
-            $process.CommandLine -match [regex]::Escape((Join-Path $QtRoot 'bin') + '\')) {
-            throw 'WebEngine helper command line contains an implicit source path.'
+            $process.CommandLine -match [regex]::Escape((Join-Path $QtRoot 'bin') + '\') -or
+            $process.CommandLine -match '(?i)--no-sandbox') {
+            throw 'WebEngine helper command line contains a source path or disabled sandbox.'
+        }
+    }
+    foreach ($resource in @('qtwebengine_resources.pak','icudtl.dat')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $staging "host\resources\$resource") `
+                -PathType Leaf)) {
+            throw "WebEngine resource is not deployed beside the bound helper: $resource"
         }
     }
     $value.SetValue('app://pilot/dashboard')
@@ -730,12 +1152,21 @@ function Invoke-DeploymentOnlyE2E {
     $webEnginePath = Join-Path $staging 'host\QtWebEngineProcess.exe'
     try {
         foreach ($name in $loaderEnvironmentNames) {
-            [Environment]::SetEnvironmentVariable(
-                $name, $null, 'Process')
+            $poison = if ($name -eq 'QTWEBENGINE_DISABLE_SANDBOX') { '1' }
+                elseif ($name -eq 'QTWEBENGINE_CHROMIUM_FLAGS') { '--no-sandbox' }
+                else { 'C:\qbrowser-poisoned-loader-path' }
+            [Environment]::SetEnvironmentVariable($name, $poison, 'Process')
+        }
+        foreach ($name in $loaderEnvironmentNames) {
+            Clear-ProcessEnvironmentValue $name
+        }
+        if (@($loaderEnvironmentNames | Where-Object {
+                Test-Path -LiteralPath "Env:$_" }).Count -ne 0) {
+            throw 'Loader/security environment poison was not cleared.'
         }
         Write-Output "DEPLOYMENT_LOADER_ENV_CLEARED=$($loaderEnvironmentNames -join ',')"
         $mock = Start-Process -FilePath $node -ArgumentList 'src/server.ts' `
-            -WorkingDirectory (Join-Path $repo 'tools\mock-api') -WindowStyle Hidden `
+            -WorkingDirectory (Join-Path $sourceStage 'tools\mock-api') -WindowStyle Hidden `
             -RedirectStandardOutput $mockOut -RedirectStandardError $mockErr -PassThru
         [void]$ownedPids.Add($mock.Id)
         $script:mockOrigin = $null
@@ -774,8 +1205,11 @@ function Invoke-DeploymentOnlyE2E {
             throw 'LPAC Worker command line contains an implicit source runtime path.'
         }
         Wait-Telemetry $telemetry '"packageVersion":"1\.0\.0","phase":"health","code":"healthy"' 30000
-        Invoke-DeployedRouteAcceptance $initialHostProcess $telemetry `
-            -NegativeWorkerPid ([int]$worker.ProcessId)
+        1..10 | ForEach-Object {
+            Invoke-DeployedRouteAcceptance $initialHostProcess $telemetry `
+                -NegativeWorker $worker
+            Write-Output "DEPLOYMENT_ROUTE_NEGATIVE_REPEAT=$_/10 identity=$($worker.Identity)"
+        }
         Stop-OwnedHost $initialHostProcess
         if ($initialHostProcess.ExitCode -ne 0) {
             throw "Initial deployed Host cleanup exited $($initialHostProcess.ExitCode)."
@@ -807,10 +1241,11 @@ function Invoke-DeploymentOnlyE2E {
             @(Get-DeployedProcesses 'qbrowser-worker.exe' $workerPath).Count -ne 1) {
             throw 'Signed 1.1.0 candidate was not stably running before crash injection.'
         }
-        Stop-Process -Id ([int]$firstUpdateWorker.ProcessId) -Force
-        Wait-Until { -not (Get-Process -Id ([int]$firstUpdateWorker.ProcessId) `
-                -ErrorAction SilentlyContinue) } 10000 'First crashed Worker did not exit.'
-        $restartedWorker = Wait-DeployedWorker @([int]$firstUpdateWorker.ProcessId)
+        Assert-CurrentDeployedWorker $firstUpdateWorker
+        $firstUpdateWorker.Lease.Terminate(88)
+        Wait-Until { -not $firstUpdateWorker.Lease.IsAlive } 10000 `
+            'First crashed Worker generation did not exit.'
+        $restartedWorker = Wait-DeployedWorker @($firstUpdateWorker.Identity)
         [void]$ownedPids.Add([int]$restartedWorker.ProcessId)
         Wait-Telemetry $telemetry '"packageVersion":"1\.1\.0","phase":"worker","code":"restarted"' 30000
         if (((Get-Content -LiteralPath $activation -Raw | ConvertFrom-Json).current `
@@ -822,15 +1257,16 @@ function Invoke-DeploymentOnlyE2E {
             @(Get-DeployedProcesses 'qbrowser-worker.exe' $workerPath).Count -ne 1) {
             throw 'Restarted 1.1.0 Worker was not stable before the second crash.'
         }
-        Stop-Process -Id ([int]$restartedWorker.ProcessId) -Force
-        Wait-Until { -not (Get-Process -Id ([int]$restartedWorker.ProcessId) `
-                -ErrorAction SilentlyContinue) } 10000 'Second crashed Worker did not exit.'
+        Assert-CurrentDeployedWorker $restartedWorker
+        $restartedWorker.Lease.Terminate(89)
+        Wait-Until { -not $restartedWorker.Lease.IsAlive } 10000 `
+            'Second crashed Worker generation did not exit.'
         Wait-Telemetry $telemetry '"packageVersion":"1\.0\.0","phase":"rollback","code":"recovered"' 60000
         Wait-Until { ((Get-Content -LiteralPath $activation -Raw |
                 ConvertFrom-Json).current -like 'versions/1.0.0-*') } 30000 `
             'Double crash did not recover the 1.0.0 last-known-good package.'
         $recoveryWorker = Wait-DeployedWorker @(
-            [int]$firstUpdateWorker.ProcessId, [int]$restartedWorker.ProcessId)
+            $firstUpdateWorker.Identity, $restartedWorker.Identity)
         [void]$ownedPids.Add([int]$recoveryWorker.ProcessId)
         if ($secondHost.HasExited) { throw 'Host exited during Worker crash recovery.' }
         Start-Sleep -Seconds 5
@@ -883,8 +1319,11 @@ function Invoke-DeploymentOnlyE2E {
         }
         $env:PATH = $previousPath
         foreach ($name in $loaderEnvironmentNames) {
-            [Environment]::SetEnvironmentVariable(
-                $name, $previousLoaderEnvironment[$name], 'Process')
+            # The release operation cleared caller-controlled loader state
+            # before entering this E2E. Keep it cleared for the production
+            # acceptance suite; only the outermost finally restores caller
+            # state after every release check is complete.
+            Clear-ProcessEnvironmentValue $name
         }
     }
 }
@@ -1029,12 +1468,71 @@ function Test-CleanupReparseDefense {
     Write-Output "CLEANUP_LONG_PATH=PASS length=$($deep.Length) residue=0"
 }
 
-$buildParentIdentity = Get-PathIdentity $repoBuild
-$primaryFailure = $null
-try {
+function Test-TrustedParentReplacementDefense {
+    $probe = Join-Path $taskTemp 'parent-replacement-probe'
+    New-OwnedDirectory $probe
+    Protect-Path $probe -Container
+    $identity = Get-PathIdentity $probe
+    $lease = [QBrowser.Task18.DirectoryLease]::new($probe)
+    $renamed = Join-Path $taskTemp 'parent-replacement-probe-renamed'
+    $renameRejected = $false
+    try {
+        try { Move-Item -LiteralPath $probe -Destination $renamed -ErrorAction Stop }
+        catch { $renameRejected = $true }
+        if (-not $renameRejected -or -not (Test-Path -LiteralPath $probe) -or
+            (Get-PathIdentity $probe) -ne $identity) {
+            throw 'A leased trusted directory accepted rename/replacement.'
+        }
+    }
+    finally { $lease.Dispose() }
+    Remove-OwnedTree $probe $probe
+
+    $unsafe = Join-Path $taskTemp 'unsafe-parent-probe'
+    New-OwnedDirectory $unsafe
+    Protect-Path $unsafe -Container
+    Invoke-Checked "$env:SystemRoot\System32\icacls.exe" @(
+        $unsafe, '/grant', '*S-1-5-11:(OI)(CI)M')
+    $unsafeRejected = $false
+    try { Assert-TrustedAncestorChain $unsafe $trusted }
+    catch { $unsafeRejected = $true }
+    if (-not $unsafeRejected) { throw 'Untrusted parent replacement ACL was accepted.' }
+    Protect-Path $unsafe -Container
+    Remove-OwnedTree $unsafe $unsafe
+    Write-Output 'TRUSTED_PARENT_REPLACEMENT_DEFENSE=PASS lease=rename-rejected acl=fail-closed'
+}
+
+$buildParentIdentity = Get-PathIdentity $trustedBuildRoot
+    # Protection helpers intentionally invoke native ACL tools whose output is useful
+    # interactively. Select only the explicit final snapshot record so native output
+    # cannot change the type of this security-sensitive result.
+    $sourceSnapshot = @(New-TrustedSourceSnapshot $sourceStage) |
+        Select-Object -Last 1
+    Assert-StableTrustedPath $sourceStage $sourceSnapshot.Identity
+    $controlCandidate = Join-Path $trustedControlRoot 'Deploy.cmake.candidate'
+    Copy-Item -LiteralPath (Join-Path $sourceStage 'cmake\Deploy.cmake') `
+        -Destination $controlCandidate
+    Protect-Path $controlCandidate
+    if (Test-Path -LiteralPath $deployScript) {
+        # This .NET runtime rejects a null backup path. Keep the rollback copy
+        # inside the already owned task directory and remove it only after the
+        # atomic replacement succeeds.
+        $controlBackup = Join-Path $taskTemp 'Deploy.cmake.previous'
+        [IO.File]::Replace($controlCandidate, $deployScript, $controlBackup, $true)
+        Remove-Item -LiteralPath $controlBackup -Force
+    } else {
+        Move-Item -LiteralPath $controlCandidate -Destination $deployScript
+    }
+    Protect-Path $deployScript
+    Write-Output "TRUSTED_SOURCE_SNAPSHOT=PASS files=$($sourceSnapshot.Count)"
     Test-CleanupReparseDefense
+    Test-TrustedParentReplacementDefense
     New-OwnedDirectory $build
     Protect-Path $build -Container
+    # CMake must enter this leaf, so its protected/deny-delete-leased parent is
+    # the operation barrier; the leaf identity and tree are checked around every
+    # build use. A DELETE lease on the leaf would block CMake's own directory open.
+    $buildIdentity = Get-PathIdentity $build
+    Assert-StableTrustedPath $build $buildIdentity
     $aclProbe = Join-Path $build 'acl-tamper-probe.txt'
     [IO.File]::WriteAllText($aclProbe, 'probe', [Text.UTF8Encoding]::new($false))
     Protect-Path $aclProbe
@@ -1053,12 +1551,15 @@ try {
     Remove-Item -LiteralPath $reparseProbe -Force
     Assert-ProtectedPath $build
     Assert-PlainTree $build
+    Assert-StableTrustedPath $build $buildIdentity
     Write-Output 'BUILD_INPUT_TAMPER_DEFENSE=PASS acl=rejected reparse=rejected'
-    Invoke-Checked $CMake @('-S', $repo, '-B', $build,
+    Invoke-Checked $CMake @('-S', $sourceStage, '-B', $build,
         '-G', 'Visual Studio 17 2022', '-A', 'x64',
         "-DCMAKE_PREFIX_PATH=$QtRoot", "-DOPENSSL_ROOT_DIR=$OpenSslRoot",
         '-DBUILD_TESTING=OFF', '-DQ_BROWSER_BUILD_WEBENGINE=ON')
-    Invoke-Checked $CMake @('--build', $build, '--config', 'Release', '--parallel', '2')
+    Invoke-TrackedBuild @('--build', $build, '--config', 'Release', '--parallel', '2',
+        '--', '/nr:false')
+    Assert-StableTrustedPath $build $buildIdentity
     Assert-ProtectedPath $build
     Assert-PlainTree $build
     $releaseHost = Join-Path $build 'apps\host\Release\qbrowser-host.exe'
@@ -1081,9 +1582,15 @@ try {
         throw 'Production Release build contains tests or CTest inventory failed.'
     }
 
-    & (Join-Path $repo 'scripts\create-dev-package.ps1') -Configuration Release `
-        -BuildDirectory $build -OutputDirectory $packageOutput -Clean:$Clean
+    & (Join-Path $sourceStage 'scripts\create-dev-package.ps1') -Configuration Release `
+        -BuildDirectory $build -OutputDirectory $packageOutput `
+        -KeyDirectory (Join-Path $trusted 'signing') -TrustedRoot $trusted `
+        -SourceDirectory $sourceStage -ParentTrustedRootLeaseHeld -Clean:$Clean
     if ($LASTEXITCODE -ne 0) { throw 'Development Pilot package creation failed.' }
+    Assert-TrustedAncestorChain $packageOutput $trusted
+    $packageOutputIdentity = Get-PathIdentity $packageOutput
+    [void](New-DirectoryLease $packageOutput)
+    Assert-StableTrustedPath $packageOutput $packageOutputIdentity
 
     $stagingHost = Join-Path $staging 'host'
     $stagingRuntime = Join-Path $staging 'runtime'
@@ -1091,7 +1598,7 @@ try {
     Invoke-Checked $CMake @('--install', $build, '--config', 'Release',
         '--prefix', $stagingHost, '--component', 'Runtime')
     Invoke-Checked $CMake @('-DQ_BROWSER_DEPLOY_MODE=ASSEMBLE',
-        "-DQ_BROWSER_DEPLOY_DIR=$staging", "-DQ_BROWSER_REPO_ROOT=$repo",
+        "-DQ_BROWSER_DEPLOY_DIR=$staging", "-DQ_BROWSER_REPO_ROOT=$sourceStage",
         "-DQ_BROWSER_QT_ROOT=$QtRoot", "-DQ_BROWSER_OPENSSL_ROOT=$OpenSslRoot",
         "-DQ_BROWSER_PACKAGE_FILE=$(Join-Path $packageOutput 'com.qbrowser.pilot-1.0.0.qapkg')",
         "-DQ_BROWSER_PUBLIC_KEY=$(Join-Path $packageOutput 'dev-public.pem')",
@@ -1107,6 +1614,7 @@ try {
     }
     Invoke-Checked $CMake @('-DQ_BROWSER_DEPLOY_MODE=PREVERIFY',
         "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+    Assert-StableTrustedPath $staging $stagingIdentity
 
     $forbiddenSymbols = @('qbrowser_host_testing', 'qbrowser_archive_testing',
         'forceLifecycleQueueFullForTesting', 'retryWorkerCleanupForTesting')
@@ -1133,16 +1641,19 @@ try {
         "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
     Invoke-AdversarialDeploymentTests
 
+    $acceptanceBuild = $defaultAcceptanceBuild
     if ($RunAcceptance) {
+        New-OwnedDirectory $acceptanceBuild
+        Protect-Path $acceptanceBuild -Container
         $env:PATH = $previousPath
-        & (Join-Path $repo 'scripts\run-acceptance.ps1') -Configuration Release `
-            -BuildDirectory (Join-Path $repoBuild 'release-acceptance') `
+        & (Join-Path $sourceStage 'scripts\run-acceptance.ps1') -Configuration Release `
+            -BuildDirectory $acceptanceBuild `
             -QtRoot $QtRoot -OpenSslRoot $OpenSslRoot
         if ($LASTEXITCODE -ne 0) { throw 'Release acceptance failed.' }
     }
 
     $privateScanRoots = @($build, $packageOutput, $staging)
-    if ($RunAcceptance) { $privateScanRoots += Join-Path $repoBuild 'release-acceptance' }
+    if ($RunAcceptance) { $privateScanRoots += $acceptanceBuild }
     foreach ($file in $privateScanRoots | ForEach-Object {
             Get-ChildItem -LiteralPath $_ -File -Recurse -Force }) {
         if ($file.Length -gt 0 -and (Test-PrivatePem $file.FullName)) {
@@ -1158,22 +1669,36 @@ try {
     }
     $env:PATH = $previousPath
     foreach ($name in $loaderEnvironmentNames) {
-        [Environment]::SetEnvironmentVariable(
-            $name, $previousLoaderEnvironment[$name], 'Process')
+        Restore-ProcessEnvironmentState $name $previousLoaderEnvironment[$name]
     }
     if ($FailureInjection -eq 'BeforePublish') {
         throw 'Injected Task18 failure before atomic publication.'
     }
-    if ((Get-PathIdentity $repoBuild) -ne $buildParentIdentity) {
-        throw 'Repository build root identity changed before publication.'
+    if ((Get-PathIdentity $trustedBuildRoot) -ne $buildParentIdentity) {
+        throw 'Trusted build root identity changed before publication.'
     }
+    Assert-StableTrustedPath $staging $stagingIdentity
+    Assert-StableTrustedPath $packageOutput $packageOutputIdentity
     Assert-NoReparseAncestor $deployment
     if (Test-Path -LiteralPath $deployment) {
         throw "Deployment appeared during staging; refusing to overwrite: $deployment"
     }
+    $stagingLease.Dispose()
     Move-Item -LiteralPath $staging -Destination $deployment
+    $deploymentIdentity = Get-PathIdentity $deployment
+    $deploymentLease = New-DirectoryLease $deployment
+    Assert-StableTrustedPath $deployment $deploymentIdentity
+    $replacement = Join-Path $trusted 'release-deploy-substitute-probe'
+    $publishedRenameRejected = $false
+    try { Move-Item -LiteralPath $deployment -Destination $replacement -ErrorAction Stop }
+    catch { $publishedRenameRejected = $true }
+    if (-not $publishedRenameRejected -or -not (Test-Path -LiteralPath $deployment) -or
+        (Get-PathIdentity $deployment) -ne $deploymentIdentity) {
+        throw 'Published deployment accepted rename/replacement substitution.'
+    }
     Invoke-Checked $CMake @('-DQ_BROWSER_DEPLOY_MODE=VERIFY',
         "-DQ_BROWSER_DEPLOY_DIR=$deployment", '-P', $deployScript)
+    Write-Output 'PUBLISHED_PARENT_REPLACEMENT_DEFENSE=PASS substitute=rejected'
     Write-Output "Q-Browser Release deployment created and accepted: $deployment"
 }
 catch {
@@ -1184,13 +1709,18 @@ finally {
     $env:TEMP = $previousTemp
     $env:TMP = $previousTmp
     $env:PATH = $previousPath
-    [Environment]::SetEnvironmentVariable(
-        'SOURCE_DATE_EPOCH', $previousSourceDateEpoch, 'Process')
+    Restore-ProcessEnvironmentState 'SOURCE_DATE_EPOCH' $previousSourceDateEpoch
+    Restore-ProcessEnvironmentState 'MSBUILDDISABLENODEREUSE' $previousMsBuildNodeReuse
     foreach ($name in $loaderEnvironmentNames) {
-        [Environment]::SetEnvironmentVariable(
-            $name, $previousLoaderEnvironment[$name], 'Process')
+        Restore-ProcessEnvironmentState $name $previousLoaderEnvironment[$name]
     }
     $cleanupFailures = @()
+    try {
+        foreach ($lease in $script:workerLeases) { $lease.Dispose() }
+        $script:workerLeases.Clear()
+        Dispose-OperationLeases
+    }
+    catch { $cleanupFailures += "lease cleanup: $($_.Exception.Message)" }
     try {
         if (Test-Path -LiteralPath $staging) {
             if (Test-Path -LiteralPath (Join-Path $staging '.qbrowser-release-root')) {
@@ -1201,11 +1731,30 @@ finally {
     }
     catch { $cleanupFailures += "staging cleanup: $($_.Exception.Message)" }
     try {
+        if (Test-Path -LiteralPath $sourceStage) {
+            Remove-OwnedTree $sourceStage $sourceStage
+        }
+    }
+    catch { $cleanupFailures += "source snapshot cleanup: $($_.Exception.Message)" }
+    try {
         if (Test-Path -LiteralPath $taskTemp) {
             Remove-OwnedTree $taskTemp $taskTemp
         }
     }
     catch { $cleanupFailures += "temporary cleanup: $($_.Exception.Message)" }
+    Start-Sleep -Milliseconds 1500
+    if (Test-Path -LiteralPath $taskTemp) {
+        $cleanupFailures += "delayed temporary residue: $taskTemp"
+    }
+    foreach ($name in $loaderEnvironmentNames) {
+        if (-not (Test-ProcessEnvironmentState $name $previousLoaderEnvironment[$name])) {
+            $cleanupFailures += "loader environment restoration: $name"
+        }
+    }
+    if (-not (Test-ProcessEnvironmentState 'MSBUILDDISABLENODEREUSE' `
+            $previousMsBuildNodeReuse)) {
+        $cleanupFailures += 'MSBuild node-reuse environment restoration'
+    }
     if ($cleanupFailures.Count -ne 0) {
         $cleanupMessage = $cleanupFailures -join '; '
         if ($null -ne $primaryFailure) {

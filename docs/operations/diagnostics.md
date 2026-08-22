@@ -8,19 +8,25 @@ and the deployment `SHA-256SUMS`. Preserve event ordering.
 Verify deployed bytes without modifying them:
 
 ```powershell
-$deploy = (Resolve-Path build\release-deploy).Path
-& 'E:\DevEnv\qt\Tools\CMake_64\bin\cmake.exe' `
-  "-DQ_BROWSER_DEPLOY_MODE=VERIFY" `
-  "-DQ_BROWSER_DEPLOY_DIR=$deploy" `
-  -P cmake\Deploy.cmake
+$task18Root = Join-Path ([Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::LocalApplicationData)) 'QBrowserTask18'
+$deploy = (Resolve-Path (Join-Path $task18Root 'release-deploy')).Path
+& powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\build-release.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Read-only deployment verification failed.' }
 ```
+
+This no-`-Clean` form uses the protected verifier copied into the trusted
+Task18 control directory and proves deployment hashes, raw ACL descriptors,
+identity, signature/app/version, and the prior acceptance attestation did not
+change. Do not substitute `cmake\Deploy.cmake` from a mutable checkout.
 
 Inspect a package only with the matching trusted public key:
 
 ```powershell
-build\release-deploy\host\qbrowser-package.exe inspect `
-  --package build\release-deploy\packages\com.qbrowser.pilot-1.0.0.qapkg `
-  --public-key build\release-deploy\trust\dev-public.pem
+& "$deploy\host\qbrowser-package.exe" inspect `
+  --package "$deploy\packages\com.qbrowser.pilot-1.0.0.qapkg" `
+  --public-key "$deploy\trust\dev-public.pem"
 ```
 
 Never attach secrets, private keys, arbitrary package payloads, user file or

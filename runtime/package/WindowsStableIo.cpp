@@ -681,7 +681,11 @@ bool WindowsStableDirectoryTree::addDirectory(
     const DWORD shareMode = immutable
         ? FILE_SHARE_READ
         : FILE_SHARE_READ
-            | (lockMembers ? FILE_SHARE_DELETE : FILE_SHARE_WRITE);
+            | (lockMembers ? FILE_SHARE_DELETE : FILE_SHARE_WRITE)
+            // Ancestors are identity anchors, not mutation locks. Sharing delete
+            // there permits a caller-owned deny-delete ancestor lease to coexist;
+            // the selected root still omits FILE_SHARE_DELETE and remains locked.
+            | (!lockRename ? FILE_SHARE_DELETE : 0U);
     UniqueWindowsHandle handle = openDirectory(
         normalized, desiredAccess, shareMode);
     WindowsFileIdentity identity;

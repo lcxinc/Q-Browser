@@ -28,7 +28,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Clean
 The Release command always exercises the staged deployment under a minimal and
 polluted `PATH`: a real deployed Host, LPAC Worker, all ten Pilot routes,
 deployed WebEngine helper, a signed update, and double-crash LKG recovery. It
-publishes `build\release-deploy` atomically only after those gates pass. A
+publishes `%LOCALAPPDATA%\QBrowserTask18\release-deploy` atomically only after
+those gates pass. The Release source is first copied into a protected tracked-file
+snapshot under that trusted root. A
 second invocation without `-Clean` is read-only and requires the acceptance
 attestation, protected ACLs, signature, identity, and canonical hashes to be
 unchanged.
@@ -43,8 +45,9 @@ powershell -ExecutionPolicy Bypass -File scripts\create-dev-package.ps1 `
   -Configuration Release -Clean
 ```
 
-**Development only:** the signing authority is stored at the exact ignored,
-protected directory `.qbrowser-dev\signing`. Never commit it, copy private
+**Development only:** the signing authority is stored outside the repository at
+the exact protected directory `%LOCALAPPDATA%\QBrowserTask18\signing`. Never
+commit it, copy private
 signing material into `build` or a deployment, attach it to diagnostics, or
 promote this trust root to production. The script publishes only the signed
 package and public key.
@@ -56,8 +59,10 @@ the mock API. Do not substitute a source-build Host, Worker, Qt directory, or
 unprotected state path.
 
 ```powershell
-$deploy = (Resolve-Path build\release-deploy).Path
-$state = Join-Path (Resolve-Path build).Path 'manual-deployed-smoke'
+$task18Root = Join-Path ([Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::LocalApplicationData)) 'QBrowserTask18'
+$deploy = (Resolve-Path (Join-Path $task18Root 'release-deploy')).Path
+$state = Join-Path $task18Root 'manual-deployed-smoke'
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 `
   -PrepareManualState $state
 $store = Join-Path $state 'package-store'
@@ -130,13 +135,16 @@ then restart with the candidate. Replace only the candidate value, not the
 trust key or installed version directories:
 
 ```powershell
-$candidate = (Resolve-Path build\candidate\com.qbrowser.pilot-1.1.0.qapkg).Path
+$candidate = (Resolve-Path (Join-Path $task18Root `
+  'candidate\com.qbrowser.pilot-1.1.0.qapkg')).Path
 & "$deploy\host\qbrowser-package.exe" inspect --package $candidate `
   --public-key "$deploy\trust\dev-public.pem"
 if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed.' }
 Stop-DeployedHost $appProcess
+$updateCommon = @($common | Where-Object { $_ -notlike '--health-window-ms=*' }) +
+  '--health-window-ms=60000'
 $appProcess = Start-Process "$deploy\host\qbrowser-host.exe" `
-  -ArgumentList (ConvertTo-LaunchArguments ($common + "--install-package=$candidate")) `
+  -ArgumentList (ConvertTo-LaunchArguments ($updateCommon + "--install-package=$candidate")) `
   -PassThru
 ```
 
@@ -146,16 +154,76 @@ deployment; the first crash restarts the candidate and the second recovers the
 reverified previous/LKG binding:
 
 ```powershell
-1..2 | ForEach-Object {
+function Wait-DistinctDeployedWorker([string[]]$Excluded = @()) {
+  $deadline = [Diagnostics.Stopwatch]::StartNew()
   do {
     Start-Sleep -Milliseconds 100
-    $worker = Get-CimInstance Win32_Process -Filter "Name='qbrowser-worker.exe'" |
-      Where-Object { $_.ExecutablePath -eq "$deploy\runtime\qbrowser-worker.exe" } |
-      Select-Object -First 1
-  } until ($null -ne $worker)
-  Stop-Process -Id $worker.ProcessId -Force
+    $workers = @(Get-CimInstance Win32_Process -Filter "Name='qbrowser-worker.exe'" |
+      Where-Object { $_.ExecutablePath -eq "$deploy\runtime\qbrowser-worker.exe" })
+    if ($workers.Count -eq 1) {
+      $identity = "$($workers[0].ProcessId)|$($workers[0].CreationDate.ToUniversalTime().Ticks)"
+      if ($identity -notin $Excluded) {
+        return [pscustomobject]@{ Process = $workers[0]; Identity = $identity }
+      }
+    }
+    if ($deadline.ElapsedMilliseconds -ge 30000) {
+      throw 'A unique distinct deployed Worker generation did not appear.'
+    }
+  } while ($true)
 }
-Get-Content "$telemetry\events.jsonl" | Select-String '"phase":"rollback","code":"recovered"'
+
+function Get-EventMatchCount([string]$Pattern) {
+  if (-not (Test-Path "$telemetry\events.jsonl")) { return 0 }
+  return @(Get-Content "$telemetry\events.jsonl" |
+    Select-String -Pattern $Pattern).Count
+}
+
+$restartPattern = '"packageVersion":"1\.1\.0","phase":"worker","code":"restarted"'
+$candidateHealthPattern = '"packageVersion":"1\.1\.0","phase":"health","code":"healthy"'
+$restartBefore = Get-EventMatchCount $restartPattern
+$candidateHealthBefore = Get-EventMatchCount $candidateHealthPattern
+$first = Wait-DistinctDeployedWorker
+Stop-Process -Id $first.Process.ProcessId -Force
+do { Start-Sleep -Milliseconds 100 } while (Get-Process -Id `
+  $first.Process.ProcessId -ErrorAction SilentlyContinue)
+$second = Wait-DistinctDeployedWorker @($first.Identity)
+$restartDeadline = [Diagnostics.Stopwatch]::StartNew()
+do {
+  Start-Sleep -Milliseconds 100
+  $restarted = (Get-EventMatchCount $restartPattern) -gt $restartBefore
+  $healthEvent = (Get-EventMatchCount $candidateHealthPattern) -gt
+    $candidateHealthBefore
+  $current = @(Get-CimInstance Win32_Process -Filter "Name='qbrowser-worker.exe'" |
+    Where-Object { $_.ExecutablePath -eq "$deploy\runtime\qbrowser-worker.exe" })
+  $healthy = $healthEvent -and $current.Count -eq 1 -and
+    "$($current[0].ProcessId)|$($current[0].CreationDate.ToUniversalTime().Ticks)" -eq
+      $second.Identity
+  if ($restartDeadline.ElapsedMilliseconds -ge 30000) {
+    throw 'The distinct replacement Worker did not report healthy restart telemetry.'
+  }
+} until ($restarted -and $healthy)
+$rollbackPattern = '"packageVersion":"1\.0\.0","phase":"rollback","code":"recovered"'
+$lkgHealthPattern = '"packageVersion":"1\.0\.0","phase":"health","code":"healthy"'
+$rollbackBefore = Get-EventMatchCount $rollbackPattern
+$lkgHealthBefore = Get-EventMatchCount $lkgHealthPattern
+Stop-Process -Id $second.Process.ProcessId -Force
+do { Start-Sleep -Milliseconds 100 } while (Get-Process -Id `
+  $second.Process.ProcessId -ErrorAction SilentlyContinue)
+$third = Wait-DistinctDeployedWorker @($first.Identity,$second.Identity)
+$rollbackDeadline = [Diagnostics.Stopwatch]::StartNew()
+do {
+  Start-Sleep -Milliseconds 100
+  $current = @(Get-CimInstance Win32_Process -Filter "Name='qbrowser-worker.exe'" |
+    Where-Object { $_.ExecutablePath -eq "$deploy\runtime\qbrowser-worker.exe" })
+  $thirdAlive = $current.Count -eq 1 -and
+    "$($current[0].ProcessId)|$($current[0].CreationDate.ToUniversalTime().Ticks)" -eq
+      $third.Identity
+  $recovered = (Get-EventMatchCount $rollbackPattern) -gt $rollbackBefore
+  $lkgHealthy = (Get-EventMatchCount $lkgHealthPattern) -gt $lkgHealthBefore
+  if ($rollbackDeadline.ElapsedMilliseconds -ge 30000) {
+    throw 'Rollback did not recover a distinct healthy 1.0.0 Worker generation.'
+  }
+} until ($thirdAlive -and $recovered -and $lkgHealthy)
 ```
 
 Close only the processes retained by this session and require complete cleanup:
