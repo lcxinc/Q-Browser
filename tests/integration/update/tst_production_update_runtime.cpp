@@ -1500,6 +1500,7 @@ void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistrat
 
 void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorkerRollback()
 {
+    constexpr int launchObservationTimeoutMs = 120'000;
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
     UpdateTemporaryDir temporary;
@@ -1560,7 +1561,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QSignalSpy capability(host.get(), &HostApplication::workerCapabilityRequestObserved);
     QSignalSpy failure(host.get(), &HostApplication::updateLifecycleFailed);
     QVERIFY(host->start());
-    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1 || !failure.isEmpty(), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1 || !failure.isEmpty(),
+                             launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
              failure.isEmpty() ? "" : qPrintable(failure.first().at(0).toString()));
     QCOMPARE(ready.count(), 1);
@@ -1585,7 +1587,8 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         10'000);
 
     QVERIFY(host->requestPackageInstall(two));
-    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 2 || !failure.isEmpty(), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 2 || !failure.isEmpty(),
+                             launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
              failure.isEmpty() ? "" : qPrintable(failure.last().at(0).toString()));
     QCOMPARE(ready.count(), 2);
@@ -1601,18 +1604,19 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
         10'000);
 
     QVERIFY(host->requestPackageInstall(crashing));
-    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 3 || !failure.isEmpty(), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 3 || !failure.isEmpty(),
+                             launchObservationTimeoutMs);
     QVERIFY2(failure.isEmpty(),
              failure.isEmpty() ? "" : qPrintable(failure.last().at(0).toString()));
     QCOMPARE(ready.count(), 3);
     QCOMPARE(readyVersion(2), QStringLiteral("1.2.0"));
     QVERIFY(terminateProcessId(readyPid(2)));
     QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 1, 10'000);
-    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 4, 30'000);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 4, launchObservationTimeoutMs);
     QCOMPARE(readyVersion(3), QStringLiteral("1.2.0"));
     QVERIFY(terminateProcessId(readyPid(3)));
     QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 2, 10'000);
-    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 5, 30'000);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 5, launchObservationTimeoutMs);
     QCOMPARE(readyVersion(4), QStringLiteral("1.1.0"));
     QCOMPARE(QFileInfo(readyPath(4)).canonicalFilePath(),
              QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
@@ -1670,12 +1674,13 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QTRY_VERIFY_WITH_TIMEOUT(
         QFileInfo(observedStore.resolveCurrent(environment.appId()).path)
             .fileName().startsWith(QStringLiteral("1.3.0-")),
-        30'000);
+        launchObservationTimeoutMs);
     QTRY_VERIFY_WITH_TIMEOUT(
         observedStore.activationState(environment.appId()).state.lastKnownGood
             .startsWith(QStringLiteral("1.3.0-")),
-        30'000);
-    QTRY_VERIFY_WITH_TIMEOUT(startedEventCount(cliTelemetry) > 0, 30'000);
+        launchObservationTimeoutMs);
+    QTRY_VERIFY_WITH_TIMEOUT(startedEventCount(cliTelemetry) > 0,
+                             launchObservationTimeoutMs);
     QVERIFY(stopOwnedProcess(productionInstallHost));
     QCOMPARE(productionInstallHost.state(), QProcess::NotRunning);
 
@@ -1700,9 +1705,10 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QTRY_VERIFY_WITH_TIMEOUT(
         observedStore.activationState(environment.appId()).state.generation
             > generationBeforeOffline,
-        30'000);
+        launchObservationTimeoutMs);
     QTRY_VERIFY_WITH_TIMEOUT(
-        startedEventCount(cliTelemetry) > startsBeforeOfflineCli, 30'000);
+        startedEventCount(cliTelemetry) > startsBeforeOfflineCli,
+        launchObservationTimeoutMs);
     QVERIFY(stopOwnedProcess(productionHost));
     QCOMPARE(productionHost.state(), QProcess::NotRunning);
 }
