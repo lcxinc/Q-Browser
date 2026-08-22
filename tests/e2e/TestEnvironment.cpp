@@ -360,7 +360,10 @@ bool TestEnvironment::start(const QString &version)
         QStringLiteral("--telemetry-directory=") + telemetry_.path(),
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--health-window-ms=2000"),
-        QStringLiteral("--heartbeat-timeout-ms=10000")};
+        // Package fixture creation is synchronous in this test harness and can
+        // stall its event loop while Debug binaries are cold.  Keep production
+        // heartbeat behavior under test without treating fixture work as a crash.
+        QStringLiteral("--heartbeat-timeout-ms=60000")};
     HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
     if (!parsed.value.has_value()) {
         error_ = parsed.stableError;

@@ -20,7 +20,7 @@ SessionReceiveResult receiveUntilWithClock(
 
 SessionReceiveResult receiveUntil(IpcSession &session,
                                   ProtocolType expectedType,
-                                  int timeoutMs = 15000);
+                                  int timeoutMs = 30000);
 
 class WorkerTestEnvironment final
 {

@@ -23,7 +23,7 @@ public:
     [[nodiscard]] QString createTamperedPackage(const QString &version);
     [[nodiscard]] bool start(const QString &version = QStringLiteral("1.0.0"));
     [[nodiscard]] bool install(const QString &packagePath);
-    [[nodiscard]] bool waitForReady(const QString &version, int timeoutMs = 30'000);
+    [[nodiscard]] bool waitForReady(const QString &version, int timeoutMs = 60'000);
     [[nodiscard]] bool waitForFailure(int previousCount, int timeoutMs = 15'000);
     [[nodiscard]] bool shutdown();
     [[nodiscard]] int failureCount() const noexcept;

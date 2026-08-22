@@ -69,6 +69,8 @@ struct ExpectedMessage final
     QString stableError;
 };
 
+constexpr int workerStartupPhaseTimeoutMilliseconds = 30'000;
+
 ExpectedMessage receiveExpected(IpcSession &session,
                                 const ProtocolType expected,
                                 const int timeoutMs)
@@ -636,12 +638,15 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     HostLaunchContext{nonce, request.appId});
             }
             const ExpectedMessage handshake = receiveExpected(
-                *context->session, ProtocolType::Handshake, 15'000);
+                *context->session, ProtocolType::Handshake,
+                workerStartupPhaseTimeoutMilliseconds);
             const ExpectedMessage surface = handshake.succeeded
-                ? receiveExpected(*context->session, ProtocolType::SurfaceReady, 15'000)
+                ? receiveExpected(*context->session, ProtocolType::SurfaceReady,
+                                  workerStartupPhaseTimeoutMilliseconds)
                 : handshake;
             const ExpectedMessage ready = surface.succeeded
-                ? receiveExpected(*context->session, ProtocolType::Ready, 15'000)
+                ? receiveExpected(*context->session, ProtocolType::Ready,
+                                  workerStartupPhaseTimeoutMilliseconds)
                 : surface;
             if (!ready.succeeded || surface.windowHandle.isEmpty()) {
                 const QString error = ready.stableError.isEmpty()
