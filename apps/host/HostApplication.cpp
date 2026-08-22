@@ -144,7 +144,6 @@ HostApplication::~HostApplication()
 {
     acceptingLifecycle_.store(false, std::memory_order_release);
     if (updateHealthTimer_ != nullptr) updateHealthTimer_->stop();
-    if (mainWindow_ != nullptr) mainWindow_->hide();
     if (installedPackageLauncher_ != nullptr) installedPackageLauncher_->cancel();
     detachWorkerContext(QStringLiteral("host.application.stopping"));
 
