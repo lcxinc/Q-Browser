@@ -28,7 +28,7 @@ constexpr int issuedGestureLifetimeMs = 250;
 struct WorkerGestureEvidence final
 {
     quint32 now = 0;
-    quint32 lastInput = 0;
+    quint32 trustedWorkerInput = 0;
     quint32 lastGrantedInput = 0;
     quint32 workerProcessId = 0;
     quint32 focusProcessId = 0;
@@ -38,14 +38,14 @@ struct WorkerGestureEvidence final
 
 bool isTrustedWorkerGesture(const WorkerGestureEvidence &evidence) noexcept
 {
-    if (evidence.workerProcessId == 0 || evidence.lastInput == 0
-        || evidence.lastInput == evidence.lastGrantedInput
+    if (evidence.workerProcessId == 0 || evidence.trustedWorkerInput == 0
+        || evidence.trustedWorkerInput == evidence.lastGrantedInput
         || evidence.focusProcessId != evidence.workerProcessId
         || !evidence.foregroundMatchesHostRoot
         || !evidence.focusBelongsToWorkerWindow) {
         return false;
     }
-    return static_cast<quint32>(evidence.now - evidence.lastInput)
+    return static_cast<quint32>(evidence.now - evidence.trustedWorkerInput)
         <= maximumGestureAgeMs;
 }
 
@@ -59,18 +59,16 @@ bool windowBelongsToRoot(const HWND candidate, const HWND root) noexcept
 WorkerGestureEvidence queryWorkerGestureEvidence(const quintptr hostWindowId,
                                                  const quintptr workerWindowId,
                                                  const quint32 workerProcessId,
+                                                 const quint32 trustedWorkerInput,
                                                  const quint32 lastGrantedInput) noexcept
 {
     WorkerGestureEvidence evidence;
     evidence.now = GetTickCount();
+    evidence.trustedWorkerInput = trustedWorkerInput;
     evidence.lastGrantedInput = lastGrantedInput;
     evidence.workerProcessId = workerProcessId;
     const HWND workerWindow = reinterpret_cast<HWND>(workerWindowId);
     if (workerWindow == nullptr || !IsWindow(workerWindow)) return evidence;
-
-    LASTINPUTINFO input{sizeof(input), 0};
-    if (!GetLastInputInfo(&input)) return evidence;
-    evidence.lastInput = input.dwTime;
 
     const HWND hostRoot = GetAncestor(reinterpret_cast<HWND>(hostWindowId), GA_ROOT);
     const HWND foreground = GetForegroundWindow();
@@ -125,6 +123,134 @@ HostPolicy hostPolicyFor(const QUrl &mockOrigin)
     return host;
 }
 }
+
+class TrustedWorkerInputObserver final
+{
+public:
+    TrustedWorkerInputObserver(const TrustedWorkerInputObserver &) = delete;
+    TrustedWorkerInputObserver &operator=(const TrustedWorkerInputObserver &) = delete;
+
+    ~TrustedWorkerInputObserver()
+    {
+        if (keyboardHook_ != nullptr) (void)UnhookWindowsHookEx(keyboardHook_);
+        if (mouseHook_ != nullptr) (void)UnhookWindowsHookEx(mouseHook_);
+        if (active_ == this) active_ = nullptr;
+    }
+
+    [[nodiscard]] static std::unique_ptr<TrustedWorkerInputObserver> create(
+        const quintptr hostWindowId, const quintptr workerWindowId,
+        const quint32 workerProcessId)
+    {
+        if (active_ != nullptr || hostWindowId == 0 || workerWindowId == 0
+            || workerProcessId == 0) {
+            return nullptr;
+        }
+        auto observer = std::unique_ptr<TrustedWorkerInputObserver>(
+            new TrustedWorkerInputObserver(hostWindowId, workerWindowId,
+                                           workerProcessId));
+        active_ = observer.get();
+        const HINSTANCE module = GetModuleHandleW(nullptr);
+        observer->mouseHook_ = SetWindowsHookExW(
+            WH_MOUSE_LL, &TrustedWorkerInputObserver::mouseHook, module, 0);
+        observer->keyboardHook_ = SetWindowsHookExW(
+            WH_KEYBOARD_LL, &TrustedWorkerInputObserver::keyboardHook, module, 0);
+        if (observer->mouseHook_ == nullptr || observer->keyboardHook_ == nullptr) {
+            return nullptr;
+        }
+        return observer;
+    }
+
+    [[nodiscard]] quint32 lastTrustedInput() const noexcept
+    {
+        return lastTrustedInput_;
+    }
+
+private:
+    TrustedWorkerInputObserver(const quintptr hostWindowId,
+                               const quintptr workerWindowId,
+                               const quint32 workerProcessId)
+        : hostWindow_(reinterpret_cast<HWND>(hostWindowId)),
+          workerWindow_(reinterpret_cast<HWND>(workerWindowId)),
+          workerProcessId_(workerProcessId)
+    {
+    }
+
+    [[nodiscard]] bool foregroundAndFocusMatchWorker() const noexcept
+    {
+        const HWND hostRoot = GetAncestor(hostWindow_, GA_ROOT);
+        const HWND foreground = GetForegroundWindow();
+        if (hostRoot == nullptr || foreground == nullptr
+            || GetAncestor(foreground, GA_ROOT) != hostRoot) {
+            return false;
+        }
+        DWORD actualWorkerPid = 0;
+        const DWORD workerThread = GetWindowThreadProcessId(workerWindow_,
+                                                             &actualWorkerPid);
+        if (workerThread == 0 || actualWorkerPid != workerProcessId_) return false;
+        GUITHREADINFO gui{sizeof(gui)};
+        if (!GetGUIThreadInfo(workerThread, &gui)) return false;
+        DWORD focusPid = 0;
+        (void)GetWindowThreadProcessId(gui.hwndFocus, &focusPid);
+        return focusPid == workerProcessId_
+            && windowBelongsToRoot(gui.hwndFocus, workerWindow_);
+    }
+
+    void observeMouse(const WPARAM message,
+                      const MSLLHOOKSTRUCT &input) noexcept
+    {
+        if (message != WM_LBUTTONDOWN && message != WM_RBUTTONDOWN
+            && message != WM_MBUTTONDOWN && message != WM_XBUTTONDOWN) {
+            return;
+        }
+        const HWND target = WindowFromPoint(input.pt);
+        DWORD targetPid = 0;
+        (void)GetWindowThreadProcessId(target, &targetPid);
+        if (targetPid == workerProcessId_
+            && windowBelongsToRoot(target, workerWindow_)
+            && foregroundAndFocusMatchWorker()) {
+            lastTrustedInput_ = input.time;
+        }
+    }
+
+    void observeKeyboard(const WPARAM message,
+                         const KBDLLHOOKSTRUCT &input) noexcept
+    {
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
+            && foregroundAndFocusMatchWorker()) {
+            lastTrustedInput_ = input.time;
+        }
+    }
+
+    static LRESULT CALLBACK mouseHook(const int code, const WPARAM message,
+                                      const LPARAM data) noexcept
+    {
+        if (code == HC_ACTION && active_ != nullptr && data != 0) {
+            active_->observeMouse(message,
+                *reinterpret_cast<const MSLLHOOKSTRUCT *>(data));
+        }
+        return CallNextHookEx(nullptr, code, message, data);
+    }
+
+    static LRESULT CALLBACK keyboardHook(const int code, const WPARAM message,
+                                         const LPARAM data) noexcept
+    {
+        if (code == HC_ACTION && active_ != nullptr && data != 0) {
+            active_->observeKeyboard(message,
+                *reinterpret_cast<const KBDLLHOOKSTRUCT *>(data));
+        }
+        return CallNextHookEx(nullptr, code, message, data);
+    }
+
+    static thread_local TrustedWorkerInputObserver *active_;
+    HWND hostWindow_ = nullptr;
+    HWND workerWindow_ = nullptr;
+    quint32 workerProcessId_ = 0;
+    quint32 lastTrustedInput_ = 0;
+    HHOOK mouseHook_ = nullptr;
+    HHOOK keyboardHook_ = nullptr;
+};
+
+thread_local TrustedWorkerInputObserver *TrustedWorkerInputObserver::active_ = nullptr;
 
 struct CapabilityDelivery final
 {
@@ -240,6 +366,7 @@ void HostCapabilityRuntime::retire(
     runtime->clipboard_.reset();
     runtime->gestureSession_.reset();
     runtime->gestureGrants_.reset();
+    runtime->inputObserver_.reset();
     runtime->fileBackend_.reset();
     runtime->clipboardBackend_.reset();
     CapabilityWorkerLane *const lane = runtime->workerLane_;
@@ -309,6 +436,17 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
         if (!gestureSession_.has_value()) {
             if (errorCode != nullptr) {
                 *errorCode = QStringLiteral("host.capability.gesture_session_unavailable");
+            }
+            delete lane;
+            delete thread;
+            return false;
+        }
+        inputObserver_ = TrustedWorkerInputObserver::create(
+            hostWindowId_, workerWindowId_, workerProcessId_);
+        if (inputObserver_ == nullptr) {
+            if (errorCode != nullptr) {
+                *errorCode = QStringLiteral(
+                    "host.capability.input_observer_unavailable");
             }
             delete lane;
             delete thread;
@@ -390,12 +528,13 @@ void HostCapabilityRuntime::dispatch(const quint64 generation,
         && gestureSession_.has_value()) {
         const WorkerGestureEvidence evidence = queryWorkerGestureEvidence(
             hostWindowId_, workerWindowId_, workerProcessId_,
+            inputObserver_ != nullptr ? inputObserver_->lastTrustedInput() : 0,
             lastGrantedInputTick_);
         if (isTrustedWorkerGesture(evidence)) {
             auto grant = gestureGrants_->issue(*gestureSession_, requestId,
                                                issuedGestureLifetimeMs);
             if (grant.has_value()) {
-                lastGrantedInputTick_ = evidence.lastInput;
+                lastGrantedInputTick_ = evidence.trustedWorkerInput;
                 const HostRequestContext gestureContext{
                     appIdentity_, requestId, &*grant};
                 emit completed(generation, requestId,
@@ -421,7 +560,7 @@ bool isTrustedWorkerGesture(const HostWorkerGestureEvidence &evidence) noexcept
 {
     return ::isTrustedWorkerGesture(WorkerGestureEvidence{
         evidence.now,
-        evidence.lastInput,
+        evidence.trustedWorkerInput,
         evidence.lastGrantedInput,
         evidence.workerProcessId,
         evidence.focusProcessId,

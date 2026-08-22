@@ -67,7 +67,8 @@ void HostCapabilityRuntimeTest::validatesTrustedWorkerGestureEvidence()
 {
     HostWorkerGestureEvidence valid;
     valid.now = 5'000;
-    valid.lastInput = 4'500;
+    valid.trustedWorkerInput = 4'500;
+    valid.lastSystemInput = 4'900;
     valid.workerProcessId = 42;
     valid.focusProcessId = 42;
     valid.foregroundMatchesHostRoot = true;
@@ -75,13 +76,18 @@ void HostCapabilityRuntimeTest::validatesTrustedWorkerGestureEvidence()
     QVERIFY(qbrowser_host_testing::isTrustedWorkerGesture(valid));
 
     HostWorkerGestureEvidence noGesture = valid;
-    noGesture.lastInput = 0;
+    noGesture.trustedWorkerInput = 0;
     QVERIFY(!qbrowser_host_testing::isTrustedWorkerGesture(noGesture));
+    HostWorkerGestureEvidence unrelatedRecentInput = valid;
+    unrelatedRecentInput.trustedWorkerInput = 0;
+    unrelatedRecentInput.lastSystemInput = 4'999;
+    QVERIFY(!qbrowser_host_testing::isTrustedWorkerGesture(
+        unrelatedRecentInput));
     HostWorkerGestureEvidence expired = valid;
-    expired.lastInput = 3'999;
+    expired.trustedWorkerInput = 3'999;
     QVERIFY(!qbrowser_host_testing::isTrustedWorkerGesture(expired));
     HostWorkerGestureEvidence replay = valid;
-    replay.lastGrantedInput = replay.lastInput;
+    replay.lastGrantedInput = replay.trustedWorkerInput;
     QVERIFY(!qbrowser_host_testing::isTrustedWorkerGesture(replay));
     HostWorkerGestureEvidence crossApp = valid;
     crossApp.focusProcessId = 43;

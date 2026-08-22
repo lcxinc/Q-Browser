@@ -2019,10 +2019,8 @@ Rectangle {
     property string replayId: ""
     property bool ready: false
     property bool firstOk: false
-    Timer {
-        interval: 1500; running: true; repeat: false
-        onTriggered: root.noGestureId = Runtime.invoke("clipboard", "read", {})
-    }
+    Component.onCompleted:
+        root.noGestureId = Runtime.invoke("clipboard", "read", {})
     Rectangle {
         anchors.centerIn: parent
         width: 240; height: 96; radius: 8

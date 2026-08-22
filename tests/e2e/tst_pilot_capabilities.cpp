@@ -486,18 +486,13 @@ Rectangle {
     id: root
     width: 1100; height: 720
     color: Theme.background
+    property string noGestureId: ""
+    property string noGestureStoreId: ""
     property string undeclaredId: ""
     property string firstId: ""
     property string replayId: ""
     property bool firstOk: false
     property string firstError: ""
-    Timer {
-        id: undeclaredTimer
-        interval: 1
-        repeat: false
-        onTriggered: root.undeclaredId = Runtime.invoke(
-            "clipboard", "write", { text: "must-not-write" })
-    }
     PilotRouter {
         anchors.fill: parent
         runtime: Runtime
@@ -517,11 +512,18 @@ Rectangle {
     Connections {
         target: Runtime
         function onRouteChanged() {
-            if (root.undeclaredId.length === 0)
-                undeclaredTimer.start()
+            if (root.noGestureId.length === 0)
+                root.noGestureId = Runtime.invoke("clipboard", "read", {})
         }
         function onCapabilityFinished(id, response) {
-            if (id === root.undeclaredId) {
+            if (id === root.noGestureId) {
+                root.noGestureStoreId = Runtime.invoke("storage", "set", {
+                    key: "clipboard-no-gesture", value: response.error.code
+                })
+            } else if (id === root.noGestureStoreId) {
+                root.undeclaredId = Runtime.invoke(
+                    "clipboard", "write", { text: "must-not-write" })
+            } else if (id === root.undeclaredId) {
                 Runtime.invoke("storage", "set", {
                     key: "clipboard-undeclared", value: response.error.code
                 })
@@ -838,6 +840,16 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     }
     QVERIFY(undeclaredRendered);
     recordStage("undeclared-rendered");
+    const int noGestureStorage = waitForCapability(
+        requests, undeclaredFrom, QStringLiteral("storage"), QStringLiteral("set"),
+        [](const QVariantMap &payload) {
+            return payload.value(QStringLiteral("key"))
+                       == QStringLiteral("clipboard-no-gesture");
+        });
+    QVERIFY(noGestureStorage >= 0);
+    QCOMPARE(requests.at(noGestureStorage).at(2).toMap()
+                 .value(QStringLiteral("value")).toString(),
+             QStringLiteral("clipboard.gesture_required"));
     const int undeclaredStorage = waitForCapability(
         requests, undeclaredFrom, QStringLiteral("storage"), QStringLiteral("set"),
         [](const QVariantMap &payload) {

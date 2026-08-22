@@ -17,6 +17,7 @@ class ClipboardBroker;
 class FileBroker;
 class QtClipboardBackend;
 class QtFileDialogBackend;
+class TrustedWorkerInputObserver;
 class QThread;
 class QTimer;
 
@@ -24,7 +25,8 @@ class QTimer;
 struct HostWorkerGestureEvidence final
 {
     quint32 now = 0;
-    quint32 lastInput = 0;
+    quint32 trustedWorkerInput = 0;
+    quint32 lastSystemInput = 0;
     quint32 lastGrantedInput = 0;
     quint32 workerProcessId = 0;
     quint32 focusProcessId = 0;
@@ -93,6 +95,7 @@ private:
     std::unique_ptr<QtClipboardBackend> clipboardBackend_;
     std::unique_ptr<QtFileDialogBackend> fileBackend_;
     std::unique_ptr<UserGestureGrantStore> gestureGrants_;
+    std::unique_ptr<TrustedWorkerInputObserver> inputObserver_;
     std::optional<UserGestureSession> gestureSession_;
     std::unique_ptr<ClipboardBroker> clipboard_;
     std::unique_ptr<FileBroker> file_;
