@@ -1,12 +1,17 @@
 # Development signing keys
 
-Generate disposable Ed25519 development keys locally; never commit private
-material:
+This directory is retained only for public documentation compatibility. Do not
+generate or store private signing material anywhere in the repository, even in
+an ignored path.
+
+Create or reuse the development authority through the guarded packaging script:
 
 ```powershell
-qbrowser-package keygen --private-key keys/dev/private.pem --public-key keys/dev/public.pem
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts\create-dev-package.ps1 -Configuration Release -Clean
 ```
 
-The CLI refuses to overwrite either key and restricts the private key to the
-current user. The ignore rules in this directory deny all generated files by
-default and allow only this README and the ignore file.
+It stores the private key outside the repository in the protected
+`%LOCALAPPDATA%\QBrowserTask18\signing` directory and publishes only the signed
+package and development public key. The authority is development-only and must
+never be promoted to production or included in diagnostics.

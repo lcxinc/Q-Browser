@@ -48,6 +48,59 @@ namespace QBrowser.Task18 {
       }
     }
   }
+  public static class ReparseDirectory {
+    const uint MountPointTag = 0xA0000003;
+    const uint OpenExisting = 3;
+    const uint OpenReparsePoint = 0x00200000;
+    const uint BackupSemantics = 0x02000000;
+    const uint GetReparsePoint = 0x000900A8;
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
+      IntPtr input, uint inputLength, byte[] output, uint outputLength,
+      out uint returned, IntPtr overlapped);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool RemoveDirectoryW(string path);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateSymbolicLinkW(string link, string target, uint flags);
+    static string Native(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      return full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                     : @"\\?\" + full;
+    }
+    public static uint ReadTag(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      using (var handle = CreateFileW(Native(full), 0, 7, IntPtr.Zero,
+                                     OpenExisting, OpenReparsePoint | BackupSemantics,
+                                     IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        byte[] buffer = new byte[16384]; uint returned;
+        if (!DeviceIoControl(handle, GetReparsePoint, IntPtr.Zero, 0,
+                             buffer, (uint)buffer.Length, out returned, IntPtr.Zero))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        if (returned < 8) throw new InvalidOperationException("Invalid reparse buffer: " + full);
+        return BitConverter.ToUInt32(buffer, 0);
+      }
+    }
+    public static void RemoveVerifiedMountPoint(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      if (ReadTag(full) != MountPointTag)
+        throw new InvalidOperationException("Not a mount-point reparse entry: " + full);
+      if (!RemoveDirectoryW(Native(full)))
+        throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+    }
+    public static void CreateFileSymbolicLink(string link, string target) {
+      string linkFull = System.IO.Path.GetFullPath(link);
+      string targetFull = System.IO.Path.GetFullPath(target);
+      // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE keeps the adversarial
+      // test runnable from Windows PowerShell 5.1 when Developer Mode allows
+      // the same unelevated link creation used by modern PowerShell.
+      if (!CreateSymbolicLinkW(Native(linkFull), Native(targetFull), 2))
+        throw new Win32Exception(Marshal.GetLastWin32Error(), linkFull);
+    }
+  }
   public static class ProcessControl {
     [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(
       uint access, bool inherit, int processId);
@@ -172,6 +225,52 @@ function Assert-NoReparseAncestor([string]$Path) {
 
 function Get-PathIdentity([string]$Path) {
     return [QBrowser.Task18.FileIdentity]::Read($Path)
+}
+
+function Remove-VerifiedJunctionEntry([string]$Link, [string]$OwnedRoot,
+        [string]$ExpectedTarget, [string]$Sentinel) {
+    $linkFull = [IO.Path]::GetFullPath($Link)
+    $ownedFull = [IO.Path]::GetFullPath($OwnedRoot)
+    $expectedFull = (Resolve-Path -LiteralPath $ExpectedTarget -ErrorAction Stop).Path
+    $sentinelFull = (Resolve-Path -LiteralPath $Sentinel -ErrorAction Stop).Path
+    Assert-ChildPath $linkFull $ownedFull 'Junction entry'
+    Assert-ChildPath $sentinelFull $expectedFull 'Junction target sentinel'
+    Assert-NoReparseAncestor $ownedFull
+    Assert-NoReparseAncestor (Split-Path -Parent $linkFull)
+    $ownedIdentity = Get-PathIdentity $ownedFull
+    $targetIdentity = Get-PathIdentity $expectedFull
+    $sentinelIdentity = Get-PathIdentity $sentinelFull
+    $sentinelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sentinelFull).Hash
+    $item = Get-Item -LiteralPath $linkFull -Force -ErrorAction Stop
+    $targets = @($item.Target | ForEach-Object {
+        (Resolve-Path -LiteralPath ([IO.Path]::GetFullPath($_)) -ErrorAction Stop).Path
+    })
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $item.LinkType -ne 'Junction' -or $targets.Count -ne 1 -or
+        -not $targets[0].Equals($expectedFull,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [QBrowser.Task18.ReparseDirectory]::ReadTag($linkFull) -ne
+            [uint32]2684354563) {
+        throw "Refusing to remove unexpected junction entry: $linkFull"
+    }
+    if ((Get-PathIdentity $ownedFull) -ne $ownedIdentity -or
+        (Get-PathIdentity $expectedFull) -ne $targetIdentity -or
+        (Get-PathIdentity $sentinelFull) -ne $sentinelIdentity -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $sentinelFull).Hash -ne
+            $sentinelHash) {
+        throw "Junction ownership/target changed before removal: $linkFull"
+    }
+    [QBrowser.Task18.ReparseDirectory]::RemoveVerifiedMountPoint($linkFull)
+    if (Test-Path -LiteralPath $linkFull -ErrorAction SilentlyContinue) {
+        throw "Verified junction entry still exists after removal: $linkFull"
+    }
+    if ((Get-PathIdentity $ownedFull) -ne $ownedIdentity -or
+        (Get-PathIdentity $expectedFull) -ne $targetIdentity -or
+        (Get-PathIdentity $sentinelFull) -ne $sentinelIdentity -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $sentinelFull).Hash -ne
+            $sentinelHash) {
+        throw "Junction target/sentinel changed during removal: $expectedFull"
+    }
 }
 
 function Get-ProcessEnvironmentState([string]$Name) {
@@ -324,12 +423,43 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-Captured([string]$Program, [string[]]$Arguments) {
+    $quoted = ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Program
+    $startInfo.Arguments = $quoted
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = (Get-Location).Path
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Output = $stdout.Result + $stderr.Result
+    }
+}
+
 function Invoke-TrackedBuild([string[]]$Arguments) {
     $quoted = ($Arguments | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
     }) -join ' '
-    $process = Start-Process -FilePath $CMake -ArgumentList $quoted `
-        -NoNewWindow -PassThru
+    # Windows PowerShell 5.1's Start-Process -PassThru can return a Process
+    # whose ExitCode stays null even after WaitForExit.  Constructing the
+    # process directly retains the native handle and gives an authoritative
+    # exit code while we track only this invocation's descendants.
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $CMake
+    $startInfo.Arguments = $quoted
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WorkingDirectory = (Get-Location).Path
+    $process = [Diagnostics.Process]::Start($startInfo)
     $descendantIds = [Collections.Generic.HashSet[int]]::new()
     [void]$descendantIds.Add($process.Id)
     $ownedMsBuild = @{}
@@ -1332,11 +1462,11 @@ function Invoke-AdversarialDeploymentTests {
     $key = Join-Path $staging 'trust\dev-public.pem'
     $keyBackup = Join-Path $taskTemp 'public-key-backup.pem'
     Move-Item -LiteralPath $key -Destination $keyBackup
-    New-Item -ItemType SymbolicLink -Path $key -Target $keyBackup | Out-Null
+    [QBrowser.Task18.ReparseDirectory]::CreateFileSymbolicLink($key, $keyBackup)
     try {
-        $output = & $CMake '-DQ_BROWSER_DEPLOY_MODE=VERIFY' `
-            "-DQ_BROWSER_DEPLOY_DIR=$staging" '-P' $deployScript 2>&1
-        if ($LASTEXITCODE -eq 0 -or ($output -join "`n") -notmatch 'reparse point rejected') {
+        $result = Invoke-Captured $CMake @('-DQ_BROWSER_DEPLOY_MODE=VERIFY',
+            "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+        if ($result.ExitCode -eq 0 -or $result.Output -notmatch 'reparse point rejected') {
             throw 'Verifier did not reject an externally linked trust key.'
         }
     }
@@ -1353,10 +1483,10 @@ function Invoke-AdversarialDeploymentTests {
     $transitiveBackup = Join-Path $taskTemp 'Qt6Qml.dll.backup'
     Move-Item -LiteralPath $transitiveDependency -Destination $transitiveBackup
     try {
-        $output = & $CMake '-DQ_BROWSER_DEPLOY_MODE=SEAL' `
-            "-DQ_BROWSER_DEPLOY_DIR=$staging" '-P' $deployScript 2>&1
-        if ($LASTEXITCODE -eq 0 -or
-            ($output -join "`n") -notmatch 'missing PE dependencies') {
+        $result = Invoke-Captured $CMake @('-DQ_BROWSER_DEPLOY_MODE=SEAL',
+            "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+        if ($result.ExitCode -eq 0 -or
+            $result.Output -notmatch 'missing PE dependencies') {
             throw 'Verifier did not reject a missing transitive PE dependency.'
         }
     }
@@ -1373,10 +1503,10 @@ function Invoke-AdversarialDeploymentTests {
     Move-Item -LiteralPath $transitiveDependency `
         -Destination (Join-Path $bogusDirectory 'Qt6Qml.dll')
     try {
-        $output = & $CMake '-DQ_BROWSER_DEPLOY_MODE=SEAL' `
-            "-DQ_BROWSER_DEPLOY_DIR=$staging" '-P' $deployScript 2>&1
-        if ($LASTEXITCODE -eq 0 -or
-            ($output -join "`n") -notmatch 'missing PE dependencies') {
+        $result = Invoke-Captured $CMake @('-DQ_BROWSER_DEPLOY_MODE=SEAL',
+            "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+        if ($result.ExitCode -eq 0 -or
+            $result.Output -notmatch 'missing PE dependencies') {
             throw 'Verifier accepted a dependency moved outside loader search directories.'
         }
     }
@@ -1399,10 +1529,10 @@ function Invoke-AdversarialDeploymentTests {
             "$preamble`n-----BEGIN $privateLabel-----`n",
             [Text.UTF8Encoding]::new($false))
         Protect-Path $privateProbe
-        $output = & $CMake '-DQ_BROWSER_DEPLOY_MODE=SEAL' `
-            "-DQ_BROWSER_DEPLOY_DIR=$staging" '-P' $deployScript 2>&1
-        if ($LASTEXITCODE -eq 0 -or
-            ($output -join "`n") -notmatch 'forbidden PEM material') {
+        $result = Invoke-Captured $CMake @('-DQ_BROWSER_DEPLOY_MODE=SEAL',
+            "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+        if ($result.ExitCode -eq 0 -or
+            $result.Output -notmatch 'forbidden PEM material') {
             throw "Verifier did not reject PEM form: $privateLabel"
         }
     }
@@ -1420,9 +1550,9 @@ function Invoke-AdversarialDeploymentTests {
     $bytes = [IO.File]::ReadAllBytes($package)
     $bytes[[Math]::Min(32, $bytes.Length - 1)] = $bytes[[Math]::Min(32, $bytes.Length - 1)] -bxor 1
     [IO.File]::WriteAllBytes($package, $bytes)
-    $output = & $CMake '-DQ_BROWSER_DEPLOY_MODE=SEAL' `
-        "-DQ_BROWSER_DEPLOY_DIR=$staging" '-P' $deployScript 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($output -join "`n") -notmatch 'signature/identity') {
+    $result = Invoke-Captured $CMake @('-DQ_BROWSER_DEPLOY_MODE=SEAL',
+        "-DQ_BROWSER_DEPLOY_DIR=$staging", '-P', $deployScript)
+    if ($result.ExitCode -eq 0 -or $result.Output -notmatch 'signature/identity') {
         throw 'Regenerated hashes blessed a tampered signed package.'
     }
     Copy-Item -LiteralPath $packageBackup -Destination $package -Force
@@ -1448,7 +1578,8 @@ function Test-CleanupReparseDefense {
         -not (Test-Path -LiteralPath $junction)) {
         throw 'Cleanup reparse defense mutated or accepted the external sentinel link.'
     }
-    Remove-Item -LiteralPath $junction -Force
+    Remove-VerifiedJunctionEntry $junction $taskTemp $external `
+        (Join-Path $external 'sentinel.txt')
     Write-Output 'CLEANUP_REPARSE_DEFENSE=PASS externalSentinel=unchanged'
 
     $longRoot = Join-Path $taskTemp 'owned-long-path-cleanup'
@@ -1548,7 +1679,8 @@ $buildParentIdentity = Get-PathIdentity $trustedBuildRoot
     $reparseRejected = $false
     try { Assert-PlainTree $build } catch { $reparseRejected = $true }
     if (-not $reparseRejected) { throw 'Build input reparse tamper was accepted.' }
-    Remove-Item -LiteralPath $reparseProbe -Force
+    Remove-VerifiedJunctionEntry $reparseProbe $build $taskTemp `
+        (Join-Path $taskTemp $ownedMarkerName)
     Assert-ProtectedPath $build
     Assert-PlainTree $build
     Assert-StableTrustedPath $build $buildIdentity

@@ -10,6 +10,84 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+if (-not ('QBrowser.Task18.FileIdentity' -as [type]) -and
+    -not ('QBrowser.Task18.ReparseDirectory' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace QBrowser.Task18 {
+  public static class FileIdentity {
+    [StructLayout(LayoutKind.Sequential)] struct Info {
+      public uint attributes; public System.Runtime.InteropServices.ComTypes.FILETIME creation;
+      public System.Runtime.InteropServices.ComTypes.FILETIME access;
+      public System.Runtime.InteropServices.ComTypes.FILETIME write;
+      public uint volume; public uint sizeHigh; public uint sizeLow; public uint links;
+      public uint indexHigh; public uint indexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    public static string Read(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      string native = full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                                : @"\\?\" + full;
+      using (var handle = CreateFileW(native, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        Info info; if (!GetFileInformationByHandle(handle, out info))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        return info.volume.ToString("x8") + ":" + info.indexHigh.ToString("x8") + info.indexLow.ToString("x8");
+      }
+    }
+  }
+  public static class ReparseDirectory {
+    const uint MountPointTag = 0xA0000003;
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+      IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
+      IntPtr input, uint inputLength, byte[] output, uint outputLength,
+      out uint returned, IntPtr overlapped);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool RemoveDirectoryW(string path);
+    static string Native(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      return full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2)
+                                     : @"\\?\" + full;
+    }
+    public static uint ReadTag(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      using (var handle = CreateFileW(Native(full), 0, 7, IntPtr.Zero, 3,
+                                     0x00200000 | 0x02000000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        byte[] buffer = new byte[16384]; uint returned;
+        if (!DeviceIoControl(handle, 0x000900A8, IntPtr.Zero, 0,
+                             buffer, (uint)buffer.Length, out returned, IntPtr.Zero))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+        if (returned < 8) throw new InvalidOperationException("Invalid reparse buffer: " + full);
+        return BitConverter.ToUInt32(buffer, 0);
+      }
+    }
+    public static void RemoveVerifiedMountPoint(string path) {
+      string full = System.IO.Path.GetFullPath(path);
+      if (ReadTag(full) != MountPointTag)
+        throw new InvalidOperationException("Not a mount-point reparse entry: " + full);
+      if (!RemoveDirectoryW(Native(full)))
+        throw new Win32Exception(Marshal.GetLastWin32Error(), full);
+    }
+  }
+}
+'@
+}
+elseif (-not ('QBrowser.Task18.FileIdentity' -as [type]) -or
+        -not ('QBrowser.Task18.ReparseDirectory' -as [type])) {
+    throw 'Task18 native path helpers are only partially loaded.'
+}
+
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
     $BuildDirectory = Join-Path ([Environment]::GetFolderPath(
@@ -43,17 +121,50 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
 function Remove-VerifiedWorkspaceJunction([string]$Name) {
     $link = Join-Path $repo "tools\node_modules\@q-browser\$Name"
     if (-not (Test-Path -LiteralPath $link)) { return }
+    $ownedRoot = [IO.Path]::GetFullPath((Join-Path $repo 'tools'))
+    $link = [IO.Path]::GetFullPath($link)
+    $ownedPrefix = $ownedRoot.TrimEnd('\') + '\'
+    if (-not $link.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Workspace junction escaped its owned root: $link"
+    }
+    $ownedItem = Get-Item -LiteralPath $ownedRoot -Force
+    if (($ownedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Workspace junction owned root is a reparse point: $ownedRoot"
+    }
+    $ancestor = Get-Item -LiteralPath (Split-Path -Parent $link) -Force
+    while ($null -ne $ancestor -and
+           $ancestor.FullName.StartsWith($ownedPrefix,
+               [StringComparison]::OrdinalIgnoreCase)) {
+        if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Workspace junction has a reparse ancestor: $($ancestor.FullName)"
+        }
+        $ancestor = $ancestor.Parent
+    }
     $item = Get-Item -LiteralPath $link -Force
     $expected = [IO.Path]::GetFullPath((Join-Path $repo "tools\$Name"))
-    $targets = @($item.Target | ForEach-Object { [IO.Path]::GetFullPath($_) })
+    $sentinel = Join-Path $expected 'package.json'
+    $targets = @($item.Target | ForEach-Object {
+        (Resolve-Path -LiteralPath ([IO.Path]::GetFullPath($_)) -ErrorAction Stop).Path
+    })
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
         $item.LinkType -ne 'Junction' -or $targets.Count -ne 1 -or
-        -not $targets[0].Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+        -not $targets[0].Equals($expected, [StringComparison]::OrdinalIgnoreCase) -or
+        [QBrowser.Task18.ReparseDirectory]::ReadTag($link) -ne
+            [uint32]2684354563) {
         throw "Refusing to remove unexpected npm workspace link: $link"
     }
-    # Removing a junction without -Recurse removes only the link itself and
-    # cannot traverse into its already verified workspace target.
-    Remove-Item -LiteralPath $link -Force
+    $ownedIdentity = [QBrowser.Task18.FileIdentity]::Read($ownedRoot)
+    $targetIdentity = [QBrowser.Task18.FileIdentity]::Read($expected)
+    $sentinelIdentity = [QBrowser.Task18.FileIdentity]::Read($sentinel)
+    $sentinelHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sentinel).Hash
+    [QBrowser.Task18.ReparseDirectory]::RemoveVerifiedMountPoint($link)
+    if ((Test-Path -LiteralPath $link -ErrorAction SilentlyContinue) -or
+        [QBrowser.Task18.FileIdentity]::Read($ownedRoot) -ne $ownedIdentity -or
+        [QBrowser.Task18.FileIdentity]::Read($expected) -ne $targetIdentity -or
+        [QBrowser.Task18.FileIdentity]::Read($sentinel) -ne $sentinelIdentity -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $sentinel).Hash -ne $sentinelHash) {
+        throw "Workspace junction target changed during link-only removal: $link"
+    }
 }
 
 try {
