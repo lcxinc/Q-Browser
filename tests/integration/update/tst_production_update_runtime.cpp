@@ -14,6 +14,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QElapsedTimer>
+#include <QEvent>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -604,11 +606,14 @@ void runLauncherThreadStartFailure(const bool observerFailure)
     if (processId.load(std::memory_order_acquire) == 0 && readyCount != 0) {
         processId.store(ready.first().at(5).toUInt(), std::memory_order_release);
     }
+    const QPointer<MainWindow> retiringWindow(host->mainWindow());
     qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
     QElapsedTimer destruction;
     destruction.start();
     host.reset();
     const qint64 destructionMs = destruction.elapsed();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(retiringWindow.isNull());
     QVERIFY(WorkerRetirementManager::instance().flush(10'000));
     const quint32 observedProcess = processId.load(std::memory_order_acquire);
     const bool processExited = observedProcess == 0
@@ -631,7 +636,9 @@ void runLauncherThreadStartFailure(const bool observerFailure)
              observerFailure
                  ? QStringLiteral("host.launch.observer_thread_unavailable")
                  : QStringLiteral("host.launch.launch_thread_unavailable"));
-    QVERIFY(destructionMs < 100);
+    QVERIFY2(destructionMs < 100,
+             qPrintable(QStringLiteral("Host destruction blocked for %1 ms")
+                            .arg(destructionMs)));
     QVERIFY(processExited);
     QVERIFY(workerEntries.isEmpty());
     QVERIFY(WorkerRetirementManager::instance().status().isIdle());

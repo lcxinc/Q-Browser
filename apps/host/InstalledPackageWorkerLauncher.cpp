@@ -318,6 +318,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     std::atomic_bool attached{false};
     std::atomic_bool fatalCleanupObserved{false};
     std::atomic_bool observationFailed{false};
+    std::atomic_bool terminationRequested{false};
     std::atomic<DWORD> observedExitCode{STILL_ACTIVE};
     std::mutex launchMutex;
     std::condition_variable launchChanged;
@@ -337,11 +338,19 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
 #endif
     }
 
-    void requestTerminate() noexcept
+    void requestTerminateNoWait() noexcept
     {
-        std::lock_guard lock(resourceMutex);
+        terminationRequested.store(true, std::memory_order_release);
+        std::unique_lock lock(resourceMutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
         if (process != nullptr)
             process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    }
+
+    void honorTerminationRequest() noexcept
+    {
+        if (terminationRequested.load(std::memory_order_acquire))
+            requestTerminateNoWait();
     }
 
     void launchFinished() noexcept
@@ -519,7 +528,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
         stopCurrent();
         for (const auto &[unused, context] : inflight_) {
             Q_UNUSED(unused);
-            context->requestTerminate();
+            context->requestTerminateNoWait();
         }
         return true;
     }
@@ -661,6 +670,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 context->process = std::move(process);
                 context->observerHandle = std::move(*observer.value);
             }
+            context->honorTerminationRequest();
 #ifdef Q_BROWSER_HOST_TESTING
             const auto processHooks =
                 qbrowser_host_testing::installedPackageWorkerLauncherTestHooks();
@@ -674,6 +684,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     std::move(hostPipe), IpcRole::Host,
                     HostLaunchContext{nonce, request.appId});
             }
+            context->honorTerminationRequest();
             const ExpectedMessage handshake = receiveExpected(
                 *context->session, ProtocolType::Handshake,
                 workerStartupPhaseTimeoutMilliseconds);
@@ -903,7 +914,7 @@ InstalledPackageWorkerLauncher::observeProcess(
                 if (waited == SandboxProcessWaitResult::Error) {
                     context->observationFailed.store(
                         true, std::memory_order_release);
-                    context->requestTerminate();
+                    context->requestTerminateNoWait();
                     break;
                 }
             }
@@ -915,7 +926,7 @@ InstalledPackageWorkerLauncher::observeProcess(
         activeObservers.fetch_sub(1, std::memory_order_acq_rel);
 #endif
         context->observationFailed.store(true, std::memory_order_release);
-        context->requestTerminate();
+        context->requestTerminateNoWait();
         context->retireAsync();
         fail(context->request.key,
              QStringLiteral("host.launch.observer_thread_unavailable"));
@@ -1006,7 +1017,7 @@ void InstalledPackageWorkerLauncher::stopCurrent()
         currentProcess_->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
     for (const auto &[unused, context] : inflight_) {
         Q_UNUSED(unused);
-        context->requestTerminate();
+        context->requestTerminateNoWait();
     }
 }
 

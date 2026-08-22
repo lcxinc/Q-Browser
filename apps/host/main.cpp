@@ -2,6 +2,7 @@
 #include "WorkerRetirementManager.h"
 
 #include <QApplication>
+#include <QEvent>
 #include <QFile>
 
 #include <cstdio>
@@ -56,6 +57,7 @@ int main(int argc, char **argv)
             recordHostDiagnosticPhase("event-loop-exit");
         }
     }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     return WorkerRetirementManager::instance().shutdownChecked(10'000)
         ? applicationResult : 70;
 }
