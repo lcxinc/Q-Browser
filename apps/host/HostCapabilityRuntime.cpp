@@ -175,14 +175,17 @@ private:
     {
     }
 
-    [[nodiscard]] bool foregroundAndFocusMatchWorker() const noexcept
+    [[nodiscard]] bool foregroundMatchesHostRoot() const noexcept
     {
         const HWND hostRoot = GetAncestor(hostWindow_, GA_ROOT);
         const HWND foreground = GetForegroundWindow();
-        if (hostRoot == nullptr || foreground == nullptr
-            || GetAncestor(foreground, GA_ROOT) != hostRoot) {
-            return false;
-        }
+        return hostRoot != nullptr && foreground != nullptr
+            && GetAncestor(foreground, GA_ROOT) == hostRoot;
+    }
+
+    [[nodiscard]] bool foregroundAndFocusMatchWorker() const noexcept
+    {
+        if (!foregroundMatchesHostRoot()) return false;
         DWORD actualWorkerPid = 0;
         const DWORD workerThread = GetWindowThreadProcessId(workerWindow_,
                                                              &actualWorkerPid);
@@ -205,9 +208,9 @@ private:
         const HWND target = WindowFromPoint(input.pt);
         DWORD targetPid = 0;
         (void)GetWindowThreadProcessId(target, &targetPid);
-        if (targetPid == workerProcessId_
-            && windowBelongsToRoot(target, workerWindow_)
-            && foregroundAndFocusMatchWorker()) {
+        const bool targetMatches = targetPid == workerProcessId_
+            && windowBelongsToRoot(target, workerWindow_);
+        if (targetMatches && foregroundMatchesHostRoot()) {
             lastTrustedInput_ = input.time;
         }
     }
