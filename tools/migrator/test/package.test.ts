@@ -105,6 +105,7 @@ describe("release acceptance script", () => {
     expect(script).toContain("byte[] pixels = CaptureClient(window);");
     expect(business).toContain("$scaleY = $clientHeight / 679.0");
     expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
+    expect(business).toContain("$customerRegionX = [int](264 * $scaleX)");
     expect(business).not.toContain("Invoke-DeployedNamedControl");
   });
 
