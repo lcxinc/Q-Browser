@@ -1262,7 +1262,8 @@ function New-SignedUpdatePackage([string]$Version, [string]$Destination,
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $manifest.version = $Version
     if ($ClipboardReadWithGesture) {
-        $manifest.permissions.clipboardRead = 'user-gesture'
+        $manifest.permissions | Add-Member -NotePropertyName clipboardRead `
+            -NotePropertyValue 'user-gesture' -Force
     }
     [IO.File]::WriteAllText($manifestPath,
         ($manifest | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))

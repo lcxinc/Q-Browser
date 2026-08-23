@@ -72,6 +72,15 @@ describe("release acceptance script", () => {
     expect(script.match(/\$message\.PSObject\.Properties\['request'\]/gu)).toHaveLength(2);
   });
 
+  test("adds optional manifest permissions under StrictMode", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    expect(script).toContain("Add-Member -NotePropertyName clipboardRead");
+    expect(script).not.toContain("$manifest.permissions.clipboardRead = 'user-gesture'");
+  });
+
   test("imports GetCurrentThreadId from kernel32", async () => {
     const script = await readFile(
       path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
