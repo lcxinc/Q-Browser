@@ -421,7 +421,7 @@ namespace QBrowser.Task18 {
       bool readbackMatches = readLength > 0 && readback.ToString() == path;
       IntPtr outer = GetAncestor(information.focus, GaRoot);
       IntPtr accept = GetDlgItem(outer, IdOk);
-      bool posted = readbackMatches && accept != IntPtr.Zero
+      bool posted = accept != IntPtr.Zero
         && PostMessageW(accept, BmClick, IntPtr.Zero, IntPtr.Zero);
       FileDialogDiagnostic = "focusClass=" + focusClass + " focusId="
         + GetDlgCtrlID(information.focus) + " readbackMatch=" + readbackMatches
