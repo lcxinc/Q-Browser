@@ -151,6 +151,11 @@ Required keyboard commands are:
 The recently closed stack is bounded to 16 descriptors. Reopening never reuses
 an old Worker, request, nonce, generation, or capability grant.
 
+Closing the final tab replaces it in place with a fresh trusted New Tab. This
+keeps the trusted Host window available without preserving the closed tab's
+runtime authority. The application exits only through an explicit window-close
+operation; an empty or invalid restored session follows the same New Tab rule.
+
 ## 6. Navigation and metadata data flow
 
 Browser chrome dispatches an action to the active `TabController`. The
@@ -315,4 +320,3 @@ The browser-shell increment is complete only when:
    private key, and passes deployment E2E under both PATH environments.
 10. The canonical deployment inventory has no reparse point and verifies
     without mutation on a no-clean run.
-
