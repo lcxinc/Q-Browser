@@ -3,6 +3,8 @@ if(NOT Q_BROWSER_BUILD_WEBENGINE)
 endif()
 
 add_library(q_browser_host STATIC
+  BrowserTabModel.cpp
+  BrowserTabModel.h
   HostApplication.cpp
   HostApplication.h
   HostCapabilityRuntime.cpp
