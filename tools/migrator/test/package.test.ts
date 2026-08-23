@@ -104,6 +104,18 @@ describe("release acceptance script", () => {
     expect(clipboard).not.toMatch(/Click\(\$window,\s*550,\s*360\)/u);
   });
 
+  test("revalidates focus and bounds retries for a missed native file click", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
+    expect(script).toContain(
+      "if (!FocusWorker(worker)) return false;\n      Input down = new Input(); down.type = InputMouse;",
+    );
+    expect(business).toContain("$fileCancelAttempt -lt 2");
+  });
+
   test("samples composited Worker pixels from the desktop DC", async () => {
     const script = await readFile(
       path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
@@ -124,7 +136,7 @@ describe("release acceptance script", () => {
     expect(business).toContain("$scaleY = $clientHeight / 679.0");
     expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
     expect(business).toContain("$customerRegionX = [int](264 * $scaleX)");
-    expect(business.match(/NativeAutomation\]::IsBluePixel\(/gu)).toHaveLength(2);
+    expect(business.match(/NativeAutomation\]::IsBluePixel\(/gu)).toHaveLength(3);
     expect(business).not.toContain("Invoke-DeployedNamedControl");
   });
 

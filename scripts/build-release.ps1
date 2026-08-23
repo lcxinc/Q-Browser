@@ -323,6 +323,7 @@ namespace QBrowser.Task18 {
       System.Threading.Thread.Sleep(50);
       Point point = new Point(); point.x = x; point.y = y;
       if (!ClientToScreen(worker, ref point) || !SetCursorPos(point.x, point.y)) return false;
+      if (!FocusWorker(worker)) return false;
       Input down = new Input(); down.type = InputMouse; down.value.mouse.flags = LeftDown;
       Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
       bool sent = Send(new Input[] { down, up });
@@ -1617,13 +1618,33 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
         [QBrowser.Task18.NativeAutomation]::IsBluePixel(
             $window, $fileReadyX, $fileControlY)
     } 10000 'Deployed file control did not render.'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click(
-            $window, $fileControlX, $fileControlY)) {
-        throw 'Real deployed file cancel click failed.'
+    $fileCancelOpened = $false
+    $fileCancelAttempt = 0
+    while (-not $fileCancelOpened -and $fileCancelAttempt -lt 2) {
+        $fileCancelAttempt++
+        if ($fileCancelAttempt -gt 1) {
+            Wait-Until {
+                [QBrowser.Task18.NativeAutomation]::IsBluePixel(
+                    $window, $fileReadyX, $fileControlY)
+            } 2000 'Deployed file control remained busy after a missed cancel click.'
+        }
+        if (-not [QBrowser.Task18.NativeAutomation]::Click(
+                $window, $fileControlX, $fileControlY)) {
+            if ($fileCancelAttempt -ge 2) {
+                throw 'Real deployed file cancel click failed.'
+            }
+            continue
+        }
+        try {
+            Wait-Until {
+                [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -gt 0
+            } 5000 'Native file cancel dialog did not open.'
+            $fileCancelOpened = $true
+        }
+        catch {
+            if ($fileCancelAttempt -ge 2) { throw }
+        }
     }
-    Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -gt 0
-    } 5000 'Native file cancel dialog did not open.'
     if ([QBrowser.Task18.NativeAutomation]::CancelFileDialogs($HostProcess.Id) -le 0) {
         throw 'Native file cancel dialog was not cancelled.'
     }
