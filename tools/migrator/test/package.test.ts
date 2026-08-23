@@ -42,3 +42,13 @@ describe("migrator production package", () => {
     );
   });
 });
+
+describe("release acceptance script", () => {
+  test("does not shadow PowerShell's read-only Host automatic variable", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    expect(script).not.toMatch(/function\s+[\w-]+\([^)]*\$Host(?:\W|$)/su);
+  });
+});

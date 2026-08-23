@@ -1426,12 +1426,12 @@ function Invoke-DeployedNavigation($Automation, [string]$Route,
         "Worker did not acknowledge normalized route with pending=0: $Route"
 }
 
-function Get-DeployedWorkerWindow([Diagnostics.Process]$Host, $Worker) {
+function Get-DeployedWorkerWindow([Diagnostics.Process]$HostProcess, $Worker) {
     $script:deployedWorkerWindow = [IntPtr]::Zero
     Wait-Until {
-        $Host.Refresh()
+        $HostProcess.Refresh()
         $candidate = [QBrowser.Task18.NativeAutomation]::FindWorkerWindow(
-            [IntPtr]$Host.MainWindowHandle, [int]$Worker.ProcessId)
+            [IntPtr]$HostProcess.MainWindowHandle, [int]$Worker.ProcessId)
         if ($candidate -eq [IntPtr]::Zero) { return $false }
         $script:deployedWorkerWindow = $candidate
         return $true
@@ -1456,11 +1456,11 @@ function Wait-StorageValue([string]$Storage, [string]$Key, [string]$Expected,
         "Storage did not persist exact value: $Key=$Expected"
 }
 
-function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$Host,
+function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProcess,
         $Worker, [string]$Telemetry, [string]$MockOutput, [string]$Storage,
         [string]$SelectedFile) {
-    $automation = New-DeployedHostAutomation $Host
-    $window = Get-DeployedWorkerWindow $Host $Worker
+    $automation = New-DeployedHostAutomation $HostProcess
+    $window = Get-DeployedWorkerWindow $HostProcess $Worker
 
     $loginBefore = Get-MockRequestCount $MockOutput 'POST' '/api/login'
     $dashboardBefore = Get-MockRequestCount $MockOutput 'GET' '/api/dashboard'
@@ -1534,13 +1534,13 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$Host,
         throw 'Real deployed file cancel click failed.'
     }
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -gt 0
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -gt 0
     } 5000 'Native file cancel dialog did not open.'
-    if ([QBrowser.Task18.NativeAutomation]::CancelFileDialogs($Host.Id) -le 0) {
+    if ([QBrowser.Task18.NativeAutomation]::CancelFileDialogs($HostProcess.Id) -le 0) {
         throw 'Native file cancel dialog was not cancelled.'
     }
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -eq 0
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -eq 0
     } 5000 'Native file cancel dialog remained open.'
     $beforeFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
     if ($null -eq $beforeFile -or
@@ -1548,14 +1548,14 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$Host,
         throw 'Real deployed file success click failed.'
     }
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -gt 0
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -gt 0
     } 5000 'Native file success dialog did not open.'
     if (-not [QBrowser.Task18.NativeAutomation]::AcceptFileDialog(
-            $Host.Id, $SelectedFile)) {
+            $HostProcess.Id, $SelectedFile)) {
         throw 'Native file success dialog automation failed.'
     }
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::FileDialogCount($Host.Id) -eq 0
+        [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -eq 0
     } 5000 'Native file success dialog remained open.'
     Wait-Until {
         $afterFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
@@ -1565,10 +1565,10 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$Host,
     Write-Output 'DEPLOYMENT_BUSINESS_FILE=PASS cancel=1 success=1 consumed=1'
 }
 
-function Assert-DeployedStoragePersistence([Diagnostics.Process]$Host, $Worker,
+function Assert-DeployedStoragePersistence([Diagnostics.Process]$HostProcess, $Worker,
         [string]$Telemetry, [string]$Storage) {
-    $automation = New-DeployedHostAutomation $Host
-    $window = Get-DeployedWorkerWindow $Host $Worker
+    $automation = New-DeployedHostAutomation $HostProcess
+    $window = Get-DeployedWorkerWindow $HostProcess $Worker
     Invoke-DeployedNavigation $automation 'app://pilot/settings' $Telemetry '/settings'
     # Light is enabled only after the restarted Worker consumes the persisted
     # dark value. One non-retried side-effect click must persist the successor.
@@ -1579,9 +1579,9 @@ function Assert-DeployedStoragePersistence([Diagnostics.Process]$Host, $Worker,
     Write-Output 'DEPLOYMENT_BUSINESS_STORAGE_RESTART=PASS dark=>restart=>light'
 }
 
-function Invoke-DeployedClipboardAcceptance([Diagnostics.Process]$Host, $Worker,
+function Invoke-DeployedClipboardAcceptance([Diagnostics.Process]$HostProcess, $Worker,
         [string]$Storage) {
-    $window = Get-DeployedWorkerWindow $Host $Worker
+    $window = Get-DeployedWorkerWindow $HostProcess $Worker
     Wait-StorageValue $Storage 'clipboard-no-gesture' 'clipboard.gesture_required'
     Wait-StorageValue $Storage 'clipboard-undeclared' 'capability.denied'
     Wait-Until {
