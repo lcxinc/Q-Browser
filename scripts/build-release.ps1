@@ -1488,7 +1488,7 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
         throw "Deployed Worker client geometry is invalid: ${clientWidth}x${clientHeight}"
     }
     $scaleX = $clientWidth / 1100.0
-    $scaleY = $clientHeight / 720.0
+    $scaleY = $clientHeight / 679.0
     $loginX = [int](550 * $scaleX)
     $loginY = [int](308 * $scaleY)
     $orderStatusX = [int](383 * $scaleX)
