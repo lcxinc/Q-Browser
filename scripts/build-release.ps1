@@ -172,7 +172,8 @@ namespace QBrowser.Task18 {
     const uint KeyUp = 0x0002, Unicode = 0x0004;
     const uint LeftDown = 0x0002, LeftUp = 0x0004;
     const uint SrcCopy = 0x00CC0020;
-    const uint WmCommand = 0x0111, WmClose = 0x0010, WmSetText = 0x000C;
+    const uint WmCommand = 0x0111, WmClose = 0x0010, WmSetText = 0x000C,
+      WmGetText = 0x000D;
     const uint BmClick = 0x00F5;
     const int IdOk = 1, IdCancel = 2, GaRoot = 2;
     [StructLayout(LayoutKind.Sequential)] struct Point { public int x, y; }
@@ -230,13 +231,14 @@ namespace QBrowser.Task18 {
       uint count, Input[] inputs, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(
       IntPtr window, System.Text.StringBuilder value, int maximum);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(
-      IntPtr window, System.Text.StringBuilder value, int maximum);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] static extern bool PostMessageW(
       IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] static extern IntPtr SendMessageW(
       IntPtr window, uint message, IntPtr wParam, string lParam);
+    [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)]
+    static extern IntPtr SendMessageTextW(IntPtr window, uint message, IntPtr wParam,
+      System.Text.StringBuilder lParam);
     [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr dialog, int id);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
@@ -414,7 +416,8 @@ namespace QBrowser.Task18 {
       System.Text.StringBuilder focusClass = new System.Text.StringBuilder(64);
       GetClassNameW(information.focus, focusClass, focusClass.Capacity);
       System.Text.StringBuilder readback = new System.Text.StringBuilder(1024);
-      int readLength = GetWindowTextW(information.focus, readback, readback.Capacity);
+      int readLength = checked((int)SendMessageTextW(information.focus, WmGetText,
+        new IntPtr(readback.Capacity), readback));
       bool readbackMatches = readLength > 0 && readback.ToString() == path;
       IntPtr outer = GetAncestor(information.focus, GaRoot);
       IntPtr accept = GetDlgItem(outer, IdOk);

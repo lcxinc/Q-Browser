@@ -105,7 +105,8 @@ describe("release acceptance script", () => {
     expect(script).toContain("byte[] pixels = CaptureClient(window);");
     expect(script).toContain("System.Threading.Thread.Sleep(250);");
     expect(script.match(/System\.Threading\.Thread\.Sleep\(50\);/gu)).toHaveLength(2);
-    expect(script).toContain("GetWindowTextW(information.focus");
+    expect(script).toContain("SendMessageTextW(information.focus");
+    expect(script).not.toContain("GetWindowTextW(information.focus");
     expect(script).toContain("readbackMatch=");
     expect(business).toContain("$scaleY = $clientHeight / 679.0");
     expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
