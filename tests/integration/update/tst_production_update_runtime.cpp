@@ -537,7 +537,8 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
     host.reset();
 }
 
-void runLauncherThreadStartFailure(const bool observerFailure)
+void runLauncherThreadStartFailure(const bool observerFailure,
+                                   const bool pauseRetirement = false)
 {
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
@@ -586,12 +587,21 @@ void runLauncherThreadStartFailure(const bool observerFailure)
     const qsizetype observersBefore =
         qbrowser_host_testing::installedPackageWorkerActiveObservers();
     std::atomic<quint32> processId = 0;
+    QSemaphore retirementEntered;
+    QSemaphore releaseRetirement;
+    QSemaphore hostDestructionReturned;
     qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
     hooks.failLaunchThreadStart = !observerFailure;
     hooks.failObserverThreadStart = observerFailure;
     hooks.afterHandshakeBeforeCompletionQueued = [&](const quint32 pid) {
         processId.store(pid, std::memory_order_release);
     };
+    if (pauseRetirement) {
+        hooks.beforeRetirementCleanup = [&] {
+            retirementEntered.release();
+            releaseRetirement.acquire();
+        };
+    }
     qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
         std::move(hooks));
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
@@ -606,14 +616,38 @@ void runLauncherThreadStartFailure(const bool observerFailure)
     if (processId.load(std::memory_order_acquire) == 0 && readyCount != 0) {
         processId.store(ready.first().at(5).toUInt(), std::memory_order_release);
     }
-    const QPointer<MainWindow> retiringWindow(host->mainWindow());
+    const bool retirementPaused = !pauseRetirement
+        || retirementEntered.tryAcquire(1, 10'000);
     qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    if (!retirementPaused) releaseRetirement.release();
+    QVERIFY2(retirementPaused,
+             "retirement attempt did not enter the deterministic cleanup barrier");
+
+    const QPointer<MainWindow> retiringWindow(host->mainWindow());
     QElapsedTimer destruction;
     destruction.start();
+    std::atomic_bool forcedRetirementRelease = false;
+    std::future<void> retirementRelease;
+    if (pauseRetirement) {
+        retirementRelease = std::async(std::launch::async, [&] {
+            const bool hostReturned =
+                hostDestructionReturned.tryAcquire(1, 10'000);
+            forcedRetirementRelease.store(!hostReturned,
+                                          std::memory_order_release);
+            releaseRetirement.release();
+        });
+    }
     host.reset();
     const qint64 destructionMs = destruction.elapsed();
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-    QVERIFY(retiringWindow.isNull());
+    const bool windowDeletedBeforeRetirementRelease = retiringWindow.isNull();
+    if (pauseRetirement) {
+        hostDestructionReturned.release();
+        retirementRelease.get();
+    }
+    QVERIFY2(!forcedRetirementRelease.load(std::memory_order_acquire),
+             "Host destruction waited for the blocked retirement attempt");
+    QVERIFY(windowDeletedBeforeRetirementRelease);
     QVERIFY(WorkerRetirementManager::instance().flush(10'000));
     const quint32 observedProcess = processId.load(std::memory_order_acquire);
     const bool processExited = observedProcess == 0
@@ -636,9 +670,11 @@ void runLauncherThreadStartFailure(const bool observerFailure)
              observerFailure
                  ? QStringLiteral("host.launch.observer_thread_unavailable")
                  : QStringLiteral("host.launch.launch_thread_unavailable"));
-    QVERIFY2(destructionMs < 100,
-             qPrintable(QStringLiteral("Host destruction blocked for %1 ms")
-                            .arg(destructionMs)));
+    if (!pauseRetirement) {
+        QVERIFY2(destructionMs < 100,
+                 qPrintable(QStringLiteral("Host destruction blocked for %1 ms")
+                                .arg(destructionMs)));
+    }
     QVERIFY(processExited);
     QVERIFY(workerEntries.isEmpty());
     QVERIFY(WorkerRetirementManager::instance().status().isIdle());
@@ -1521,7 +1557,7 @@ void ProductionUpdateRuntimeTest::launchThreadStartFailureRetiresSynchronously()
 
 void ProductionUpdateRuntimeTest::observerThreadStartFailureRetiresSynchronously()
 {
-    runLauncherThreadStartFailure(true);
+    runLauncherThreadStartFailure(true, true);
 }
 
 void ProductionUpdateRuntimeTest::launchThreadStartFailureHandlerCanDestroyHost()

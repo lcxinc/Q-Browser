@@ -374,6 +374,11 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
                         QStringLiteral("host.launch.retirement_wait_timeout")};
             }
         }
+#ifdef Q_BROWSER_HOST_TESTING
+        const auto hooks =
+            qbrowser_host_testing::installedPackageWorkerLauncherTestHooks();
+        if (hooks.beforeRetirementCleanup) hooks.beforeRetirementCleanup();
+#endif
         std::shared_ptr<SandboxProcess> ownedProcess;
         std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
             ownedTempTree;

@@ -23,6 +23,7 @@ struct InstalledPackageWorkerLauncherTestHooks final
                        UpdateLifecycleCoordinator &)>
         beforeAdmissionDecision;
     std::function<bool(const QString &)> failWorkerTempCleanup;
+    std::function<void()> beforeRetirementCleanup;
     std::function<void()> afterFailureSignalBeforeLifecycleEnqueue;
     bool failLaunchThreadStart = false;
     bool failObserverThreadStart = false;
