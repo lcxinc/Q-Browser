@@ -1,7 +1,8 @@
 #include "HostRuntimeConfig.h"
 
+#include "HostOwnedFileAuthority.h"
+#include "HostOwnedStateDirectory.h"
 #include "SignatureVerifier.h"
-#include "WindowsStableIo.h"
 
 #include <QDir>
 #include <QFile>
@@ -101,6 +102,14 @@ bool overlaps(const QString &left, const QString &right)
         || nativeRight.startsWith(leftPrefix, Qt::CaseInsensitive);
 }
 
+bool isStrictlyWithin(const QString &root, const QString &candidate)
+{
+    const QString nativeRoot = QDir::toNativeSeparators(root);
+    const QString nativeCandidate = QDir::toNativeSeparators(candidate);
+    return nativeCandidate.startsWith(
+        nativeRoot + QDir::separator(), Qt::CaseInsensitive);
+}
+
 QString argumentValue(const QString &argument, const QStringView name)
 {
     const QString prefix = QStringLiteral("--") + name + QLatin1Char('=');
@@ -109,7 +118,8 @@ QString argumentValue(const QString &argument, const QStringView name)
 }
 
 HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
-    const QStringList &arguments)
+    const QStringList &arguments,
+    const HostRuntimeParseContext &context)
 {
     HostRuntimeConfig config;
     bool trustedShell = false;
@@ -133,11 +143,12 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
             packageMode = true;
             continue;
         }
-        static constexpr std::array<QStringView, 12> names{
+        static constexpr std::array<QStringView, 14> names{
             u"mock-origin", u"app-id", u"trusted-public-key", u"package-store",
             u"sandbox-temp", u"runtime-root", u"worker-executable",
             u"telemetry-directory", u"install-package", u"health-window-ms",
-            u"heartbeat-timeout-ms", u"storage-directory"};
+            u"heartbeat-timeout-ms", u"storage-directory", u"deployment-root",
+            u"browser-state-directory"};
         bool recognized = false;
         for (const QStringView name : names) {
             const QString value = argumentValue(argument, name);
@@ -191,6 +202,16 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         return {std::move(config), HostRuntimeConfigError::None, {}};
     }
 
+    if (!singleValues.contains(QStringLiteral("deployment-root"))) {
+        return failure(HostRuntimeConfigError::MissingArgument,
+                       QStringLiteral("host.config.missing_deployment_root"));
+    }
+    if (!singleValues.contains(QStringLiteral("browser-state-directory"))) {
+        return failure(
+            HostRuntimeConfigError::MissingArgument,
+            QStringLiteral("host.config.missing_browser_state_directory"));
+    }
+
     const QStringList required{QStringLiteral("app-id"),
                                QStringLiteral("trusted-public-key"),
                                QStringLiteral("package-store"),
@@ -219,49 +240,28 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
     config.mode_ = HostRuntimeMode::Package;
     config.appId_ = singleValues.value(QStringLiteral("app-id"));
 
+    const auto deployment = safeExistingPath(
+        singleValues.value(QStringLiteral("deployment-root")), true);
+    const auto browserState = safeExistingPath(
+        singleValues.value(QStringLiteral("browser-state-directory")), true);
+    if (!deployment.has_value()) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.unsafe_deployment_root"));
+    }
+    if (!browserState.has_value()) {
+        return failure(
+            HostRuntimeConfigError::UnsafePath,
+            QStringLiteral("host.config.unsafe_browser_state_directory"));
+    }
+    if (!context.currentHostExecutable
+        || !context.currentHostExecutable->revalidate()) {
+        return failure(
+            HostRuntimeConfigError::UnsafePath,
+            QStringLiteral("host.config.current_host_unavailable"));
+    }
+
     const auto keyPath = safeExistingPath(
         singleValues.value(QStringLiteral("trusted-public-key")), false);
-    if (!keyPath.has_value()) {
-        return failure(HostRuntimeConfigError::UnsafePath,
-                       QStringLiteral("host.config.unsafe_public_key_path"));
-    }
-#ifdef Q_OS_WIN
-    qbrowser_archive_detail::WindowsStableDirectoryTree keyTree;
-    qbrowser_archive_detail::WindowsStableFile keyFile;
-    QByteArray keyBytes;
-    const QString keyParent = QFileInfo(*keyPath).absolutePath();
-    if (!keyTree.openRoot(keyParent)
-        || !keyFile.openReadLocked(*keyPath, keyTree)
-        || !keyFile.readBounded(MaximumPublicKeyBytes, keyBytes)
-        || !keyFile.isSameIdentityAt(*keyPath)
-        || !keyFile.isStableWithin(keyTree) || !keyTree.isStable()) {
-        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
-                       QStringLiteral("host.config.public_key_unavailable"));
-    }
-    if (!keyFile.hasRestrictedTrustAcl()) {
-        return failure(HostRuntimeConfigError::UnsafePath,
-                       QStringLiteral("host.config.unsafe_public_key_path"));
-    }
-    if (!SignatureVerifier::isValidPublicKeyPem(keyBytes)) {
-        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
-                       QStringLiteral("host.config.public_key_unavailable"));
-    }
-    config.trustedPublicKeyPem_ = std::move(keyBytes);
-    config.trustedPublicKeyIdentity_ = keyFile.identity();
-#else
-    QFile keyFile(*keyPath);
-    if (!keyFile.open(QIODevice::ReadOnly) || keyFile.size() <= 0
-        || keyFile.size() > MaximumPublicKeyBytes) {
-        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
-                       QStringLiteral("host.config.public_key_unavailable"));
-    }
-    config.trustedPublicKeyPem_ = keyFile.readAll();
-    if (!SignatureVerifier::isValidPublicKeyPem(config.trustedPublicKeyPem_)) {
-        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
-                       QStringLiteral("host.config.public_key_unavailable"));
-    }
-#endif
-
     const auto store = safeExistingPath(
         singleValues.value(QStringLiteral("package-store")), true);
     const auto sandboxTemp = safeExistingPath(
@@ -272,11 +272,17 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         singleValues.value(QStringLiteral("telemetry-directory")), true);
     const auto storage = safeExistingPath(
         singleValues.value(QStringLiteral("storage-directory")), true);
+    if (!keyPath.has_value()) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.unsafe_public_key_path"));
+    }
     if (!store.has_value() || !sandboxTemp.has_value() || !worker.has_value()
         || !telemetry.has_value() || !storage.has_value()) {
         return failure(HostRuntimeConfigError::UnsafePath,
                        QStringLiteral("host.config.unsafe_path"));
     }
+    config.deploymentRoot_ = *deployment;
+    config.browserStateDirectory_ = *browserState;
     config.packageStoreRoot_ = *store;
     config.sandboxTempRoot_ = *sandboxTemp;
     config.workerExecutable_ = *worker;
@@ -290,27 +296,26 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         }
         config.immutableRuntimeRoots_.push_back(*root);
     }
-    QStringList boundaryRoots{config.packageStoreRoot_, config.sandboxTempRoot_,
-                              config.telemetryDirectory_, config.storageDirectory_};
-    boundaryRoots.append(config.immutableRuntimeRoots_);
-    for (qsizetype left = 0; left < boundaryRoots.size(); ++left) {
-        for (qsizetype right = left + 1; right < boundaryRoots.size(); ++right) {
-            if (overlaps(boundaryRoots[left], boundaryRoots[right])) {
-                return failure(HostRuntimeConfigError::OverlappingRoots,
-                               QStringLiteral("host.config.overlapping_roots"));
-            }
+
+    const QString keyParent = QDir(QFileInfo(*keyPath).absolutePath())
+        .canonicalPath();
+    if (keyParent.isEmpty()
+        || !isStrictlyWithin(
+            config.deploymentRoot_,
+            context.currentHostExecutable->canonicalPath())
+        || !isStrictlyWithin(config.deploymentRoot_, config.workerExecutable_)
+        || !isStrictlyWithin(config.deploymentRoot_, *keyPath)) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.content_outside_deployment"));
+    }
+    for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
+        if (!isStrictlyWithin(config.deploymentRoot_, runtimeRoot)) {
+            return failure(
+                HostRuntimeConfigError::UnsafePath,
+                QStringLiteral("host.config.runtime_outside_deployment"));
         }
     }
-    if (overlaps(config.telemetryDirectory_,
-                 QFileInfo(*keyPath).absolutePath())) {
-        return failure(HostRuntimeConfigError::OverlappingRoots,
-                       QStringLiteral("host.config.overlapping_roots"));
-    }
-    if (overlaps(config.storageDirectory_,
-                 QFileInfo(*keyPath).absolutePath())) {
-        return failure(HostRuntimeConfigError::OverlappingRoots,
-                       QStringLiteral("host.config.overlapping_roots"));
-    }
+
     bool workerInRuntime = false;
     for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
         const QString prefix = QDir::toNativeSeparators(runtimeRoot)
@@ -325,24 +330,116 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         return failure(HostRuntimeConfigError::UnsafePath,
                        QStringLiteral("host.config.worker_outside_runtime"));
     }
+
+    QStringList mutableRoots{config.packageStoreRoot_, config.sandboxTempRoot_,
+                             config.telemetryDirectory_, config.storageDirectory_,
+                             config.browserStateDirectory_};
+    for (const QString &root : mutableRoots) {
+        if (overlaps(config.deploymentRoot_, root)) {
+            return failure(HostRuntimeConfigError::OverlappingRoots,
+                           QStringLiteral("host.config.overlapping_roots"));
+        }
+    }
+    for (qsizetype left = 0; left < mutableRoots.size(); ++left) {
+        for (qsizetype right = left + 1; right < mutableRoots.size(); ++right) {
+            if (overlaps(mutableRoots[left], mutableRoots[right])) {
+                return failure(HostRuntimeConfigError::OverlappingRoots,
+                               QStringLiteral("host.config.overlapping_roots"));
+            }
+        }
+    }
+    for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
+        if (overlaps(config.browserStateDirectory_, runtimeRoot)) {
+            return failure(HostRuntimeConfigError::OverlappingRoots,
+                           QStringLiteral("host.config.overlapping_roots"));
+        }
+    }
+    if (overlaps(config.browserStateDirectory_, keyParent)) {
+        return failure(HostRuntimeConfigError::OverlappingRoots,
+                       QStringLiteral("host.config.overlapping_roots"));
+    }
+
+    std::optional<QString> installPackage;
+    QString externalPackageParent;
     if (singleValues.contains(QStringLiteral("install-package"))) {
-        const auto package = safeExistingPath(
+        installPackage = safeExistingPath(
             singleValues.value(QStringLiteral("install-package")), false);
-        if (!package.has_value()) {
+        if (!installPackage.has_value()) {
             return failure(HostRuntimeConfigError::UnsafePath,
                            QStringLiteral("host.config.unsafe_install_package"));
         }
-        if (overlaps(config.telemetryDirectory_,
-                     QFileInfo(*package).absolutePath())) {
-            return failure(HostRuntimeConfigError::OverlappingRoots,
-                           QStringLiteral("host.config.overlapping_roots"));
+        const QString packageParent = QDir(
+            QFileInfo(*installPackage).absolutePath()).canonicalPath();
+        const auto canonicalDeployedPackages = safeExistingPath(
+            QDir(config.deploymentRoot_).filePath(QStringLiteral("packages")),
+            true);
+        const bool deployedPackage = canonicalDeployedPackages.has_value()
+            && isStrictlyWithin(*canonicalDeployedPackages, *installPackage);
+        if (!deployedPackage) {
+            if (packageParent.isEmpty()
+                || overlaps(config.deploymentRoot_, packageParent)) {
+                return failure(HostRuntimeConfigError::OverlappingRoots,
+                               QStringLiteral("host.config.overlapping_roots"));
+            }
+            for (const QString &root : mutableRoots) {
+                if (overlaps(root, packageParent)) {
+                    return failure(HostRuntimeConfigError::OverlappingRoots,
+                                   QStringLiteral("host.config.overlapping_roots"));
+                }
+            }
+            externalPackageParent = packageParent;
         }
-        if (overlaps(config.storageDirectory_,
-                     QFileInfo(*package).absolutePath())) {
-            return failure(HostRuntimeConfigError::OverlappingRoots,
-                           QStringLiteral("host.config.overlapping_roots"));
+    }
+
+    QStringList stateDisjointFrom{config.deploymentRoot_,
+                                  config.packageStoreRoot_,
+                                  config.sandboxTempRoot_,
+                                  config.telemetryDirectory_,
+                                  config.storageDirectory_, keyParent};
+    stateDisjointFrom.append(config.immutableRuntimeRoots_);
+    if (!externalPackageParent.isEmpty()) {
+        stateDisjointFrom.push_back(externalPackageParent);
+    }
+    QStringList deploymentDisjointFrom = mutableRoots;
+    if (!externalPackageParent.isEmpty()) {
+        deploymentDisjointFrom.push_back(externalPackageParent);
+    }
+    config.deploymentAuthority_ = HostOwnedStateDirectory::open(
+        config.deploymentRoot_, deploymentDisjointFrom);
+    config.browserStateAuthority_ = HostOwnedStateDirectory::open(
+        config.browserStateDirectory_, stateDisjointFrom);
+    config.currentHostExecutableAuthority_ = context.currentHostExecutable;
+    config.workerExecutableAuthority_ = HostOwnedFileAuthority::open(
+        config.workerExecutable_);
+    config.trustedPublicKeyAuthority_ = HostOwnedFileAuthority::open(*keyPath);
+    if (!config.deploymentAuthority_ || !config.browserStateAuthority_
+        || !config.workerExecutableAuthority_
+        || !config.trustedPublicKeyAuthority_) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.unsafe_protected_authority"));
+    }
+    QByteArray keyBytes;
+    if (!config.trustedPublicKeyAuthority_->readBounded(
+            MaximumPublicKeyBytes, keyBytes)
+        || !config.trustedPublicKeyAuthority_->revalidate()
+        || !SignatureVerifier::isValidPublicKeyPem(keyBytes)) {
+        return failure(HostRuntimeConfigError::PublicKeyUnavailable,
+                       QStringLiteral("host.config.public_key_unavailable"));
+    }
+    config.trustedPublicKeyPem_ = std::move(keyBytes);
+
+    if (installPackage.has_value()) {
+        if (!externalPackageParent.isEmpty()) {
+            config.installPackageAuthority_ = HostOwnedFileAuthority::open(
+                *installPackage);
+            if (!config.installPackageAuthority_
+                || !config.installPackageAuthority_->revalidate()) {
+                return failure(
+                    HostRuntimeConfigError::UnsafePath,
+                    QStringLiteral("host.config.unsafe_install_package"));
+            }
         }
-        config.installPackage_ = *package;
+        config.installPackage_ = *installPackage;
     }
     const auto boundedMilliseconds = [&](const QString &name,
                                          const qint64 defaultValue)
@@ -366,6 +463,16 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
     }
     config.healthWindowMs_ = *healthWindow;
     config.heartbeatTimeoutMs_ = *heartbeatTimeout;
+    if (!config.deploymentAuthority_->revalidate()
+        || !config.browserStateAuthority_->revalidate()
+        || !config.currentHostExecutableAuthority_->revalidate()
+        || !config.workerExecutableAuthority_->revalidate()
+        || !config.trustedPublicKeyAuthority_->revalidate()
+        || (config.installPackageAuthority_
+            && !config.installPackageAuthority_->revalidate())) {
+        return failure(HostRuntimeConfigError::UnsafePath,
+                       QStringLiteral("host.config.authority_changed"));
+    }
     return {std::move(config), HostRuntimeConfigError::None, {}};
 }
 
@@ -400,9 +507,32 @@ const QString &HostRuntimeConfig::storageDirectory() const noexcept
 {
     return storageDirectory_;
 }
+const QString &HostRuntimeConfig::deploymentRoot() const noexcept
+{
+    return deploymentRoot_;
+}
+const QString &HostRuntimeConfig::browserStateDirectory() const noexcept
+{
+    return browserStateDirectory_;
+}
 const std::optional<QString> &HostRuntimeConfig::installPackage() const noexcept
 {
     return installPackage_;
+}
+const std::shared_ptr<const HostOwnedStateDirectory> &
+HostRuntimeConfig::deploymentAuthority() const noexcept
+{
+    return deploymentAuthority_;
+}
+const std::shared_ptr<const HostOwnedStateDirectory> &
+HostRuntimeConfig::browserStateAuthority() const noexcept
+{
+    return browserStateAuthority_;
+}
+const std::shared_ptr<const HostOwnedFileAuthority> &
+HostRuntimeConfig::installPackageAuthority() const noexcept
+{
+    return installPackageAuthority_;
 }
 qint64 HostRuntimeConfig::healthWindowMs() const noexcept { return healthWindowMs_; }
 qint64 HostRuntimeConfig::heartbeatTimeoutMs() const noexcept

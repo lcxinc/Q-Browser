@@ -1180,7 +1180,8 @@ if (-not [string]::IsNullOrWhiteSpace($PrepareManualState)) {
     New-Item -ItemType Directory -Path $manualState -Force | Out-Null
     Protect-Path $manualState -Container
     Assert-PlainTree $manualState
-    foreach ($name in @('package-store','sandbox-temp','telemetry','storage')) {
+    foreach ($name in @('package-store','sandbox-temp','telemetry','storage',
+            'browser-state')) {
         $directory = Join-Path $manualState $name
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         Protect-Path $directory -Container
@@ -1356,7 +1357,7 @@ function Wait-DeployedWorker([string[]]$ExcludedIdentities = @()) {
 
 function Start-DeployedHost([string]$MockOrigin, [string]$Store,
         [string]$Sandbox, [string]$Telemetry, [string]$Storage,
-        [string]$InstallPackage,
+        [string]$BrowserState, [string]$InstallPackage,
         [int]$HealthWindowMs) {
     $arguments = @('--package-mode', "--mock-origin=$MockOrigin",
         '--app-id=com.qbrowser.pilot',
@@ -1365,6 +1366,8 @@ function Start-DeployedHost([string]$MockOrigin, [string]$Store,
         "--runtime-root=$(Join-Path $staging 'runtime')",
         "--worker-executable=$(Join-Path $staging 'runtime\qbrowser-worker.exe')",
         "--telemetry-directory=$Telemetry", "--storage-directory=$Storage",
+        "--deployment-root=$staging",
+        "--browser-state-directory=$BrowserState",
         "--health-window-ms=$HealthWindowMs",
         '--heartbeat-timeout-ms=10000')
     if (-not [string]::IsNullOrEmpty($InstallPackage)) {
@@ -2017,17 +2020,21 @@ function Invoke-DeploymentOnlyE2E {
         $sandbox = Join-Path $state 'sandbox-temp'
         $telemetry = Join-Path $state 'telemetry'
         $storage = Join-Path $state 'storage'
-        New-Item -ItemType Directory -Path $store, $sandbox, $telemetry, $storage | Out-Null
+        $browserState = Join-Path $state 'browser-state'
+        New-Item -ItemType Directory -Path $store, $sandbox, $telemetry, $storage, `
+            $browserState | Out-Null
         Protect-Path $store -Container
         Protect-Path $sandbox -Container
         Protect-Path $telemetry -Container
         Protect-Path $storage -Container
+        Protect-Path $browserState -Container
         $minimalPath = "$(Join-Path $staging 'host');$env:SystemRoot\System32;$env:SystemRoot"
         $env:PATH = $minimalPath
         $pilot = Join-Path $staging 'packages\com.qbrowser.pilot-1.0.0.qapkg'
         $deployAclRoots = @((Join-Path $staging 'runtime'), (Join-Path $staging 'packages'))
         $deployAclBefore = Get-AclTreeSnapshot $deployAclRoots
-        $initialHostProcess = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $storage $pilot 1000
+        $initialHostProcess = Start-DeployedHost $script:mockOrigin $store $sandbox `
+            $telemetry $storage $browserState $pilot 1000
         [void]$ownedPids.Add($initialHostProcess.Id)
         $worker = Wait-DeployedWorker
         [void]$ownedPids.Add([int]$worker.ProcessId)
@@ -2063,7 +2070,8 @@ function Invoke-DeploymentOnlyE2E {
         New-SignedUpdatePackage '1.1.0' $update
         Protect-Path $update
         $env:PATH = "C:\polluted-does-not-exist;$minimalPath"
-        $secondHost = Start-DeployedHost $script:mockOrigin $store $sandbox $telemetry $storage $update 60000
+        $secondHost = Start-DeployedHost $script:mockOrigin $store $sandbox `
+            $telemetry $storage $browserState $update 60000
         [void]$ownedPids.Add($secondHost.Id)
         $firstUpdateWorker = Wait-DeployedWorker
         [void]$ownedPids.Add([int]$firstUpdateWorker.ProcessId)
@@ -2193,7 +2201,7 @@ Rectangle {
             -MainQml $clipboardQml -ClipboardReadWithGesture
         Protect-Path $clipboardPackage
         $thirdHost = Start-DeployedHost $script:mockOrigin $store $sandbox `
-            $telemetry $storage $clipboardPackage 1000
+            $telemetry $storage $browserState $clipboardPackage 1000
         [void]$ownedPids.Add($thirdHost.Id)
         $clipboardWorker = Wait-DeployedWorker @(
             $firstUpdateWorker.Identity, $restartedWorker.Identity,
@@ -2536,7 +2544,9 @@ $buildParentIdentity = Get-PathIdentity $trustedBuildRoot
             (Join-Path $staging 'packages'), (Join-Path $staging 'trust'))) {
         Protect-Path $container -Container
     }
-    foreach ($file in @((Join-Path $staging 'packages\com.qbrowser.pilot-1.0.0.qapkg'),
+    foreach ($file in @((Join-Path $staging 'host\qbrowser-host.exe'),
+            (Join-Path $staging 'runtime\qbrowser-worker.exe'),
+            (Join-Path $staging 'packages\com.qbrowser.pilot-1.0.0.qapkg'),
             (Join-Path $staging 'trust\dev-public.pem'),
             (Join-Path $staging 'SHA-256SUMS'))) {
         Protect-Path $file

@@ -59,6 +59,8 @@ public:
         const QString &path);
     [[nodiscard]] bool contains(const QString &path) const;
     [[nodiscard]] bool isStable() const;
+    [[nodiscard]] bool rootHasRestrictedTrustAcl() const;
+    [[nodiscard]] bool isSameRootIdentityAt(const QString &path) const;
     [[nodiscard]] bool publishRootNoReplace(
         const QString &destination,
         const WindowsStableDirectoryTree &destinationTree);
@@ -127,6 +129,7 @@ public:
         QByteArray &bytes);
     [[nodiscard]] bool readBounded(quint64 maximum, QByteArray &bytes);
     [[nodiscard]] bool hasRestrictedTrustAcl() const;
+    [[nodiscard]] bool hasSingleLink() const;
     [[nodiscard]] bool publishNoReplace(
         const QString &destination,
         const WindowsStableDirectoryTree &tree);

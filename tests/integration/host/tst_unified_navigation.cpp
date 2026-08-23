@@ -1,5 +1,6 @@
 #include "HostApplication.h"
 #include "HostCapabilityRuntime.h"
+#include "HostOwnedFileAuthority.h"
 #include "MainWindow.h"
 #include "NavigationBar.h"
 #include "HostWorkerSessionController.h"
@@ -15,7 +16,9 @@
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QLineEdit>
 #include <QSignalSpy>
@@ -39,6 +42,7 @@
 #include <atomic>
 #include <semaphore>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -49,7 +53,7 @@ DWORD processHandleCount()
     return GetProcessHandleCount(GetCurrentProcess(), &count) ? count : 0;
 }
 
-bool protectTrustKey(const QString &path)
+bool protectPath(const QString &path, const bool container = false)
 {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -72,7 +76,8 @@ bool protectTrustKey(const QString &path)
     for (EXPLICIT_ACCESSW &entry : entries) {
         entry.grfAccessPermissions = GENERIC_ALL;
         entry.grfAccessMode = GRANT_ACCESS;
-        entry.grfInheritance = NO_INHERITANCE;
+        entry.grfInheritance = container
+            ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
         entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     }
     entries[0].Trustee.ptstrName = static_cast<LPWSTR>(owner);
@@ -91,6 +96,52 @@ bool protectTrustKey(const QString &path)
     return applied == ERROR_SUCCESS;
 }
 #endif
+
+QString currentExecutablePath()
+{
+#ifdef Q_OS_WIN
+    std::vector<wchar_t> buffer(32U * 1024U);
+    DWORD length = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(GetCurrentProcess(), 0U, buffer.data(),
+                                   &length) == FALSE
+        || length == 0U || length >= buffer.size()) {
+        return {};
+    }
+    return QString::fromWCharArray(buffer.data(),
+                                   static_cast<qsizetype>(length));
+#else
+    return QCoreApplication::applicationFilePath();
+#endif
+}
+
+bool copyPlainTree(const QString &source, const QString &destination)
+{
+    const QFileInfo sourceInfo(source);
+    const QString canonicalSource = sourceInfo.canonicalFilePath();
+    if (!sourceInfo.isDir() || sourceInfo.isSymLink()
+        || canonicalSource.isEmpty() || !QDir().mkpath(destination)) {
+        return false;
+    }
+    QDirIterator entries(canonicalSource,
+                         QDir::AllEntries | QDir::Hidden | QDir::System
+                             | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+                         QDirIterator::Subdirectories);
+    const QDir sourceDirectory(canonicalSource);
+    while (entries.hasNext()) {
+        const QString path = entries.next();
+        const QFileInfo information(path);
+        const QString target = QDir(destination).filePath(
+            sourceDirectory.relativeFilePath(path));
+        if (information.isDir()) {
+            if (!QDir().mkpath(target)) return false;
+        } else if (!information.isFile()
+                   || !QDir().mkpath(QFileInfo(target).absolutePath())
+                   || !QFile::copy(path, target)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 class HelpServer final : public QObject
 {
@@ -963,9 +1014,9 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     WorkerSurface *const surfacePointer = surface.get();
 
     QTemporaryDir authority;
-    QTemporaryDir trust;
+    QTemporaryDir hostFixture;
     QVERIFY(authority.isValid());
-    QVERIFY(trust.isValid());
+    QVERIFY(hostFixture.isValid());
     const QString store = authority.filePath(QStringLiteral("store"));
     const QString sandbox = authority.filePath(QStringLiteral("sandbox"));
     const QString telemetry = authority.filePath(QStringLiteral("telemetry"));
@@ -974,17 +1025,50 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     QVERIFY(QDir().mkpath(sandbox));
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
+    const QString deployment = hostFixture.filePath(
+        QStringLiteral("deployment"));
+    const QString browserState = hostFixture.filePath(
+        QStringLiteral("browser-state"));
+    const QString runtime = QDir(deployment).filePath(QStringLiteral("runtime"));
+    const QString hostDirectory = QDir(deployment).filePath(QStringLiteral("host"));
+    const QString trustDirectory = QDir(deployment).filePath(QStringLiteral("trust"));
+    const QString packagesDirectory = QDir(deployment).filePath(
+        QStringLiteral("packages"));
+    QVERIFY(QDir().mkpath(browserState));
+    QVERIFY(QDir().mkpath(hostDirectory));
+    QVERIFY(QDir().mkpath(trustDirectory));
+    QVERIFY(QDir().mkpath(packagesDirectory));
+    QVERIFY(copyPlainTree(environment.runtimeRoot(), runtime));
+    const QString workerRelative = QDir(environment.runtimeRoot())
+        .relativeFilePath(environment.workerExecutable());
+    const QString stagedWorker = QDir(runtime).filePath(workerRelative);
+    QVERIFY(QFileInfo(stagedWorker).isFile());
+    const QString sourceHost = currentExecutablePath();
+    QVERIFY(!sourceHost.isEmpty());
+    const QString stagedHost = QDir(hostDirectory).filePath(
+        QFileInfo(sourceHost).fileName());
+    QVERIFY(QFile::copy(sourceHost, stagedHost));
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
-    const QString publicKey = trust.filePath(QStringLiteral("trusted.pem"));
+    const QString publicKey = QDir(trustDirectory).filePath(
+        QStringLiteral("trusted.pem"));
     QFile keyFile(publicKey);
     QVERIFY(keyFile.open(QIODevice::WriteOnly | QIODevice::NewOnly));
     QCOMPARE(keyFile.write(keys.value().publicKeyPem),
              keys.value().publicKeyPem.size());
     keyFile.close();
 #ifdef Q_OS_WIN
-    QVERIFY(protectTrustKey(publicKey));
+    const QStringList protectedPaths{deployment, browserState, runtime,
+                                     QFileInfo(stagedWorker).absolutePath(),
+                                     stagedWorker, hostDirectory, stagedHost,
+                                     trustDirectory, publicKey};
+    for (const QString &path : protectedPaths) {
+        QVERIFY(protectPath(path, QFileInfo(path).isDir()));
+    }
 #endif
+    HostRuntimeParseContext parseContext;
+    parseContext.currentHostExecutable = HostOwnedFileAuthority::open(stagedHost);
+    QVERIFY(parseContext.currentHostExecutable);
     const HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments({
         QStringLiteral("--package-mode"),
         QStringLiteral("--mock-origin=")
@@ -993,11 +1077,13 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
         QStringLiteral("--trusted-public-key=") + publicKey,
         QStringLiteral("--package-store=") + store,
         QStringLiteral("--sandbox-temp=") + sandbox,
-        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
-        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--runtime-root=") + runtime,
+        QStringLiteral("--worker-executable=") + stagedWorker,
         QStringLiteral("--telemetry-directory=") + telemetry,
         QStringLiteral("--storage-directory=") + storage,
-    });
+        QStringLiteral("--deployment-root=") + deployment,
+        QStringLiteral("--browser-state-directory=") + browserState,
+    }, parseContext);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
     HostApplication application(std::move(*parsed.value));
     QVERIFY(application.start());

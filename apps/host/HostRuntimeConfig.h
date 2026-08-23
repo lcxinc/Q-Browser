@@ -6,10 +6,15 @@
 #include <QUrl>
 
 #include <optional>
+#include <memory>
 
-#ifdef Q_OS_WIN
-#include "WindowsStableIo.h"
-#endif
+class HostOwnedFileAuthority;
+class HostOwnedStateDirectory;
+
+struct HostRuntimeParseContext final
+{
+    std::shared_ptr<const HostOwnedFileAuthority> currentHostExecutable;
+};
 
 enum class HostRuntimeMode
 {
@@ -35,7 +40,8 @@ class HostRuntimeConfig final
 {
 public:
     [[nodiscard]] static struct HostRuntimeConfigResult fromArguments(
-        const QStringList &arguments);
+        const QStringList &arguments,
+        const HostRuntimeParseContext &context = {});
 
     [[nodiscard]] HostRuntimeMode mode() const noexcept;
     [[nodiscard]] const QUrl &mockOrigin() const noexcept;
@@ -47,7 +53,15 @@ public:
     [[nodiscard]] const QString &workerExecutable() const noexcept;
     [[nodiscard]] const QString &telemetryDirectory() const noexcept;
     [[nodiscard]] const QString &storageDirectory() const noexcept;
+    [[nodiscard]] const QString &deploymentRoot() const noexcept;
+    [[nodiscard]] const QString &browserStateDirectory() const noexcept;
     [[nodiscard]] const std::optional<QString> &installPackage() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const HostOwnedStateDirectory> &
+    deploymentAuthority() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const HostOwnedStateDirectory> &
+    browserStateAuthority() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const HostOwnedFileAuthority> &
+    installPackageAuthority() const noexcept;
     [[nodiscard]] qint64 healthWindowMs() const noexcept;
     [[nodiscard]] qint64 heartbeatTimeoutMs() const noexcept;
 
@@ -58,16 +72,21 @@ private:
     QUrl mockOrigin_{QStringLiteral("http://127.0.0.1:4173/")};
     QString appId_;
     QByteArray trustedPublicKeyPem_;
-#ifdef Q_OS_WIN
-    qbrowser_archive_detail::WindowsFileIdentity trustedPublicKeyIdentity_;
-#endif
     QString packageStoreRoot_;
     QString sandboxTempRoot_;
     QStringList immutableRuntimeRoots_;
     QString workerExecutable_;
     QString telemetryDirectory_;
     QString storageDirectory_;
+    QString deploymentRoot_;
+    QString browserStateDirectory_;
     std::optional<QString> installPackage_;
+    std::shared_ptr<const HostOwnedStateDirectory> deploymentAuthority_;
+    std::shared_ptr<const HostOwnedStateDirectory> browserStateAuthority_;
+    std::shared_ptr<const HostOwnedFileAuthority> currentHostExecutableAuthority_;
+    std::shared_ptr<const HostOwnedFileAuthority> workerExecutableAuthority_;
+    std::shared_ptr<const HostOwnedFileAuthority> trustedPublicKeyAuthority_;
+    std::shared_ptr<const HostOwnedFileAuthority> installPackageAuthority_;
     qint64 healthWindowMs_ = 10'000;
     qint64 heartbeatTimeoutMs_ = 2'000;
 };

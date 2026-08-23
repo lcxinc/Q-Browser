@@ -43,17 +43,22 @@ public:
 private:
     bool startMockApi();
     bool prepareTrustKey();
+    bool prepareProtectedHostFixture();
 
     WorkerTestEnvironment workerEnvironment_;
     QString appId_;
     QTemporaryDir packages_;
-    QTemporaryDir trust_;
+    QTemporaryDir deployment_;
+    QTemporaryDir browserState_;
     QTemporaryDir telemetry_;
     QTemporaryDir storage_;
     QProcess mockApi_;
     QByteArray privateKey_;
     QByteArray publicKey_;
     QString publicKeyPath_;
+    QString runtimeRoot_;
+    QString workerExecutable_;
+    QString hostExecutableEvidence_;
     QString mockOrigin_;
     QStringList mockRequests_;
     QString error_;

@@ -54,7 +54,7 @@ package and public key.
 
 ## Manual deployed Host smoke
 
-The following commands create four distinct protected state roots and start
+The following commands create five distinct protected state roots and start
 the mock API. Do not substitute a source-build Host, Worker, Qt directory, or
 unprotected state path.
 
@@ -69,6 +69,7 @@ $store = Join-Path $state 'package-store'
 $sandbox = Join-Path $state 'sandbox-temp'
 $telemetry = Join-Path $state 'telemetry'
 $storage = Join-Path $state 'storage'
+$browserState = Join-Path $state 'browser-state'
 
 $mockOut = Join-Path $state 'mock.stdout'
 $mockErr = Join-Path $state 'mock.stderr'
@@ -96,6 +97,7 @@ $common = @('--package-mode',"--mock-origin=$origin",'--app-id=com.qbrowser.pilo
   "--sandbox-temp=$sandbox","--runtime-root=$deploy\runtime",
   "--worker-executable=$deploy\runtime\qbrowser-worker.exe",
   "--telemetry-directory=$telemetry","--storage-directory=$storage",
+  "--deployment-root=$deploy","--browser-state-directory=$browserState",
   '--health-window-ms=2000',
   '--heartbeat-timeout-ms=10000')
 function ConvertTo-LaunchArguments([string[]]$Values) {
@@ -122,6 +124,11 @@ $appProcess = Start-Process "$deploy\host\qbrowser-host.exe" `
   -ArgumentList (ConvertTo-LaunchArguments ($common + "--install-package=$pilot")) `
   -PassThru
 ```
+
+Keep `$deploy` and `$browserState` unchanged across every restart. A candidate
+outside `$deploy\packages` must remain in its own protected source directory,
+with a protected file ACL; package mode rejects an inherited or broadly
+writable candidate source.
 
 Close that Host before an offline restart. Offline startup omits
 `--install-package` and re-verifies the selected installed binding:

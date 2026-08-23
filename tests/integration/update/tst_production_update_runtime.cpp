@@ -1,4 +1,5 @@
 #include "HostApplication.h"
+#include "HostOwnedFileAuthority.h"
 #include "HostRuntimeConfig.h"
 #include "InstalledPackageWorkerLauncherTestHooks.h"
 #include "MainWindow.h"
@@ -11,6 +12,7 @@
 
 #include <QApplication>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QElapsedTimer>
@@ -25,12 +27,14 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
+#include <QUuid>
 
 #include <qt_windows.h>
 #include <Aclapi.h>
 
 #include <future>
 #include <mutex>
+#include <vector>
 
 namespace
 {
@@ -41,18 +45,7 @@ bool writeNewFile(const QString &path, const QByteArray &bytes)
         && file.write(bytes) == bytes.size();
 }
 
-HostRuntimeConfigResult parseHostArguments(const QStringList &arguments,
-                                           const QString &storage)
-{
-    QStringList completeArguments = arguments;
-    const QString storageArgument = QStringLiteral("--storage-directory=") + storage;
-    if (!completeArguments.contains(storageArgument)) {
-        completeArguments.push_back(storageArgument);
-    }
-    return HostRuntimeConfig::fromArguments(completeArguments);
-}
-
-bool protectTrustKey(const QString &path)
+bool protectPath(const QString &path, const bool container = false)
 {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -75,7 +68,8 @@ bool protectTrustKey(const QString &path)
     for (EXPLICIT_ACCESSW &entry : entries) {
         entry.grfAccessPermissions = GENERIC_ALL;
         entry.grfAccessMode = GRANT_ACCESS;
-        entry.grfInheritance = NO_INHERITANCE;
+        entry.grfInheritance = container
+            ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
         entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     }
     entries[0].Trustee.ptstrName = static_cast<LPWSTR>(owner);
@@ -92,6 +86,252 @@ bool protectTrustKey(const QString &path)
     if (dacl != nullptr) LocalFree(dacl);
     LocalFree(descriptor);
     return applied == ERROR_SUCCESS;
+}
+
+QString currentExecutablePath()
+{
+    std::vector<wchar_t> buffer(32U * 1024U);
+    DWORD length = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(GetCurrentProcess(), 0U, buffer.data(),
+                                   &length) == FALSE
+        || length == 0U || length >= buffer.size()) {
+        return {};
+    }
+    return QString::fromWCharArray(buffer.data(),
+                                   static_cast<qsizetype>(length));
+}
+
+bool copyPlainTree(const QString &source, const QString &destination)
+{
+    const QFileInfo sourceInfo(source);
+    const QString canonicalSource = sourceInfo.canonicalFilePath();
+    if (!sourceInfo.isDir() || sourceInfo.isSymLink()
+        || canonicalSource.isEmpty() || !QDir().mkpath(destination)) {
+        return false;
+    }
+    QDirIterator entries(canonicalSource,
+                         QDir::AllEntries | QDir::Hidden | QDir::System
+                             | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+                         QDirIterator::Subdirectories);
+    const QDir sourceDirectory(canonicalSource);
+    while (entries.hasNext()) {
+        const QString path = entries.next();
+        const QFileInfo information(path);
+        const QString target = QDir(destination).filePath(
+            sourceDirectory.relativeFilePath(path));
+        if (information.isDir()) {
+            if (!QDir().mkpath(target)) return false;
+        } else if (!information.isFile()
+                   || !QDir().mkpath(QFileInfo(target).absolutePath())
+                   || !QFile::copy(path, target)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QString argumentPath(const QStringList &arguments, const QString &name)
+{
+    const QString prefix = QStringLiteral("--") + name + QLatin1Char('=');
+    for (const QString &argument : arguments) {
+        if (argument.startsWith(prefix)) return argument.sliced(prefix.size());
+    }
+    return {};
+}
+
+bool replaceArgument(QStringList &arguments, const QString &name,
+                     const QString &value)
+{
+    const QString prefix = QStringLiteral("--") + name + QLatin1Char('=');
+    for (QString &argument : arguments) {
+        if (argument.startsWith(prefix)) {
+            argument = prefix + value;
+            return true;
+        }
+    }
+    return false;
+}
+
+struct ProtectedProcessLaunchFixture final
+{
+    QString program;
+    QStringList arguments;
+    QString error;
+};
+
+ProtectedProcessLaunchFixture prepareProtectedProcessLaunch(
+    QStringList arguments,
+    const QString &fixtureBase,
+    const QString &sourceHost)
+{
+    ProtectedProcessLaunchFixture fixture;
+    const QString sourceRuntime = argumentPath(
+        arguments, QStringLiteral("runtime-root"));
+    const QString sourceWorker = argumentPath(
+        arguments, QStringLiteral("worker-executable"));
+    const QString sourceKey = argumentPath(
+        arguments, QStringLiteral("trusted-public-key"));
+    const QString sourcePackage = argumentPath(
+        arguments, QStringLiteral("install-package"));
+    if (sourceRuntime.isEmpty() || sourceWorker.isEmpty() || sourceKey.isEmpty()
+        || sourcePackage.isEmpty() || !QFileInfo(sourceHost).isFile()) {
+        fixture.error = QStringLiteral("protected process fixture source is unavailable");
+        return fixture;
+    }
+    const QString fixtureName = QStringLiteral("process-host-")
+        + QUuid::createUuid().toString(QUuid::Id128);
+    const QString deployment = QDir(fixtureBase).filePath(
+        fixtureName + QStringLiteral("-deployment"));
+    const QString browserState = QDir(fixtureBase).filePath(
+        fixtureName + QStringLiteral("-browser-state"));
+    const QString runtime = QDir(deployment).filePath(QStringLiteral("runtime"));
+    const QString hostDirectory = QDir(deployment).filePath(QStringLiteral("host"));
+    const QString trustDirectory = QDir(deployment).filePath(QStringLiteral("trust"));
+    const QString packagesDirectory = QDir(deployment).filePath(
+        QStringLiteral("packages"));
+    if (!QDir().mkpath(browserState) || !QDir().mkpath(hostDirectory)
+        || !QDir().mkpath(trustDirectory) || !QDir().mkpath(packagesDirectory)
+        || !copyPlainTree(sourceRuntime, runtime)) {
+        fixture.error = QStringLiteral("protected process fixture directories failed");
+        return fixture;
+    }
+    const QString workerRelative = QDir(sourceRuntime).relativeFilePath(sourceWorker);
+    if (workerRelative == QStringLiteral("..")
+        || workerRelative.startsWith(QStringLiteral("../"))
+        || workerRelative.startsWith(QStringLiteral("..\\"))) {
+        fixture.error = QStringLiteral("protected process worker is outside runtime");
+        return fixture;
+    }
+    const QString worker = QDir(runtime).filePath(workerRelative);
+    const QString host = QDir(hostDirectory).filePath(
+        QFileInfo(sourceHost).fileName());
+    const QString key = QDir(trustDirectory).filePath(
+        QFileInfo(sourceKey).fileName());
+    const QString package = QDir(packagesDirectory).filePath(
+        QFileInfo(sourcePackage).fileName());
+    if (!QFileInfo(worker).isFile() || !QFile::copy(sourceHost, host)
+        || !QFile::copy(sourceKey, key) || !QFile::copy(sourcePackage, package)) {
+        fixture.error = QStringLiteral("protected process fixture copies failed");
+        return fixture;
+    }
+    const QStringList protectedPaths{deployment, browserState, runtime,
+                                     QFileInfo(worker).absolutePath(), worker,
+                                     hostDirectory, host, trustDirectory, key};
+    for (const QString &path : protectedPaths) {
+        if (!protectPath(path, QFileInfo(path).isDir())) {
+            fixture.error = QStringLiteral("protected process fixture ACL failed");
+            return fixture;
+        }
+    }
+    if (!replaceArgument(arguments, QStringLiteral("runtime-root"), runtime)
+        || !replaceArgument(arguments, QStringLiteral("worker-executable"), worker)
+        || !replaceArgument(arguments, QStringLiteral("trusted-public-key"), key)
+        || !replaceArgument(arguments, QStringLiteral("install-package"), package)) {
+        fixture.error = QStringLiteral("protected process fixture arguments failed");
+        return fixture;
+    }
+    arguments.push_back(QStringLiteral("--deployment-root=") + deployment);
+    arguments.push_back(
+        QStringLiteral("--browser-state-directory=") + browserState);
+    fixture.program = host;
+    fixture.arguments = std::move(arguments);
+    return fixture;
+}
+
+HostRuntimeConfigResult parseHostArguments(const QStringList &arguments,
+                                           const QString &storage)
+{
+    const auto fixtureFailure = [](const QString &detail) {
+        return HostRuntimeConfigResult{
+            std::nullopt, HostRuntimeConfigError::UnsafePath,
+            QStringLiteral("host.test.protected_fixture_failed.") + detail};
+    };
+    QStringList completeArguments = arguments;
+    const QString storageArgument = QStringLiteral("--storage-directory=") + storage;
+    if (!completeArguments.contains(storageArgument)) {
+        completeArguments.push_back(storageArgument);
+    }
+
+    const QString sourceRuntime = argumentPath(
+        completeArguments, QStringLiteral("runtime-root"));
+    const QString sourceWorker = argumentPath(
+        completeArguments, QStringLiteral("worker-executable"));
+    const QString sourceKey = argumentPath(
+        completeArguments, QStringLiteral("trusted-public-key"));
+    const QString sourcePackage = argumentPath(
+        completeArguments, QStringLiteral("install-package"));
+    const QString sourceHost = currentExecutablePath();
+    if (sourceRuntime.isEmpty() || sourceWorker.isEmpty() || sourceKey.isEmpty()
+        || sourceHost.isEmpty()) {
+        return fixtureFailure(QStringLiteral("missing_source"));
+    }
+
+    const QString fixtureBase = QFileInfo(storage).absolutePath();
+    const QString fixtureName = QStringLiteral("host-fixture-")
+        + QUuid::createUuid().toString(QUuid::Id128);
+    const QString deployment = QDir(fixtureBase).filePath(
+        fixtureName + QStringLiteral("-deployment"));
+    const QString browserState = QDir(fixtureBase).filePath(
+        fixtureName + QStringLiteral("-browser-state"));
+    const QString runtime = QDir(deployment).filePath(QStringLiteral("runtime"));
+    const QString hostDirectory = QDir(deployment).filePath(QStringLiteral("host"));
+    const QString trustDirectory = QDir(deployment).filePath(QStringLiteral("trust"));
+    const QString packagesDirectory = QDir(deployment).filePath(
+        QStringLiteral("packages"));
+    if (!QDir().mkpath(browserState) || !QDir().mkpath(hostDirectory)
+        || !QDir().mkpath(trustDirectory) || !QDir().mkpath(packagesDirectory)
+        || !copyPlainTree(sourceRuntime, runtime)) {
+        return fixtureFailure(QStringLiteral("directory_setup"));
+    }
+
+    const QString workerRelative = QDir(sourceRuntime).relativeFilePath(sourceWorker);
+    if (workerRelative == QStringLiteral("..")
+        || workerRelative.startsWith(QStringLiteral("../"))
+        || workerRelative.startsWith(QStringLiteral("..\\"))) {
+        return fixtureFailure(QStringLiteral("worker_outside_runtime"));
+    }
+    const QString worker = QDir(runtime).filePath(workerRelative);
+    const QString host = QDir(hostDirectory).filePath(
+        QFileInfo(sourceHost).fileName());
+    const QString key = QDir(trustDirectory).filePath(
+        QFileInfo(sourceKey).fileName());
+    if (!QFileInfo(worker).isFile() || !QFile::copy(sourceHost, host)
+        || !QFile::copy(sourceKey, key)) {
+        return fixtureFailure(QStringLiteral("immutable_copy"));
+    }
+    if (!sourcePackage.isEmpty()) {
+        const QString package = QDir(packagesDirectory).filePath(
+            QFileInfo(sourcePackage).fileName());
+        if (!QFile::copy(sourcePackage, package)
+            || !replaceArgument(completeArguments,
+                                QStringLiteral("install-package"), package)) {
+            return fixtureFailure(QStringLiteral("package_copy"));
+        }
+    }
+    const QStringList protectedPaths{deployment, browserState, runtime,
+                                     QFileInfo(worker).absolutePath(), worker,
+                                     hostDirectory, host, trustDirectory, key};
+    for (const QString &path : protectedPaths) {
+        if (!protectPath(path, QFileInfo(path).isDir())) {
+            return fixtureFailure(QStringLiteral("protection"));
+        }
+    }
+    if (!replaceArgument(completeArguments, QStringLiteral("runtime-root"), runtime)
+        || !replaceArgument(completeArguments,
+                            QStringLiteral("worker-executable"), worker)
+        || !replaceArgument(completeArguments,
+                            QStringLiteral("trusted-public-key"), key)) {
+        return fixtureFailure(QStringLiteral("argument_rewrite"));
+    }
+    completeArguments.push_back(QStringLiteral("--deployment-root=") + deployment);
+    completeArguments.push_back(
+        QStringLiteral("--browser-state-directory=") + browserState);
+    HostRuntimeParseContext context;
+    context.currentHostExecutable = HostOwnedFileAuthority::open(host);
+    if (!context.currentHostExecutable) {
+        return fixtureFailure(QStringLiteral("host_authority"));
+    }
+    return HostRuntimeConfig::fromArguments(completeArguments, context);
 }
 
 bool terminateProcessId(const quint32 processId)
@@ -282,7 +522,7 @@ void runHostDestroyDuringValidation(const bool beforeFirstValidation)
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("authority-lifetime"),
         QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
@@ -357,7 +597,7 @@ void runActivationAdmissionRace(const ActivationRacePoint racePoint)
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QByteArray qml = racePoint == ActivationRacePoint::BeforeAdmission
         ? QByteArrayLiteral(
               "import QtQuick\nItem { width: 320; height: 200; "
@@ -486,7 +726,7 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("close-failure"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem, false,
@@ -566,7 +806,7 @@ void runLauncherThreadStartFailure(
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary,
         observerFailure ? QStringLiteral("observer-thread-failure")
@@ -806,7 +1046,7 @@ void runThreadStartFailureDestroyingHost(const bool observerFailure)
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary,
         observerFailure ? QStringLiteral("observer-thread-destroy-host")
@@ -952,7 +1192,7 @@ void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHeal
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString packageA = updateSignedPackage(
         temporary, QStringLiteral("stale-admission-a"),
         QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
@@ -1089,7 +1329,7 @@ void ProductionUpdateRuntimeTest::destroyedLauncherRetiresHandshakeCompletedInfl
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("inflight-destroy"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem, false,
@@ -1155,7 +1395,7 @@ void ProductionUpdateRuntimeTest::tempCleanupFailureStopsAdmissionAndCanBeRetrie
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QByteArray qml = QByteArrayLiteral(
         "import QtQuick\nItem { width: 320; height: 200 }");
     const QString packageA = updateSignedPackage(
@@ -1246,7 +1486,7 @@ void ProductionUpdateRuntimeTest::cleanupFailureOutlivesDestroyedHostAndAutoReco
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("manager-outlives-host"),
         QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
@@ -1361,7 +1601,7 @@ void ProductionUpdateRuntimeTest::repeatedLiveCancellationLeavesNoObserversOrCon
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     QStringList packages;
     for (int iteration = 0; iteration < 3; ++iteration) {
         packages.push_back(updateSignedPackage(
@@ -1435,7 +1675,7 @@ void ProductionUpdateRuntimeTest::admissionTimeoutRejectsLateAcceptedReplay()
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("admission-timeout"),
         QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
@@ -1522,7 +1762,7 @@ void ProductionUpdateRuntimeTest::lifecycleQueueFullBeforeAdmissionNeverAttaches
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("admission-queue-full"),
         QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
@@ -1598,7 +1838,7 @@ void ProductionUpdateRuntimeTest::readyHandlerCanDestroyHostWithoutUseAfterFree(
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("ready-destroy"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem, false,
@@ -1740,7 +1980,7 @@ void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistrat
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QString package = updateSignedPackage(
         temporary, QStringLiteral("checked-shutdown"), QStringLiteral("1.0.0"),
         keys.value().privateKeyPem, false,
@@ -1825,7 +2065,7 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     QVERIFY(QDir().mkpath(telemetry));
     QVERIFY(QDir().mkpath(storage));
     QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
-    QVERIFY(protectTrustKey(publicKey));
+    QVERIFY(protectPath(publicKey));
     const QByteArray recoveredQml = QByteArrayLiteral(
         "import QtQuick\nItem { width: 320; height: 200; "
         "Component.onCompleted: Runtime.invoke(\"storage\", \"get\", "
@@ -1991,6 +2231,12 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
             argument = QStringLiteral("--telemetry-directory=") + cliTelemetry;
         }
     }
+    const ProtectedProcessLaunchFixture processFixture =
+        prepareProtectedProcessLaunch(
+            installArguments, telemetryRoot.path(),
+            QString::fromUtf8(Q_BROWSER_HOST_PATH));
+    QVERIFY2(!processFixture.program.isEmpty(), qPrintable(processFixture.error));
+    installArguments = processFixture.arguments;
     QProcess productionInstallHost;
     QProcessEnvironment diagnosticEnvironment =
         QProcessEnvironment::systemEnvironment();
@@ -2007,7 +2253,7 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     [[maybe_unused]] const auto cleanupInstallHost = qScopeGuard([&] {
         (void)stopOwnedProcess(productionInstallHost);
     });
-    productionInstallHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
+    productionInstallHost.setProgram(processFixture.program);
     productionInstallHost.setArguments(installArguments);
     recordProductionPhase("cli-install-start");
     productionInstallHost.start();
@@ -2060,7 +2306,7 @@ void ProductionUpdateRuntimeTest::signedInstalledPackagesDriveAutomaticRealWorke
     [[maybe_unused]] const auto cleanupOfflineHost = qScopeGuard([&] {
         (void)stopOwnedProcess(productionHost);
     });
-    productionHost.setProgram(QString::fromUtf8(Q_BROWSER_HOST_PATH));
+    productionHost.setProgram(processFixture.program);
     productionHost.setArguments(offlineArguments);
     recordProductionPhase("cli-offline-start");
     productionHost.start();

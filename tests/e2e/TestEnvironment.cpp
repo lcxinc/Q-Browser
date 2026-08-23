@@ -3,6 +3,7 @@
 #include "Archive.h"
 #include "AppContainerProfile.h"
 #include "ContentDigest.h"
+#include "HostOwnedFileAuthority.h"
 #include "HostRuntimeConfig.h"
 #include "HostWorkerSessionController.h"
 #include "MainWindow.h"
@@ -25,6 +26,7 @@
 #include <userenv.h>
 
 #include <limits>
+#include <vector>
 
 namespace {
 bool writeNewFile(const QString &path, const QByteArray &bytes)
@@ -34,7 +36,7 @@ bool writeNewFile(const QString &path, const QByteArray &bytes)
         && file.write(bytes) == bytes.size();
 }
 
-bool protectTrustKey(const QString &path)
+bool protectPath(const QString &path, const bool container = false)
 {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -56,7 +58,8 @@ bool protectTrustKey(const QString &path)
     for (EXPLICIT_ACCESSW &entry : entries) {
         entry.grfAccessPermissions = GENERIC_ALL;
         entry.grfAccessMode = GRANT_ACCESS;
-        entry.grfInheritance = NO_INHERITANCE;
+        entry.grfInheritance = container
+            ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
         entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     }
     entries[0].Trustee.ptstrName = static_cast<LPWSTR>(owner);
@@ -73,6 +76,48 @@ bool protectTrustKey(const QString &path)
     if (dacl != nullptr) LocalFree(dacl);
     LocalFree(descriptor);
     return applied == ERROR_SUCCESS;
+}
+
+QString currentExecutablePath()
+{
+    std::vector<wchar_t> buffer(32U * 1024U);
+    DWORD length = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(GetCurrentProcess(), 0U, buffer.data(),
+                                   &length) == FALSE
+        || length == 0U || length >= buffer.size()) {
+        return {};
+    }
+    return QString::fromWCharArray(buffer.data(),
+                                   static_cast<qsizetype>(length));
+}
+
+bool copyPlainTree(const QString &source, const QString &destination)
+{
+    const QFileInfo sourceInfo(source);
+    const QString canonicalSource = sourceInfo.canonicalFilePath();
+    if (!sourceInfo.isDir() || sourceInfo.isSymLink()
+        || canonicalSource.isEmpty() || !QDir().mkpath(destination)) {
+        return false;
+    }
+    QDirIterator entries(canonicalSource,
+                         QDir::AllEntries | QDir::Hidden | QDir::System
+                             | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+                         QDirIterator::Subdirectories);
+    const QDir sourceDirectory(canonicalSource);
+    while (entries.hasNext()) {
+        const QString path = entries.next();
+        const QFileInfo information(path);
+        const QString target = QDir(destination).filePath(
+            sourceDirectory.relativeFilePath(path));
+        if (information.isDir()) {
+            if (!QDir().mkpath(target)) return false;
+        } else if (!information.isFile()
+                   || !QDir().mkpath(QFileInfo(target).absolutePath())
+                   || !QFile::copy(path, target)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool waitUntil(const std::function<bool()> &predicate, const int timeoutMs)
@@ -186,12 +231,16 @@ TestEnvironment::TestEnvironment()
         return;
     }
     appId_ = workerEnvironment_.appId();
-    if (!packages_.isValid() || !trust_.isValid() || !telemetry_.isValid()
+    if (!packages_.isValid() || !deployment_.isValid()
+        || !browserState_.isValid() || !telemetry_.isValid()
         || !storage_.isValid()) {
         error_ = QStringLiteral("e2e temporary roots are unavailable");
         return;
     }
-    if (!prepareTrustKey() || !startMockApi()) return;
+    if (!prepareProtectedHostFixture() || !prepareTrustKey()
+        || !startMockApi()) {
+        return;
+    }
 }
 
 TestEnvironment::~TestEnvironment()
@@ -233,10 +282,15 @@ bool TestEnvironment::shutdown()
     } else {
         packages_.setAutoRemove(false);
     }
-    if (!trust_.remove()) {
-        cleanupError_ = QStringLiteral("trust fixture cleanup failed");
+    if (!deployment_.remove()) {
+        cleanupError_ = QStringLiteral("deployment fixture cleanup failed");
     } else {
-        trust_.setAutoRemove(false);
+        deployment_.setAutoRemove(false);
+    }
+    if (!browserState_.remove()) {
+        cleanupError_ = QStringLiteral("browser state fixture cleanup failed");
+    } else {
+        browserState_.setAutoRemove(false);
     }
     if (!telemetry_.remove()) {
         cleanupError_ = QStringLiteral("telemetry fixture cleanup failed");
@@ -297,6 +351,43 @@ QString TestEnvironment::lastKnownGoodVersionDirectory() const
     return state.hasValue() ? state.state.lastKnownGood : QString{};
 }
 
+bool TestEnvironment::prepareProtectedHostFixture()
+{
+    runtimeRoot_ = deployment_.filePath(QStringLiteral("runtime"));
+    const QString hostDirectory = deployment_.filePath(QStringLiteral("host"));
+    const QString trustDirectory = deployment_.filePath(QStringLiteral("trust"));
+    const QString packagesDirectory = deployment_.filePath(
+        QStringLiteral("packages"));
+    if (!QDir().mkpath(hostDirectory) || !QDir().mkpath(trustDirectory)
+        || !QDir().mkpath(packagesDirectory)
+        || !copyPlainTree(workerEnvironment_.runtimeRoot(), runtimeRoot_)) {
+        error_ = QStringLiteral("protected deployment tree could not be staged");
+        return false;
+    }
+    const QString workerRelative = QDir(workerEnvironment_.runtimeRoot())
+        .relativeFilePath(workerEnvironment_.workerExecutable());
+    workerExecutable_ = QDir(runtimeRoot_).filePath(workerRelative);
+    const QString sourceHost = currentExecutablePath();
+    hostExecutableEvidence_ = QDir(hostDirectory).filePath(
+        QFileInfo(sourceHost).fileName());
+    if (!QFileInfo(workerExecutable_).isFile() || sourceHost.isEmpty()
+        || !QFile::copy(sourceHost, hostExecutableEvidence_)) {
+        error_ = QStringLiteral("protected deployment binaries could not be staged");
+        return false;
+    }
+    const QStringList protectedPaths{
+        deployment_.path(), browserState_.path(), packages_.path(),
+        runtimeRoot_, QFileInfo(workerExecutable_).absolutePath(),
+        workerExecutable_, hostDirectory, hostExecutableEvidence_};
+    for (const QString &path : protectedPaths) {
+        if (!protectPath(path, QFileInfo(path).isDir())) {
+            error_ = QStringLiteral("protected deployment ACL could not be applied");
+            return false;
+        }
+    }
+    return true;
+}
+
 bool TestEnvironment::prepareTrustKey()
 {
     const auto keys = SignatureVerifier::generateKeyPair();
@@ -306,8 +397,10 @@ bool TestEnvironment::prepareTrustKey()
     }
     privateKey_ = keys.value().privateKeyPem;
     publicKey_ = keys.value().publicKeyPem;
-    publicKeyPath_ = trust_.filePath(QStringLiteral("trusted.pem"));
-    if (!writeNewFile(publicKeyPath_, publicKey_) || !protectTrustKey(publicKeyPath_)) {
+    const QString trustDirectory = deployment_.filePath(QStringLiteral("trust"));
+    publicKeyPath_ = QDir(trustDirectory).filePath(QStringLiteral("trusted.pem"));
+    if (!writeNewFile(publicKeyPath_, publicKey_)
+        || !protectPath(trustDirectory, true) || !protectPath(publicKeyPath_)) {
         error_ = QStringLiteral("development trust key could not be protected");
         return false;
     }
@@ -379,7 +472,10 @@ QString TestEnvironment::createPackage(const QString &version,
     if (!signature.hasValue()) return {};
     files.push_back({QByteArrayLiteral("metadata/signature.ed25519"), signature.value()});
     const QString output = packages_.filePath(version + QStringLiteral(".qapkg"));
-    return Archive::createFromFiles(files, output).hasValue() ? output : QString{};
+    return Archive::createFromFiles(files, output).hasValue()
+            && protectPath(output)
+        ? output
+        : QString{};
 }
 
 QString TestEnvironment::createTamperedPackage(const QString &version)
@@ -397,7 +493,10 @@ QString TestEnvironment::createTamperedPackage(const QString &version)
         }
     }
     const QString tampered = packages_.filePath(version + QStringLiteral("-tampered.qapkg"));
-    return Archive::createFromFiles(files, tampered).hasValue() ? tampered : QString{};
+    return Archive::createFromFiles(files, tampered).hasValue()
+            && protectPath(tampered)
+        ? tampered
+        : QString{};
 }
 
 bool TestEnvironment::start(const QString &version)
@@ -412,17 +511,27 @@ bool TestEnvironment::start(const QString &version)
         QStringLiteral("--trusted-public-key=") + publicKeyPath_,
         QStringLiteral("--package-store=") + workerEnvironment_.packageRoot(),
         QStringLiteral("--sandbox-temp=") + workerEnvironment_.sandboxTempRoot(),
-        QStringLiteral("--runtime-root=") + workerEnvironment_.runtimeRoot(),
-        QStringLiteral("--worker-executable=") + workerEnvironment_.workerExecutable(),
+        QStringLiteral("--runtime-root=") + runtimeRoot_,
+        QStringLiteral("--worker-executable=") + workerExecutable_,
         QStringLiteral("--telemetry-directory=") + telemetry_.path(),
         QStringLiteral("--storage-directory=") + storage_.path(),
+        QStringLiteral("--deployment-root=") + deployment_.path(),
+        QStringLiteral("--browser-state-directory=") + browserState_.path(),
         QStringLiteral("--install-package=") + package,
         QStringLiteral("--health-window-ms=2000"),
         // Package fixture creation is synchronous in this test harness and can
         // stall its event loop while Debug binaries are cold.  Keep production
         // heartbeat behavior under test without treating fixture work as a crash.
         QStringLiteral("--heartbeat-timeout-ms=60000")};
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeParseContext parseContext;
+    parseContext.currentHostExecutable = HostOwnedFileAuthority::open(
+        hostExecutableEvidence_);
+    if (!parseContext.currentHostExecutable) {
+        error_ = QStringLiteral("protected Host executable evidence is unavailable");
+        return false;
+    }
+    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(
+        arguments, parseContext);
     if (!parsed.value.has_value()) {
         error_ = parsed.stableError;
         return false;

@@ -133,6 +133,81 @@ bool finalPathIsWithin(const QString &root, const QString &candidate)
         || foldedCandidate.startsWith(foldedRoot + QLatin1Char('\\'));
 }
 
+bool handleHasRestrictedTrustAcl(HANDLE handle)
+{
+    if (handle == INVALID_HANDLE_VALUE || handle == nullptr) return false;
+    HANDLE rawToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken) == FALSE) {
+        return false;
+    }
+    UniqueWindowsHandle token(rawToken);
+    DWORD tokenBytes = 0;
+    (void)GetTokenInformation(token.get(), TokenUser, nullptr, 0, &tokenBytes);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || tokenBytes == 0) {
+        return false;
+    }
+    QByteArray tokenStorage(static_cast<qsizetype>(tokenBytes), Qt::Uninitialized);
+    if (GetTokenInformation(token.get(), TokenUser, tokenStorage.data(),
+                            tokenBytes, &tokenBytes) == FALSE) {
+        return false;
+    }
+    const auto *tokenUser = reinterpret_cast<const TOKEN_USER *>(
+        tokenStorage.constData());
+    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD systemBytes = sizeof(systemBuffer);
+    if (CreateWellKnownSid(WinLocalSystemSid, nullptr, systemBuffer,
+                           &systemBytes) == FALSE) {
+        return false;
+    }
+
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD security = GetSecurityInfo(
+        handle, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, nullptr, &dacl, nullptr, &descriptor);
+    if (security != ERROR_SUCCESS || descriptor == nullptr || owner == nullptr
+        || dacl == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    bool valid = GetSecurityDescriptorControl(
+                     descriptor, &control, &revision) != FALSE
+        && (control & SE_DACL_PROTECTED) != 0
+        && (EqualSid(owner, tokenUser->User.Sid) != FALSE
+            || EqualSid(owner, systemBuffer) != FALSE);
+    bool userAllowed = false;
+    bool systemAllowed = false;
+    for (DWORD index = 0; valid && index < dacl->AceCount; ++index) {
+        void *rawAce = nullptr;
+        if (GetAce(dacl, index, &rawAce) == FALSE || rawAce == nullptr) {
+            valid = false;
+            break;
+        }
+        const auto *header = static_cast<const ACE_HEADER *>(rawAce);
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            valid = false;
+            break;
+        }
+        const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(rawAce);
+        PSID sid = const_cast<DWORD *>(&ace->SidStart);
+        const bool isUser = EqualSid(sid, tokenUser->User.Sid) != FALSE;
+        const bool isSystem = EqualSid(sid, systemBuffer) != FALSE;
+        if (!isUser && !isSystem) {
+            valid = false;
+            break;
+        }
+        userAllowed = userAllowed || isUser;
+        systemAllowed = systemAllowed || isSystem;
+    }
+    LocalFree(descriptor);
+    return valid && userAllowed && systemAllowed;
+}
+
 bool sealHandleMutations(
     HANDLE handle,
     const bool directory,
@@ -470,6 +545,37 @@ bool WindowsStableDirectoryTree::isStable() const
     return true;
 }
 
+bool WindowsStableDirectoryTree::rootHasRestrictedTrustAcl() const
+{
+    const auto root = std::find_if(
+        m_directories.cbegin(), m_directories.cend(),
+        [this](const DirectoryRecord &record) {
+            return record.key == m_rootKey;
+        });
+    return root != m_directories.cend() && root->handle.isValid()
+        && handleHasRestrictedTrustAcl(root->handle.get());
+}
+
+bool WindowsStableDirectoryTree::isSameRootIdentityAt(
+    const QString &path) const
+{
+    const auto root = std::find_if(
+        m_directories.cbegin(), m_directories.cend(),
+        [this](const DirectoryRecord &record) {
+            return record.key == m_rootKey;
+        });
+    if (root == m_directories.cend() || !root->handle.isValid()) return false;
+    UniqueWindowsHandle reopened = openDirectory(
+        absolutePath(path), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    WindowsFileIdentity identity;
+    QString finalPath;
+    return reopened.isValid()
+        && queryHandle(reopened.get(), true, identity, finalPath)
+        && identity == root->identity
+        && finalPath.toCaseFolded() == root->finalPath.toCaseFolded();
+}
+
 bool WindowsStableDirectoryTree::publishRootNoReplace(
     const QString &destination,
     const WindowsStableDirectoryTree &destinationTree)
@@ -675,6 +781,7 @@ bool WindowsStableDirectoryTree::addDirectory(
         || key.startsWith(m_rootKey + QLatin1Char('\\'));
     const bool lockMembers = m_movableRoot && lockRename;
     const DWORD desiredAccess = FILE_READ_ATTRIBUTES
+        | (key == m_rootKey ? READ_CONTROL : 0U)
         | ((lockMembers || immutable) ? FILE_LIST_DIRECTORY : 0U)
         | (lockMembers ? READ_CONTROL | WRITE_DAC : 0U)
         | ((!immutable && (created || lockRename)) ? DELETE : 0U);
@@ -904,77 +1011,16 @@ bool WindowsStableFile::readBounded(const quint64 maximum, QByteArray &bytes)
 
 bool WindowsStableFile::hasRestrictedTrustAcl() const
 {
-    if (!m_handle.isValid()) return false;
-    HANDLE rawToken = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken) == FALSE) {
-        return false;
-    }
-    UniqueWindowsHandle token(rawToken);
-    DWORD tokenBytes = 0;
-    (void)GetTokenInformation(token.get(), TokenUser, nullptr, 0, &tokenBytes);
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || tokenBytes == 0) {
-        return false;
-    }
-    QByteArray tokenStorage(static_cast<qsizetype>(tokenBytes), Qt::Uninitialized);
-    if (GetTokenInformation(token.get(), TokenUser, tokenStorage.data(),
-                            tokenBytes, &tokenBytes) == FALSE) {
-        return false;
-    }
-    const auto *tokenUser = reinterpret_cast<const TOKEN_USER *>(
-        tokenStorage.constData());
-    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
-    DWORD systemBytes = sizeof(systemBuffer);
-    if (CreateWellKnownSid(WinLocalSystemSid, nullptr, systemBuffer,
-                           &systemBytes) == FALSE) {
-        return false;
-    }
+    return m_handle.isValid()
+        && handleHasRestrictedTrustAcl(m_handle.get());
+}
 
-    PSID owner = nullptr;
-    PACL dacl = nullptr;
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    const DWORD security = GetSecurityInfo(
-        m_handle.get(), SE_FILE_OBJECT,
-        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &owner, nullptr, &dacl, nullptr, &descriptor);
-    if (security != ERROR_SUCCESS || descriptor == nullptr || owner == nullptr
-        || dacl == nullptr) {
-        if (descriptor != nullptr) LocalFree(descriptor);
-        return false;
-    }
-    SECURITY_DESCRIPTOR_CONTROL control = 0;
-    DWORD revision = 0;
-    bool valid = GetSecurityDescriptorControl(
-                     descriptor, &control, &revision) != FALSE
-        && (control & SE_DACL_PROTECTED) != 0
-        && (EqualSid(owner, tokenUser->User.Sid) != FALSE
-            || EqualSid(owner, systemBuffer) != FALSE);
-    bool userAllowed = false;
-    bool systemAllowed = false;
-    for (DWORD index = 0; valid && index < dacl->AceCount; ++index) {
-        void *rawAce = nullptr;
-        if (GetAce(dacl, index, &rawAce) == FALSE || rawAce == nullptr) {
-            valid = false;
-            break;
-        }
-        const auto *header = static_cast<const ACE_HEADER *>(rawAce);
-        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
-        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
-            valid = false;
-            break;
-        }
-        const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(rawAce);
-        PSID sid = const_cast<DWORD *>(&ace->SidStart);
-        const bool isUser = EqualSid(sid, tokenUser->User.Sid) != FALSE;
-        const bool isSystem = EqualSid(sid, systemBuffer) != FALSE;
-        if (!isUser && !isSystem) {
-            valid = false;
-            break;
-        }
-        userAllowed = userAllowed || isUser;
-        systemAllowed = systemAllowed || isSystem;
-    }
-    LocalFree(descriptor);
-    return valid && userAllowed && systemAllowed;
+bool WindowsStableFile::hasSingleLink() const
+{
+    BY_HANDLE_FILE_INFORMATION information{};
+    return m_handle.isValid()
+        && GetFileInformationByHandle(m_handle.get(), &information) != FALSE
+        && information.nNumberOfLinks == 1U;
 }
 
 bool WindowsStableFile::publishNoReplace(

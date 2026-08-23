@@ -1,4 +1,5 @@
 #include "HostApplication.h"
+#include "HostOwnedFileAuthority.h"
 #include "WorkerRetirementManager.h"
 
 #include <QApplication>
@@ -30,7 +31,12 @@ int main(int argc, char **argv)
     QCoreApplication::setOrganizationName(QStringLiteral("QBrowser"));
     QStringList arguments = QCoreApplication::arguments();
     if (!arguments.isEmpty()) arguments.removeFirst();
-    HostRuntimeConfigResult parsed = HostRuntimeConfig::fromArguments(arguments);
+    HostRuntimeConfigResult parsed = [&arguments] {
+        HostRuntimeParseContext parseContext;
+        parseContext.currentHostExecutable =
+            HostOwnedFileAuthority::openCurrentProcessExecutable();
+        return HostRuntimeConfig::fromArguments(arguments, parseContext);
+    }();
     if (!parsed.value.has_value()) return 64;
     recordHostDiagnosticPhase("arguments-parsed");
     int applicationResult = 64;

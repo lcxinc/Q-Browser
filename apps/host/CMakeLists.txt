@@ -9,6 +9,10 @@ add_library(q_browser_host STATIC
   HostApplication.h
   HostCapabilityRuntime.cpp
   HostCapabilityRuntime.h
+  HostOwnedFileAuthority.cpp
+  HostOwnedFileAuthority.h
+  HostOwnedStateDirectory.cpp
+  HostOwnedStateDirectory.h
   HostRuntimeConfig.cpp
   HostRuntimeConfig.h
   InstalledPackageWorkerLauncher.cpp
