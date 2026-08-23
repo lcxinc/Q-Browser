@@ -1460,11 +1460,11 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
         $Worker, [string]$Telemetry, [string]$MockOutput, [string]$Storage,
         [string]$SelectedFile) {
     $automation = New-DeployedHostAutomation $HostProcess
-    $window = Get-DeployedWorkerWindow $HostProcess $Worker
 
     $loginBefore = Get-MockRequestCount $MockOutput 'POST' '/api/login'
     $dashboardBefore = Get-MockRequestCount $MockOutput 'GET' '/api/dashboard'
     Invoke-DeployedNavigation $automation 'app://pilot/login' $Telemetry '/login'
+    $window = Get-DeployedWorkerWindow $HostProcess $Worker
     $focused = $false
     1..3 | ForEach-Object {
         if (-not $focused) {
@@ -1568,8 +1568,8 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
 function Assert-DeployedStoragePersistence([Diagnostics.Process]$HostProcess, $Worker,
         [string]$Telemetry, [string]$Storage) {
     $automation = New-DeployedHostAutomation $HostProcess
-    $window = Get-DeployedWorkerWindow $HostProcess $Worker
     Invoke-DeployedNavigation $automation 'app://pilot/settings' $Telemetry '/settings'
+    $window = Get-DeployedWorkerWindow $HostProcess $Worker
     # Light is enabled only after the restarted Worker consumes the persisted
     # dark value. One non-retried side-effect click must persist the successor.
     if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 328, 140)) {
@@ -1580,7 +1580,9 @@ function Assert-DeployedStoragePersistence([Diagnostics.Process]$HostProcess, $W
 }
 
 function Invoke-DeployedClipboardAcceptance([Diagnostics.Process]$HostProcess, $Worker,
-        [string]$Storage) {
+        [string]$Telemetry, [string]$Storage) {
+    $automation = New-DeployedHostAutomation $HostProcess
+    Invoke-DeployedNavigation $automation 'app://pilot/dashboard' $Telemetry '/dashboard'
     $window = Get-DeployedWorkerWindow $HostProcess $Worker
     Wait-StorageValue $Storage 'clipboard-no-gesture' 'clipboard.gesture_required'
     Wait-StorageValue $Storage 'clipboard-undeclared' 'capability.denied'
@@ -2078,7 +2080,7 @@ Rectangle {
         [void]$ownedPids.Add([int]$clipboardWorker.ProcessId)
         Wait-Telemetry $telemetry `
             '"packageVersion":"1\.2\.0","phase":"health","code":"healthy"' 30000
-        Invoke-DeployedClipboardAcceptance $thirdHost $clipboardWorker $storage
+        Invoke-DeployedClipboardAcceptance $thirdHost $clipboardWorker $telemetry $storage
         Stop-OwnedHost $thirdHost
         if ($thirdHost.ExitCode -ne 0) {
             throw "Clipboard deployed Host cleanup exited $($thirdHost.ExitCode)."

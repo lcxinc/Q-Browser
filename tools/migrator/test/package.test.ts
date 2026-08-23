@@ -44,11 +44,34 @@ describe("migrator production package", () => {
 });
 
 describe("release acceptance script", () => {
+  async function releaseFunction(name: string): Promise<string> {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    const start = script.indexOf(`function ${name}(`);
+    const end = script.indexOf("\nfunction ", start + 1);
+    expect(start, `${name} must exist`).toBeGreaterThanOrEqual(0);
+    return script.slice(start, end < 0 ? undefined : end);
+  }
+
   test("does not shadow PowerShell's read-only Host automatic variable", async () => {
     const script = await readFile(
       path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
       "utf8",
     );
     expect(script).not.toMatch(/function\s+[\w-]+\([^)]*\$Host(?:\W|$)/su);
+  });
+
+  test.each([
+    "Invoke-DeployedPilotBusinessAcceptance",
+    "Assert-DeployedStoragePersistence",
+    "Invoke-DeployedClipboardAcceptance",
+  ])("activates the Worker surface before native discovery in %s", async (name) => {
+    const source = await releaseFunction(name);
+    const activation = source.indexOf("Invoke-DeployedNavigation");
+    const discovery = source.indexOf("Get-DeployedWorkerWindow");
+    expect(activation, `${name} must activate a Worker route`).toBeGreaterThanOrEqual(0);
+    expect(discovery, `${name} must discover the Worker HWND`).toBeGreaterThan(activation);
   });
 });
