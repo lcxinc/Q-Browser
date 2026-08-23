@@ -450,21 +450,23 @@ namespace QBrowser.Task18 {
       } finally { ReleaseDC(IntPtr.Zero, dc); }
     }
     public static int DarkPixels(IntPtr window, int x, int y, int width, int height) {
-      Point origin = new Point(); origin.x = x; origin.y = y;
-      if (!ClientToScreen(window, ref origin)) return -1;
-      IntPtr dc = GetDC(IntPtr.Zero); if (dc == IntPtr.Zero) return -1;
-      try {
-        int dark = 0;
-        for (int row = origin.y; row < origin.y + height; row++) {
-          for (int column = origin.x; column < origin.x + width; column++) {
-            uint color = GetPixel(dc, column, row);
-            if (color != 0xffffffff && (color & 0xff) < 100
-                && ((color >> 8) & 0xff) < 100
-                && ((color >> 16) & 0xff) < 100) dark++;
-          }
+      Rect rect;
+      if (!GetClientRect(window, out rect)) return -1;
+      int clientWidth = rect.right - rect.left, clientHeight = rect.bottom - rect.top;
+      if (x < 0 || y < 0 || width <= 0 || height <= 0
+          || x + width > clientWidth || y + height > clientHeight) return -1;
+      byte[] pixels = CaptureClient(window);
+      if (pixels == null || pixels.Length != checked(clientWidth * clientHeight * 4))
+        return -1;
+      int dark = 0;
+      for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+          int index = checked((row * clientWidth + column) * 4);
+          if (pixels[index + 2] < 100 && pixels[index + 1] < 100
+              && pixels[index] < 100) dark++;
         }
-        return dark;
-      } finally { ReleaseDC(IntPtr.Zero, dc); }
+      }
+      return dark;
     }
     public static bool SetClipboardText(string text) {
       if (text == null || !OpenClipboard(IntPtr.Zero)) return false;

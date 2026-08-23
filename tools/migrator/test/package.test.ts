@@ -101,7 +101,8 @@ describe("release acceptance script", () => {
       "utf8",
     );
     const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
-    expect(script.match(/GetDC\(IntPtr\.Zero\)/gu)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    expect(script.match(/GetDC\(IntPtr\.Zero\)/gu)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    expect(script).toContain("byte[] pixels = CaptureClient(window);");
     expect(business).toContain("$scaleY = $clientHeight / 679.0");
     expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
     expect(business).not.toContain("Invoke-DeployedNamedControl");
