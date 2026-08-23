@@ -63,6 +63,15 @@ describe("release acceptance script", () => {
     expect(script).not.toMatch(/function\s+[\w-]+\([^)]*\$Host(?:\W|$)/su);
   });
 
+  test("guards optional mock request records under StrictMode", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    expect(script).not.toContain("$null -ne $message.request");
+    expect(script.match(/\$message\.PSObject\.Properties\['request'\]/gu)).toHaveLength(2);
+  });
+
   test.each([
     "Invoke-DeployedPilotBusinessAcceptance",
     "Assert-DeployedStoragePersistence",

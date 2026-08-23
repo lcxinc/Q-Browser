@@ -1342,7 +1342,7 @@ function Wait-MockRequest([string]$MockOutput, [string]$Method,
         }
         foreach ($line in Get-Content -LiteralPath $MockOutput -ErrorAction SilentlyContinue) {
             try { $message = $line | ConvertFrom-Json } catch { continue }
-            if ($null -ne $message.request -and
+            if ($null -ne $message.PSObject.Properties['request'] -and
                 [string]$message.request.method -eq $Method -and
                 [string]$message.request.target -eq $Target) {
                 return $true
@@ -1358,7 +1358,7 @@ function Get-MockRequestCount([string]$MockOutput, [string]$Method,
     $count = 0
     foreach ($line in Get-Content -LiteralPath $MockOutput -ErrorAction SilentlyContinue) {
         try { $message = $line | ConvertFrom-Json } catch { continue }
-        if ($null -ne $message.request -and
+        if ($null -ne $message.PSObject.Properties['request'] -and
             [string]$message.request.method -eq $Method -and
             [string]$message.request.target -eq $Target) {
             ++$count
