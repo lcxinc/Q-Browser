@@ -234,7 +234,7 @@ namespace QBrowser.Task18 {
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] static extern bool PostMessageW(
       IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")] static extern IntPtr SendMessageW(
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessageW(
       IntPtr window, uint message, IntPtr wParam, string lParam);
     [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)]
     static extern IntPtr SendMessageTextW(IntPtr window, uint message, IntPtr wParam,
@@ -421,7 +421,7 @@ namespace QBrowser.Task18 {
       bool readbackMatches = readLength > 0 && readback.ToString() == path;
       IntPtr outer = GetAncestor(information.focus, GaRoot);
       IntPtr accept = GetDlgItem(outer, IdOk);
-      bool posted = accept != IntPtr.Zero
+      bool posted = readbackMatches && accept != IntPtr.Zero
         && PostMessageW(accept, BmClick, IntPtr.Zero, IntPtr.Zero);
       FileDialogDiagnostic = "focusClass=" + focusClass + " focusId="
         + GetDlgCtrlID(information.focus) + " readbackMatch=" + readbackMatches
