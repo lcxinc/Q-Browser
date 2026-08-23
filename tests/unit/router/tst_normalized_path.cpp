@@ -55,6 +55,12 @@ void NormalizedPathTest::rejectsUnsafeOrNonCanonicalPath_data()
                                          << NormalizedPathError::NonCanonicalEncoding;
     QTest::newRow("invalid-utf8") << QStringLiteral("/orders/%FF")
                                    << NormalizedPathError::InvalidUtf8;
+    QTest::newRow("truncated-2-byte-utf8") << QStringLiteral("/orders/%C2")
+                                            << NormalizedPathError::InvalidUtf8;
+    QTest::newRow("truncated-3-byte-utf8") << QStringLiteral("/orders/%E2%82")
+                                            << NormalizedPathError::InvalidUtf8;
+    QTest::newRow("truncated-4-byte-utf8") << QStringLiteral("/orders/%F0%9F%98")
+                                            << NormalizedPathError::InvalidUtf8;
     QTest::newRow("decoded-forward-slash") << QStringLiteral("/orders/acme%2Fadmin")
                                             << NormalizedPathError::DecodedSeparator;
     QTest::newRow("decoded-backslash") << QStringLiteral("/orders/acme%5Cadmin")

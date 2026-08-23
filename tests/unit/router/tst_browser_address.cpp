@@ -240,6 +240,12 @@ void BrowserAddressTest::rejectsUnsafeOrNonCanonicalQuery_data()
     QTest::newRow("encoded-backslash") << QStringLiteral("q=%5C");
     QTest::newRow("invalid-utf8") << QStringLiteral("q=%FF");
     QTest::newRow("overlong-utf8") << QStringLiteral("q=%C0%AF");
+    QTest::newRow("truncated-2-byte-utf8") << QStringLiteral("q=%C2");
+    QTest::newRow("truncated-3-byte-utf8") << QStringLiteral("q=%E2%82");
+    QTest::newRow("truncated-4-byte-utf8") << QStringLiteral("q=%F0%9F%98");
+    QTest::newRow("valid-unicode-then-truncated") << QStringLiteral("q=%C2%A1%C2");
+    QTest::newRow("truncated-then-literal") << QStringLiteral("q=%C2A");
+    QTest::newRow("truncated-then-encoded-reserved") << QStringLiteral("q=%C2%2F");
     QTest::newRow("utf8-surrogate") << QStringLiteral("q=%ED%A0%80");
     QTest::newRow("utf8-out-of-range") << QStringLiteral("q=%F4%90%80%80");
     QTest::newRow("unicode-control") << QStringLiteral("q=%C2%80");
@@ -267,6 +273,9 @@ void BrowserAddressTest::rejectsInvalidApplicationPath_data()
     QTest::newRow("traversal") << QStringLiteral("app://pilot/orders/../secret");
     QTest::newRow("encoded-separator") << QStringLiteral("app://pilot/orders%2Fsecret");
     QTest::newRow("invalid-utf8") << QStringLiteral("app://pilot/orders/%FF");
+    QTest::newRow("truncated-2-byte-utf8") << QStringLiteral("app://pilot/orders/%C2");
+    QTest::newRow("truncated-3-byte-utf8") << QStringLiteral("app://pilot/orders/%E2%82");
+    QTest::newRow("truncated-4-byte-utf8") << QStringLiteral("app://pilot/orders/%F0%9F%98");
     QTest::newRow("fragment") << QStringLiteral("app://pilot/orders#history");
 }
 

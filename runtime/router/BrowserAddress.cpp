@@ -159,7 +159,7 @@ constexpr qsizetype MaximumAddressBytes = 2048;
             index += 3;
         }
 
-        QStringDecoder decoder(QStringDecoder::Utf8);
+        QStringDecoder decoder(QStringDecoder::Utf8, QStringConverter::Flag::Stateless);
         const QString decoded = decoder(encodedBytes);
         if (decoder.hasError() || !isSafeDecodedUnicode(decoded)) {
             return false;

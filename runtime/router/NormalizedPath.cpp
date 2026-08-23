@@ -100,7 +100,7 @@ namespace {
         bytes.append(static_cast<char>(character.unicode()));
     }
 
-    QStringDecoder decoder(QStringDecoder::Utf8);
+    QStringDecoder decoder(QStringDecoder::Utf8, QStringConverter::Flag::Stateless);
     decoded = decoder(bytes);
     if (decoder.hasError()) {
         return NormalizedPathError::InvalidUtf8;
