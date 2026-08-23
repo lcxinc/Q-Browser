@@ -25,6 +25,11 @@ template <typename T>
 concept HasCookie = requires(T value) { value.cookie; };
 template <typename T>
 concept HasGrant = requires(T value) { value.grant; };
+template <typename T>
+concept HasContentIdentitySetter = requires(
+    T value, BrowserContentIdentity identity) {
+    value.setContentIdentity(identity);
+};
 
 static_assert(std::is_copy_constructible_v<BrowserTabSnapshot>);
 static_assert(!HasPid<BrowserTabSnapshot>);
@@ -35,6 +40,7 @@ static_assert(!HasRequest<BrowserTabSnapshot>);
 static_assert(!HasCapability<BrowserTabSnapshot>);
 static_assert(!HasCookie<BrowserTabSnapshot>);
 static_assert(!HasGrant<BrowserTabSnapshot>);
+static_assert(!HasContentIdentitySetter<BrowserTabModel>);
 
 QString validId(int value)
 {
@@ -83,6 +89,9 @@ private slots:
     void refusesSeventeenthTabWithoutChangingAnything();
     void stableIdsSurviveTabBarStyleReordering();
     void historiesAreIndependentAndSuppressCurrentDuplicates();
+    void validatedRouteNavigationChangesKindAndIdentity();
+    void backAndForwardCommitValidatedTargetKindAtomically();
+    void invalidValidatedKindOperationsAreAtomicAndSilent();
     void backForwardBranchingAndHistoryBoundAreExact();
     void recentlyClosedIsASixteenEntryLifo();
     void reopenUsesFreshIdentityAndOnlyRestoresDescriptorState();
@@ -390,7 +399,8 @@ void BrowserTabModelTest::historiesAreIndependentAndSuppressCurrentDuplicates()
     QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
     QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
 
-    QVERIFY(model.navigateTab(first, QStringLiteral("app://pilot/orders/42")));
+    QVERIFY(model.navigateTab(first, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/42")));
     QCOMPARE(model.snapshotAt(model.indexOfId(first)).history,
              QStringList({QStringLiteral("app://pilot/orders"),
                           QStringLiteral("app://pilot/orders/42")}));
@@ -402,14 +412,15 @@ void BrowserTabModelTest::historiesAreIndependentAndSuppressCurrentDuplicates()
 
     changed.clear();
     persistence.clear();
-    QVERIFY(model.navigateTab(first, QStringLiteral("app://pilot/orders/42")));
+    QVERIFY(model.navigateTab(first, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/42")));
     QCOMPARE(changed.count(), 0);
     QCOMPARE(persistence.count(), 0);
     QCOMPARE(model.snapshotAt(model.indexOfId(first)).history.size(), 2);
 
-    QVERIFY(!model.navigateTab(QStringLiteral("missing"),
+    QVERIFY(!model.navigateTab(QStringLiteral("missing"), BrowserTabKind::App,
                                QStringLiteral("app://pilot/orders")));
-    QVERIFY(!model.navigateTab(first, QString()));
+    QVERIFY(!model.navigateTab(first, BrowserTabKind::App, QString()));
     QCOMPARE(changed.count(), 0);
     QCOMPARE(persistence.count(), 0);
 }
@@ -420,14 +431,16 @@ void BrowserTabModelTest::backForwardBranchingAndHistoryBoundAreExact()
     const QString id = model.createTab(BrowserTabKind::App,
                                        QStringLiteral("Orders"),
                                        QStringLiteral("app://pilot/orders/0"));
-    QVERIFY(model.navigateTab(id, QStringLiteral("app://pilot/orders/1")));
-    QVERIFY(model.navigateTab(id, QStringLiteral("app://pilot/orders/2")));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/1")));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/2")));
     QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
     QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
 
     QVERIFY(model.canGoBack(id));
     QVERIFY(!model.canGoForward(id));
-    QVERIFY(model.goBack(id));
+    QVERIFY(model.goBack(id, BrowserTabKind::App));
     QCOMPARE(model.snapshotAt(0).address, QStringLiteral("app://pilot/orders/1"));
     QCOMPARE(model.snapshotAt(0).historyIndex, 1);
     QCOMPARE(changed.count(), 1);
@@ -435,7 +448,8 @@ void BrowserTabModelTest::backForwardBranchingAndHistoryBoundAreExact()
 
     changed.clear();
     persistence.clear();
-    QVERIFY(model.navigateTab(id, QStringLiteral("app://pilot/orders/1")));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/1")));
     QCOMPARE(model.snapshotAt(0).history,
              QStringList({QStringLiteral("app://pilot/orders/0"),
                           QStringLiteral("app://pilot/orders/1"),
@@ -445,29 +459,30 @@ void BrowserTabModelTest::backForwardBranchingAndHistoryBoundAreExact()
     QCOMPARE(changed.count(), 0);
     QCOMPARE(persistence.count(), 0);
 
-    QVERIFY(model.goBack(id));
-    QVERIFY(!model.goBack(id));
+    QVERIFY(model.goBack(id, BrowserTabKind::App));
+    QVERIFY(!model.goBack(id, BrowserTabKind::App));
     QCOMPARE(model.snapshotAt(0).historyIndex, 0);
     QCOMPARE(changed.count(), 1);
     QCOMPARE(persistence.count(), 1);
 
     changed.clear();
     persistence.clear();
-    QVERIFY(model.goForward(id));
+    QVERIFY(model.goForward(id, BrowserTabKind::App));
     QCOMPARE(model.snapshotAt(0).historyIndex, 1);
     QCOMPARE(changed.count(), 1);
     QCOMPARE(persistence.count(), 1);
 
     changed.clear();
     persistence.clear();
-    QVERIFY(model.navigateTab(id, QStringLiteral("app://pilot/orders/branch")));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/branch")));
     QCOMPARE(model.snapshotAt(0).history,
              QStringList({QStringLiteral("app://pilot/orders/0"),
                           QStringLiteral("app://pilot/orders/1"),
                           QStringLiteral("app://pilot/orders/branch")}));
     QCOMPARE(model.snapshotAt(0).historyIndex, 2);
     QVERIFY(!model.canGoForward(id));
-    QVERIFY(!model.goForward(id));
+    QVERIFY(!model.goForward(id, BrowserTabKind::App));
     QCOMPARE(changed.count(), 1);
     QCOMPARE(persistence.count(), 1);
 
@@ -477,7 +492,8 @@ void BrowserTabModelTest::backForwardBranchingAndHistoryBoundAreExact()
         QStringLiteral("app://pilot/orders/0"));
     for (int index = 1; index <= 300; ++index) {
         QVERIFY(bounded.navigateTab(
-            boundedId, QStringLiteral("app://pilot/orders/%1").arg(index)));
+            boundedId, BrowserTabKind::App,
+            QStringLiteral("app://pilot/orders/%1").arg(index)));
     }
     const BrowserTabSnapshot boundedSnapshot = bounded.snapshotAt(0);
     QCOMPARE(boundedSnapshot.history.size(), BrowserTabModel::MaxHistoryEntries);
@@ -487,6 +503,251 @@ void BrowserTabModelTest::backForwardBranchingAndHistoryBoundAreExact()
              QStringLiteral("app://pilot/orders/45"));
     QCOMPARE(boundedSnapshot.history.last(),
              QStringLiteral("app://pilot/orders/300"));
+}
+
+void BrowserTabModelTest::validatedRouteNavigationChangesKindAndIdentity()
+{
+    BrowserTabModel model;
+    const QString id = model.createTab(BrowserTabKind::Host,
+                                       QStringLiteral("New tab"),
+                                       QStringLiteral("qbrowser://newtab"));
+
+    // The caller has already resolved this logical address to the Web engine.
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+
+    QVERIFY(model.setLifecycle(id, BrowserTabLifecycle::Active));
+    QVERIFY(model.setLoadState(id, true, 67));
+    QVERIFY(model.setVisualState(id, BrowserVisualState::Crashed));
+    changed.clear();
+
+    QVERIFY(model.navigateTab(id, BrowserTabKind::Web,
+                              QStringLiteral("app://pilot/help")));
+
+    QCOMPARE(model.snapshotAt(0).id, id);
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::Web);
+    QCOMPARE(model.snapshotAt(0).address, QStringLiteral("app://pilot/help"));
+    QCOMPARE(model.snapshotAt(0).history,
+             QStringList({QStringLiteral("qbrowser://newtab"),
+                          QStringLiteral("app://pilot/help")}));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 1);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::RestrictedWeb);
+    QCOMPARE(model.lifecycleAt(0), BrowserTabLifecycle::Dormant);
+    QCOMPARE(model.presentationAt(0).loading, false);
+    QCOMPARE(model.presentationAt(0).progress, 0);
+    QCOMPARE(model.presentationAt(0).visualState, BrowserVisualState::Normal);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(changed.at(0).at(0).toInt(), 0);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.setLifecycle(id, BrowserTabLifecycle::Loading));
+    QVERIFY(model.setLoadState(id, true, 35));
+    QVERIFY(model.setVisualState(id, BrowserVisualState::Recovering));
+    changed.clear();
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders")));
+    QCOMPARE(model.snapshotAt(0).id, id);
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::App);
+    QCOMPARE(model.snapshotAt(0).address,
+             QStringLiteral("app://pilot/orders"));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 2);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::SignedApplication);
+    QCOMPARE(model.lifecycleAt(0), BrowserTabLifecycle::Dormant);
+    QCOMPARE(model.presentationAt(0).loading, false);
+    QCOMPARE(model.presentationAt(0).progress, 0);
+    QCOMPARE(model.presentationAt(0).visualState, BrowserVisualState::Normal);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    const int historySize = static_cast<int>(model.snapshotAt(0).history.size());
+    QVERIFY(model.setLifecycle(id, BrowserTabLifecycle::Active));
+    QVERIFY(model.setLoadState(id, true, 81));
+    QVERIFY(model.setVisualState(id, BrowserVisualState::Crashed));
+    changed.clear();
+    QVERIFY(model.navigateTab(id, BrowserTabKind::TrustedError,
+                              QStringLiteral("app://pilot/orders")));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::TrustedError);
+    QCOMPARE(model.snapshotAt(0).history.size(), historySize);
+    QCOMPARE(model.snapshotAt(0).historyIndex, 2);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::QBrowser);
+    QCOMPARE(model.lifecycleAt(0), BrowserTabLifecycle::Dormant);
+    QCOMPARE(model.presentationAt(0).loading, false);
+    QCOMPARE(model.presentationAt(0).progress, 0);
+    QCOMPARE(model.presentationAt(0).visualState,
+             BrowserVisualState::TrustedError);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders")));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::App);
+    QCOMPARE(model.snapshotAt(0).history.size(), historySize);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::SignedApplication);
+    QCOMPARE(model.presentationAt(0).visualState, BrowserVisualState::Normal);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders")));
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(persistence.count(), 0);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+}
+
+void BrowserTabModelTest::backAndForwardCommitValidatedTargetKindAtomically()
+{
+    BrowserTabModel model;
+    const QString id = model.createTab(BrowserTabKind::Host,
+                                       QStringLiteral("Routes"),
+                                       QStringLiteral("qbrowser://newtab"));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::Web,
+                              QStringLiteral("app://pilot/help")));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders")));
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+
+    QVERIFY(model.setLifecycle(id, BrowserTabLifecycle::Active));
+    QVERIFY(model.setLoadState(id, true, 91));
+    QVERIFY(model.setVisualState(id, BrowserVisualState::Crashed));
+    changed.clear();
+    QVERIFY(model.goBack(id, BrowserTabKind::Web));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 1);
+    QCOMPARE(model.snapshotAt(0).address, QStringLiteral("app://pilot/help"));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::Web);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::RestrictedWeb);
+    QCOMPARE(model.lifecycleAt(0), BrowserTabLifecycle::Dormant);
+    QCOMPARE(model.presentationAt(0).loading, false);
+    QCOMPARE(model.presentationAt(0).progress, 0);
+    QCOMPARE(model.presentationAt(0).visualState, BrowserVisualState::Normal);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.goBack(id, BrowserTabKind::Host));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 0);
+    QCOMPARE(model.snapshotAt(0).address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::Host);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::QBrowser);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.goForward(id, BrowserTabKind::Web));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 1);
+    QCOMPARE(model.snapshotAt(0).address, QStringLiteral("app://pilot/help"));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::Web);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::RestrictedWeb);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    changed.clear();
+    persistence.clear();
+    QVERIFY(model.goForward(id, BrowserTabKind::App));
+    QCOMPARE(model.snapshotAt(0).historyIndex, 2);
+    QCOMPARE(model.snapshotAt(0).address,
+             QStringLiteral("app://pilot/orders"));
+    QCOMPARE(model.snapshotAt(0).kind, BrowserTabKind::App);
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::SignedApplication);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+}
+
+void BrowserTabModelTest::invalidValidatedKindOperationsAreAtomicAndSilent()
+{
+    BrowserTabModel model;
+    const QString id = model.createTab(BrowserTabKind::Host,
+                                       QStringLiteral("Routes"),
+                                       QStringLiteral("qbrowser://newtab"));
+    QVERIFY(model.navigateTab(id, BrowserTabKind::Web,
+                              QStringLiteral("app://pilot/help")));
+    const auto invalidKind = static_cast<BrowserTabKind>(99);
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+    const BrowserTabSnapshot before = model.snapshotAt(0);
+    const BrowserTabLifecycle lifecycleBefore = model.lifecycleAt(0);
+    const BrowserTabPresentation presentationBefore = model.presentationAt(0);
+
+    QVERIFY(!model.navigateTab(id, invalidKind,
+                               QStringLiteral("app://pilot/orders")));
+    QVERIFY(!model.navigateTab(QStringLiteral("missing"), BrowserTabKind::App,
+                               QStringLiteral("app://pilot/orders")));
+    QVERIFY(!model.navigateTab(id, BrowserTabKind::App, QString()));
+    QVERIFY(!model.goBack(id, invalidKind));
+    QVERIFY(!model.goBack(QStringLiteral("missing"), BrowserTabKind::Host));
+    QVERIFY(!model.goForward(QStringLiteral("missing"), BrowserTabKind::Web));
+    QVERIFY(model.snapshotAt(0) == before);
+    QCOMPARE(model.lifecycleAt(0), lifecycleBefore);
+    QVERIFY(model.presentationAt(0) == presentationBefore);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(persistence.count(), 0);
+
+    QVERIFY(model.goBack(id, BrowserTabKind::Host));
+    changed.clear();
+    persistence.clear();
+    const BrowserTabSnapshot atStart = model.snapshotAt(0);
+    const BrowserTabPresentation startPresentation = model.presentationAt(0);
+    QVERIFY(!model.goBack(id, BrowserTabKind::App));
+    QVERIFY(!model.goForward(id, invalidKind));
+
+    QVERIFY(model.snapshotAt(0) == atStart);
+    QVERIFY(model.presentationAt(0) == startPresentation);
+    QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(active.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(persistence.count(), 0);
+
 }
 
 void BrowserTabModelTest::recentlyClosedIsASixteenEntryLifo()
@@ -531,9 +792,11 @@ void BrowserTabModelTest::reopenUsesFreshIdentityAndOnlyRestoresDescriptorState(
     const QString oldId = model.createTab(BrowserTabKind::App,
                                           QStringLiteral("Order details"),
                                           QStringLiteral("app://pilot/orders"));
-    QVERIFY(model.navigateTab(oldId, QStringLiteral("app://pilot/orders/42")));
-    QVERIFY(model.navigateTab(oldId, QStringLiteral("app://pilot/orders/43")));
-    QVERIFY(model.goBack(oldId));
+    QVERIFY(model.navigateTab(oldId, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/42")));
+    QVERIFY(model.navigateTab(oldId, BrowserTabKind::App,
+                              QStringLiteral("app://pilot/orders/43")));
+    QVERIFY(model.goBack(oldId, BrowserTabKind::App));
     QVERIFY(model.setLifecycle(oldId, BrowserTabLifecycle::Active));
     QVERIFY(model.setLoadState(oldId, true, 73));
     QVERIFY(model.setVisualState(oldId, BrowserVisualState::Crashed));

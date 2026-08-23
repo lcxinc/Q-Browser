@@ -111,11 +111,14 @@ public:
     [[nodiscard]] int recentlyClosedCount() const noexcept;
 
     [[nodiscard]] bool navigateTab(const QString &id,
+                                   BrowserTabKind validatedKind,
                                    const QString &canonicalAddress);
     [[nodiscard]] bool canGoBack(const QString &id) const noexcept;
     [[nodiscard]] bool canGoForward(const QString &id) const noexcept;
-    [[nodiscard]] bool goBack(const QString &id);
-    [[nodiscard]] bool goForward(const QString &id);
+    [[nodiscard]] bool goBack(const QString &id,
+                              BrowserTabKind validatedTargetKind);
+    [[nodiscard]] bool goForward(const QString &id,
+                                 BrowserTabKind validatedTargetKind);
 
     [[nodiscard]] bool setTitle(const QString &id, const QString &untrustedTitle);
     [[nodiscard]] bool setLifecycle(const QString &id,
@@ -162,6 +165,8 @@ private:
         BrowserTabKind kind) noexcept;
     [[nodiscard]] static BrowserVisualState defaultVisualStateFor(
         BrowserTabKind kind) noexcept;
+    static void applyValidatedKind(TabState &tab,
+                                   BrowserTabKind validatedKind) noexcept;
     [[nodiscard]] static TabState dormantState(BrowserTabSnapshot snapshot);
     [[nodiscard]] static bool isValidRestoredSnapshot(
         const BrowserTabSnapshot &snapshot);

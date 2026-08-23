@@ -259,14 +259,23 @@ int BrowserTabModel::recentlyClosedCount() const noexcept
 }
 
 bool BrowserTabModel::navigateTab(const QString &id,
+                                  BrowserTabKind validatedKind,
                                   const QString &canonicalAddress)
 {
     const int index = indexOfId(id);
-    if (index < 0 || canonicalAddress.isEmpty()) return false;
-    BrowserTabSnapshot &snapshot = tabs_[index].snapshot;
+    if (index < 0 || !isValidKind(validatedKind)
+        || canonicalAddress.isEmpty()) {
+        return false;
+    }
+    TabState &tab = tabs_[index];
+    BrowserTabSnapshot &snapshot = tab.snapshot;
     if (snapshot.historyIndex >= 0
         && snapshot.historyIndex < static_cast<int>(snapshot.history.size())
         && snapshot.history.at(snapshot.historyIndex) == canonicalAddress) {
+        if (snapshot.kind == validatedKind) return true;
+        applyValidatedKind(tab, validatedKind);
+        emit tabChanged(index);
+        emit persistenceNeeded();
         return true;
     }
 
@@ -280,6 +289,7 @@ bool BrowserTabModel::navigateTab(const QString &id,
     }
     snapshot.historyIndex = static_cast<int>(snapshot.history.size()) - 1;
     snapshot.address = canonicalAddress;
+    applyValidatedKind(tab, validatedKind);
     emit tabChanged(index);
     emit persistenceNeeded();
     return true;
@@ -300,25 +310,37 @@ bool BrowserTabModel::canGoForward(const QString &id) const noexcept
             < static_cast<int>(tabs_.at(index).snapshot.history.size());
 }
 
-bool BrowserTabModel::goBack(const QString &id)
+bool BrowserTabModel::goBack(const QString &id,
+                             BrowserTabKind validatedTargetKind)
 {
     const int index = indexOfId(id);
-    if (index < 0 || !canGoBack(id)) return false;
-    BrowserTabSnapshot &snapshot = tabs_[index].snapshot;
+    if (index < 0 || !isValidKind(validatedTargetKind)
+        || !canGoBack(id)) {
+        return false;
+    }
+    TabState &tab = tabs_[index];
+    BrowserTabSnapshot &snapshot = tab.snapshot;
     --snapshot.historyIndex;
     snapshot.address = snapshot.history.at(snapshot.historyIndex);
+    applyValidatedKind(tab, validatedTargetKind);
     emit tabChanged(index);
     emit persistenceNeeded();
     return true;
 }
 
-bool BrowserTabModel::goForward(const QString &id)
+bool BrowserTabModel::goForward(const QString &id,
+                                BrowserTabKind validatedTargetKind)
 {
     const int index = indexOfId(id);
-    if (index < 0 || !canGoForward(id)) return false;
-    BrowserTabSnapshot &snapshot = tabs_[index].snapshot;
+    if (index < 0 || !isValidKind(validatedTargetKind)
+        || !canGoForward(id)) {
+        return false;
+    }
+    TabState &tab = tabs_[index];
+    BrowserTabSnapshot &snapshot = tab.snapshot;
     ++snapshot.historyIndex;
     snapshot.address = snapshot.history.at(snapshot.historyIndex);
+    applyValidatedKind(tab, validatedTargetKind);
     emit tabChanged(index);
     emit persistenceNeeded();
     return true;
@@ -563,6 +585,17 @@ BrowserVisualState BrowserTabModel::defaultVisualStateFor(
     return kind == BrowserTabKind::TrustedError
         ? BrowserVisualState::TrustedError
         : BrowserVisualState::Normal;
+}
+
+void BrowserTabModel::applyValidatedKind(TabState &tab,
+                                         BrowserTabKind validatedKind) noexcept
+{
+    if (tab.snapshot.kind == validatedKind) return;
+    tab.snapshot.kind = validatedKind;
+    tab.lifecycle = BrowserTabLifecycle::Dormant;
+    tab.loading = false;
+    tab.progress = 0;
+    tab.visualState = defaultVisualStateFor(validatedKind);
 }
 
 BrowserTabModel::TabState BrowserTabModel::dormantState(
