@@ -72,6 +72,19 @@ describe("release acceptance script", () => {
     expect(script.match(/\$message\.PSObject\.Properties\['request'\]/gu)).toHaveLength(2);
   });
 
+  test("imports GetCurrentThreadId from kernel32", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
+    );
+    expect(script).toContain(
+      '[DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();',
+    );
+    expect(script).not.toContain(
+      '[DllImport("user32.dll")] static extern uint GetCurrentThreadId();',
+    );
+  });
+
   test.each([
     "Invoke-DeployedPilotBusinessAcceptance",
     "Assert-DeployedStoragePersistence",

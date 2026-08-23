@@ -218,7 +218,7 @@ namespace QBrowser.Task18 {
     [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr SetActiveWindow(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr window);
-    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(
       uint first, uint second, bool attach);
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(
