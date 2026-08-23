@@ -95,6 +95,15 @@ describe("release acceptance script", () => {
     expect(clipboard).not.toMatch(/Click\(\$window,\s*550,\s*360\)/u);
   });
 
+  test("targets the order mutation by its accessible PageTab identity", async () => {
+    const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
+    expect(business).toContain(
+      "Invoke-DeployedNamedControl $window 'processing' `\n" +
+      "        ([System.Windows.Automation.ControlType]::TabItem)",
+    );
+    expect(business).not.toContain("$bottomControlY - 22");
+  });
+
   test.each([
     "Invoke-DeployedPilotBusinessAcceptance",
     "Assert-DeployedStoragePersistence",

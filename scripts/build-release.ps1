@@ -320,6 +320,12 @@ namespace QBrowser.Task18 {
       Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
       return Send(new Input[] { down, up });
     }
+    public static bool ClickScreen(IntPtr worker, int x, int y) {
+      if (!FocusWorker(worker) || !SetCursorPos(x, y)) return false;
+      Input down = new Input(); down.type = InputMouse; down.value.mouse.flags = LeftDown;
+      Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
+      return Send(new Input[] { down, up });
+    }
     public static bool SendUnicodeText(IntPtr worker, string text) {
       foreach (char character in text) {
         if (!FocusWorker(worker)) return false;
@@ -1425,6 +1431,48 @@ function New-DeployedHostAutomation([Diagnostics.Process]$Process) {
     }
 }
 
+function Get-DeployedControlCenter([IntPtr]$Window, [string]$Name, $ControlType) {
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+        if ($null -eq $root) { return $null }
+        $condition = [System.Windows.Automation.AndCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty, $Name),
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                $ControlType))
+        $element = $root.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($null -eq $element -or -not $element.Current.IsEnabled -or
+            $element.Current.IsOffscreen) {
+            return $null
+        }
+        $bounds = $element.Current.BoundingRectangle
+        if ($bounds.Width -le 1 -or $bounds.Height -le 1) { return $null }
+        return [pscustomobject]@{
+            X = [int]($bounds.Left + $bounds.Width / 2)
+            Y = [int]($bounds.Top + $bounds.Height / 2)
+        }
+    }
+    catch { return $null }
+}
+
+function Invoke-DeployedNamedControl([IntPtr]$Window, [string]$Name,
+        $ControlType, [string]$Failure) {
+    $script:deployedControlCenter = $null
+    Wait-Until {
+        $candidate = Get-DeployedControlCenter $Window $Name $ControlType
+        if ($null -eq $candidate) { return $false }
+        $script:deployedControlCenter = $candidate
+        return $true
+    } 10000 $Failure
+    if (-not [QBrowser.Task18.NativeAutomation]::ClickScreen(
+            $Window, $script:deployedControlCenter.X,
+            $script:deployedControlCenter.Y)) {
+        throw $Failure
+    }
+}
+
 function Invoke-DeployedNavigation($Automation, [string]$Route,
         [string]$Telemetry, [string]$Template) {
     $before = Get-RouteAckCount $Telemetry $Template
@@ -1506,15 +1554,9 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     Invoke-DeployedNavigation $automation 'app://pilot/orders/ORD-1001' `
         $Telemetry '/orders/:id'
     Wait-MockRequestAfter $MockOutput 'GET' '/api/orders/ORD-1001' $orderGetBefore
-    Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::DarkPixels(
-            $window, 340, $bottomControlY - 22, 95, 44) `
-            -ge 30
-    } 10000 'Loaded order did not enable the processing mutation control.'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click(
-            $window, 383, $bottomControlY)) {
-        throw 'Real deployed order mutation click failed.'
-    }
+    Invoke-DeployedNamedControl $window 'processing' `
+        ([System.Windows.Automation.ControlType]::TabItem) `
+        'Loaded order did not expose an enabled processing mutation control.'
     Wait-MockRequestAfter $MockOutput 'PATCH' '/api/orders/ORD-1001' $orderPatchBefore
     Write-Output 'DEPLOYMENT_BUSINESS_ORDER=PASS GET=>PATCH status=processing'
 
