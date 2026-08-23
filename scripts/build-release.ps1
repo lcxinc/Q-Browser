@@ -376,6 +376,7 @@ namespace QBrowser.Task18 {
     public static bool AcceptFileDialog(int processId, string path) {
       IntPtr dialog = FindFileDialog(processId);
       if (dialog == IntPtr.Zero || !SetForegroundWindow(dialog)) return false;
+      System.Threading.Thread.Sleep(250);
       // Alt+N selects the native file-name editor regardless of locale.
       Input altDown = new Input(); altDown.type = InputKeyboard;
       altDown.value.keyboard.virtualKey = 0x12;

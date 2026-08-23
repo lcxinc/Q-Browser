@@ -103,6 +103,7 @@ describe("release acceptance script", () => {
     const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
     expect(script.match(/GetDC\(IntPtr\.Zero\)/gu)?.length ?? 0).toBeGreaterThanOrEqual(2);
     expect(script).toContain("byte[] pixels = CaptureClient(window);");
+    expect(script).toContain("System.Threading.Thread.Sleep(250);");
     expect(business).toContain("$scaleY = $clientHeight / 679.0");
     expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
     expect(business).toContain("$customerRegionX = [int](264 * $scaleX)");
