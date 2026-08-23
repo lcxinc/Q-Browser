@@ -248,6 +248,7 @@ private slots:
     void readyHandlerCanDestroyHostWithoutUseAfterFree();
     void launchThreadStartFailureRetiresSynchronously();
     void observerThreadStartFailureRetiresSynchronously();
+    void observerThreadStartFailureEarlyScopeExitCleansTestState();
     void launchThreadStartFailureHandlerCanDestroyHost();
     void observerThreadStartFailureHandlerCanDestroyHost();
     void retirementThreadStartFailureIsFatalAndRetryable();
@@ -537,8 +538,17 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
     host.reset();
 }
 
-void runLauncherThreadStartFailure(const bool observerFailure,
-                                   const bool pauseRetirement = false)
+struct LauncherRetirementBarrier final
+{
+    QSemaphore entered;
+    QSemaphore release;
+    QSemaphore hostDestructionReturned;
+};
+
+void runLauncherThreadStartFailure(
+    const bool observerFailure,
+    const bool pauseRetirement = false,
+    const bool exerciseEarlyScopeExit = false)
 {
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
@@ -586,10 +596,97 @@ void runLauncherThreadStartFailure(const bool observerFailure,
         qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads();
     const qsizetype observersBefore =
         qbrowser_host_testing::installedPackageWorkerActiveObservers();
+
+    if (exerciseEarlyScopeExit) {
+        QVERIFY(observerFailure);
+        QVERIFY(pauseRetirement);
+        const auto barrier = std::make_shared<LauncherRetirementBarrier>();
+        QPointer<MainWindow> earlyExitWindow;
+        bool observerFailureObserved = false;
+        bool retirementPaused = false;
+        bool earlyScopeCleanupFlushed = false;
+
+        [&] {
+            qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+            hooks.failObserverThreadStart = true;
+            hooks.beforeRetirementCleanup = [barrier] {
+                barrier->entered.release();
+                barrier->release.acquire();
+            };
+            std::unique_ptr<HostApplication> host;
+            const auto cleanupTestState = [&, barrier] {
+                qbrowser_host_testing::
+                    resetInstalledPackageWorkerLauncherTestHooks();
+                barrier->release.release();
+                host.reset();
+                earlyScopeCleanupFlushed =
+                    WorkerRetirementManager::instance().flush(10'000);
+            };
+            [[maybe_unused]] const auto cleanupGuard =
+                qScopeGuard(cleanupTestState);
+            qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+                std::move(hooks));
+
+            host = std::make_unique<HostApplication>(std::move(*parsed.value));
+            earlyExitWindow = host->mainWindow();
+            QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+            QSignalSpy failed(host.get(),
+                              &HostApplication::updateLifecycleFailed);
+            QVERIFY(host->start());
+            QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty() || !ready.isEmpty(),
+                                     30'000);
+            observerFailureObserved = ready.isEmpty() && !failed.isEmpty()
+                && failed.first().at(0).toString()
+                    == QStringLiteral(
+                        "host.launch.observer_thread_unavailable");
+            retirementPaused = barrier->entered.tryAcquire(1, 10'000);
+        }();
+
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        const auto installedHooks = qbrowser_host_testing::
+            installedPackageWorkerLauncherTestHooks();
+        const bool hooksResetOnScopeExit =
+            !installedHooks.beforeRetirementCleanup;
+        const bool managerIdleOnScopeExit =
+            WorkerRetirementManager::instance().status().isIdle();
+        const bool windowDeletedOnScopeExit = earlyExitWindow.isNull();
+
+        // Regression safety fallback keeps a failed cleanup assertion from
+        // contaminating later tests.
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        barrier->release.release();
+        const bool cleanupFlushed =
+            WorkerRetirementManager::instance().flush(10'000);
+        const QStringList workerEntries = QDir(
+            QDir(environment.sandboxTempRoot())
+                .filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot);
+
+        QVERIFY(retirementPaused);
+        QVERIFY2(hooksResetOnScopeExit,
+                 "nested observer scope left launcher test hooks installed");
+        QVERIFY2(managerIdleOnScopeExit,
+                 "nested observer scope returned before retirement became idle");
+        QVERIFY(windowDeletedOnScopeExit);
+        QVERIFY(earlyScopeCleanupFlushed);
+        QVERIFY(cleanupFlushed);
+        QVERIFY(observerFailureObserved);
+        QVERIFY(workerEntries.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads(),
+            launchesBefore, 10'000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qbrowser_host_testing::installedPackageWorkerActiveObservers(),
+            observersBefore, 10'000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+            contextsBefore, 10'000);
+        QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+        return;
+    }
+
     std::atomic<quint32> processId = 0;
-    QSemaphore retirementEntered;
-    QSemaphore releaseRetirement;
-    QSemaphore hostDestructionReturned;
+    const auto barrier = std::make_shared<LauncherRetirementBarrier>();
     qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
     hooks.failLaunchThreadStart = !observerFailure;
     hooks.failObserverThreadStart = observerFailure;
@@ -597,14 +694,24 @@ void runLauncherThreadStartFailure(const bool observerFailure,
         processId.store(pid, std::memory_order_release);
     };
     if (pauseRetirement) {
-        hooks.beforeRetirementCleanup = [&] {
-            retirementEntered.release();
-            releaseRetirement.acquire();
+        hooks.beforeRetirementCleanup = [barrier] {
+            barrier->entered.release();
+            barrier->release.acquire();
         };
     }
+    std::unique_ptr<HostApplication> host;
+    const auto cleanupTestState = [&, barrier] {
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        barrier->release.release();
+        host.reset();
+        return WorkerRetirementManager::instance().flush(10'000);
+    };
+    auto cleanupGuard = qScopeGuard([cleanupTestState] {
+        (void)cleanupTestState();
+    });
     qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
         std::move(hooks));
-    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
     QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
     QVERIFY(host->start());
@@ -617,9 +724,9 @@ void runLauncherThreadStartFailure(const bool observerFailure,
         processId.store(ready.first().at(5).toUInt(), std::memory_order_release);
     }
     const bool retirementPaused = !pauseRetirement
-        || retirementEntered.tryAcquire(1, 10'000);
+        || barrier->entered.tryAcquire(1, 10'000);
     qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
-    if (!retirementPaused) releaseRetirement.release();
+    if (!retirementPaused) barrier->release.release();
     QVERIFY2(retirementPaused,
              "retirement attempt did not enter the deterministic cleanup barrier");
 
@@ -631,10 +738,10 @@ void runLauncherThreadStartFailure(const bool observerFailure,
     if (pauseRetirement) {
         retirementRelease = std::async(std::launch::async, [&] {
             const bool hostReturned =
-                hostDestructionReturned.tryAcquire(1, 10'000);
+                barrier->hostDestructionReturned.tryAcquire(1, 10'000);
             forcedRetirementRelease.store(!hostReturned,
                                           std::memory_order_release);
-            releaseRetirement.release();
+            barrier->release.release();
         });
     }
     host.reset();
@@ -642,13 +749,14 @@ void runLauncherThreadStartFailure(const bool observerFailure,
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     const bool windowDeletedBeforeRetirementRelease = retiringWindow.isNull();
     if (pauseRetirement) {
-        hostDestructionReturned.release();
+        barrier->hostDestructionReturned.release();
         retirementRelease.get();
     }
     QVERIFY2(!forcedRetirementRelease.load(std::memory_order_acquire),
              "Host destruction waited for the blocked retirement attempt");
     QVERIFY(windowDeletedBeforeRetirementRelease);
-    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY(cleanupTestState());
+    cleanupGuard.dismiss();
     const quint32 observedProcess = processId.load(std::memory_order_acquire);
     const bool processExited = observedProcess == 0
         || waitForProcessExit(observedProcess, 10'000);
@@ -1558,6 +1666,12 @@ void ProductionUpdateRuntimeTest::launchThreadStartFailureRetiresSynchronously()
 void ProductionUpdateRuntimeTest::observerThreadStartFailureRetiresSynchronously()
 {
     runLauncherThreadStartFailure(true, true);
+}
+
+void ProductionUpdateRuntimeTest::
+    observerThreadStartFailureEarlyScopeExitCleansTestState()
+{
+    runLauncherThreadStartFailure(true, true, true);
 }
 
 void ProductionUpdateRuntimeTest::launchThreadStartFailureHandlerCanDestroyHost()
