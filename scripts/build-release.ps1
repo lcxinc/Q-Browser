@@ -314,11 +314,14 @@ namespace QBrowser.Task18 {
     }
     public static bool Click(IntPtr worker, int x, int y) {
       if (!FocusWorker(worker)) return false;
+      System.Threading.Thread.Sleep(50);
       Point point = new Point(); point.x = x; point.y = y;
       if (!ClientToScreen(worker, ref point) || !SetCursorPos(point.x, point.y)) return false;
       Input down = new Input(); down.type = InputMouse; down.value.mouse.flags = LeftDown;
       Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
-      return Send(new Input[] { down, up });
+      bool sent = Send(new Input[] { down, up });
+      if (sent) System.Threading.Thread.Sleep(50);
+      return sent;
     }
     public static bool SendUnicodeText(IntPtr worker, string text) {
       foreach (char character in text) {
