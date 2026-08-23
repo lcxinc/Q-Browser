@@ -67,6 +67,7 @@ if(WIN32 AND Q_BROWSER_BUILD_WEBENGINE)
     PRIVATE "${PROJECT_SOURCE_DIR}/tests/integration/worker")
   target_compile_definitions(tst_production_update_runtime PRIVATE
     Q_BROWSER_ARCHIVE_TESTING
+    Q_BROWSER_PACKAGE_INSTALLER_TESTING
     Q_BROWSER_HOST_PATH="$<TARGET_FILE:qbrowser-host>"
     Q_BROWSER_WORKER_PATH="$<TARGET_FILE:qbrowser-worker>"
     Q_BROWSER_WINDEPLOYQT_PATH="${WINDEPLOYQT_EXECUTABLE}"

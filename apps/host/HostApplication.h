@@ -73,6 +73,9 @@ signals:
                                          const QVariantMap &payload);
 
 private:
+    [[nodiscard]] bool requestPackageInstall(
+        const QString &packagePath,
+        std::shared_ptr<const HostOwnedFileAuthority> sourceAuthority);
     [[nodiscard]] bool enqueueLifecycle(
         std::function<void(UpdateLifecycleCoordinator &)> operation);
     [[nodiscard]] bool initializePackageRuntime();

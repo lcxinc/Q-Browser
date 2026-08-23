@@ -2,6 +2,7 @@
 
 #include "EventRecorder.h"
 #include "HostCapabilityRuntime.h"
+#include "HostOwnedFileAuthority.h"
 #include "HostWorkerSessionController.h"
 #include "InstalledPackageWorkerLauncher.h"
 #include "InstalledPackageWorkerLauncherTestHooks.h"
@@ -204,10 +205,29 @@ bool HostApplication::retryWorkerCleanupForTesting()
 
 bool HostApplication::requestPackageInstall(const QString &packagePath)
 {
+    return requestPackageInstall(packagePath, {});
+}
+
+bool HostApplication::requestPackageInstall(
+    const QString &packagePath,
+    std::shared_ptr<const HostOwnedFileAuthority> sourceAuthority)
+{
     if (packagePath.isEmpty()) return false;
     QPointer<HostApplication> guard(this);
     return enqueueLifecycle(
-        [guard, packagePath](UpdateLifecycleCoordinator &coordinator) {
+        [guard, packagePath,
+         sourceAuthority = std::move(sourceAuthority)](
+            UpdateLifecycleCoordinator &coordinator) {
+            if (sourceAuthority && !sourceAuthority->revalidate()) {
+                if (guard) {
+                    const QString error = QStringLiteral(
+                        "host.runtime.install_source_authority_changed");
+                    QMetaObject::invokeMethod(guard, [guard, error] {
+                        if (guard) emit guard->updateLifecycleFailed(error);
+                    }, Qt::QueuedConnection);
+                }
+                return;
+            }
             const UpdateLifecycleResult result = coordinator.installAndLaunch(
                 packagePath);
             if (!result.succeeded() && guard) {
@@ -486,7 +506,9 @@ bool HostApplication::start()
     if (runtimeConfig_.has_value()
         && runtimeConfig_->mode() == HostRuntimeMode::Package) {
         const bool queued = runtimeConfig_->installPackage().has_value()
-            ? requestPackageInstall(*runtimeConfig_->installPackage())
+            ? requestPackageInstall(
+                  *runtimeConfig_->installPackage(),
+                  runtimeConfig_->installPackageAuthority())
             : requestOfflineStart();
         if (!queued) {
             emit updateLifecycleFailed(QStringLiteral("host.runtime.start_queue_failed"));
