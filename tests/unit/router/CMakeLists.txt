@@ -39,3 +39,17 @@ q_browser_enable_strict_warnings(tst_normalized_path)
 q_browser_add_qt_test(
   NAME normalized_path
   TARGET tst_normalized_path)
+
+add_executable(tst_browser_address
+  tst_browser_address.cpp)
+
+target_link_libraries(tst_browser_address
+  PRIVATE
+    q_browser_router
+    Qt6::Test)
+
+q_browser_enable_strict_warnings(tst_browser_address)
+
+q_browser_add_qt_test(
+  NAME browser_address
+  TARGET tst_browser_address)

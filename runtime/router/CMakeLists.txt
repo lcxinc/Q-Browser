@@ -1,6 +1,8 @@
 add_library(q_browser_router STATIC
   AppUrl.cpp
   AppUrl.h
+  BrowserAddress.cpp
+  BrowserAddress.h
   NormalizedPath.cpp
   NormalizedPath.h
   PilotRoutes.cpp
