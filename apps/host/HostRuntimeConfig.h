@@ -66,7 +66,11 @@ public:
     [[nodiscard]] qint64 heartbeatTimeoutMs() const noexcept;
 
 private:
+    friend class HostApplication;
     friend struct HostRuntimeConfigResult;
+
+    [[nodiscard]] std::shared_ptr<const HostOwnedFileAuthority>
+    takeInstallPackageAuthority() noexcept;
 
     HostRuntimeMode mode_ = HostRuntimeMode::TrustedShell;
     QUrl mockOrigin_{QStringLiteral("http://127.0.0.1:4173/")};

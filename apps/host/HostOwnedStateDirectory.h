@@ -9,6 +9,15 @@
 #include "WindowsStableIo.h"
 #endif
 
+namespace qbrowser_host_detail
+{
+[[nodiscard]] bool pathWithinOrEqual(const QString &root,
+                                     const QString &candidate);
+[[nodiscard]] bool strictPathDescendant(const QString &root,
+                                        const QString &candidate);
+[[nodiscard]] bool pathsOverlap(const QString &left, const QString &right);
+}
+
 class HostOwnedStateDirectory final
 {
 public:

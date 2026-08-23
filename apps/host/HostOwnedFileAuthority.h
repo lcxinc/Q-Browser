@@ -1,7 +1,6 @@
 #pragma once
 
 #include <QByteArray>
-#include <QFile>
 #include <QString>
 
 #include <memory>
@@ -36,7 +35,5 @@ private:
 #ifdef Q_OS_WIN
     qbrowser_archive_detail::WindowsStableDirectoryTree parentTree_;
     mutable qbrowser_archive_detail::WindowsStableFile file_;
-#else
-    mutable std::unique_ptr<QFile> file_;
 #endif
 };

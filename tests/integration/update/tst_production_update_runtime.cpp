@@ -501,6 +501,7 @@ private slots:
     void hostDestroyBetweenValidationsKeepsAuthorityAlive();
     void initialExternalInstallRetainsSourceAuthorityUntilConsumed();
     void initialExternalInstallRejectsChangedSourceAuthority();
+    void initialExternalInstallReleasesSourceAuthorityAfterConsumption();
     void tempCleanupFailureStopsAdmissionAndCanBeRetried();
     void cleanupFailureOutlivesDestroyedHostAndAutoRecovers();
     void repeatedLiveCancellationLeavesNoObserversOrContexts();
@@ -1378,6 +1379,94 @@ void ProductionUpdateRuntimeTest::initialExternalInstallRejectsChangedSourceAuth
         PackageStore(environment.packageRoot()).activationState(
             environment.appId());
     QVERIFY(!activation.hasValue() || activation.state.current.isEmpty());
+}
+
+void ProductionUpdateRuntimeTest::initialExternalInstallReleasesSourceAuthorityAfterConsumption()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir packageSource;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(packageSource.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+
+    const QByteArray qml = QByteArrayLiteral(
+        "import QtQuick\nItem { width: 320; height: 200 }");
+    const QString package = updateSignedPackage(
+        packageSource, QStringLiteral("external-release-original"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false, qml,
+        environment.appId());
+    const QString replacement = updateSignedPackage(
+        packageSource, QStringLiteral("external-release-replacement"),
+        QStringLiteral("9.9.9"), keys.value().privateKeyPem, false, qml,
+        QStringLiteral("company.substituted"));
+    QVERIFY(!package.isEmpty());
+    QVERIFY(!replacement.isEmpty());
+    QVERIFY(protectPath(packageSource.path(), true));
+    QVERIFY(protectPath(package));
+    QVERIFY(protectPath(replacement));
+
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(
+        arguments, storage, InstallPackagePlacement::External);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    QVERIFY(parsed.value->installPackageAuthority());
+    std::weak_ptr<const HostOwnedFileAuthority> sourceAuthority =
+        parsed.value->installPackageAuthority();
+
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    const auto cleanup = qScopeGuard([&] {
+        host.reset();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(!ready.isEmpty() || !failed.isEmpty(), 30'000);
+    QVERIFY2(failed.isEmpty(),
+             failed.isEmpty() ? "" : qPrintable(failed.first().at(0).toString()));
+    QCOMPARE(ready.count(), 1);
+
+    const bool authorityExpiredWhileHostAlive = sourceAuthority.expired();
+    SetLastError(ERROR_SUCCESS);
+    const bool replacementSucceeded = MoveFileExW(
+        reinterpret_cast<LPCWSTR>(replacement.utf16()),
+        reinterpret_cast<LPCWSTR>(package.utf16()),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    const DWORD replacementError = replacementSucceeded
+        ? ERROR_SUCCESS : GetLastError();
+
+    host.reset();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QVERIFY2(authorityExpiredWhileHostAlive,
+             "external install source authority outlived consumption");
+    QVERIFY2(replacementSucceeded,
+             qPrintable(QStringLiteral(
+                 "consumed external install source remained locked; "
+                 "GetLastError=%1").arg(replacementError)));
 }
 
 void ProductionUpdateRuntimeTest::activationChangedBeforeProcessLaunchNeverAdmitsStaleWorker()

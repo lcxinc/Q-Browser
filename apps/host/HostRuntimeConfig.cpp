@@ -91,25 +91,6 @@ std::optional<QString> safeExistingPath(const QString &value, const bool directo
     return QDir::cleanPath(canonical);
 }
 
-bool overlaps(const QString &left, const QString &right)
-{
-    const QString leftPrefix = QDir::toNativeSeparators(left) + QDir::separator();
-    const QString rightPrefix = QDir::toNativeSeparators(right) + QDir::separator();
-    const QString nativeLeft = QDir::toNativeSeparators(left);
-    const QString nativeRight = QDir::toNativeSeparators(right);
-    return nativeLeft.compare(nativeRight, Qt::CaseInsensitive) == 0
-        || nativeLeft.startsWith(rightPrefix, Qt::CaseInsensitive)
-        || nativeRight.startsWith(leftPrefix, Qt::CaseInsensitive);
-}
-
-bool isStrictlyWithin(const QString &root, const QString &candidate)
-{
-    const QString nativeRoot = QDir::toNativeSeparators(root);
-    const QString nativeCandidate = QDir::toNativeSeparators(candidate);
-    return nativeCandidate.startsWith(
-        nativeRoot + QDir::separator(), Qt::CaseInsensitive);
-}
-
 QString argumentValue(const QString &argument, const QStringView name)
 {
     const QString prefix = QStringLiteral("--") + name + QLatin1Char('=');
@@ -296,20 +277,35 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
         }
         config.immutableRuntimeRoots_.push_back(*root);
     }
+    for (qsizetype left = 0;
+         left < config.immutableRuntimeRoots_.size(); ++left) {
+        for (qsizetype right = left + 1;
+             right < config.immutableRuntimeRoots_.size(); ++right) {
+            if (qbrowser_host_detail::pathsOverlap(
+                    config.immutableRuntimeRoots_[left],
+                    config.immutableRuntimeRoots_[right])) {
+                return failure(HostRuntimeConfigError::OverlappingRoots,
+                               QStringLiteral("host.config.overlapping_roots"));
+            }
+        }
+    }
 
     const QString keyParent = QDir(QFileInfo(*keyPath).absolutePath())
         .canonicalPath();
     if (keyParent.isEmpty()
-        || !isStrictlyWithin(
+        || !qbrowser_host_detail::strictPathDescendant(
             config.deploymentRoot_,
             context.currentHostExecutable->canonicalPath())
-        || !isStrictlyWithin(config.deploymentRoot_, config.workerExecutable_)
-        || !isStrictlyWithin(config.deploymentRoot_, *keyPath)) {
+        || !qbrowser_host_detail::strictPathDescendant(
+            config.deploymentRoot_, config.workerExecutable_)
+        || !qbrowser_host_detail::strictPathDescendant(
+            config.deploymentRoot_, *keyPath)) {
         return failure(HostRuntimeConfigError::UnsafePath,
                        QStringLiteral("host.config.content_outside_deployment"));
     }
     for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
-        if (!isStrictlyWithin(config.deploymentRoot_, runtimeRoot)) {
+        if (!qbrowser_host_detail::strictPathDescendant(
+                config.deploymentRoot_, runtimeRoot)) {
             return failure(
                 HostRuntimeConfigError::UnsafePath,
                 QStringLiteral("host.config.runtime_outside_deployment"));
@@ -318,10 +314,8 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
 
     bool workerInRuntime = false;
     for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
-        const QString prefix = QDir::toNativeSeparators(runtimeRoot)
-            + QDir::separator();
-        if (QDir::toNativeSeparators(config.workerExecutable_)
-                .startsWith(prefix, Qt::CaseInsensitive)) {
+        if (qbrowser_host_detail::strictPathDescendant(
+                runtimeRoot, config.workerExecutable_)) {
             workerInRuntime = true;
             break;
         }
@@ -335,26 +329,29 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
                              config.telemetryDirectory_, config.storageDirectory_,
                              config.browserStateDirectory_};
     for (const QString &root : mutableRoots) {
-        if (overlaps(config.deploymentRoot_, root)) {
+        if (qbrowser_host_detail::pathsOverlap(config.deploymentRoot_, root)) {
             return failure(HostRuntimeConfigError::OverlappingRoots,
                            QStringLiteral("host.config.overlapping_roots"));
         }
     }
     for (qsizetype left = 0; left < mutableRoots.size(); ++left) {
         for (qsizetype right = left + 1; right < mutableRoots.size(); ++right) {
-            if (overlaps(mutableRoots[left], mutableRoots[right])) {
+            if (qbrowser_host_detail::pathsOverlap(
+                    mutableRoots[left], mutableRoots[right])) {
                 return failure(HostRuntimeConfigError::OverlappingRoots,
                                QStringLiteral("host.config.overlapping_roots"));
             }
         }
     }
     for (const QString &runtimeRoot : config.immutableRuntimeRoots_) {
-        if (overlaps(config.browserStateDirectory_, runtimeRoot)) {
+        if (qbrowser_host_detail::pathsOverlap(
+                config.browserStateDirectory_, runtimeRoot)) {
             return failure(HostRuntimeConfigError::OverlappingRoots,
                            QStringLiteral("host.config.overlapping_roots"));
         }
     }
-    if (overlaps(config.browserStateDirectory_, keyParent)) {
+    if (qbrowser_host_detail::pathsOverlap(
+            config.browserStateDirectory_, keyParent)) {
         return failure(HostRuntimeConfigError::OverlappingRoots,
                        QStringLiteral("host.config.overlapping_roots"));
     }
@@ -374,15 +371,17 @@ HostRuntimeConfigResult HostRuntimeConfig::fromArguments(
             QDir(config.deploymentRoot_).filePath(QStringLiteral("packages")),
             true);
         const bool deployedPackage = canonicalDeployedPackages.has_value()
-            && isStrictlyWithin(*canonicalDeployedPackages, *installPackage);
+            && qbrowser_host_detail::strictPathDescendant(
+                *canonicalDeployedPackages, *installPackage);
         if (!deployedPackage) {
             if (packageParent.isEmpty()
-                || overlaps(config.deploymentRoot_, packageParent)) {
+                || qbrowser_host_detail::pathsOverlap(
+                    config.deploymentRoot_, packageParent)) {
                 return failure(HostRuntimeConfigError::OverlappingRoots,
                                QStringLiteral("host.config.overlapping_roots"));
             }
             for (const QString &root : mutableRoots) {
-                if (overlaps(root, packageParent)) {
+                if (qbrowser_host_detail::pathsOverlap(root, packageParent)) {
                     return failure(HostRuntimeConfigError::OverlappingRoots,
                                    QStringLiteral("host.config.overlapping_roots"));
                 }
@@ -533,6 +532,11 @@ const std::shared_ptr<const HostOwnedFileAuthority> &
 HostRuntimeConfig::installPackageAuthority() const noexcept
 {
     return installPackageAuthority_;
+}
+std::shared_ptr<const HostOwnedFileAuthority>
+HostRuntimeConfig::takeInstallPackageAuthority() noexcept
+{
+    return std::move(installPackageAuthority_);
 }
 qint64 HostRuntimeConfig::healthWindowMs() const noexcept { return healthWindowMs_; }
 qint64 HostRuntimeConfig::heartbeatTimeoutMs() const noexcept

@@ -1,6 +1,5 @@
 #include "HostOwnedFileAuthority.h"
 
-#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 
@@ -13,6 +12,10 @@
 std::shared_ptr<const HostOwnedFileAuthority> HostOwnedFileAuthority::open(
     const QString &path)
 {
+#ifndef Q_OS_WIN
+    Q_UNUSED(path);
+    return {};
+#else
     const QFileInfo supplied(path);
     if (path.isEmpty() || !supplied.isAbsolute() || !supplied.isFile()
         || supplied.isSymLink()) {
@@ -25,7 +28,6 @@ std::shared_ptr<const HostOwnedFileAuthority> HostOwnedFileAuthority::open(
         new HostOwnedFileAuthority);
     authority->canonicalPath_ = QDir::cleanPath(canonical);
     authority->parentCanonicalPath_ = QDir::cleanPath(parent);
-#ifdef Q_OS_WIN
     if (!authority->parentTree_.openRoot(supplied.absolutePath())
         || !authority->parentTree_.rootHasRestrictedTrustAcl()
         || !authority->parentTree_.isSameRootIdentityAt(
@@ -37,11 +39,8 @@ std::shared_ptr<const HostOwnedFileAuthority> HostOwnedFileAuthority::open(
         || !authority->file_.isStableWithin(authority->parentTree_)) {
         return {};
     }
-#else
-    authority->file_ = std::make_unique<QFile>(authority->canonicalPath_);
-    if (!authority->file_->open(QIODevice::ReadOnly)) return {};
-#endif
     return authority;
+#endif
 }
 
 std::shared_ptr<const HostOwnedFileAuthority>
@@ -58,7 +57,7 @@ HostOwnedFileAuthority::openCurrentProcessExecutable()
     return open(QString::fromWCharArray(
         buffer.data(), static_cast<qsizetype>(length)));
 #else
-    return open(QCoreApplication::applicationFilePath());
+    return {};
 #endif
 }
 
@@ -79,34 +78,28 @@ bool HostOwnedFileAuthority::readBounded(
 #ifdef Q_OS_WIN
     return file_.readBounded(maximum, bytes);
 #else
-    if (!file_ || !file_->isOpen() || file_->size() <= 0
-        || static_cast<quint64>(file_->size()) > maximum
-        || !file_->seek(0)) {
-        bytes.clear();
-        return false;
-    }
-    bytes = file_->read(static_cast<qint64>(maximum) + 1);
-    return !bytes.isEmpty()
-        && static_cast<quint64>(bytes.size()) <= maximum;
+    Q_UNUSED(maximum);
+    bytes.clear();
+    return false;
 #endif
 }
 
 bool HostOwnedFileAuthority::revalidate() const
 {
+#ifndef Q_OS_WIN
+    return false;
+#else
     const QFileInfo current(canonicalPath_);
     if (!current.isFile() || current.isSymLink()
         || current.canonicalFilePath().compare(canonicalPath_,
                                                Qt::CaseInsensitive) != 0) {
         return false;
     }
-#ifdef Q_OS_WIN
     return parentTree_.isStable()
         && parentTree_.rootHasRestrictedTrustAcl()
         && parentTree_.isSameRootIdentityAt(parentCanonicalPath_)
         && file_.hasRestrictedTrustAcl() && file_.hasSingleLink()
         && file_.isSameIdentityAt(canonicalPath_)
         && file_.isStableWithin(parentTree_);
-#else
-    return file_ && file_->isOpen();
 #endif
 }

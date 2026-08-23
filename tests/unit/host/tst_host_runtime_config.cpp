@@ -252,8 +252,14 @@ class HostRuntimeConfigTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void init();
     void requiresExplicitMode();
     void acceptsOnlyExplicitTrustedShellWithoutPackageAuthority();
+    void nonWindowsStableAuthoritiesFailClosed();
+    void hostPathRelationsAreRootAware_data();
+    void hostPathRelationsAreRootAware();
+    void validatesImmutableRuntimeRootDisjointness_data();
+    void validatesImmutableRuntimeRootDisjointness();
     void loadsCompletePackageAuthorityFromAbsolutePaths();
     void rejectsAmbientOrOverlappingAuthority();
     void rejectsTelemetryOverlappingPackageAuthority();
@@ -280,6 +286,156 @@ private slots:
     void rejectsReparseAncestors();
     void parsingPreservesProtectedAclsAndAuthoritiesBlockReplacement();
 };
+
+void HostRuntimeConfigTest::init()
+{
+#ifndef Q_OS_WIN
+    const QString test = QString::fromLatin1(QTest::currentTestFunction());
+    if (test != QLatin1String("requiresExplicitMode")
+        && test != QLatin1String(
+            "acceptsOnlyExplicitTrustedShellWithoutPackageAuthority")
+        && test != QLatin1String("nonWindowsStableAuthoritiesFailClosed")
+        && test != QLatin1String("hostPathRelationsAreRootAware")) {
+        QSKIP("Package-mode stable authorities are Windows-only");
+    }
+#endif
+}
+
+void HostRuntimeConfigTest::nonWindowsStableAuthoritiesFailClosed()
+{
+#ifdef Q_OS_WIN
+    QSKIP("Non-Windows fail-closed behavior cannot run on Windows");
+#else
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString file = temporary.filePath(QStringLiteral("authority.bin"));
+    QVERIFY(writeFile(file, QByteArrayLiteral("authority")));
+
+    QVERIFY(!HostOwnedStateDirectory::open(temporary.path()));
+    QVERIFY(!HostOwnedFileAuthority::open(file));
+    QVERIFY(!HostOwnedFileAuthority::openCurrentProcessExecutable());
+
+    HostRuntimeParseContext context;
+    const HostRuntimeConfigResult package = HostRuntimeConfig::fromArguments(
+        {QStringLiteral("--package-mode"),
+         QStringLiteral("--deployment-root=") + temporary.path(),
+         QStringLiteral("--browser-state-directory=") + temporary.path(),
+         QStringLiteral("--app-id=com.qbrowser.runtime"),
+         QStringLiteral("--trusted-public-key=") + file,
+         QStringLiteral("--package-store=") + temporary.path(),
+         QStringLiteral("--sandbox-temp=") + temporary.path(),
+         QStringLiteral("--runtime-root=") + temporary.path(),
+         QStringLiteral("--worker-executable=") + file,
+         QStringLiteral("--telemetry-directory=") + temporary.path(),
+         QStringLiteral("--storage-directory=") + temporary.path()},
+        context);
+    QVERIFY(!package.value.has_value());
+    QCOMPARE(package.error, HostRuntimeConfigError::UnsafePath);
+    QCOMPARE(package.stableError,
+             QStringLiteral("host.config.current_host_unavailable"));
+
+    const HostRuntimeConfigResult shell = HostRuntimeConfig::fromArguments(
+        {QStringLiteral("--trusted-shell")}, context);
+    QVERIFY2(shell.value.has_value(), qPrintable(shell.stableError));
+#endif
+}
+
+void HostRuntimeConfigTest::hostPathRelationsAreRootAware_data()
+{
+    QTest::addColumn<QString>("root");
+    QTest::addColumn<QString>("candidate");
+    QTest::addColumn<bool>("withinOrEqual");
+    QTest::addColumn<bool>("strictDescendant");
+    QTest::addColumn<bool>("overlap");
+
+    QTest::newRow("drive-root-descendant")
+        << QStringLiteral("D:\\") << QStringLiteral("D:\\deployment")
+        << true << true << true;
+    QTest::newRow("drive-root-equality")
+        << QStringLiteral("D:\\") << QStringLiteral("d:\\")
+        << true << false << true;
+    QTest::newRow("non-prefix-sibling")
+        << QStringLiteral("D:\\foo") << QStringLiteral("D:\\foobar")
+        << false << false << false;
+    QTest::newRow("normal-descendant")
+        << QStringLiteral("D:\\deployment")
+        << QStringLiteral("D:\\deployment\\runtime")
+        << true << true << true;
+    QTest::newRow("normal-equality")
+        << QStringLiteral("D:\\deployment")
+        << QStringLiteral("d:\\deployment")
+        << true << false << true;
+    QTest::newRow("normal-sibling")
+        << QStringLiteral("D:\\deployment")
+        << QStringLiteral("D:\\browser-state")
+        << false << false << false;
+    QTest::newRow("unc-root-descendant")
+        << QStringLiteral("\\\\server\\share\\")
+        << QStringLiteral("\\\\server\\share\\deployment")
+        << true << true << true;
+}
+
+void HostRuntimeConfigTest::hostPathRelationsAreRootAware()
+{
+    QFETCH(QString, root);
+    QFETCH(QString, candidate);
+    QFETCH(bool, withinOrEqual);
+    QFETCH(bool, strictDescendant);
+    QFETCH(bool, overlap);
+
+    QCOMPARE(qbrowser_host_detail::pathWithinOrEqual(root, candidate),
+             withinOrEqual);
+    QCOMPARE(qbrowser_host_detail::strictPathDescendant(root, candidate),
+             strictDescendant);
+    QCOMPARE(qbrowser_host_detail::pathsOverlap(root, candidate), overlap);
+    QCOMPARE(qbrowser_host_detail::pathsOverlap(candidate, root), overlap);
+}
+
+void HostRuntimeConfigTest::validatesImmutableRuntimeRootDisjointness_data()
+{
+    QTest::addColumn<int>("relation");
+    QTest::addColumn<bool>("accepted");
+    QTest::newRow("duplicate") << 0 << false;
+    QTest::newRow("nested-child") << 1 << false;
+    QTest::newRow("distinct-sibling") << 2 << true;
+}
+
+void HostRuntimeConfigTest::validatesImmutableRuntimeRootDisjointness()
+{
+    QFETCH(int, relation);
+    QFETCH(bool, accepted);
+    ValidArguments arguments;
+    QVERIFY(!arguments.values.isEmpty());
+
+    QString additionalRoot = arguments.runtime;
+    if (relation == 1) {
+        additionalRoot = QDir(arguments.runtime).filePath(
+            QStringLiteral("nested-runtime"));
+    } else if (relation == 2) {
+        additionalRoot = QDir(arguments.deployment).filePath(
+            QStringLiteral("runtime-sibling"));
+    }
+    if (relation != 0) {
+        QVERIFY(QDir().mkpath(additionalRoot));
+#ifdef Q_OS_WIN
+        QVERIFY(protectPath(additionalRoot, true));
+#endif
+    }
+    arguments.values.push_back(
+        QStringLiteral("--runtime-root=") + additionalRoot);
+
+    const HostRuntimeConfigResult result = HostRuntimeConfig::fromArguments(
+        arguments.values, arguments.context);
+    QCOMPARE(result.value.has_value(), accepted);
+    if (accepted) {
+        QCOMPARE(result.error, HostRuntimeConfigError::None);
+        QCOMPARE(result.value->immutableRuntimeRoots().size(), 2);
+    } else {
+        QCOMPARE(result.error, HostRuntimeConfigError::OverlappingRoots);
+        QCOMPARE(result.stableError,
+                 QStringLiteral("host.config.overlapping_roots"));
+    }
+}
 
 void HostRuntimeConfigTest::requiresDeploymentRoot()
 {

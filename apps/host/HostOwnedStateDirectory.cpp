@@ -8,6 +8,52 @@
 
 namespace
 {
+QString relationPathKey(const QString &path)
+{
+    QString key = QDir::toNativeSeparators(path).toCaseFolded();
+    key.replace(u'/', u'\\');
+    return key;
+}
+
+QString relationRootKey(const QString &path)
+{
+    QString key = relationPathKey(path);
+    const QString volumeRoot = relationPathKey(QDir(path).rootPath());
+    while (key.size() > 1 && key.endsWith(u'\\') && key != volumeRoot) {
+        key.chop(1);
+    }
+    return key;
+}
+}
+
+namespace qbrowser_host_detail
+{
+bool pathWithinOrEqual(const QString &root, const QString &candidate)
+{
+    const QString rootKey = relationRootKey(root);
+    const QString candidateKey = relationRootKey(candidate);
+    if (rootKey.isEmpty() || candidateKey.isEmpty()) return false;
+    if (candidateKey == rootKey) return true;
+    return rootKey.endsWith(u'\\')
+        ? candidateKey.startsWith(rootKey)
+        : candidateKey.startsWith(rootKey + u'\\');
+}
+
+bool strictPathDescendant(const QString &root, const QString &candidate)
+{
+    return pathWithinOrEqual(root, candidate)
+        && !pathWithinOrEqual(candidate, root);
+}
+
+bool pathsOverlap(const QString &left, const QString &right)
+{
+    return pathWithinOrEqual(left, right) || pathWithinOrEqual(right, left);
+}
+}
+
+namespace
+{
+#ifdef Q_OS_WIN
 std::optional<QString> canonicalExistingPath(const QString &path)
 {
     const QFileInfo information(path);
@@ -23,28 +69,6 @@ std::optional<QString> canonicalExistingPath(const QString &path)
         : std::optional<QString>(QDir::cleanPath(canonical));
 }
 
-bool overlaps(const QString &left, const QString &right)
-{
-    const QString nativeLeft = QDir::toNativeSeparators(left);
-    const QString nativeRight = QDir::toNativeSeparators(right);
-    const QString leftPrefix = nativeLeft + QDir::separator();
-    const QString rightPrefix = nativeRight + QDir::separator();
-    return nativeLeft.compare(nativeRight, Qt::CaseInsensitive) == 0
-        || nativeLeft.startsWith(rightPrefix, Qt::CaseInsensitive)
-        || nativeRight.startsWith(leftPrefix, Qt::CaseInsensitive);
-}
-
-#ifndef Q_OS_WIN
-bool hasSymlinkComponent(const QString &path)
-{
-    QString current = QFileInfo(path).absoluteFilePath();
-    for (;;) {
-        if (QFileInfo(current).isSymLink()) return true;
-        const QString parent = QFileInfo(current).absolutePath();
-        if (parent == current) return false;
-        current = parent;
-    }
-}
 #endif
 }
 
@@ -52,6 +76,11 @@ std::shared_ptr<const HostOwnedStateDirectory> HostOwnedStateDirectory::open(
     const QString &path,
     const QStringList &disjointFrom)
 {
+#ifndef Q_OS_WIN
+    Q_UNUSED(path);
+    Q_UNUSED(disjointFrom);
+    return {};
+#else
     const QFileInfo supplied(path);
     if (path.isEmpty() || !supplied.isAbsolute() || !supplied.isDir()
         || supplied.isSymLink()) {
@@ -59,31 +88,27 @@ std::shared_ptr<const HostOwnedStateDirectory> HostOwnedStateDirectory::open(
     }
     auto authority = std::shared_ptr<HostOwnedStateDirectory>(
         new HostOwnedStateDirectory);
-#ifdef Q_OS_WIN
     if (!authority->tree_.openRoot(supplied.absoluteFilePath())
         || !authority->tree_.rootHasRestrictedTrustAcl()) {
         return {};
     }
-#else
-    if (hasSymlinkComponent(supplied.absoluteFilePath())) return {};
-#endif
     const auto canonical = canonicalExistingPath(path);
     if (!canonical.has_value()) return {};
     authority->canonicalPath_ = *canonical;
-#ifdef Q_OS_WIN
     if (!authority->tree_.isSameRootIdentityAt(authority->canonicalPath_)) {
         return {};
     }
-#endif
     for (const QString &candidate : disjointFrom) {
         const auto canonicalCandidate = canonicalExistingPath(candidate);
         if (!canonicalCandidate.has_value()
-            || overlaps(authority->canonicalPath_, *canonicalCandidate)) {
+            || qbrowser_host_detail::pathsOverlap(
+                authority->canonicalPath_, *canonicalCandidate)) {
             return {};
         }
         authority->disjointPaths_.push_back(*canonicalCandidate);
     }
     return authority;
+#endif
 }
 
 const QString &HostOwnedStateDirectory::canonicalPath() const noexcept
@@ -93,25 +118,26 @@ const QString &HostOwnedStateDirectory::canonicalPath() const noexcept
 
 bool HostOwnedStateDirectory::revalidate() const
 {
+#ifndef Q_OS_WIN
+    return false;
+#else
     const auto current = canonicalExistingPath(canonicalPath_);
     if (!current.has_value()
         || current->compare(canonicalPath_, Qt::CaseInsensitive) != 0) {
         return false;
     }
-#ifdef Q_OS_WIN
     if (!tree_.isStable() || !tree_.isSameRootIdentityAt(canonicalPath_)
         || !tree_.rootHasRestrictedTrustAcl()) {
         return false;
     }
-#else
-    if (hasSymlinkComponent(canonicalPath_)) return false;
-#endif
     for (const QString &candidate : disjointPaths_) {
         const auto currentCandidate = canonicalExistingPath(candidate);
         if (!currentCandidate.has_value()
-            || overlaps(canonicalPath_, *currentCandidate)) {
+            || qbrowser_host_detail::pathsOverlap(
+                canonicalPath_, *currentCandidate)) {
             return false;
         }
     }
     return true;
+#endif
 }

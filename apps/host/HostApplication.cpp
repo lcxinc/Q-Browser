@@ -505,11 +505,14 @@ bool HostApplication::start()
 
     if (runtimeConfig_.has_value()
         && runtimeConfig_->mode() == HostRuntimeMode::Package) {
-        const bool queued = runtimeConfig_->installPackage().has_value()
-            ? requestPackageInstall(
-                  *runtimeConfig_->installPackage(),
-                  runtimeConfig_->installPackageAuthority())
-            : requestOfflineStart();
+        bool queued = false;
+        if (runtimeConfig_->installPackage().has_value()) {
+            queued = requestPackageInstall(
+                *runtimeConfig_->installPackage(),
+                runtimeConfig_->takeInstallPackageAuthority());
+        } else {
+            queued = requestOfflineStart();
+        }
         if (!queued) {
             emit updateLifecycleFailed(QStringLiteral("host.runtime.start_queue_failed"));
             return false;
