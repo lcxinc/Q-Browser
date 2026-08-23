@@ -1598,6 +1598,10 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     Wait-Until {
         [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -eq 0
     } 5000 'Native file cancel dialog remained open.'
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::IsBluePixel(
+            $window, $fileReadyX, $fileControlY)
+    } 10000 'Deployed file control did not re-enable after cancellation.'
     $beforeFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
     if ($null -eq $beforeFile -or
         -not [QBrowser.Task18.NativeAutomation]::Click(
