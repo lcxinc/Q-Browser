@@ -462,7 +462,6 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     if (alreadyRestored) return true;
 
     const int oldActive = activeIndex_;
-    const QString oldActiveId = activeId();
     QVector<QString> oldIds;
     oldIds.reserve(tabs_.size());
     for (const TabState &tab : tabs_) oldIds.append(tab.snapshot.id);
@@ -474,27 +473,20 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
         restoredTabs.append(dormantState(snapshot));
         restoredIds.append(snapshot.id);
     }
-    const QString newActiveId = activeIndex >= 0
-        ? ownedSnapshots.at(activeIndex).id
-        : QString();
-
     tabs_.reserve(std::max(count(), restoredCount));
     recentlyClosed_.clear();
+    activeIndex_ = -1;
 
     for (int index = static_cast<int>(oldIds.size()) - 1; index >= 0; --index) {
         tabs_.removeAt(index);
-        activeIndex_ = tabs_.isEmpty()
-            ? -1
-            : std::min(activeIndex_, count() - 1);
         emit tabRemoved(index, oldIds.at(index));
     }
     for (int index = 0; index < restoredCount; ++index) {
         tabs_.append(std::move(restoredTabs[index]));
-        if (activeIndex_ < 0) activeIndex_ = 0;
         emit tabInserted(index, restoredIds.at(index));
     }
     activeIndex_ = activeIndex;
-    if (oldActive != activeIndex_ || oldActiveId != newActiveId) {
+    if (restoredCount > 0 || oldActive != -1) {
         emit activeTabChanged(oldActive, activeIndex_);
     }
     return true;
