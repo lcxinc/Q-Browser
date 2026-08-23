@@ -279,6 +279,16 @@ namespace QBrowser.Task18 {
       }, IntPtr.Zero);
       return found;
     }
+    public static int ClientWidth(IntPtr window) {
+      Rect rect;
+      return IsWindow(window) && GetClientRect(window, out rect)
+        ? rect.right - rect.left : -1;
+    }
+    public static int ClientHeight(IntPtr window) {
+      Rect rect;
+      return IsWindow(window) && GetClientRect(window, out rect)
+        ? rect.bottom - rect.top : -1;
+    }
     public static bool FocusWorker(IntPtr worker) {
       if (worker == IntPtr.Zero || !IsWindow(worker)) return false;
       IntPtr host = GetAncestor(worker, GaRoot);
@@ -1465,6 +1475,12 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     $dashboardBefore = Get-MockRequestCount $MockOutput 'GET' '/api/dashboard'
     Invoke-DeployedNavigation $automation 'app://pilot/login' $Telemetry '/login'
     $window = Get-DeployedWorkerWindow $HostProcess $Worker
+    $clientWidth = [QBrowser.Task18.NativeAutomation]::ClientWidth($window)
+    $clientHeight = [QBrowser.Task18.NativeAutomation]::ClientHeight($window)
+    if ($clientWidth -lt 900 -or $clientHeight -lt 600) {
+        throw "Deployed Worker client geometry is invalid: ${clientWidth}x${clientHeight}"
+    }
+    $bottomControlY = $clientHeight - 46
     $focused = $false
     1..3 | ForEach-Object {
         if (-not $focused) {
@@ -1491,10 +1507,12 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
         $Telemetry '/orders/:id'
     Wait-MockRequestAfter $MockOutput 'GET' '/api/orders/ORD-1001' $orderGetBefore
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::DarkPixels($window, 340, 610, 95, 48) `
+        [QBrowser.Task18.NativeAutomation]::DarkPixels(
+            $window, 340, $bottomControlY - 22, 95, 44) `
             -ge 30
     } 10000 'Loaded order did not enable the processing mutation control.'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 383, 634)) {
+    if (-not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, 383, $bottomControlY)) {
         throw 'Real deployed order mutation click failed.'
     }
     Wait-MockRequestAfter $MockOutput 'PATCH' '/api/orders/ORD-1001' $orderPatchBefore
@@ -1511,7 +1529,8 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
             -ge 30
     } 10000 'Loaded customer list did not render a selectable entity.'
     if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 650, 170) -or
-        -not [QBrowser.Task18.NativeAutomation]::Click($window, 900, 634)) {
+        -not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, 900, $bottomControlY)) {
         throw 'Real deployed customer successor clicks failed.'
     }
     Wait-MockRequestAfter $MockOutput 'GET' '/api/customers/CUS-001' $customerBefore
@@ -1584,13 +1603,20 @@ function Invoke-DeployedClipboardAcceptance([Diagnostics.Process]$HostProcess, $
     $automation = New-DeployedHostAutomation $HostProcess
     Invoke-DeployedNavigation $automation 'app://pilot/dashboard' $Telemetry '/dashboard'
     $window = Get-DeployedWorkerWindow $HostProcess $Worker
+    $clientWidth = [QBrowser.Task18.NativeAutomation]::ClientWidth($window)
+    $clientHeight = [QBrowser.Task18.NativeAutomation]::ClientHeight($window)
+    if ($clientWidth -lt 900 -or $clientHeight -lt 600) {
+        throw "Deployed clipboard Worker geometry is invalid: ${clientWidth}x${clientHeight}"
+    }
+    $centerX = [int]($clientWidth / 2)
+    $centerY = [int]($clientHeight / 2)
     Wait-StorageValue $Storage 'clipboard-no-gesture' 'clipboard.gesture_required'
     Wait-StorageValue $Storage 'clipboard-undeclared' 'capability.denied'
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::IsBluePixel($window, 550, 360)
+        [QBrowser.Task18.NativeAutomation]::IsBluePixel($window, $centerX, $centerY)
     } 10000 'Deployed clipboard gesture control did not render.'
     if (-not [QBrowser.Task18.NativeAutomation]::SetClipboardText('gesture-canary') -or
-        -not [QBrowser.Task18.NativeAutomation]::Click($window, 550, 360)) {
+        -not [QBrowser.Task18.NativeAutomation]::Click($window, $centerX, $centerY)) {
         throw 'Real deployed clipboard gesture input failed.'
     }
     Wait-StorageValue $Storage 'clipboard-gesture' `

@@ -85,6 +85,16 @@ describe("release acceptance script", () => {
     );
   });
 
+  test("derives embedded Worker interaction points from its client size", async () => {
+    const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
+    const clipboard = await releaseFunction("Invoke-DeployedClipboardAcceptance");
+    expect(business).toContain("ClientHeight($window)");
+    expect(clipboard).toContain("ClientWidth($window)");
+    expect(clipboard).toContain("ClientHeight($window)");
+    expect(business).not.toMatch(/Click\(\$window,\s*900,\s*634\)/u);
+    expect(clipboard).not.toMatch(/Click\(\$window,\s*550,\s*360\)/u);
+  });
+
   test.each([
     "Invoke-DeployedPilotBusinessAcceptance",
     "Assert-DeployedStoragePersistence",
