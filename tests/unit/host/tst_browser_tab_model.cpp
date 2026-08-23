@@ -1,11 +1,13 @@
 #include "BrowserTabModel.h"
 
 #include <QRegularExpression>
+#include <QScopedValueRollback>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTest>
 
 #include <type_traits>
+#include <utility>
 
 namespace
 {
@@ -32,6 +34,9 @@ concept HasContentIdentitySetter = requires(
 };
 
 static_assert(std::is_copy_constructible_v<BrowserTabSnapshot>);
+static_assert(std::is_same_v<
+              decltype(std::declval<const BrowserTabModel &>().snapshotAt(0)),
+              BrowserTabSnapshot>);
 static_assert(!HasPid<BrowserTabSnapshot>);
 static_assert(!HasHwnd<BrowserTabSnapshot>);
 static_assert(!HasNonce<BrowserTabSnapshot>);
@@ -87,6 +92,7 @@ private slots:
     void createActivateMoveAndCloseHaveExactSignals();
     void activeIndexTracksStructuralChangesExactly();
     void refusesSeventeenthTabWithoutChangingAnything();
+    void snapshotAtReturnsAnOwnedValueAcrossStructuralChanges();
     void stableIdsSurviveTabBarStyleReordering();
     void historiesAreIndependentAndSuppressCurrentDuplicates();
     void validatedRouteNavigationChangesKindAndIdentity();
@@ -96,9 +102,15 @@ private slots:
     void recentlyClosedIsASixteenEntryLifo();
     void reopenUsesFreshIdentityAndOnlyRestoresDescriptorState();
     void titleIsBoundedSanitizedPlainText();
+    void titleSanitizerValidatesTheWholeLargeInput();
     void loneSurrogateTitlesAreRejectedAtomically();
     void identityLifecycleAndPresentationStayResourceFree();
     void accessiblePresentationUsesFixedHostText();
+    void directSignalsRejectReentrantMutators();
+    void tabChangedObserversKeepAValidIndexDuringNotification();
+    void restorePublishesSelfConsistentGranularChanges();
+    void restoreRejectsNestedMutations();
+    void restoreOwnsItsInputBeforeEmittingSignals();
     void validatedRestoreIsAtomicDormantAndNonPersistent();
 };
 
@@ -359,6 +371,31 @@ void BrowserTabModelTest::activeIndexTracksStructuralChangesExactly()
     QCOMPARE(lastActive.count(), 1);
     QCOMPARE(lastActive.at(0).at(0).toInt(), 2);
     QCOMPARE(lastActive.at(0).at(1).toInt(), 1);
+}
+
+void BrowserTabModelTest::snapshotAtReturnsAnOwnedValueAcrossStructuralChanges()
+{
+    BrowserTabModel model;
+    const QString originalId = model.createTab(
+        BrowserTabKind::Host, QStringLiteral("Owned snapshot"),
+        QStringLiteral("qbrowser://owned-snapshot"));
+    QVERIFY(!originalId.isEmpty());
+    const BrowserTabSnapshot &ownedSnapshot = model.snapshotAt(0);
+    const BrowserTabSnapshot expected = ownedSnapshot;
+
+    QVERIFY(model.closeTab(0));
+    for (int index = 0; index < BrowserTabModel::MaxOpenTabs; ++index) {
+        QVERIFY(!model.createTab(
+                     BrowserTabKind::Host,
+                     QStringLiteral("Replacement %1").arg(index),
+                     QStringLiteral("qbrowser://replacement/%1").arg(index),
+                     false)
+                     .isEmpty());
+    }
+
+    QVERIFY(ownedSnapshot == expected);
+    QCOMPARE(ownedSnapshot.id, originalId);
+    QCOMPARE(ownedSnapshot.title, QStringLiteral("Owned snapshot"));
 }
 
 void BrowserTabModelTest::stableIdsSurviveTabBarStyleReordering()
@@ -777,11 +814,36 @@ void BrowserTabModelTest::recentlyClosedIsASixteenEntryLifo()
     QCOMPARE(model.count(), BrowserTabModel::MaxOpenTabs);
     QCOMPARE(model.recentlyClosedCount(), 0);
 
+    const QString retainedClosedId = model.snapshotAt(0).id;
+    QVERIFY(model.closeTab(0));
+    QCOMPARE(model.count(), BrowserTabModel::MaxOpenTabs - 1);
+    QCOMPARE(model.recentlyClosedCount(), 1);
+    const QString fillId = model.createTab(
+        BrowserTabKind::Host, QStringLiteral("Fill to capacity"),
+        QStringLiteral("qbrowser://fill-to-capacity"), false);
+    QVERIFY(!fillId.isEmpty());
+    QCOMPARE(model.count(), BrowserTabModel::MaxOpenTabs);
+    QCOMPARE(model.recentlyClosedCount(), 1);
+    const QVector<BrowserTabSnapshot> beforeFailedReopen = model.snapshots();
+    const int activeBeforeFailedReopen = model.activeIndex();
+
     QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
     QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
     QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
     QVERIFY(model.reopenMostRecentlyClosed().isEmpty());
+    QVERIFY(model.reopenMostRecentlyClosed().isEmpty());
+    QCOMPARE(model.count(), BrowserTabModel::MaxOpenTabs);
+    QVERIFY(model.snapshots() == beforeFailedReopen);
+    QCOMPARE(model.activeIndex(), activeBeforeFailedReopen);
+    QCOMPARE(model.recentlyClosedCount(), 1);
+    QVERIFY(model.indexOfId(retainedClosedId) == -1);
     QCOMPARE(inserted.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(changed.count(), 0);
     QCOMPARE(active.count(), 0);
     QCOMPARE(persistence.count(), 0);
 }
@@ -888,6 +950,35 @@ void BrowserTabModelTest::titleIsBoundedSanitizedPlainText()
     changed.clear();
     persistence.clear();
     QVERIFY(model.setTitle(id, model.snapshotAt(0).title));
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(persistence.count(), 0);
+}
+
+void BrowserTabModelTest::titleSanitizerValidatesTheWholeLargeInput()
+{
+    BrowserTabModel model;
+    const QString id = model.createTab(BrowserTabKind::Host,
+                                       QStringLiteral("Safe"),
+                                       QStringLiteral("qbrowser://newtab"));
+    QVERIFY(!id.isEmpty());
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+
+    QString largeTitle(16 * 1024 * 1024, QLatin1Char('x'));
+    QVERIFY(model.setTitle(id, largeTitle));
+    QCOMPARE(model.snapshotAt(0).title,
+             QString(BrowserTabModel::MaxTitleCodeUnits,
+                     QLatin1Char('x')));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(persistence.count(), 1);
+
+    const BrowserTabSnapshot beforeInvalid = model.snapshotAt(0);
+    changed.clear();
+    persistence.clear();
+    largeTitle.fill(QLatin1Char('y'));
+    largeTitle[largeTitle.size() - 1] = QChar(0xd800);
+    QVERIFY(!model.setTitle(id, largeTitle));
+    QVERIFY(model.snapshotAt(0) == beforeInvalid);
     QCOMPARE(changed.count(), 0);
     QCOMPARE(persistence.count(), 0);
 }
@@ -1003,6 +1094,508 @@ void BrowserTabModelTest::accessiblePresentationUsesFixedHostText()
              QStringLiteral("Restricted web, Crashed"));
     QCOMPARE(model.accessiblePresentationAt(model.indexOfId(error)).description,
              QStringLiteral("Q-Browser, Error"));
+}
+
+void BrowserTabModelTest::directSignalsRejectReentrantMutators()
+{
+    enum SignalCase
+    {
+        Inserted,
+        Moved,
+        Removed,
+        Changed,
+        ActiveChanged,
+        Persistence,
+        SignalCaseCount,
+    };
+
+    for (int signalCase = Inserted; signalCase < SignalCaseCount;
+         ++signalCase) {
+        BrowserTabModel model;
+        const QString closed = model.createTab(
+            BrowserTabKind::Host, QStringLiteral("Closed"),
+            QStringLiteral("qbrowser://closed"));
+        QVERIFY(!closed.isEmpty());
+        QVERIFY(model.closeTab(0));
+
+        const QString anchor = model.createTab(
+            BrowserTabKind::Host, QStringLiteral("Anchor"),
+            QStringLiteral("qbrowser://anchor"));
+        QVERIFY(!anchor.isEmpty());
+        QVERIFY(model.navigateTab(anchor, BrowserTabKind::Web,
+                                  QStringLiteral("app://pilot/help")));
+        QVERIFY(model.navigateTab(anchor, BrowserTabKind::App,
+                                  QStringLiteral("app://pilot/orders")));
+        QVERIFY(model.goBack(anchor, BrowserTabKind::Web));
+        const QString other = model.createTab(
+            BrowserTabKind::App, QStringLiteral("Other"),
+            QStringLiteral("app://pilot/other"), false);
+        const QString victim = model.createTab(
+            BrowserTabKind::Web, QStringLiteral("Victim"),
+            QStringLiteral("https://example.test/victim"), false);
+        QVERIFY(!other.isEmpty());
+        QVERIFY(!victim.isEmpty());
+        QCOMPARE(model.activeId(), anchor);
+        QVERIFY(model.canGoBack(anchor));
+        QVERIFY(model.canGoForward(anchor));
+        QCOMPARE(model.recentlyClosedCount(), 1);
+
+        QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+        QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+        QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+        QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+        QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+        QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+        QStringList order;
+        connect(&model, &BrowserTabModel::tabInserted, this,
+                [&order](int index, const QString &id) {
+                    order.append(
+                        QStringLiteral("insert:%1:%2").arg(index).arg(id));
+                });
+        connect(&model, &BrowserTabModel::tabRemoved, this,
+                [&order](int index, const QString &id) {
+                    order.append(
+                        QStringLiteral("remove:%1:%2").arg(index).arg(id));
+                });
+        connect(&model, &BrowserTabModel::tabMoved, this,
+                [&order](int from, int to) {
+                    order.append(
+                        QStringLiteral("move:%1:%2").arg(from).arg(to));
+                });
+        connect(&model, &BrowserTabModel::tabChanged, this,
+                [&order](int index) {
+                    order.append(QStringLiteral("change:%1").arg(index));
+                });
+        connect(&model, &BrowserTabModel::activeTabChanged, this,
+                [&order](int from, int to) {
+                    order.append(
+                        QStringLiteral("active:%1:%2").arg(from).arg(to));
+                });
+        connect(&model, &BrowserTabModel::persistenceNeeded, this,
+                [&order] { order.append(QStringLiteral("persist")); });
+
+        bool probing = false;
+        bool allRejected = true;
+        bool readOnlyQueriesStayedCoherent = true;
+        int probeCalls = 0;
+        const auto probe = [&] {
+            if (probing) return;
+            QScopedValueRollback<bool> probingGuard(probing, true);
+            ++probeCalls;
+
+            const QVector<BrowserTabSnapshot> before = model.snapshots();
+            const int activeBefore = model.activeIndex();
+            const int closedBefore = model.recentlyClosedCount();
+            const int anchorIndex = model.indexOfId(anchor);
+            readOnlyQueriesStayedCoherent =
+                readOnlyQueriesStayedCoherent && !model.isEmpty()
+                && model.count() == before.size() && anchorIndex >= 0
+                && model.snapshotAt(anchorIndex).id == anchor
+                && model.activeIndex() >= 0
+                && model.activeIndex() < model.count()
+                && model.snapshotAt(model.activeIndex()).id == model.activeId();
+            if (!readOnlyQueriesStayedCoherent) return;
+            (void)model.lifecycleAt(anchorIndex);
+            (void)model.presentationAt(anchorIndex);
+            (void)model.accessiblePresentationAt(anchorIndex);
+            (void)model.canGoBack(anchor);
+            (void)model.canGoForward(anchor);
+
+            const auto reject = [&allRejected](bool accepted) {
+                if (!accepted) return true;
+                allRejected = false;
+                return false;
+            };
+            const QString reentrantCreated = model.createTab(
+                BrowserTabKind::Host, QStringLiteral("Reentrant create"),
+                QStringLiteral("qbrowser://reentrant"));
+            if (!reject(!reentrantCreated.isEmpty())) return;
+            const QString activationTarget = model.activeId() == anchor
+                ? other
+                : anchor;
+            if (!reject(model.activateTab(model.indexOfId(activationTarget))))
+                return;
+            if (!reject(model.moveTab(model.indexOfId(anchor),
+                                      model.indexOfId(other))))
+                return;
+            if (!reject(model.closeTab(model.indexOfId(other)))) return;
+            if (!reject(!model.reopenMostRecentlyClosed().isEmpty())) return;
+            if (!reject(model.navigateTab(
+                    anchor, BrowserTabKind::App,
+                    QStringLiteral("app://pilot/reentrant"))))
+                return;
+            if (!reject(model.goBack(anchor, BrowserTabKind::Host))) return;
+            if (!reject(model.goForward(anchor, BrowserTabKind::App))) return;
+            if (!reject(model.setTitle(anchor,
+                                       QStringLiteral("Reentrant title"))))
+                return;
+            if (!reject(model.setLifecycle(anchor,
+                                           BrowserTabLifecycle::Starting)))
+                return;
+            if (!reject(model.setLoadState(anchor, true, 33))) return;
+            if (!reject(model.setVisualState(
+                    anchor, BrowserVisualState::Recovering)))
+                return;
+            if (!reject(model.replaceFromValidatedSnapshot({}, -1))) return;
+
+            readOnlyQueriesStayedCoherent =
+                readOnlyQueriesStayedCoherent && model.snapshots() == before
+                && model.activeIndex() == activeBefore
+                && model.recentlyClosedCount() == closedBefore;
+        };
+
+        switch (signalCase) {
+        case Inserted:
+            connect(&model, &BrowserTabModel::tabInserted, this,
+                    [probe](int, const QString &) { probe(); },
+                    Qt::DirectConnection);
+            break;
+        case Moved:
+            connect(&model, &BrowserTabModel::tabMoved, this,
+                    [probe](int, int) { probe(); }, Qt::DirectConnection);
+            break;
+        case Removed:
+            connect(&model, &BrowserTabModel::tabRemoved, this,
+                    [probe](int, const QString &) { probe(); },
+                    Qt::DirectConnection);
+            break;
+        case Changed:
+            connect(&model, &BrowserTabModel::tabChanged, this,
+                    [probe](int) { probe(); }, Qt::DirectConnection);
+            break;
+        case ActiveChanged:
+            connect(&model, &BrowserTabModel::activeTabChanged, this,
+                    [probe](int, int) { probe(); }, Qt::DirectConnection);
+            break;
+        case Persistence:
+            connect(&model, &BrowserTabModel::persistenceNeeded, this, probe,
+                    Qt::DirectConnection);
+            break;
+        default:
+            QFAIL("Unexpected signal case");
+        }
+
+        QStringList expectedOrder;
+        switch (signalCase) {
+        case Inserted: {
+            const QString outerId = model.createTab(
+                BrowserTabKind::Host, QStringLiteral("Outer insert"),
+                QStringLiteral("qbrowser://outer"), false);
+            QVERIFY(!outerId.isEmpty());
+            QVERIFY(model.indexOfId(outerId) >= 0);
+            QCOMPARE(model.activeId(), anchor);
+            expectedOrder = {
+                QStringLiteral("insert:3:%1").arg(outerId),
+                QStringLiteral("persist"),
+            };
+            break;
+        }
+        case Moved:
+            QVERIFY(model.moveTab(1, 2));
+            QCOMPARE(model.snapshotAt(0).id, anchor);
+            QCOMPARE(model.snapshotAt(1).id, victim);
+            QCOMPARE(model.snapshotAt(2).id, other);
+            QCOMPARE(model.activeId(), anchor);
+            expectedOrder = {QStringLiteral("move:1:2"),
+                             QStringLiteral("persist")};
+            break;
+        case Removed:
+            QVERIFY(model.closeTab(2));
+            QCOMPARE(model.count(), 2);
+            QCOMPARE(model.indexOfId(victim), -1);
+            QCOMPARE(model.activeId(), anchor);
+            expectedOrder = {
+                QStringLiteral("remove:2:%1").arg(victim),
+                QStringLiteral("persist"),
+            };
+            break;
+        case Changed:
+            QVERIFY(model.setTitle(anchor, QStringLiteral("Outer title")));
+            QCOMPARE(model.snapshotAt(model.indexOfId(anchor)).title,
+                     QStringLiteral("Outer title"));
+            expectedOrder = {QStringLiteral("change:0"),
+                             QStringLiteral("persist")};
+            break;
+        case ActiveChanged:
+            QVERIFY(model.activateTab(1));
+            QCOMPARE(model.activeId(), other);
+            expectedOrder = {QStringLiteral("active:0:1"),
+                             QStringLiteral("persist")};
+            break;
+        case Persistence:
+            QVERIFY(model.navigateTab(anchor, BrowserTabKind::Host,
+                                      QStringLiteral("qbrowser://settings")));
+            QCOMPARE(model.snapshotAt(model.indexOfId(anchor)).address,
+                     QStringLiteral("qbrowser://settings"));
+            expectedOrder = {QStringLiteral("change:0"),
+                             QStringLiteral("persist")};
+            break;
+        default:
+            QFAIL("Unexpected signal case");
+        }
+
+        QVERIFY2(probeCalls > 0, "The selected direct signal was not emitted");
+        QVERIFY2(allRejected,
+                 "A direct signal slot was allowed to mutate the model");
+        QVERIFY(readOnlyQueriesStayedCoherent);
+        QCOMPARE(inserted.count(), signalCase == Inserted ? 1 : 0);
+        QCOMPARE(removed.count(), signalCase == Removed ? 1 : 0);
+        QCOMPARE(moved.count(), signalCase == Moved ? 1 : 0);
+        QCOMPARE(changed.count(),
+                 signalCase == Changed || signalCase == Persistence ? 1 : 0);
+        QCOMPARE(active.count(), signalCase == ActiveChanged ? 1 : 0);
+        QCOMPARE(persistence.count(), 1);
+        QCOMPARE(order, expectedOrder);
+    }
+}
+
+void BrowserTabModelTest::tabChangedObserversKeepAValidIndexDuringNotification()
+{
+    BrowserTabModel model;
+    const QString first = model.createTab(BrowserTabKind::Host,
+                                          QStringLiteral("First"),
+                                          QStringLiteral("qbrowser://first"));
+    const QString second = model.createTab(BrowserTabKind::App,
+                                           QStringLiteral("Second"),
+                                           QStringLiteral("app://second"),
+                                           false);
+    QVERIFY(!first.isEmpty());
+    QVERIFY(!second.isEmpty());
+
+    bool closeWasRejected = false;
+    bool laterObserverSawOriginalTab = false;
+    int laterObserverCalls = 0;
+    connect(&model, &BrowserTabModel::tabChanged, this,
+            [&](int index) { closeWasRejected = !model.closeTab(index); },
+            Qt::DirectConnection);
+    connect(&model, &BrowserTabModel::tabChanged, this,
+            [&](int index) {
+                ++laterObserverCalls;
+                laterObserverSawOriginalTab = index >= 0
+                    && index < model.count()
+                    && model.snapshotAt(index).id == first;
+            },
+            Qt::DirectConnection);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+
+    QVERIFY(model.setTitle(first, QStringLiteral("Updated first")));
+    QVERIFY(closeWasRejected);
+    QCOMPARE(laterObserverCalls, 1);
+    QVERIFY(laterObserverSawOriginalTab);
+    QCOMPARE(model.count(), 2);
+    QCOMPARE(model.snapshotAt(0).id, first);
+    QCOMPARE(model.snapshotAt(0).title, QStringLiteral("Updated first"));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(active.count(), 0);
+    QCOMPARE(persistence.count(), 1);
+}
+
+void BrowserTabModelTest::restorePublishesSelfConsistentGranularChanges()
+{
+    BrowserTabModel model;
+    const QString oldFirst = model.createTab(
+        BrowserTabKind::Host, QStringLiteral("Old first"),
+        QStringLiteral("qbrowser://old-first"));
+    const QString oldSecond = model.createTab(
+        BrowserTabKind::App, QStringLiteral("Old second"),
+        QStringLiteral("app://old-second"), false);
+    const QString oldThird = model.createTab(
+        BrowserTabKind::Web, QStringLiteral("Old third"),
+        QStringLiteral("https://example.test/old-third"), false);
+    QVERIFY(model.activateTab(1));
+
+    const BrowserTabSnapshot newFirst = restoredTab(
+        201, BrowserTabKind::App, QStringLiteral("New first"),
+        {QStringLiteral("app://new-first")}, 0);
+    const BrowserTabSnapshot newSecond = restoredTab(
+        202, BrowserTabKind::Host, QStringLiteral("New second"),
+        {QStringLiteral("qbrowser://new-second")}, 0);
+    const QVector<BrowserTabSnapshot> restored{newFirst, newSecond};
+
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+    QStringList observations;
+    bool everyObservationWasCoherent = true;
+    connect(&model, &BrowserTabModel::tabRemoved, this,
+            [&](int index, const QString &id) {
+                const int visibleCount = model.count();
+                everyObservationWasCoherent = everyObservationWasCoherent
+                    && visibleCount == index && model.indexOfId(id) == -1
+                    && (visibleCount == 0
+                        ? model.activeIndex() == -1
+                        : model.activeIndex() >= 0
+                            && model.activeIndex() < visibleCount);
+                observations.append(
+                    QStringLiteral("remove:%1:%2:%3")
+                        .arg(index)
+                        .arg(id)
+                        .arg(visibleCount));
+            },
+            Qt::DirectConnection);
+    connect(&model, &BrowserTabModel::tabInserted, this,
+            [&](int index, const QString &id) {
+                const int visibleCount = model.count();
+                const bool indexIsValid = index >= 0 && index < visibleCount;
+                const QString visibleId = indexIsValid
+                    ? model.snapshotAt(index).id
+                    : QStringLiteral("<invalid>");
+                everyObservationWasCoherent = everyObservationWasCoherent
+                    && visibleCount == index + 1 && indexIsValid
+                    && visibleId == id && model.activeIndex() >= 0
+                    && model.activeIndex() < visibleCount;
+                observations.append(
+                    QStringLiteral("insert:%1:%2:%3:%4")
+                        .arg(index)
+                        .arg(id)
+                        .arg(visibleCount)
+                        .arg(visibleId));
+            },
+            Qt::DirectConnection);
+    connect(&model, &BrowserTabModel::activeTabChanged, this,
+            [&](int from, int to) {
+                observations.append(
+                    QStringLiteral("active:%1:%2").arg(from).arg(to));
+            });
+
+    QVERIFY(model.replaceFromValidatedSnapshot(restored, 1));
+    QVERIFY(everyObservationWasCoherent);
+    QVERIFY(model.snapshots() == restored);
+    QCOMPARE(model.activeIndex(), 1);
+    QCOMPARE(removed.count(), 3);
+    QCOMPARE(inserted.count(), 2);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(active.count(), 1);
+    QCOMPARE(active.at(0).at(0).toInt(), 1);
+    QCOMPARE(active.at(0).at(1).toInt(), 1);
+    QCOMPARE(persistence.count(), 0);
+    QCOMPARE(observations,
+             QStringList({
+                 QStringLiteral("remove:2:%1:2").arg(oldThird),
+                 QStringLiteral("remove:1:%1:1").arg(oldSecond),
+                 QStringLiteral("remove:0:%1:0").arg(oldFirst),
+                 QStringLiteral("insert:0:%1:1:%1").arg(newFirst.id),
+                 QStringLiteral("insert:1:%1:2:%1").arg(newSecond.id),
+                 QStringLiteral("active:1:1"),
+             }));
+}
+
+void BrowserTabModelTest::restoreRejectsNestedMutations()
+{
+    BrowserTabModel model;
+    const QString oldFirst = model.createTab(
+        BrowserTabKind::Host, QStringLiteral("Old first"),
+        QStringLiteral("qbrowser://old-first"));
+    const QString oldSecond = model.createTab(
+        BrowserTabKind::App, QStringLiteral("Old second"),
+        QStringLiteral("app://old-second"), false);
+    const QString oldThird = model.createTab(
+        BrowserTabKind::Web, QStringLiteral("Old third"),
+        QStringLiteral("https://example.test/old-third"), false);
+    QVERIFY(!oldFirst.isEmpty());
+    QVERIFY(!oldSecond.isEmpty());
+    QVERIFY(!oldThird.isEmpty());
+
+    const QVector<BrowserTabSnapshot> restored{
+        restoredTab(211, BrowserTabKind::App, QStringLiteral("Restored one"),
+                    {QStringLiteral("app://restored-one")}, 0),
+        restoredTab(212, BrowserTabKind::Host, QStringLiteral("Restored two"),
+                    {QStringLiteral("qbrowser://restored-two")}, 0),
+    };
+    const QVector<BrowserTabSnapshot> nested{
+        restoredTab(213, BrowserTabKind::Web, QStringLiteral("Nested"),
+                    {QStringLiteral("https://example.test/nested")}, 0),
+    };
+
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    QSignalSpy removed(&model, &BrowserTabModel::tabRemoved);
+    QSignalSpy moved(&model, &BrowserTabModel::tabMoved);
+    QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
+    QSignalSpy active(&model, &BrowserTabModel::activeTabChanged);
+    QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
+    bool attempted = false;
+    bool nestedCloseWasAccepted = false;
+    bool nestedRestoreWasAccepted = false;
+    connect(&model, &BrowserTabModel::tabRemoved, this,
+            [&](int, const QString &) {
+                if (attempted) return;
+                attempted = true;
+                nestedCloseWasAccepted = model.closeTab(0);
+                nestedRestoreWasAccepted =
+                    model.replaceFromValidatedSnapshot(nested, 0);
+            },
+            Qt::DirectConnection);
+
+    QVERIFY(model.replaceFromValidatedSnapshot(restored, 1));
+    QVERIFY(attempted);
+    QVERIFY(!nestedCloseWasAccepted);
+    QVERIFY(!nestedRestoreWasAccepted);
+    QVERIFY(model.snapshots() == restored);
+    QCOMPARE(model.activeIndex(), 1);
+    QCOMPARE(removed.count(), 3);
+    QCOMPARE(inserted.count(), 2);
+    QCOMPARE(moved.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(active.count(), 1);
+    QCOMPARE(persistence.count(), 0);
+}
+
+void BrowserTabModelTest::restoreOwnsItsInputBeforeEmittingSignals()
+{
+    BrowserTabModel model;
+    const QString oldFirst = model.createTab(
+        BrowserTabKind::Host, QStringLiteral("Old first"),
+        QStringLiteral("qbrowser://old-first"));
+    const QString oldSecond = model.createTab(
+        BrowserTabKind::App, QStringLiteral("Old second"),
+        QStringLiteral("app://old-second"), false);
+    QVERIFY(!oldFirst.isEmpty());
+    QVERIFY(!oldSecond.isEmpty());
+
+    QVector<BrowserTabSnapshot> input{
+        restoredTab(221, BrowserTabKind::App, QStringLiteral("Owned one"),
+                    {QStringLiteral("app://owned-one")}, 0),
+        restoredTab(222, BrowserTabKind::Host, QStringLiteral("Owned two"),
+                    {QStringLiteral("qbrowser://owned-two")}, 0),
+    };
+    const QVector<BrowserTabSnapshot> expected = input;
+    const BrowserTabSnapshot aliasReplacementOne = restoredTab(
+        223, BrowserTabKind::Web, QStringLiteral("Alias one"),
+        {QStringLiteral("https://example.test/alias-one")}, 0);
+    const BrowserTabSnapshot aliasReplacementTwo = restoredTab(
+        224, BrowserTabKind::Web, QStringLiteral("Alias two"),
+        {QStringLiteral("https://example.test/alias-two")}, 0);
+
+    QSignalSpy inserted(&model, &BrowserTabModel::tabInserted);
+    bool aliasWasMutated = false;
+    connect(&model, &BrowserTabModel::tabRemoved, this,
+            [&](int, const QString &) {
+                if (aliasWasMutated) return;
+                aliasWasMutated = true;
+                input.clear();
+                input.append(aliasReplacementOne);
+                input.append(aliasReplacementTwo);
+            },
+            Qt::DirectConnection);
+
+    QVERIFY(model.replaceFromValidatedSnapshot(input, 1));
+    QVERIFY(aliasWasMutated);
+    QVERIFY(input != expected);
+    QVERIFY(model.snapshots() == expected);
+    QCOMPARE(model.activeIndex(), 1);
+    QCOMPARE(inserted.count(), 2);
+    QCOMPARE(inserted.at(0).at(0).toInt(), 0);
+    QCOMPARE(inserted.at(0).at(1).toString(), expected.at(0).id);
+    QCOMPARE(inserted.at(1).at(0).toInt(), 1);
+    QCOMPARE(inserted.at(1).at(1).toString(), expected.at(1).id);
 }
 
 void BrowserTabModelTest::validatedRestoreIsAtomicDormantAndNonPersistent()

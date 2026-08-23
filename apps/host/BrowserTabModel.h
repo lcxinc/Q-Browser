@@ -93,7 +93,7 @@ public:
     [[nodiscard]] QString activeId() const;
     [[nodiscard]] int indexOfId(const QString &id) const noexcept;
 
-    [[nodiscard]] const BrowserTabSnapshot &snapshotAt(int index) const;
+    [[nodiscard]] BrowserTabSnapshot snapshotAt(int index) const;
     [[nodiscard]] QVector<BrowserTabSnapshot> snapshots() const;
     [[nodiscard]] BrowserTabLifecycle lifecycleAt(int index) const;
     [[nodiscard]] BrowserTabPresentation presentationAt(int index) const;
@@ -174,4 +174,5 @@ private:
     QVector<TabState> tabs_;
     QVector<BrowserTabSnapshot> recentlyClosed_;
     int activeIndex_ = -1;
+    bool mutationInProgress_ = false;
 };

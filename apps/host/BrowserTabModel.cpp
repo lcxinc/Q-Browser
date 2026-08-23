@@ -1,6 +1,7 @@
 #include "BrowserTabModel.h"
 
 #include <QChar>
+#include <QScopedValueRollback>
 #include <QSet>
 #include <QUuid>
 
@@ -76,7 +77,7 @@ int BrowserTabModel::indexOfId(const QString &id) const noexcept
     return -1;
 }
 
-const BrowserTabSnapshot &BrowserTabModel::snapshotAt(int index) const
+BrowserTabSnapshot BrowserTabModel::snapshotAt(int index) const
 {
     Q_ASSERT(isValidIndex(index));
     return tabs_.at(index).snapshot;
@@ -144,6 +145,8 @@ QString BrowserTabModel::createTab(BrowserTabKind kind,
                                    const QString &canonicalAddress,
                                    bool makeActive)
 {
+    if (mutationInProgress_) return {};
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     if (count() >= MaxOpenTabs || !isValidKind(kind)
         || canonicalAddress.isEmpty()) {
         return {};
@@ -175,6 +178,8 @@ QString BrowserTabModel::createTab(BrowserTabKind kind,
 
 bool BrowserTabModel::activateTab(int index)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     if (!isValidIndex(index)) return false;
     if (index == activeIndex_) return true;
     const int oldActive = activeIndex_;
@@ -186,6 +191,8 @@ bool BrowserTabModel::activateTab(int index)
 
 bool BrowserTabModel::moveTab(int from, int to)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     if (!isValidIndex(from) || !isValidIndex(to)) return false;
     if (from == to) return true;
 
@@ -204,6 +211,8 @@ bool BrowserTabModel::moveTab(int from, int to)
 
 bool BrowserTabModel::closeTab(int index)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     if (!isValidIndex(index)) return false;
 
     const int oldActive = activeIndex_;
@@ -234,6 +243,8 @@ bool BrowserTabModel::closeTab(int index)
 
 QString BrowserTabModel::reopenMostRecentlyClosed(bool makeActive)
 {
+    if (mutationInProgress_) return {};
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     if (recentlyClosed_.isEmpty() || count() >= MaxOpenTabs) return {};
 
     BrowserTabSnapshot snapshot = recentlyClosed_.back();
@@ -262,6 +273,8 @@ bool BrowserTabModel::navigateTab(const QString &id,
                                   BrowserTabKind validatedKind,
                                   const QString &canonicalAddress)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0 || !isValidKind(validatedKind)
         || canonicalAddress.isEmpty()) {
@@ -313,6 +326,8 @@ bool BrowserTabModel::canGoForward(const QString &id) const noexcept
 bool BrowserTabModel::goBack(const QString &id,
                              BrowserTabKind validatedTargetKind)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0 || !isValidKind(validatedTargetKind)
         || !canGoBack(id)) {
@@ -331,6 +346,8 @@ bool BrowserTabModel::goBack(const QString &id,
 bool BrowserTabModel::goForward(const QString &id,
                                 BrowserTabKind validatedTargetKind)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0 || !isValidKind(validatedTargetKind)
         || !canGoForward(id)) {
@@ -348,6 +365,8 @@ bool BrowserTabModel::goForward(const QString &id,
 
 bool BrowserTabModel::setTitle(const QString &id, const QString &untrustedTitle)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0) return false;
     const std::optional<QString> safeTitle = sanitizedTitle(untrustedTitle);
@@ -362,6 +381,8 @@ bool BrowserTabModel::setTitle(const QString &id, const QString &untrustedTitle)
 bool BrowserTabModel::setLifecycle(const QString &id,
                                    BrowserTabLifecycle lifecycle)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0 || !isValidLifecycle(lifecycle)) return false;
     if (tabs_.at(index).lifecycle == lifecycle) return true;
@@ -372,6 +393,8 @@ bool BrowserTabModel::setLifecycle(const QString &id,
 
 bool BrowserTabModel::setLoadState(const QString &id, bool loading, int progress)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0) return false;
     const int boundedProgress = std::clamp(progress, 0, 100);
@@ -386,6 +409,8 @@ bool BrowserTabModel::setLoadState(const QString &id, bool loading, int progress
 bool BrowserTabModel::setVisualState(const QString &id,
                                      BrowserVisualState visualState)
 {
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0 || !isValidVisualState(visualState)) return false;
     if (tabs_.at(index).visualState == visualState) return true;
@@ -398,7 +423,11 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     const QVector<BrowserTabSnapshot> &snapshots,
     int activeIndex)
 {
-    const int restoredCount = static_cast<int>(snapshots.size());
+    if (mutationInProgress_) return false;
+    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
+
+    const QVector<BrowserTabSnapshot> ownedSnapshots = snapshots;
+    const int restoredCount = static_cast<int>(ownedSnapshots.size());
     if (restoredCount > MaxOpenTabs
         || (restoredCount == 0 && activeIndex != -1)
         || (restoredCount > 0
@@ -407,7 +436,7 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     }
 
     QSet<QString> ids;
-    for (const BrowserTabSnapshot &snapshot : snapshots) {
+    for (const BrowserTabSnapshot &snapshot : ownedSnapshots) {
         if (!isValidRestoredSnapshot(snapshot) || ids.contains(snapshot.id)) {
             return false;
         }
@@ -415,11 +444,12 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     }
 
     bool alreadyRestored = activeIndex_ == activeIndex
-        && recentlyClosed_.isEmpty() && tabs_.size() == snapshots.size();
+        && recentlyClosed_.isEmpty()
+        && tabs_.size() == ownedSnapshots.size();
     if (alreadyRestored) {
         for (int index = 0; index < restoredCount; ++index) {
             const TabState &tab = tabs_.at(index);
-            if (tab.snapshot != snapshots.at(index)
+            if (tab.snapshot != ownedSnapshots.at(index)
                 || tab.lifecycle != BrowserTabLifecycle::Dormant
                 || tab.loading || tab.progress != 0
                 || tab.visualState
@@ -437,22 +467,33 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     oldIds.reserve(tabs_.size());
     for (const TabState &tab : tabs_) oldIds.append(tab.snapshot.id);
     QVector<TabState> restoredTabs;
-    restoredTabs.reserve(snapshots.size());
-    for (const BrowserTabSnapshot &snapshot : snapshots) {
+    QVector<QString> restoredIds;
+    restoredTabs.reserve(ownedSnapshots.size());
+    restoredIds.reserve(ownedSnapshots.size());
+    for (const BrowserTabSnapshot &snapshot : ownedSnapshots) {
         restoredTabs.append(dormantState(snapshot));
+        restoredIds.append(snapshot.id);
     }
+    const QString newActiveId = activeIndex >= 0
+        ? ownedSnapshots.at(activeIndex).id
+        : QString();
 
-    tabs_ = std::move(restoredTabs);
+    tabs_.reserve(std::max(count(), restoredCount));
     recentlyClosed_.clear();
-    activeIndex_ = activeIndex;
-    const QString newActiveId = activeId();
 
     for (int index = static_cast<int>(oldIds.size()) - 1; index >= 0; --index) {
+        tabs_.removeAt(index);
+        activeIndex_ = tabs_.isEmpty()
+            ? -1
+            : std::min(activeIndex_, count() - 1);
         emit tabRemoved(index, oldIds.at(index));
     }
     for (int index = 0; index < restoredCount; ++index) {
-        emit tabInserted(index, snapshots.at(index).id);
+        tabs_.append(std::move(restoredTabs[index]));
+        if (activeIndex_ < 0) activeIndex_ = 0;
+        emit tabInserted(index, restoredIds.at(index));
     }
+    activeIndex_ = activeIndex;
     if (oldActive != activeIndex_ || oldActiveId != newActiveId) {
         emit activeTabChanged(oldActive, activeIndex_);
     }
@@ -536,8 +577,8 @@ bool BrowserTabModel::isValidVisualState(
 std::optional<QString> BrowserTabModel::sanitizedTitle(const QString &title)
 {
     QString result;
-    result.reserve(std::min(title.size(),
-                            static_cast<qsizetype>(MaxTitleCodeUnits)));
+    result.reserve(MaxTitleCodeUnits);
+    bool prefixComplete = false;
     for (qsizetype index = 0; index < title.size(); ++index) {
         const QChar value = title.at(index);
         if (value.isHighSurrogate()) {
@@ -545,8 +586,14 @@ std::optional<QString> BrowserTabModel::sanitizedTitle(const QString &title)
                 || !title.at(index + 1).isLowSurrogate()) {
                 return std::nullopt;
             }
-            result.append(value);
-            result.append(title.at(index + 1));
+            if (!prefixComplete
+                && result.size() + 2 <= MaxTitleCodeUnits) {
+                result.append(value);
+                result.append(title.at(index + 1));
+                prefixComplete = result.size() == MaxTitleCodeUnits;
+            } else if (!prefixComplete) {
+                prefixComplete = true;
+            }
             ++index;
             continue;
         }
@@ -555,11 +602,10 @@ std::optional<QString> BrowserTabModel::sanitizedTitle(const QString &title)
             || isBidiControl(value.unicode())) {
             continue;
         }
-        result.append(value);
-    }
-    if (result.size() > MaxTitleCodeUnits) {
-        result.truncate(MaxTitleCodeUnits);
-        if (!result.isEmpty() && result.back().isHighSurrogate()) result.chop(1);
+        if (!prefixComplete) {
+            result.append(value);
+            prefixComplete = result.size() == MaxTitleCodeUnits;
+        }
     }
     return result;
 }
