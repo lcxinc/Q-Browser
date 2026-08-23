@@ -320,12 +320,6 @@ namespace QBrowser.Task18 {
       Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
       return Send(new Input[] { down, up });
     }
-    public static bool ClickScreen(IntPtr worker, int x, int y) {
-      if (!FocusWorker(worker) || !SetCursorPos(x, y)) return false;
-      Input down = new Input(); down.type = InputMouse; down.value.mouse.flags = LeftDown;
-      Input up = new Input(); up.type = InputMouse; up.value.mouse.flags = LeftUp;
-      return Send(new Input[] { down, up });
-    }
     public static bool SendUnicodeText(IntPtr worker, string text) {
       foreach (char character in text) {
         if (!FocusWorker(worker)) return false;
@@ -407,7 +401,9 @@ namespace QBrowser.Task18 {
       Rect rect; if (!GetClientRect(window, out rect)) return null;
       int width = rect.right - rect.left, height = rect.bottom - rect.top;
       if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return null;
-      IntPtr source = GetDC(window), memory = IntPtr.Zero, bitmap = IntPtr.Zero,
+      Point origin = new Point();
+      if (!ClientToScreen(window, ref origin)) return null;
+      IntPtr source = GetDC(IntPtr.Zero), memory = IntPtr.Zero, bitmap = IntPtr.Zero,
         previous = IntPtr.Zero;
       try {
         if (source == IntPtr.Zero) return null;
@@ -415,7 +411,8 @@ namespace QBrowser.Task18 {
         bitmap = CreateCompatibleBitmap(source, width, height);
         if (memory == IntPtr.Zero || bitmap == IntPtr.Zero) return null;
         previous = SelectObject(memory, bitmap);
-        if (!BitBlt(memory, 0, 0, width, height, source, 0, 0, SrcCopy)) return null;
+        if (!BitBlt(memory, 0, 0, width, height, source, origin.x, origin.y, SrcCopy))
+          return null;
         BitmapInfo information = new BitmapInfo();
         information.header.size = (uint)Marshal.SizeOf(typeof(BitmapInfoHeader));
         information.header.width = width; information.header.height = -height;
@@ -427,7 +424,7 @@ namespace QBrowser.Task18 {
         if (previous != IntPtr.Zero && memory != IntPtr.Zero) SelectObject(memory, previous);
         if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
         if (memory != IntPtr.Zero) DeleteDC(memory);
-        if (source != IntPtr.Zero) ReleaseDC(window, source);
+        if (source != IntPtr.Zero) ReleaseDC(IntPtr.Zero, source);
       }
     }
     public static int DifferentPixels(byte[] before, byte[] after) {
@@ -440,22 +437,26 @@ namespace QBrowser.Task18 {
       return different;
     }
     public static bool IsBluePixel(IntPtr window, int x, int y) {
-      IntPtr dc = GetDC(window);
+      Point point = new Point(); point.x = x; point.y = y;
+      if (!ClientToScreen(window, ref point)) return false;
+      IntPtr dc = GetDC(IntPtr.Zero);
       if (dc == IntPtr.Zero) return false;
       try {
-        uint color = GetPixel(dc, x, y);
+        uint color = GetPixel(dc, point.x, point.y);
         if (color == 0xffffffff) return false;
         int red = (int)(color & 0xff), green = (int)((color >> 8) & 0xff),
           blue = (int)((color >> 16) & 0xff);
         return blue > 140 && red < 100 && green < 150;
-      } finally { ReleaseDC(window, dc); }
+      } finally { ReleaseDC(IntPtr.Zero, dc); }
     }
     public static int DarkPixels(IntPtr window, int x, int y, int width, int height) {
-      IntPtr dc = GetDC(window); if (dc == IntPtr.Zero) return -1;
+      Point origin = new Point(); origin.x = x; origin.y = y;
+      if (!ClientToScreen(window, ref origin)) return -1;
+      IntPtr dc = GetDC(IntPtr.Zero); if (dc == IntPtr.Zero) return -1;
       try {
         int dark = 0;
-        for (int row = y; row < y + height; row++) {
-          for (int column = x; column < x + width; column++) {
+        for (int row = origin.y; row < origin.y + height; row++) {
+          for (int column = origin.x; column < origin.x + width; column++) {
             uint color = GetPixel(dc, column, row);
             if (color != 0xffffffff && (color & 0xff) < 100
                 && ((color >> 8) & 0xff) < 100
@@ -463,7 +464,7 @@ namespace QBrowser.Task18 {
           }
         }
         return dark;
-      } finally { ReleaseDC(window, dc); }
+      } finally { ReleaseDC(IntPtr.Zero, dc); }
     }
     public static bool SetClipboardText(string text) {
       if (text == null || !OpenClipboard(IntPtr.Zero)) return false;
@@ -1431,48 +1432,6 @@ function New-DeployedHostAutomation([Diagnostics.Process]$Process) {
     }
 }
 
-function Get-DeployedControlCenter([IntPtr]$Window, [string]$Name, $ControlType) {
-    try {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
-        if ($null -eq $root) { return $null }
-        $condition = [System.Windows.Automation.AndCondition]::new(
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty, $Name),
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                $ControlType))
-        $element = $root.FindFirst(
-            [System.Windows.Automation.TreeScope]::Descendants, $condition)
-        if ($null -eq $element -or -not $element.Current.IsEnabled -or
-            $element.Current.IsOffscreen) {
-            return $null
-        }
-        $bounds = $element.Current.BoundingRectangle
-        if ($bounds.Width -le 1 -or $bounds.Height -le 1) { return $null }
-        return [pscustomobject]@{
-            X = [int]($bounds.Left + $bounds.Width / 2)
-            Y = [int]($bounds.Top + $bounds.Height / 2)
-        }
-    }
-    catch { return $null }
-}
-
-function Invoke-DeployedNamedControl([IntPtr]$Window, [string]$Name,
-        $ControlType, [string]$Failure) {
-    $script:deployedControlCenter = $null
-    Wait-Until {
-        $candidate = Get-DeployedControlCenter $Window $Name $ControlType
-        if ($null -eq $candidate) { return $false }
-        $script:deployedControlCenter = $candidate
-        return $true
-    } 10000 $Failure
-    if (-not [QBrowser.Task18.NativeAutomation]::ClickScreen(
-            $Window, $script:deployedControlCenter.X,
-            $script:deployedControlCenter.Y)) {
-        throw $Failure
-    }
-}
-
 function Invoke-DeployedNavigation($Automation, [string]$Route,
         [string]$Telemetry, [string]$Template) {
     $before = Get-RouteAckCount $Telemetry $Template
@@ -1528,11 +1487,34 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     if ($clientWidth -lt 900 -or $clientHeight -lt 600) {
         throw "Deployed Worker client geometry is invalid: ${clientWidth}x${clientHeight}"
     }
-    $bottomControlY = $clientHeight - 46
+    $scaleX = $clientWidth / 1100.0
+    $scaleY = $clientHeight / 720.0
+    $loginX = [int](550 * $scaleX)
+    $loginY = [int](308 * $scaleY)
+    $orderStatusX = [int](383 * $scaleX)
+    $orderStatusY = [int](634 * $scaleY)
+    $orderRegionX = [int](340 * $scaleX)
+    $orderRegionY = [int](610 * $scaleY)
+    $orderRegionWidth = [int](95 * $scaleX)
+    $orderRegionHeight = [int](48 * $scaleY)
+    $customerRegionX = [int](520 * $scaleX)
+    $customerRegionY = [int](130 * $scaleY)
+    $customerRegionWidth = [int](300 * $scaleX)
+    $customerRegionHeight = [int](90 * $scaleY)
+    $customerListX = [int](650 * $scaleX)
+    $customerListY = [int](170 * $scaleY)
+    $customerDetailX = [int](900 * $scaleX)
+    $customerDetailY = [int](634 * $scaleY)
+    $settingsX = [int](432 * $scaleX)
+    $settingsY = [int](140 * $scaleY)
+    $fileReadyX = [int](280 * $scaleX)
+    $fileControlX = [int](312 * $scaleX)
+    $fileControlY = [int](127 * $scaleY)
     $focused = $false
     1..3 | ForEach-Object {
         if (-not $focused) {
-            $focused = [QBrowser.Task18.NativeAutomation]::Click($window, 550, 308)
+            $focused = [QBrowser.Task18.NativeAutomation]::Click(
+                $window, $loginX, $loginY)
         }
     }
     if (-not $focused -or
@@ -1554,9 +1536,15 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     Invoke-DeployedNavigation $automation 'app://pilot/orders/ORD-1001' `
         $Telemetry '/orders/:id'
     Wait-MockRequestAfter $MockOutput 'GET' '/api/orders/ORD-1001' $orderGetBefore
-    Invoke-DeployedNamedControl $window 'processing' `
-        ([System.Windows.Automation.ControlType]::TabItem) `
-        'Loaded order did not expose an enabled processing mutation control.'
+    Wait-Until {
+        [QBrowser.Task18.NativeAutomation]::DarkPixels(
+            $window, $orderRegionX, $orderRegionY,
+            $orderRegionWidth, $orderRegionHeight) -ge 30
+    } 10000 'Loaded order did not render an enabled processing mutation control.'
+    if (-not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, $orderStatusX, $orderStatusY)) {
+        throw 'Real deployed order status click failed.'
+    }
     Wait-MockRequestAfter $MockOutput 'PATCH' '/api/orders/ORD-1001' $orderPatchBefore
     Write-Output 'DEPLOYMENT_BUSINESS_ORDER=PASS GET=>PATCH status=processing'
 
@@ -1567,12 +1555,14 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     Wait-MockRequestAfter $MockOutput 'GET' `
         '/api/customers?page=1&pageSize=20&query=' $customersBefore
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::DarkPixels($window, 520, 130, 300, 90) `
-            -ge 30
+        [QBrowser.Task18.NativeAutomation]::DarkPixels(
+            $window, $customerRegionX, $customerRegionY,
+            $customerRegionWidth, $customerRegionHeight) -ge 30
     } 10000 'Loaded customer list did not render a selectable entity.'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 650, 170) -or
+    if (-not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, $customerListX, $customerListY) -or
         -not [QBrowser.Task18.NativeAutomation]::Click(
-            $window, 900, $bottomControlY)) {
+            $window, $customerDetailX, $customerDetailY)) {
         throw 'Real deployed customer successor clicks failed.'
     }
     Wait-MockRequestAfter $MockOutput 'GET' '/api/customers/CUS-001' $customerBefore
@@ -1581,7 +1571,8 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     Write-Output 'DEPLOYMENT_BUSINESS_CUSTOMERS=PASS list=>detail CUS-001'
 
     Invoke-DeployedNavigation $automation 'app://pilot/settings' $Telemetry '/settings'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 432, 140)) {
+    if (-not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, $settingsX, $settingsY)) {
         throw 'Real deployed dark-theme click failed.'
     }
     Wait-StorageValue $Storage 'theme' 'dark'
@@ -1589,9 +1580,11 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
 
     Invoke-DeployedNavigation $automation 'app://pilot/files' $Telemetry '/files'
     Wait-Until {
-        [QBrowser.Task18.NativeAutomation]::IsBluePixel($window, 280, 127)
+        [QBrowser.Task18.NativeAutomation]::IsBluePixel(
+            $window, $fileReadyX, $fileControlY)
     } 10000 'Deployed file control did not render.'
-    if (-not [QBrowser.Task18.NativeAutomation]::Click($window, 312, 127)) {
+    if (-not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, $fileControlX, $fileControlY)) {
         throw 'Real deployed file cancel click failed.'
     }
     Wait-Until {
@@ -1605,7 +1598,8 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     } 5000 'Native file cancel dialog remained open.'
     $beforeFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
     if ($null -eq $beforeFile -or
-        -not [QBrowser.Task18.NativeAutomation]::Click($window, 312, 127)) {
+        -not [QBrowser.Task18.NativeAutomation]::Click(
+            $window, $fileControlX, $fileControlY)) {
         throw 'Real deployed file success click failed.'
     }
     Wait-Until {

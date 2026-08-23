@@ -95,13 +95,15 @@ describe("release acceptance script", () => {
     expect(clipboard).not.toMatch(/Click\(\$window,\s*550,\s*360\)/u);
   });
 
-  test("targets the order mutation by its accessible PageTab identity", async () => {
-    const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
-    expect(business).toContain(
-      "Invoke-DeployedNamedControl $window 'processing' `\n" +
-      "        ([System.Windows.Automation.ControlType]::TabItem)",
+  test("samples composited Worker pixels from the desktop DC", async () => {
+    const script = await readFile(
+      path.resolve(migratorRoot, "../..", "scripts/build-release.ps1"),
+      "utf8",
     );
-    expect(business).not.toContain("$bottomControlY - 22");
+    const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
+    expect(script.match(/GetDC\(IntPtr\.Zero\)/gu)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    expect(business).toContain("$orderStatusY = [int](634 * $scaleY)");
+    expect(business).not.toContain("Invoke-DeployedNamedControl");
   });
 
   test.each([
