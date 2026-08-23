@@ -230,6 +230,9 @@ namespace QBrowser.Task18 {
       uint count, Input[] inputs, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(
       IntPtr window, System.Text.StringBuilder value, int maximum);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(
+      IntPtr window, System.Text.StringBuilder value, int maximum);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] static extern bool PostMessageW(
       IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] static extern IntPtr SendMessageW(
@@ -265,6 +268,7 @@ namespace QBrowser.Task18 {
       return inputs.Length > 0 && SendInput((uint)inputs.Length, inputs,
         Marshal.SizeOf(typeof(Input))) == inputs.Length;
     }
+    public static string FileDialogDiagnostic = "not-run";
     public static IntPtr FindWorkerWindow(IntPtr host, int processId) {
       IntPtr found = IntPtr.Zero;
       EnumChildWindows(host, delegate(IntPtr candidate, IntPtr ignored) {
@@ -377,8 +381,12 @@ namespace QBrowser.Task18 {
       return count;
     }
     public static bool AcceptFileDialog(int processId, string path) {
+      FileDialogDiagnostic = "started";
       IntPtr dialog = FindFileDialog(processId);
-      if (dialog == IntPtr.Zero || !SetForegroundWindow(dialog)) return false;
+      if (dialog == IntPtr.Zero || !SetForegroundWindow(dialog)) {
+        FileDialogDiagnostic = "dialog-or-foreground-failed";
+        return false;
+      }
       System.Threading.Thread.Sleep(250);
       // Alt+N selects the native file-name editor regardless of locale.
       Input altDown = new Input(); altDown.type = InputKeyboard;
@@ -387,19 +395,35 @@ namespace QBrowser.Task18 {
       nDown.value.keyboard.virtualKey = 0x4e;
       Input nUp = nDown; nUp.value.keyboard.flags = KeyUp;
       Input altUp = altDown; altUp.value.keyboard.flags = KeyUp;
-      if (!Send(new Input[] { altDown, nDown, nUp, altUp })) return false;
+      if (!Send(new Input[] { altDown, nDown, nUp, altUp })) {
+        FileDialogDiagnostic = "mnemonic-send-failed";
+        return false;
+      }
       System.Threading.Thread.Sleep(100);
       uint ignored; uint thread = GetWindowThreadProcessId(dialog, out ignored);
       GuiThreadInfo information = new GuiThreadInfo();
       information.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
-      if (!GetGUIThreadInfo(thread, ref information) || information.focus == IntPtr.Zero)
+      if (!GetGUIThreadInfo(thread, ref information) || information.focus == IntPtr.Zero) {
+        FileDialogDiagnostic = "focus-missing";
         return false;
-      if (SendMessageW(information.focus, WmSetText, IntPtr.Zero, path) == IntPtr.Zero)
+      }
+      if (SendMessageW(information.focus, WmSetText, IntPtr.Zero, path) == IntPtr.Zero) {
+        FileDialogDiagnostic = "set-text-failed";
         return false;
+      }
+      System.Text.StringBuilder focusClass = new System.Text.StringBuilder(64);
+      GetClassNameW(information.focus, focusClass, focusClass.Capacity);
+      System.Text.StringBuilder readback = new System.Text.StringBuilder(1024);
+      int readLength = GetWindowTextW(information.focus, readback, readback.Capacity);
+      bool readbackMatches = readLength > 0 && readback.ToString() == path;
       IntPtr outer = GetAncestor(information.focus, GaRoot);
       IntPtr accept = GetDlgItem(outer, IdOk);
-      return accept != IntPtr.Zero
+      bool posted = readbackMatches && accept != IntPtr.Zero
         && PostMessageW(accept, BmClick, IntPtr.Zero, IntPtr.Zero);
+      FileDialogDiagnostic = "focusClass=" + focusClass + " focusId="
+        + GetDlgCtrlID(information.focus) + " readbackMatch=" + readbackMatches
+        + " accept=" + (accept != IntPtr.Zero) + " posted=" + posted;
+      return posted;
     }
     public static byte[] CaptureClient(IntPtr window) {
       Rect rect; if (!GetClientRect(window, out rect)) return null;
@@ -1617,11 +1641,11 @@ function Invoke-DeployedPilotBusinessAcceptance([Diagnostics.Process]$HostProces
     } 5000 'Native file success dialog did not open.'
     if (-not [QBrowser.Task18.NativeAutomation]::AcceptFileDialog(
             $HostProcess.Id, $SelectedFile)) {
-        throw 'Native file success dialog automation failed.'
+        throw "Native file success dialog automation failed: $([QBrowser.Task18.NativeAutomation]::FileDialogDiagnostic)"
     }
     Wait-Until {
         [QBrowser.Task18.NativeAutomation]::FileDialogCount($HostProcess.Id) -eq 0
-    } 5000 'Native file success dialog remained open.'
+    } 5000 "Native file success dialog remained open: $([QBrowser.Task18.NativeAutomation]::FileDialogDiagnostic)"
     Wait-Until {
         $afterFile = [QBrowser.Task18.NativeAutomation]::CaptureClient($window)
         [QBrowser.Task18.NativeAutomation]::DifferentPixels(
