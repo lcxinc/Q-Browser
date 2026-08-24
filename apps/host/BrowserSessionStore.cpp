@@ -27,6 +27,8 @@ constexpr auto CorruptLeaf = "browser-session.json.corrupt";
 constexpr auto SessionTemporaryLeaf = "browser-session.json.tmp";
 constexpr auto CorruptTemporaryLeaf = "browser-session.json.corrupt.tmp";
 constexpr quint64 MaximumSessionBytes = 16U * 1024U * 1024U;
+constexpr qsizetype MaximumRuntimeTitleInputCodeUnits =
+    BrowserTabModel::MaxTitleCodeUnits * 16;
 
 BrowserSessionLoadResult ioFailure()
 {
@@ -57,6 +59,13 @@ bool isBidiControl(const char16_t value) noexcept
 
 std::optional<QString> sanitizedTitle(const QString &title)
 {
+    if (title.size() > MaximumRuntimeTitleInputCodeUnits) {
+        return std::nullopt;
+    }
+#ifdef Q_BROWSER_HOST_TESTING
+    const auto hooks = qbrowser_host_testing::browserSessionStoreTestHooks();
+    if (hooks.beforeTitleSanitize) hooks.beforeTitleSanitize();
+#endif
     QString result;
     result.reserve(BrowserTabModel::MaxTitleCodeUnits);
     bool prefixComplete = false;
@@ -143,7 +152,14 @@ std::optional<BrowserTabKind> parseKind(const QString &kind) noexcept
 std::optional<BrowserAddress> parseLogicalAddress(const QString &text)
 {
     BrowserAddress parsed = BrowserAddress::parse(text);
+    if (parsed.error() == BrowserAddressError::TooLong) {
+        return std::nullopt;
+    }
     if (text.startsWith(QLatin1String("app://"))) {
+#ifdef Q_BROWSER_HOST_TESTING
+        const auto hooks = qbrowser_host_testing::browserSessionStoreTestHooks();
+        if (hooks.beforeAppAuthorityScan) hooks.beforeAppAuthorityScan();
+#endif
         constexpr qsizetype authorityStart = 6;
         qsizetype authorityEnd = text.size();
         for (qsizetype index = authorityStart; index < text.size(); ++index) {
@@ -187,8 +203,7 @@ std::optional<BrowserWindowSnapshot> normalizedSnapshot(
             || static_cast<int>(tab.history.size())
                 > BrowserTabModel::MaxHistoryEntries
             || tab.historyIndex < 0
-            || tab.historyIndex >= static_cast<int>(tab.history.size())
-            || tab.history.at(tab.historyIndex) != tab.address) {
+            || tab.historyIndex >= static_cast<int>(tab.history.size())) {
             return std::nullopt;
         }
         ids.insert(tab.id);
@@ -207,6 +222,15 @@ std::optional<BrowserWindowSnapshot> normalizedSnapshot(
             if (!parseLogicalAddress(entry).has_value()) {
                 return std::nullopt;
             }
+        }
+#ifdef Q_BROWSER_HOST_TESTING
+        const auto hooks = qbrowser_host_testing::browserSessionStoreTestHooks();
+        if (hooks.beforeCurrentHistoryEquality) {
+            hooks.beforeCurrentHistoryEquality();
+        }
+#endif
+        if (tab.history.at(tab.historyIndex) != tab.address) {
+            return std::nullopt;
         }
     }
     return activeFound

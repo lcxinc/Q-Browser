@@ -335,6 +335,9 @@ private slots:
     void rejectsMalformedAndBoundViolations();
     void rejectsOversizedDocument();
     void sanitizesRuntimeTitleBeforeSave();
+    void rejectsOversizedInMemoryTitleBeforeSanitization();
+    void returnsOnTooLongAddressBeforeAuthorityScan();
+    void validatesAddressesBeforeCurrentHistoryEquality();
     void rejectsNoncanonicalLoadedTitle();
     void handlesSurrogateBoundariesAndRejectsLoneSurrogates();
     void rejectsOneMalformedTabWithoutPartialRecovery();
@@ -614,6 +617,146 @@ void BrowserSessionStoreTest::sanitizesRuntimeTitleBeforeSave()
     QCOMPARE(loaded.status, BrowserSessionLoadStatus::Loaded);
     QVERIFY(loaded.snapshot.has_value());
     QCOMPARE(loaded.snapshot->tabs.at(0).title, QString(255, u'a'));
+#endif
+}
+
+void BrowserSessionStoreTest::rejectsOversizedInMemoryTitleBeforeSanitization()
+{
+#if !defined(Q_OS_WIN) || !defined(Q_BROWSER_HOST_TESTING)
+    QSKIP("Windows session test hooks are unavailable");
+#else
+    SessionHooksReset hooksReset;
+    StateDirectoryFixture fixture;
+    QVERIFY(fixture.authority);
+    BrowserSessionStore store(fixture.authority);
+
+    int titleSanitizations = 0;
+    qbrowser_host_testing::BrowserSessionStoreTestHooks hooks;
+    hooks.beforeTitleSanitize = [&titleSanitizations]() {
+        ++titleSanitizations;
+    };
+    qbrowser_host_testing::setBrowserSessionStoreTestHooks(std::move(hooks));
+
+    const BrowserSessionResolveResult control = store.validateAndResolve(
+        sampleSnapshot(),
+        [](const BrowserAddress &) {
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+    QVERIFY(control.snapshot.has_value());
+    QVERIFY(titleSanitizations > 0);
+
+    titleSanitizations = 0;
+    BrowserWindowSnapshot oversized = sampleSnapshot();
+    oversized.tabs[0].title = QString(
+        BrowserTabModel::MaxTitleCodeUnits * 16 + 1, u'a');
+    int resolverCalls = 0;
+    const BrowserSessionSaveResult saved = store.save(oversized);
+    const BrowserSessionResolveResult resolved = store.validateAndResolve(
+        oversized,
+        [&resolverCalls](const BrowserAddress &) {
+            ++resolverCalls;
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+
+    QCOMPARE(saved.status, BrowserSessionSaveStatus::InvalidSnapshot);
+    QVERIFY(!resolved.snapshot.has_value());
+    QCOMPARE(resolverCalls, 0);
+    QCOMPARE(titleSanitizations, 0);
+#endif
+}
+
+void BrowserSessionStoreTest::returnsOnTooLongAddressBeforeAuthorityScan()
+{
+#if !defined(Q_OS_WIN) || !defined(Q_BROWSER_HOST_TESTING)
+    QSKIP("Windows session test hooks are unavailable");
+#else
+    SessionHooksReset hooksReset;
+    StateDirectoryFixture fixture;
+    QVERIFY(fixture.authority);
+    BrowserSessionStore store(fixture.authority);
+
+    int authorityScans = 0;
+    qbrowser_host_testing::BrowserSessionStoreTestHooks hooks;
+    hooks.beforeAppAuthorityScan = [&authorityScans]() {
+        ++authorityScans;
+    };
+    qbrowser_host_testing::setBrowserSessionStoreTestHooks(std::move(hooks));
+
+    const BrowserSessionResolveResult control = store.validateAndResolve(
+        sampleSnapshot(),
+        [](const BrowserAddress &) {
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+    QVERIFY(control.snapshot.has_value());
+    QVERIFY(authorityScans > 0);
+
+    authorityScans = 0;
+    const QString tooLong = QStringLiteral("app://")
+        + QString(1024, QChar(0x00e9));
+    BrowserWindowSnapshot oversized = sampleSnapshot();
+    oversized.tabs[0].address = QString(tooLong.constData(), tooLong.size());
+    oversized.tabs[0].history = {
+        QString(tooLong.constData(), tooLong.size())};
+    int resolverCalls = 0;
+    const BrowserSessionSaveResult saved = store.save(oversized);
+    const BrowserSessionResolveResult resolved = store.validateAndResolve(
+        oversized,
+        [&resolverCalls](const BrowserAddress &) {
+            ++resolverCalls;
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+
+    QCOMPARE(saved.status, BrowserSessionSaveStatus::InvalidSnapshot);
+    QVERIFY(!resolved.snapshot.has_value());
+    QCOMPARE(resolverCalls, 0);
+    QCOMPARE(authorityScans, 0);
+#endif
+}
+
+void BrowserSessionStoreTest::validatesAddressesBeforeCurrentHistoryEquality()
+{
+#if !defined(Q_OS_WIN) || !defined(Q_BROWSER_HOST_TESTING)
+    QSKIP("Windows session test hooks are unavailable");
+#else
+    SessionHooksReset hooksReset;
+    StateDirectoryFixture fixture;
+    QVERIFY(fixture.authority);
+    BrowserSessionStore store(fixture.authority);
+
+    int currentHistoryComparisons = 0;
+    qbrowser_host_testing::BrowserSessionStoreTestHooks hooks;
+    hooks.beforeCurrentHistoryEquality = [&currentHistoryComparisons]() {
+        ++currentHistoryComparisons;
+    };
+    qbrowser_host_testing::setBrowserSessionStoreTestHooks(std::move(hooks));
+
+    const BrowserSessionResolveResult control = store.validateAndResolve(
+        sampleSnapshot(),
+        [](const BrowserAddress &) {
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+    QVERIFY(control.snapshot.has_value());
+    QVERIFY(currentHistoryComparisons > 0);
+
+    currentHistoryComparisons = 0;
+    const QString tooLong = QStringLiteral("app://") + QString(4096, u'a');
+    BrowserWindowSnapshot oversized = sampleSnapshot();
+    oversized.tabs[0].address = QString(tooLong.constData(), tooLong.size());
+    oversized.tabs[0].history = {
+        QString(tooLong.constData(), tooLong.size())};
+    int resolverCalls = 0;
+    const BrowserSessionSaveResult saved = store.save(oversized);
+    const BrowserSessionResolveResult resolved = store.validateAndResolve(
+        oversized,
+        [&resolverCalls](const BrowserAddress &) {
+            ++resolverCalls;
+            return std::optional<BrowserTabKind>(BrowserTabKind::Host);
+        });
+
+    QCOMPARE(saved.status, BrowserSessionSaveStatus::InvalidSnapshot);
+    QVERIFY(!resolved.snapshot.has_value());
+    QCOMPARE(resolverCalls, 0);
+    QCOMPARE(currentHistoryComparisons, 0);
 #endif
 }
 

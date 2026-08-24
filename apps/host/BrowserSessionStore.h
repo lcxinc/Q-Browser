@@ -65,6 +65,9 @@ namespace qbrowser_host_testing
 {
 struct BrowserSessionStoreTestHooks final
 {
+    std::function<void()> beforeTitleSanitize;
+    std::function<void()> beforeAppAuthorityScan;
+    std::function<void()> beforeCurrentHistoryEquality;
     std::function<void(const QString &)> afterPrimaryLeafOpenedBeforeRead;
     std::function<void(const QString &)> afterCorruptLeafOpenedBeforeUse;
     std::function<void(const QString &)> beforeAtomicPublish;
