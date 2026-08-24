@@ -86,5 +86,6 @@ private:
     QVector<CommandAction> commandActions_;
     QString selectedTabId_;
     bool synchronizationInProgress_ = false;
+    bool terminalSynchronizationPhase_ = false;
     std::optional<PresentationBatch> pendingBatch_;
 };

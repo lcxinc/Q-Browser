@@ -265,6 +265,8 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
 
 bool BrowserChrome::synchronizeTabs(const BrowserTabModel &model)
 {
+    if (terminalSynchronizationPhase_) return false;
+
     std::optional<PresentationBatch> batch = batchFromModel(model);
     if (!batch.has_value()) return false;
 
@@ -285,11 +287,15 @@ bool BrowserChrome::synchronizeTabs(const BrowserTabModel &model)
 
     // A signal observer that continually requests alternating states must not
     // turn presentation into unbounded recursion or a livelock. Apply the
-    // newest bounded pending batch once with the three observable re-entry
-    // sources suppressed.
+    // newest bounded pending batch once with the common observer signals
+    // blocked. Event filters can still observe QAction changes, so explicitly
+    // reject synchronization requests during this terminal phase instead of
+    // acknowledging a request that cannot be committed.
     pendingBatch_.reset();
+    const QScopedValueRollback<bool> terminalGuard(
+        terminalSynchronizationPhase_, true);
     applyBatchWithObserverSignalsBlocked(next);
-    pendingBatch_.reset();
+    Q_ASSERT(!pendingBatch_.has_value());
     return true;
 }
 
@@ -482,6 +488,8 @@ QAction *BrowserChrome::actionForCommand(BrowserCommand command) const noexcept
 
 void BrowserChrome::dispatchCommand(BrowserCommand command)
 {
+    if (synchronizationInProgress_) return;
+
     QAction *const action = actionForCommand(command);
     if (action == nullptr || !action->isEnabled()) return;
     if (command == BrowserCommand::FocusAddress) {

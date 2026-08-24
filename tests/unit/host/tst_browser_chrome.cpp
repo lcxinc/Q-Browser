@@ -5,6 +5,7 @@
 #include <QAccessible>
 #include <QAction>
 #include <QCoreApplication>
+#include <QEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QSet>
@@ -162,6 +163,65 @@ bool synchronizeChrome(
     return restoreModel(model, snapshots, presentations, activeTabId)
         && chrome.synchronizeTabs(model);
 }
+
+enum class ObservableSynchronizationTransition
+{
+    BackToNoBack,
+    ActiveToEmpty,
+    EmptyToActive,
+    IdleToLoading,
+    LoadingToIdle,
+    OneToMaximum,
+    MaximumToOne,
+};
+
+class AlternatingActionSynchronizationFilter final : public QObject
+{
+public:
+    AlternatingActionSynchronizationFilter(BrowserChrome *chrome,
+                                           QAction *observedAction,
+                                           const BrowserTabModel *idleModel,
+                                           const BrowserTabModel *loadingModel)
+        : chrome_(chrome),
+          observedAction_(observedAction),
+          idleModel_(idleModel),
+          loadingModel_(loadingModel)
+    {
+    }
+
+    bool enabled = false;
+    int eventCount = 0;
+    int maximumDepth = 0;
+    bool lastRequestedLoading = false;
+    QVector<bool> synchronizationResults;
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (!enabled || watched != chrome_
+            || event->type() != QEvent::ActionChanged) {
+            return false;
+        }
+        const auto *const actionEvent = static_cast<QActionEvent *>(event);
+        if (actionEvent->action() != observedAction_) return false;
+
+        ++depth_;
+        maximumDepth = qMax(maximumDepth, depth_);
+        ++eventCount;
+        lastRequestedLoading = eventCount % 2 == 0;
+        synchronizationResults.append(chrome_->synchronizeTabs(
+            lastRequestedLoading ? *loadingModel_ : *idleModel_));
+        --depth_;
+        return false;
+    }
+
+private:
+    BrowserChrome *chrome_ = nullptr;
+    QAction *observedAction_ = nullptr;
+    const BrowserTabModel *idleModel_ = nullptr;
+    const BrowserTabModel *loadingModel_ = nullptr;
+    int depth_ = 0;
+};
 }
 
 class BrowserChromeTest final : public QObject
@@ -183,6 +243,9 @@ private slots:
     void modelBoundSynchronizationValidatesCanonicalStateAtomically();
     void nestedSynchronizationUsesOwnedLatestBatch();
     void alternatingNestedSynchronizationIsBounded();
+    void commandsAreInertDuringObservableSynchronization_data();
+    void commandsAreInertDuringObservableSynchronization();
+    void terminalSynchronizationRejectsUncommittedRequest();
     void standaloneNavigationBarStartsNeutral();
     void disabledForeignAndDirectDispatchIsInert();
     void tabMovesDoNotRequestRedundantActivation();
@@ -1001,6 +1064,336 @@ void BrowserChromeTest::alternatingNestedSynchronizationIsBounded()
     QCOMPARE(chrome.windowTitle(), QStringLiteral("First - Q-Browser"));
     QCOMPARE(chrome.actionForCommand(BrowserCommand::Reload)->isEnabled(),
              true);
+}
+
+void BrowserChromeTest::commandsAreInertDuringObservableSynchronization_data()
+{
+    QTest::addColumn<int>("transitionValue");
+
+    QTest::newRow("active-back-to-active-no-back")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::BackToNoBack);
+    QTest::newRow("active-to-empty")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::ActiveToEmpty);
+    QTest::newRow("empty-to-active")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::EmptyToActive);
+    QTest::newRow("idle-to-loading")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::IdleToLoading);
+    QTest::newRow("loading-to-idle")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::LoadingToIdle);
+    QTest::newRow("one-to-maximum")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::OneToMaximum);
+    QTest::newRow("maximum-to-one")
+        << static_cast<int>(
+               ObservableSynchronizationTransition::MaximumToOne);
+}
+
+void BrowserChromeTest::commandsAreInertDuringObservableSynchronization()
+{
+    QFETCH(int, transitionValue);
+    const auto transition =
+        static_cast<ObservableSynchronizationTransition>(transitionValue);
+
+    QVector<BrowserTabSnapshot> beforeTabs;
+    QVector<BrowserTabPresentation> beforePresentations;
+    QString beforeActiveId;
+    QVector<BrowserTabSnapshot> afterTabs;
+    QVector<BrowserTabPresentation> afterPresentations;
+    QString afterActiveId;
+
+    auto appendMaximum = [](QVector<BrowserTabSnapshot> &tabs,
+                            QVector<BrowserTabPresentation> &presentations,
+                            const QString &stateName) {
+        for (int index = 0; index < BrowserTabModel::MaxOpenTabs; ++index) {
+            const QString id = QString::number(index, 16)
+                                   .rightJustified(32, QLatin1Char('0'));
+            tabs.append(tab(
+                id,
+                BrowserTabKind::App,
+                index == 0 ? stateName
+                           : QStringLiteral("%1 tab %2")
+                                 .arg(stateName)
+                                 .arg(index + 1),
+                {QStringLiteral("app://pilot/%1/%2")
+                     .arg(stateName.toLower())
+                     .arg(index)},
+                0));
+            presentations.append(presentation(
+                BrowserContentIdentity::SignedApplication));
+        }
+    };
+
+    switch (transition) {
+    case ObservableSynchronizationTransition::BackToNoBack:
+        beforeTabs.append(tab(
+            tabId(u'1'), BrowserTabKind::App, QStringLiteral("Back source"),
+            {QStringLiteral("app://pilot/back/0"),
+             QStringLiteral("app://pilot/back/1")},
+            1));
+        beforePresentations.append(presentation(
+            BrowserContentIdentity::SignedApplication));
+        beforeActiveId = beforeTabs.first().id;
+        afterTabs.append(tab(
+            tabId(u'1'), BrowserTabKind::App,
+            QStringLiteral("No-back target"),
+            {QStringLiteral("app://pilot/no-back/0"),
+             QStringLiteral("app://pilot/no-back/1")},
+            0));
+        afterPresentations.append(presentation(
+            BrowserContentIdentity::SignedApplication));
+        afterActiveId = afterTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::ActiveToEmpty:
+        beforeTabs.append(tab(
+            tabId(u'2'), BrowserTabKind::Host,
+            QStringLiteral("Active source"),
+            {QStringLiteral("qbrowser://active-source")}, 0));
+        beforePresentations.append(presentation());
+        beforeActiveId = beforeTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::EmptyToActive:
+        afterTabs.append(tab(
+            tabId(u'3'), BrowserTabKind::Host,
+            QStringLiteral("Active target"),
+            {QStringLiteral("qbrowser://active-target")}, 0));
+        afterPresentations.append(presentation());
+        afterActiveId = afterTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::IdleToLoading:
+        beforeTabs.append(tab(
+            tabId(u'4'), BrowserTabKind::Web, QStringLiteral("Idle source"),
+            {QStringLiteral("app://pilot/web/idle-source")}, 0));
+        beforePresentations.append(presentation(
+            BrowserContentIdentity::RestrictedWeb));
+        beforeActiveId = beforeTabs.first().id;
+        afterTabs.append(tab(
+            tabId(u'4'), BrowserTabKind::Web,
+            QStringLiteral("Loading target"),
+            {QStringLiteral("app://pilot/web/loading-target")}, 0));
+        afterPresentations.append(presentation(
+            BrowserContentIdentity::RestrictedWeb, true, 47));
+        afterActiveId = afterTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::LoadingToIdle:
+        beforeTabs.append(tab(
+            tabId(u'5'), BrowserTabKind::Web,
+            QStringLiteral("Loading source"),
+            {QStringLiteral("app://pilot/web/loading-source")}, 0));
+        beforePresentations.append(presentation(
+            BrowserContentIdentity::RestrictedWeb, true, 63));
+        beforeActiveId = beforeTabs.first().id;
+        afterTabs.append(tab(
+            tabId(u'5'), BrowserTabKind::Web, QStringLiteral("Idle target"),
+            {QStringLiteral("app://pilot/web/idle-target")}, 0));
+        afterPresentations.append(presentation(
+            BrowserContentIdentity::RestrictedWeb));
+        afterActiveId = afterTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::OneToMaximum:
+        beforeTabs.append(tab(
+            tabId(u'e'), BrowserTabKind::App, QStringLiteral("One source"),
+            {QStringLiteral("app://pilot/one-source")}, 0));
+        beforePresentations.append(presentation(
+            BrowserContentIdentity::SignedApplication));
+        beforeActiveId = beforeTabs.first().id;
+        appendMaximum(afterTabs,
+                      afterPresentations,
+                      QStringLiteral("Maximum target"));
+        afterActiveId = afterTabs.first().id;
+        break;
+    case ObservableSynchronizationTransition::MaximumToOne:
+        appendMaximum(beforeTabs,
+                      beforePresentations,
+                      QStringLiteral("Maximum source"));
+        beforeActiveId = beforeTabs.first().id;
+        afterTabs.append(tab(
+            tabId(u'e'), BrowserTabKind::App, QStringLiteral("One target"),
+            {QStringLiteral("app://pilot/one-target")}, 0));
+        afterPresentations.append(presentation(
+            BrowserContentIdentity::SignedApplication));
+        afterActiveId = afterTabs.first().id;
+        break;
+    }
+
+    BrowserTabModel beforeModel;
+    BrowserTabModel afterModel;
+    QVERIFY(restoreModel(beforeModel,
+                         beforeTabs,
+                         beforePresentations,
+                         beforeActiveId));
+    QVERIFY(restoreModel(afterModel,
+                         afterTabs,
+                         afterPresentations,
+                         afterActiveId));
+
+    BrowserChrome chrome;
+    QVERIFY(chrome.synchronizeTabs(beforeModel));
+    QLineEdit *const address = chrome.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QVERIFY(address != nullptr);
+
+    QSignalSpy commands(&chrome, &BrowserChrome::commandRequested);
+    int addressObserverCount = 0;
+    int titleObserverCount = 0;
+    bool observeSynchronization = true;
+    auto attemptEveryCommandSource = [&] {
+        for (BrowserCommand command : browserCommands()) {
+            chrome.dispatchCommand(command);
+        }
+        for (const BrowserCommandChord &chord : browserCommandChords()) {
+            const std::optional<BrowserCommand> foreignCommand =
+                browserCommandForKeyCombination(chord.keyCombination);
+            if (foreignCommand.has_value()) {
+                chrome.dispatchCommand(*foreignCommand);
+            }
+        }
+        for (BrowserCommand command : browserCommands()) {
+            QAction *const action = chrome.actionForCommand(command);
+            if (action != nullptr) action->trigger();
+        }
+        const QStringList toolButtonNames{
+            QStringLiteral("browser-new-tab"),
+            QStringLiteral("navigation-back"),
+            QStringLiteral("navigation-forward"),
+            QStringLiteral("navigation-reload-stop"),
+            QStringLiteral("navigation-home"),
+        };
+        for (const QString &name : toolButtonNames) {
+            QToolButton *const button = toolButton(chrome, name);
+            if (button != nullptr) button->click();
+        }
+    };
+    connect(address, &QLineEdit::textChanged, &chrome, [&](const QString &) {
+        if (!observeSynchronization) return;
+        ++addressObserverCount;
+        attemptEveryCommandSource();
+    });
+    connect(&chrome, &QWidget::windowTitleChanged, &chrome,
+            [&](const QString &) {
+                if (!observeSynchronization) return;
+                ++titleObserverCount;
+                attemptEveryCommandSource();
+            });
+
+    QVERIFY(chrome.synchronizeTabs(afterModel));
+    observeSynchronization = false;
+    QVERIFY(addressObserverCount > 0);
+    QVERIFY(titleObserverCount > 0);
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(!address->hasSelectedText());
+
+    auto enabled = [&](BrowserCommand command) {
+        QAction *const action = chrome.actionForCommand(command);
+        Q_ASSERT(action != nullptr);
+        return action->isEnabled();
+    };
+    BrowserCommand steadyEnabled = BrowserCommand::Reload;
+    BrowserCommand steadyDisabled = BrowserCommand::Stop;
+    switch (transition) {
+    case ObservableSynchronizationTransition::BackToNoBack:
+        QVERIFY(!enabled(BrowserCommand::Back));
+        QVERIFY(enabled(BrowserCommand::Forward));
+        QVERIFY(enabled(BrowserCommand::CloseTab));
+        break;
+    case ObservableSynchronizationTransition::ActiveToEmpty:
+        QVERIFY(!enabled(BrowserCommand::CloseTab));
+        QVERIFY(!enabled(BrowserCommand::Reload));
+        QVERIFY(!enabled(BrowserCommand::Home));
+        QVERIFY(enabled(BrowserCommand::NewTab));
+        steadyEnabled = BrowserCommand::NewTab;
+        steadyDisabled = BrowserCommand::CloseTab;
+        break;
+    case ObservableSynchronizationTransition::EmptyToActive:
+        QVERIFY(enabled(BrowserCommand::CloseTab));
+        QVERIFY(enabled(BrowserCommand::Reload));
+        QVERIFY(enabled(BrowserCommand::Home));
+        break;
+    case ObservableSynchronizationTransition::IdleToLoading:
+        QVERIFY(enabled(BrowserCommand::Stop));
+        QVERIFY(enabled(BrowserCommand::Reload));
+        steadyEnabled = BrowserCommand::Stop;
+        steadyDisabled = BrowserCommand::Back;
+        break;
+    case ObservableSynchronizationTransition::LoadingToIdle:
+        QVERIFY(!enabled(BrowserCommand::Stop));
+        QVERIFY(enabled(BrowserCommand::Reload));
+        break;
+    case ObservableSynchronizationTransition::OneToMaximum:
+        QVERIFY(!enabled(BrowserCommand::NewTab));
+        QVERIFY(!enabled(BrowserCommand::ReopenClosedTab));
+        QVERIFY(enabled(BrowserCommand::CloseTab));
+        steadyEnabled = BrowserCommand::CloseTab;
+        steadyDisabled = BrowserCommand::NewTab;
+        break;
+    case ObservableSynchronizationTransition::MaximumToOne:
+        QVERIFY(enabled(BrowserCommand::NewTab));
+        QVERIFY(enabled(BrowserCommand::ReopenClosedTab));
+        QVERIFY(enabled(BrowserCommand::CloseTab));
+        break;
+    }
+
+    chrome.dispatchCommand(steadyEnabled);
+    chrome.actionForCommand(steadyEnabled)->trigger();
+    QCOMPARE(commands.count(), 2);
+    chrome.dispatchCommand(steadyDisabled);
+    chrome.actionForCommand(steadyDisabled)->trigger();
+    QCOMPARE(commands.count(), 2);
+}
+
+void BrowserChromeTest::terminalSynchronizationRejectsUncommittedRequest()
+{
+    const BrowserTabSnapshot page = tab(
+        tabId(u'6'), BrowserTabKind::Web, QStringLiteral("Alternating"),
+        {QStringLiteral("app://pilot/web/alternating")}, 0);
+    BrowserTabModel idleModel;
+    BrowserTabModel loadingModel;
+    QVERIFY(restoreModel(
+        idleModel,
+        {page},
+        {presentation(BrowserContentIdentity::RestrictedWeb)},
+        page.id));
+    QVERIFY(restoreModel(
+        loadingModel,
+        {page},
+        {presentation(BrowserContentIdentity::RestrictedWeb, true, 71)},
+        page.id));
+
+    BrowserChrome chrome;
+    QVERIFY(chrome.synchronizeTabs(idleModel));
+    QAction *const stopAction =
+        chrome.actionForCommand(BrowserCommand::Stop);
+    QToolButton *const reloadStop = toolButton(
+        chrome, QStringLiteral("navigation-reload-stop"));
+    QVERIFY(stopAction != nullptr);
+    QVERIFY(reloadStop != nullptr);
+
+    AlternatingActionSynchronizationFilter filter(
+        &chrome, stopAction, &idleModel, &loadingModel);
+    chrome.installEventFilter(&filter);
+    filter.enabled = true;
+
+    QVERIFY(chrome.synchronizeTabs(loadingModel));
+    filter.enabled = false;
+    QCOMPARE(filter.maximumDepth, 1);
+    QCOMPARE(filter.eventCount, BrowserTabModel::MaxOpenTabs + 1);
+    QCOMPARE(filter.synchronizationResults.size(), filter.eventCount);
+    for (int index = 0; index < BrowserTabModel::MaxOpenTabs; ++index) {
+        QVERIFY(filter.synchronizationResults.at(index));
+    }
+    QVERIFY(!filter.lastRequestedLoading);
+    QCOMPARE(reloadStop->defaultAction(), stopAction);
+    QVERIFY(stopAction->isEnabled());
+    QCOMPARE(filter.synchronizationResults.last(), false);
+
+    QVERIFY(chrome.synchronizeTabs(idleModel));
+    QCOMPARE(reloadStop->defaultAction(),
+             chrome.actionForCommand(BrowserCommand::Reload));
+    QVERIFY(!stopAction->isEnabled());
 }
 
 void BrowserChromeTest::standaloneNavigationBarStartsNeutral()
