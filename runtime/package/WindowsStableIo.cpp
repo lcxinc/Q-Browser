@@ -392,20 +392,27 @@ void UniqueWindowsHandle::reset(HANDLE handle) noexcept
 
 bool WindowsStableDirectoryTree::openRoot(const QString &rootPath)
 {
-    return openRootImpl(rootPath, false);
+    return openRootImpl(rootPath, false, true);
+}
+
+bool WindowsStableDirectoryTree::openSharedRoot(const QString &rootPath)
+{
+    return openRootImpl(rootPath, false, false);
 }
 
 bool WindowsStableDirectoryTree::openMovableRoot(const QString &rootPath)
 {
-    return openRootImpl(rootPath, true);
+    return openRootImpl(rootPath, true, true);
 }
 
 bool WindowsStableDirectoryTree::openRootImpl(
     const QString &rootPath,
-    const bool movable)
+    const bool movable,
+    const bool requestRootDeleteAccess)
 {
     m_directories.clear();
     m_movableRoot = movable;
+    m_requestRootDeleteAccess = requestRootDeleteAccess;
     m_rootPath = absolutePath(rootPath);
     m_rootKey = pathKey(m_rootPath);
 
@@ -784,7 +791,10 @@ bool WindowsStableDirectoryTree::addDirectory(
         | (key == m_rootKey ? READ_CONTROL : 0U)
         | ((lockMembers || immutable) ? FILE_LIST_DIRECTORY : 0U)
         | (lockMembers ? READ_CONTROL | WRITE_DAC : 0U)
-        | ((!immutable && (created || lockRename)) ? DELETE : 0U);
+        | ((!immutable
+            && (created || (lockRename && m_requestRootDeleteAccess)))
+               ? DELETE
+               : 0U);
     const DWORD shareMode = immutable
         ? FILE_SHARE_READ
         : FILE_SHARE_READ
@@ -874,6 +884,43 @@ bool WindowsStableFile::openForDelete(
         tree);
 }
 
+WindowsStableFileOpenStatus WindowsStableFile::openReadDeleteLocked(
+    const QString &path,
+    const WindowsStableDirectoryTree &tree)
+{
+    const auto apiPath = windowsApiPath(path);
+    if (!apiPath) return WindowsStableFileOpenStatus::Failure;
+    constexpr DWORD desiredAccess = GENERIC_READ | FILE_READ_ATTRIBUTES
+        | READ_CONTROL | DELETE;
+    m_handle.reset(CreateFileW(
+        reinterpret_cast<LPCWSTR>(apiPath->utf16()),
+        desiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr));
+    if (!m_handle.isValid()) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+            ? WindowsStableFileOpenStatus::Missing
+            : WindowsStableFileOpenStatus::Failure;
+    }
+
+    QString finalPath;
+    WindowsFileIdentity identity;
+    if (!queryHandle(m_handle.get(), false, identity, finalPath)
+        || identity.volumeSerial != tree.rootVolumeSerial()
+        || !finalPathIsWithin(tree.rootFinalPath(), finalPath)) {
+        m_handle.reset();
+        return WindowsStableFileOpenStatus::Failure;
+    }
+    m_identity = identity;
+    m_finalPath = finalPath;
+    m_path = absolutePath(path);
+    return WindowsStableFileOpenStatus::Opened;
+}
+
 bool WindowsStableFile::createOwnedOutput(
     const QString &path,
     const WindowsStableDirectoryTree &tree,
@@ -912,6 +959,114 @@ bool WindowsStableFile::createOwnedOutput(
             m_path, static_cast<quint32>(desiredAccess), true);
     }
 #endif
+    return true;
+}
+
+bool WindowsStableFile::createRestrictedOutput(
+    const QString &path,
+    const WindowsStableDirectoryTree &tree)
+{
+    const auto apiPath = windowsApiPath(path);
+    if (!apiPath || !tree.isStable()
+        || !tree.contains(QFileInfo(path).dir().absolutePath())
+        || !tree.rootHasRestrictedTrustAcl()) {
+        return false;
+    }
+
+    HANDLE rawToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken) == FALSE) {
+        return false;
+    }
+    UniqueWindowsHandle token(rawToken);
+    DWORD tokenBytes = 0;
+    (void)GetTokenInformation(token.get(), TokenUser, nullptr, 0, &tokenBytes);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || tokenBytes == 0U) {
+        return false;
+    }
+    QByteArray tokenStorage(static_cast<qsizetype>(tokenBytes), Qt::Uninitialized);
+    if (GetTokenInformation(token.get(),
+                            TokenUser,
+                            tokenStorage.data(),
+                            tokenBytes,
+                            &tokenBytes)
+        == FALSE) {
+        return false;
+    }
+    const auto *tokenUser = reinterpret_cast<const TOKEN_USER *>(
+        tokenStorage.constData());
+
+    BYTE systemBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD systemBytes = sizeof(systemBuffer);
+    if (CreateWellKnownSid(WinLocalSystemSid,
+                           nullptr,
+                           systemBuffer,
+                           &systemBytes)
+        == FALSE) {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entries[2]{};
+    for (EXPLICIT_ACCESSW &entry : entries) {
+        entry.grfAccessPermissions = FILE_ALL_ACCESS;
+        entry.grfAccessMode = GRANT_ACCESS;
+        entry.grfInheritance = NO_INHERITANCE;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    }
+    entries[0].Trustee.ptstrName = static_cast<LPWSTR>(tokenUser->User.Sid);
+    entries[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(systemBuffer);
+    PACL dacl = nullptr;
+    if (SetEntriesInAclW(2, entries, nullptr, &dacl) != ERROR_SUCCESS
+        || dacl == nullptr) {
+        if (dacl != nullptr) LocalFree(dacl);
+        return false;
+    }
+
+    SECURITY_DESCRIPTOR descriptor{};
+    const bool descriptorReady = InitializeSecurityDescriptor(
+                                     &descriptor,
+                                     SECURITY_DESCRIPTOR_REVISION)
+            != FALSE
+        && SetSecurityDescriptorOwner(
+               &descriptor, tokenUser->User.Sid, FALSE)
+            != FALSE
+        && SetSecurityDescriptorDacl(&descriptor, TRUE, dacl, FALSE) != FALSE
+        && SetSecurityDescriptorControl(
+               &descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+            != FALSE;
+    SECURITY_ATTRIBUTES attributes{
+        static_cast<DWORD>(sizeof(SECURITY_ATTRIBUTES)),
+        descriptorReady ? &descriptor : nullptr,
+        FALSE,
+    };
+    constexpr DWORD desiredAccess = GENERIC_READ | GENERIC_WRITE | DELETE
+        | FILE_READ_ATTRIBUTES | READ_CONTROL;
+    m_handle.reset(descriptorReady
+                       ? CreateFileW(
+                             reinterpret_cast<LPCWSTR>(apiPath->utf16()),
+                             desiredAccess,
+                             0U,
+                             &attributes,
+                             CREATE_NEW,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+                                 | FILE_FLAG_SEQUENTIAL_SCAN,
+                             nullptr)
+                       : INVALID_HANDLE_VALUE);
+    LocalFree(dacl);
+
+    QString finalPath;
+    WindowsFileIdentity identity;
+    if (!m_handle.isValid()
+        || !queryHandle(m_handle.get(), false, identity, finalPath)
+        || identity.volumeSerial != tree.rootVolumeSerial()
+        || !finalPathIsWithin(tree.rootFinalPath(), finalPath)
+        || !handleHasRestrictedTrustAcl(m_handle.get())) {
+        if (m_handle.isValid()) deleteOnClose(m_handle.get());
+        m_handle.reset();
+        return false;
+    }
+    m_identity = identity;
+    m_finalPath = finalPath;
+    m_path = absolutePath(path);
     return true;
 }
 
@@ -1009,6 +1164,26 @@ bool WindowsStableFile::readBounded(const quint64 maximum, QByteArray &bytes)
     return readExact(static_cast<quint64>(size.QuadPart), maximum, bytes);
 }
 
+WindowsStableReadStatus WindowsStableFile::readBoundedIncludingEmpty(
+    const quint64 maximum,
+    QByteArray &bytes)
+{
+    LARGE_INTEGER size{};
+    if (!m_handle.isValid() || maximum == 0U
+        || GetFileSizeEx(m_handle.get(), &size) == FALSE || size.QuadPart < 0) {
+        bytes.clear();
+        return WindowsStableReadStatus::Failure;
+    }
+    if (static_cast<quint64>(size.QuadPart) > maximum) {
+        bytes.clear();
+        return WindowsStableReadStatus::TooLarge;
+    }
+    bytes.clear();
+    return readExact(static_cast<quint64>(size.QuadPart), maximum, bytes)
+        ? WindowsStableReadStatus::Read
+        : WindowsStableReadStatus::Failure;
+}
+
 bool WindowsStableFile::hasRestrictedTrustAcl() const
 {
     return m_handle.isValid()
@@ -1061,6 +1236,49 @@ bool WindowsStableFile::publishNoReplace(
         return false;
     }
     m_path = *normalizedDestination;
+    return true;
+}
+
+bool WindowsStableFile::publishAtomic(
+    const QString &destination,
+    const WindowsStableDirectoryTree &tree,
+    const bool replaceExisting)
+{
+    if (!m_handle.isValid() || !tree.isStable()
+        || !tree.rootHasRestrictedTrustAcl()
+        || !tree.contains(QFileInfo(destination).dir().absolutePath())
+        || !isStableWithin(tree) || !hasSingleLink()
+        || !hasRestrictedTrustAcl() || !isSameIdentityAt(m_path)) {
+        return false;
+    }
+    const auto normalizedDestination = windowsApiPath(destination);
+    if (!normalizedDestination) return false;
+    const size_t nameBytes = static_cast<size_t>(normalizedDestination->size())
+        * sizeof(wchar_t);
+    constexpr size_t renameHeaderSize = sizeof(FILE_RENAME_INFO);
+    if (nameBytes > static_cast<size_t>(std::numeric_limits<DWORD>::max())
+            - renameHeaderSize
+        || nameBytes > std::numeric_limits<size_t>::max() - renameHeaderSize) {
+        return false;
+    }
+    std::vector<unsigned char> renameBuffer(renameHeaderSize + nameBytes);
+    auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(renameBuffer.data());
+    rename->Flags = FILE_RENAME_FLAG_POSIX_SEMANTICS
+        | (replaceExisting ? FILE_RENAME_FLAG_REPLACE_IF_EXISTS : 0U);
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(nameBytes);
+    std::memcpy(rename->FileName, normalizedDestination->utf16(), nameBytes);
+    if (SetFileInformationByHandle(
+            m_handle.get(),
+            FileRenameInfoEx,
+            rename,
+            static_cast<DWORD>(renameBuffer.size()))
+        == FALSE) {
+        return false;
+    }
+    m_path = absolutePath(destination);
+    m_finalPath.clear();
+    m_handle.reset();
     return true;
 }
 

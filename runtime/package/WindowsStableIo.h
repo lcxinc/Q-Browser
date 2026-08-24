@@ -46,10 +46,25 @@ struct WindowsFileIdentity final
     [[nodiscard]] bool operator==(const WindowsFileIdentity &other) const noexcept = default;
 };
 
+enum class WindowsStableFileOpenStatus
+{
+    Opened,
+    Missing,
+    Failure,
+};
+
+enum class WindowsStableReadStatus
+{
+    Read,
+    TooLarge,
+    Failure,
+};
+
 class WindowsStableDirectoryTree final
 {
 public:
     [[nodiscard]] bool openRoot(const QString &rootPath);
+    [[nodiscard]] bool openSharedRoot(const QString &rootPath);
     [[nodiscard]] bool openMovableRoot(const QString &rootPath);
     [[nodiscard]] bool addExistingDirectory(const QString &path);
     [[nodiscard]] bool addImmutableDirectory(const QString &path);
@@ -91,7 +106,9 @@ private:
         const QString &path,
         bool created,
         bool immutable = false);
-    [[nodiscard]] bool openRootImpl(const QString &rootPath, bool movable);
+    [[nodiscard]] bool openRootImpl(const QString &rootPath,
+                                    bool movable,
+                                    bool requestRootDeleteAccess);
     [[nodiscard]] bool pathIsWithinRoot(const QString &path) const;
 
     std::vector<DirectoryRecord> m_directories;
@@ -100,6 +117,7 @@ private:
     QString m_rootFinalPath;
     DWORD m_rootVolumeSerial = 0;
     bool m_movableRoot = false;
+    bool m_requestRootDeleteAccess = true;
 };
 
 class WindowsStableFile final
@@ -117,10 +135,16 @@ public:
     [[nodiscard]] bool openForDelete(
         const QString &path,
         const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] WindowsStableFileOpenStatus openReadDeleteLocked(
+        const QString &path,
+        const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool createOwnedOutput(
         const QString &path,
         const WindowsStableDirectoryTree &tree,
         SECURITY_ATTRIBUTES *securityAttributes = nullptr);
+    [[nodiscard]] bool createRestrictedOutput(
+        const QString &path,
+        const WindowsStableDirectoryTree &tree);
     [[nodiscard]] bool writeAll(const char *bytes, size_t size);
     [[nodiscard]] bool flush();
     [[nodiscard]] bool readExact(
@@ -128,11 +152,18 @@ public:
         quint64 maximum,
         QByteArray &bytes);
     [[nodiscard]] bool readBounded(quint64 maximum, QByteArray &bytes);
+    [[nodiscard]] WindowsStableReadStatus readBoundedIncludingEmpty(
+        quint64 maximum,
+        QByteArray &bytes);
     [[nodiscard]] bool hasRestrictedTrustAcl() const;
     [[nodiscard]] bool hasSingleLink() const;
     [[nodiscard]] bool publishNoReplace(
         const QString &destination,
         const WindowsStableDirectoryTree &tree);
+    [[nodiscard]] bool publishAtomic(
+        const QString &destination,
+        const WindowsStableDirectoryTree &tree,
+        bool replaceExisting);
     [[nodiscard]] bool deleteOwned() noexcept;
     [[nodiscard]] bool setReadOnly(bool readOnly) noexcept;
     [[nodiscard]] bool sealMutationsForMove();
