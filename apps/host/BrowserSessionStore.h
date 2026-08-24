@@ -78,6 +78,10 @@ struct BrowserSessionStoreTestHooks final
 void setBrowserSessionStoreTestHooks(BrowserSessionStoreTestHooks hooks);
 void resetBrowserSessionStoreTestHooks();
 [[nodiscard]] BrowserSessionStoreTestHooks browserSessionStoreTestHooks();
+[[nodiscard]] bool isCollectionSizeWithinLimit(qsizetype size,
+                                               qsizetype maximum) noexcept;
+[[nodiscard]] bool isCollectionIndexInRange(int index,
+                                            qsizetype size) noexcept;
 }
 #endif
 

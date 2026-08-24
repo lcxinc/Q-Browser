@@ -7,6 +7,8 @@
 #include <QTemporaryDir>
 #include <QTest>
 
+#include <limits>
+
 #ifdef Q_OS_WIN
 #include <Aclapi.h>
 #include <Sddl.h>
@@ -338,6 +340,8 @@ private slots:
     void rejectsOversizedInMemoryTitleBeforeSanitization();
     void returnsOnTooLongAddressBeforeAuthorityScan();
     void validatesAddressesBeforeCurrentHistoryEquality();
+    void comparesCollectionSizesWithoutNarrowing();
+    void comparesCollectionIndexWithoutNarrowing();
     void rejectsNoncanonicalLoadedTitle();
     void handlesSurrogateBoundariesAndRejectsLoneSurrogates();
     void rejectsOneMalformedTabWithoutPartialRecovery();
@@ -757,6 +761,55 @@ void BrowserSessionStoreTest::validatesAddressesBeforeCurrentHistoryEquality()
     QVERIFY(!resolved.snapshot.has_value());
     QCOMPARE(resolverCalls, 0);
     QCOMPARE(currentHistoryComparisons, 0);
+#endif
+}
+
+void BrowserSessionStoreTest::comparesCollectionSizesWithoutNarrowing()
+{
+#ifndef Q_BROWSER_HOST_TESTING
+    QSKIP("Session normalization test helpers are unavailable");
+#else
+    using qbrowser_host_testing::isCollectionSizeWithinLimit;
+
+    constexpr qsizetype intMaximum = std::numeric_limits<int>::max();
+    constexpr qsizetype beyondIntMaximum = intMaximum + 1;
+
+    QVERIFY(isCollectionSizeWithinLimit(
+        BrowserTabModel::MaxOpenTabs, BrowserTabModel::MaxOpenTabs));
+    QVERIFY(!isCollectionSizeWithinLimit(
+        BrowserTabModel::MaxOpenTabs + 1,
+        BrowserTabModel::MaxOpenTabs));
+    QVERIFY(isCollectionSizeWithinLimit(
+        BrowserTabModel::MaxHistoryEntries,
+        BrowserTabModel::MaxHistoryEntries));
+    QVERIFY(!isCollectionSizeWithinLimit(
+        BrowserTabModel::MaxHistoryEntries + 1,
+        BrowserTabModel::MaxHistoryEntries));
+    QVERIFY(!isCollectionSizeWithinLimit(
+        intMaximum, BrowserTabModel::MaxHistoryEntries));
+    QVERIFY(!isCollectionSizeWithinLimit(
+        beyondIntMaximum, BrowserTabModel::MaxHistoryEntries));
+#endif
+}
+
+void BrowserSessionStoreTest::comparesCollectionIndexWithoutNarrowing()
+{
+#ifndef Q_BROWSER_HOST_TESTING
+    QSKIP("Session normalization test helpers are unavailable");
+#else
+    using qbrowser_host_testing::isCollectionIndexInRange;
+
+    constexpr qsizetype intMaximum = std::numeric_limits<int>::max();
+    constexpr qsizetype beyondIntMaximum = intMaximum + 1;
+
+    QVERIFY(isCollectionIndexInRange(0, 1));
+    QVERIFY(!isCollectionIndexInRange(-1, beyondIntMaximum));
+    QVERIFY(isCollectionIndexInRange(
+        std::numeric_limits<int>::max() - 1, intMaximum));
+    QVERIFY(!isCollectionIndexInRange(
+        std::numeric_limits<int>::max(), intMaximum));
+    QVERIFY(isCollectionIndexInRange(
+        std::numeric_limits<int>::max(), beyondIntMaximum));
 #endif
 }
 

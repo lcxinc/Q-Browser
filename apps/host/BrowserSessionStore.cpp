@@ -50,6 +50,17 @@ BrowserSessionSaveResult saveIoFailure()
             QStringLiteral("host.session.save_failed")};
 }
 
+bool collectionSizeWithinLimit(const qsizetype size,
+                               const qsizetype maximum) noexcept
+{
+    return size <= maximum;
+}
+
+bool collectionIndexInRange(const int index, const qsizetype size) noexcept
+{
+    return index >= 0 && static_cast<qsizetype>(index) < size;
+}
+
 bool isBidiControl(const char16_t value) noexcept
 {
     return value == 0x061c || value == 0x200e || value == 0x200f
@@ -188,8 +199,8 @@ std::optional<BrowserWindowSnapshot> normalizedSnapshot(
         || geometry.width() < 320 || geometry.width() > 32'768
         || geometry.height() < 320 || geometry.height() > 32'768
         || snapshot.tabs.isEmpty()
-        || static_cast<int>(snapshot.tabs.size())
-            > BrowserTabModel::MaxOpenTabs
+        || !collectionSizeWithinLimit(snapshot.tabs.size(),
+                                      BrowserTabModel::MaxOpenTabs)
         || !isValidId(snapshot.activeTabId)) {
         return std::nullopt;
     }
@@ -200,10 +211,10 @@ std::optional<BrowserWindowSnapshot> normalizedSnapshot(
     for (BrowserTabSnapshot &tab : normalized.tabs) {
         if (!isValidId(tab.id) || ids.contains(tab.id)
             || !isValidKind(tab.kind) || tab.history.isEmpty()
-            || static_cast<int>(tab.history.size())
-                > BrowserTabModel::MaxHistoryEntries
-            || tab.historyIndex < 0
-            || tab.historyIndex >= static_cast<int>(tab.history.size())) {
+            || !collectionSizeWithinLimit(
+                tab.history.size(), BrowserTabModel::MaxHistoryEntries)
+            || !collectionIndexInRange(tab.historyIndex,
+                                       tab.history.size())) {
             return std::nullopt;
         }
         ids.insert(tab.id);
@@ -686,6 +697,17 @@ BrowserSessionStoreTestHooks browserSessionStoreTestHooks()
 {
     std::lock_guard lock(hooksMutex);
     return currentHooks;
+}
+
+bool isCollectionSizeWithinLimit(const qsizetype size,
+                                 const qsizetype maximum) noexcept
+{
+    return collectionSizeWithinLimit(size, maximum);
+}
+
+bool isCollectionIndexInRange(const int index, const qsizetype size) noexcept
+{
+    return collectionIndexInRange(index, size);
 }
 }
 #endif
