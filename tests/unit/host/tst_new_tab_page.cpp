@@ -8,11 +8,13 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QEventLoop>
 #include <QLabel>
 #include <QPointer>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTest>
+#include <QTimer>
 #include <QUrl>
 #include <QWebEnginePage>
 #include <QWebEngineView>
@@ -88,6 +90,25 @@ QWidget *nextFocusable(QWidget *widget)
     return candidate;
 }
 
+#ifdef Q_BROWSER_HOST_TESTING
+class NewTabPageHooksReset final
+{
+public:
+    NewTabPageHooksReset()
+    {
+        qbrowser_host_testing::resetNewTabPageTestHooks();
+    }
+
+    ~NewTabPageHooksReset()
+    {
+        qbrowser_host_testing::resetNewTabPageTestHooks();
+    }
+
+    NewTabPageHooksReset(const NewTabPageHooksReset &) = delete;
+    NewTabPageHooksReset &operator=(const NewTabPageHooksReset &) = delete;
+};
+#endif
+
 #ifdef Q_OS_WIN
 int directChildProcessCount(const QString &imageName)
 {
@@ -131,6 +152,7 @@ private slots:
     void providesStableNamesPlainLabelsAndFocusOrder();
     void destroyedButtonReentryIsSafe();
     void synchronousCleanupReentryIsCoalesced();
+    void nestedEventLoopDoesNotSpinPendingDispatch();
     void synchronousActivationRefreshKeepsTheSenderAlive();
     void populatedEmptyRepopulatedStateIsDeterministic();
     void activatesFocusedEntriesFromTheKeyboard();
@@ -209,12 +231,29 @@ void NewTabPageTest::recentCandidateInspectionAndRawTitlesAreBounded()
          QStringLiteral("app://pilot/dashboard")},
         {boundedTitle, QStringLiteral("app://pilot/customers")},
     });
-    QCOMPARE(recentButtons(page).size(), 1);
-    QAbstractButton *const accepted = button(
-        page, QStringLiteral("new-tab-recent-0"));
-    QVERIFY(accepted != nullptr);
-    QCOMPARE(accepted->text(),
+    QCOMPARE(recentButtons(page).size(), 3);
+    QCOMPARE(button(page, QStringLiteral("new-tab-recent-0"))->text(),
+             QStringLiteral("Duplicate valid title"));
+    QCOMPARE(button(page, QStringLiteral("new-tab-recent-1"))->text(),
+             QStringLiteral("Another duplicate valid title"));
+    QCOMPARE(button(page, QStringLiteral("new-tab-recent-2"))->text(),
              QString(BrowserTabModel::MaxTitleCodeUnits, QLatin1Char('x')));
+
+    QSignalSpy activated(&page, &NewTabPage::addressActivated);
+    const QStringList expectedAddresses{
+        QStringLiteral("app://pilot/orders"),
+        QStringLiteral("app://pilot/dashboard"),
+        QStringLiteral("app://pilot/customers"),
+    };
+    for (qsizetype index = 0; index < expectedAddresses.size(); ++index) {
+        QAbstractButton *const routeButton = button(
+            page, QStringLiteral("new-tab-recent-%1").arg(index));
+        QVERIFY(routeButton != nullptr);
+        routeButton->click();
+        QCOMPARE(activated.count(), 1);
+        QCOMPARE(activated.takeFirst().at(0).toString(),
+                 expectedAddresses.at(index));
+    }
 }
 
 void NewTabPageTest::recentRoutesPreserveOrderAndFirstDuplicate()
@@ -500,6 +539,114 @@ void NewTabPageTest::synchronousCleanupReentryIsCoalesced()
     QCOMPARE(recentButtons(page).size(), 1);
     QCOMPARE(button(page, QStringLiteral("new-tab-recent-0"))->text(),
              QStringLiteral("Final"));
+}
+
+void NewTabPageTest::nestedEventLoopDoesNotSpinPendingDispatch()
+{
+#ifndef Q_BROWSER_HOST_TESTING
+    QSKIP("NewTabPage dispatch observation requires host test hooks");
+#else
+    NewTabPageHooksReset hooksReset;
+    constexpr int NestedDispatchLimit = 32;
+    QEventLoop *activeNestedLoop = nullptr;
+    int totalDispatchAttempts = 0;
+    int nestedDispatchAttempts = 0;
+    bool nestedDispatchLimitReached = false;
+    qbrowser_host_testing::NewTabPageTestHooks hooks;
+    hooks.beforePendingRecentRoutesDispatch = [&] {
+        ++totalDispatchAttempts;
+        if (activeNestedLoop == nullptr) return;
+
+        ++nestedDispatchAttempts;
+        if (nestedDispatchAttempts >= NestedDispatchLimit) {
+            nestedDispatchLimitReached = true;
+            activeNestedLoop->quit();
+        }
+    };
+    qbrowser_host_testing::setNewTabPageTestHooks(std::move(hooks));
+
+    NewTabPage page;
+    page.setRecentRoutes({
+        {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
+    });
+    QAbstractButton *const reusedButton = button(
+        page, QStringLiteral("new-tab-recent-0"));
+    QVERIFY(reusedButton != nullptr);
+
+    int cleanupPhase = 0;
+    bool watchdogExpired = false;
+    connect(reusedButton, &QObject::objectNameChanged, &page,
+            [&page,
+             &cleanupPhase,
+             &activeNestedLoop,
+             &watchdogExpired](const QString &name) {
+                if (!name.isEmpty()) return;
+                if (cleanupPhase == 0) {
+                    cleanupPhase = 1;
+                    page.setRecentRoutes({
+                        {QStringLiteral("Initially pending"),
+                         QStringLiteral("app://pilot/files")},
+                    });
+                    return;
+                }
+                if (cleanupPhase != 1) return;
+
+                cleanupPhase = 2;
+                page.setRecentRoutes({
+                    {QStringLiteral("Superseded"),
+                     QStringLiteral("app://pilot/customers")},
+                });
+                page.setRecentRoutes({
+                    {QStringLiteral("Final"),
+                     QStringLiteral("app://pilot/settings")},
+                });
+
+                QEventLoop nestedLoop;
+                activeNestedLoop = &nestedLoop;
+                QTimer watchdog;
+                watchdog.setSingleShot(true);
+                watchdog.setTimerType(Qt::PreciseTimer);
+                connect(&watchdog, &QTimer::timeout, &nestedLoop,
+                        [&nestedLoop, &watchdogExpired] {
+                            watchdogExpired = true;
+                            nestedLoop.quit();
+                        });
+                watchdog.start(20);
+                nestedLoop.exec(QEventLoop::ExcludeUserInputEvents);
+                activeNestedLoop = nullptr;
+            });
+
+    page.setRecentRoutes({
+        {QStringLiteral("First intermediate"),
+         QStringLiteral("app://pilot/dashboard")},
+    });
+    QCOMPARE(cleanupPhase, 1);
+    page.setRecentRoutes({
+        {QStringLiteral("Second intermediate"),
+         QStringLiteral("app://pilot/web/help")},
+    });
+
+    QCOMPARE(cleanupPhase, 2);
+    QVERIFY2(!nestedDispatchLimitReached,
+             qPrintable(QStringLiteral(
+                 "pending dispatch reached the %1-attempt nested-loop bound; "
+                 "watchdogExpired=%2")
+                            .arg(nestedDispatchAttempts)
+                            .arg(watchdogExpired)));
+    QVERIFY(watchdogExpired);
+    QCOMPARE(nestedDispatchAttempts, 1);
+    QCOMPARE(button(page, QStringLiteral("new-tab-recent-0"))->text(),
+             QStringLiteral("Second intermediate"));
+
+    QCoreApplication::processEvents();
+
+    QCOMPARE(recentButtons(page).size(), 1);
+    QCOMPARE(button(page, QStringLiteral("new-tab-recent-0"))->text(),
+             QStringLiteral("Final"));
+    QCOMPARE(totalDispatchAttempts, 2);
+    QCoreApplication::processEvents();
+    QCOMPARE(totalDispatchAttempts, 2);
+#endif
 }
 
 void NewTabPageTest::synchronousActivationRefreshKeepsTheSenderAlive()

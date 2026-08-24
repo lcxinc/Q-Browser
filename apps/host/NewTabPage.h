@@ -5,8 +5,26 @@
 #include <QVector>
 #include <QWidget>
 
+#ifdef Q_BROWSER_HOST_TESTING
+#include <functional>
+#endif
+
 class QPushButton;
 class QVBoxLayout;
+
+#ifdef Q_BROWSER_HOST_TESTING
+namespace qbrowser_host_testing
+{
+struct NewTabPageTestHooks final
+{
+    std::function<void()> beforePendingRecentRoutesDispatch;
+};
+
+void setNewTabPageTestHooks(NewTabPageTestHooks hooks);
+void resetNewTabPageTestHooks();
+[[nodiscard]] NewTabPageTestHooks newTabPageTestHooks();
+}
+#endif
 
 struct NewTabEntry
 {

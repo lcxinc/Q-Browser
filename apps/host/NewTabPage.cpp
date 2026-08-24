@@ -14,6 +14,9 @@
 
 #include <algorithm>
 #include <array>
+#ifdef Q_BROWSER_HOST_TESTING
+#include <mutex>
+#endif
 #include <optional>
 #include <utility>
 
@@ -67,12 +70,12 @@ QVector<NewTabEntry> normalizedRecentRoutes(
             || seenAddresses.contains(*canonicalAddress)) {
             continue;
         }
-        seenAddresses.insert(*canonicalAddress);
 
         const std::optional<QString> title =
             BrowserTabModel::canonicalTitle(entry.title);
         if (!title.has_value()) continue;
 
+        seenAddresses.insert(*canonicalAddress);
         normalized.append({title->isEmpty() ? QStringLiteral("Untitled route")
                                             : *title,
                            *canonicalAddress});
@@ -102,6 +105,35 @@ QLabel *plainLabel(const QString &text,
 }
 
 } // namespace
+
+#ifdef Q_BROWSER_HOST_TESTING
+namespace qbrowser_host_testing
+{
+namespace
+{
+NewTabPageTestHooks currentHooks;
+std::mutex hooksMutex;
+}
+
+void setNewTabPageTestHooks(NewTabPageTestHooks hooks)
+{
+    std::lock_guard lock(hooksMutex);
+    currentHooks = std::move(hooks);
+}
+
+void resetNewTabPageTestHooks()
+{
+    std::lock_guard lock(hooksMutex);
+    currentHooks = {};
+}
+
+NewTabPageTestHooks newTabPageTestHooks()
+{
+    std::lock_guard lock(hooksMutex);
+    return currentHooks;
+}
+}
+#endif
 
 NewTabPage::NewTabPage(QWidget *parent)
     : QWidget(parent)
@@ -176,7 +208,6 @@ void NewTabPage::setRecentRoutes(const QVector<NewTabEntry> &validatedRoutes)
     if (recentRoutesRebuildInProgress_) {
         pendingRecentRoutes_ = std::move(normalized);
         recentRoutesUpdatePending_ = true;
-        schedulePendingRecentRoutes();
         return;
     }
 
@@ -189,61 +220,64 @@ void NewTabPage::applyRecentRoutes(
     const QVector<NewTabEntry> &normalizedRoutes)
 {
     Q_ASSERT(!recentRoutesRebuildInProgress_);
-    QScopedValueRollback<bool> rebuildGuard(
-        recentRoutesRebuildInProgress_, true);
+    {
+        QScopedValueRollback<bool> rebuildGuard(
+            recentRoutesRebuildInProgress_, true);
 
-    QVector<QPointer<QPushButton>> previousButtons =
-        std::exchange(recentButtons_, {});
-    reusableRecentButtons_.erase(
-        std::remove_if(reusableRecentButtons_.begin(),
-                       reusableRecentButtons_.end(),
-                       [](const QPointer<QPushButton> &candidate) {
-                           return candidate.isNull();
-                       }),
-        reusableRecentButtons_.end());
-    for (const QPointer<QPushButton> &candidate : previousButtons) {
-        if (candidate.isNull()) continue;
+        QVector<QPointer<QPushButton>> previousButtons =
+            std::exchange(recentButtons_, {});
+        reusableRecentButtons_.erase(
+            std::remove_if(reusableRecentButtons_.begin(),
+                           reusableRecentButtons_.end(),
+                           [](const QPointer<QPushButton> &candidate) {
+                               return candidate.isNull();
+                           }),
+            reusableRecentButtons_.end());
+        for (const QPointer<QPushButton> &candidate : previousButtons) {
+            if (candidate.isNull()) continue;
 
-        recentRoutesLayout_->removeWidget(candidate.data());
-        QObject::disconnect(
-            candidate.data(), &QPushButton::clicked, this, nullptr);
-        candidate->hide();
-        if (candidate.isNull()) continue;
-        candidate->setEnabled(false);
-        if (candidate.isNull()) continue;
-        candidate->setFocusPolicy(Qt::NoFocus);
-        if (candidate.isNull()) continue;
-        candidate->setShortcut(QKeySequence());
-        if (candidate.isNull()) continue;
-        candidate->setText(QString());
-        if (candidate.isNull()) continue;
-        candidate->setAccessibleName(QString());
-        if (candidate.isNull()) continue;
-        candidate->setObjectName(QString());
-        if (!candidate.isNull()) reusableRecentButtons_.append(candidate);
-    }
-
-    for (const NewTabEntry &entry : normalizedRoutes) {
-        const qsizetype index = recentButtons_.size();
-        const QPointer<QPushButton> routeButton = acquireRecentButton();
-        if (!configureRouteButton(
-                routeButton.data(),
-                entry.title,
-                entry.address,
-                QStringLiteral("new-tab-recent-%1").arg(index),
-                QStringLiteral("Open recent route: %1").arg(entry.title))) {
-            if (!routeButton.isNull()) {
-                reusableRecentButtons_.append(routeButton);
-            }
-            continue;
+            recentRoutesLayout_->removeWidget(candidate.data());
+            QObject::disconnect(
+                candidate.data(), &QPushButton::clicked, this, nullptr);
+            candidate->hide();
+            if (candidate.isNull()) continue;
+            candidate->setEnabled(false);
+            if (candidate.isNull()) continue;
+            candidate->setFocusPolicy(Qt::NoFocus);
+            if (candidate.isNull()) continue;
+            candidate->setShortcut(QKeySequence());
+            if (candidate.isNull()) continue;
+            candidate->setText(QString());
+            if (candidate.isNull()) continue;
+            candidate->setAccessibleName(QString());
+            if (candidate.isNull()) continue;
+            candidate->setObjectName(QString());
+            if (!candidate.isNull()) reusableRecentButtons_.append(candidate);
         }
-        recentRoutesLayout_->addWidget(routeButton.data());
-        recentButtons_.append(routeButton);
-    }
 
-    Q_ASSERT(recentButtons_.size() + reusableRecentButtons_.size()
-             <= MaximumRecentRoutes);
-    rebuildFocusOrder();
+        for (const NewTabEntry &entry : normalizedRoutes) {
+            const qsizetype index = recentButtons_.size();
+            const QPointer<QPushButton> routeButton = acquireRecentButton();
+            if (!configureRouteButton(
+                    routeButton.data(),
+                    entry.title,
+                    entry.address,
+                    QStringLiteral("new-tab-recent-%1").arg(index),
+                    QStringLiteral("Open recent route: %1").arg(entry.title))) {
+                if (!routeButton.isNull()) {
+                    reusableRecentButtons_.append(routeButton);
+                }
+                continue;
+            }
+            recentRoutesLayout_->addWidget(routeButton.data());
+            recentButtons_.append(routeButton);
+        }
+
+        Q_ASSERT(recentButtons_.size() + reusableRecentButtons_.size()
+                 <= MaximumRecentRoutes);
+        rebuildFocusOrder();
+    }
+    if (recentRoutesUpdatePending_) schedulePendingRecentRoutes();
 }
 
 void NewTabPage::schedulePendingRecentRoutes()
@@ -253,16 +287,17 @@ void NewTabPage::schedulePendingRecentRoutes()
     QTimer::singleShot(0, this, [this] {
         recentRoutesDispatchScheduled_ = false;
         if (!recentRoutesUpdatePending_) return;
+#ifdef Q_BROWSER_HOST_TESTING
+        const auto hooks = qbrowser_host_testing::newTabPageTestHooks();
+        if (hooks.beforePendingRecentRoutesDispatch) {
+            hooks.beforePendingRecentRoutesDispatch();
+        }
+#endif
+        if (recentRoutesRebuildInProgress_) return;
 
         QVector<NewTabEntry> pending = std::move(pendingRecentRoutes_);
         pendingRecentRoutes_.clear();
         recentRoutesUpdatePending_ = false;
-        if (recentRoutesRebuildInProgress_) {
-            pendingRecentRoutes_ = std::move(pending);
-            recentRoutesUpdatePending_ = true;
-            schedulePendingRecentRoutes();
-            return;
-        }
         applyRecentRoutes(pending);
     });
 }
