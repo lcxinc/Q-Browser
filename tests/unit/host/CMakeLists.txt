@@ -52,3 +52,12 @@ target_link_libraries(tst_new_tab_page
     Qt6::Widgets)
 q_browser_enable_strict_warnings(tst_new_tab_page)
 q_browser_add_qt_test(NAME new_tab_page TARGET tst_new_tab_page)
+
+add_executable(tst_browser_chrome tst_browser_chrome.cpp)
+target_link_libraries(tst_browser_chrome
+  PRIVATE
+    q_browser_host
+    Qt6::Test
+    Qt6::Widgets)
+q_browser_enable_strict_warnings(tst_browser_chrome)
+q_browser_add_qt_test(NAME browser_chrome TARGET tst_browser_chrome)

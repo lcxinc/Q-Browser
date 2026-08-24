@@ -3,6 +3,10 @@ if(NOT Q_BROWSER_BUILD_WEBENGINE)
 endif()
 
 add_library(q_browser_host STATIC
+  BrowserChrome.cpp
+  BrowserChrome.h
+  BrowserCommand.cpp
+  BrowserCommand.h
   BrowserSessionStore.cpp
   BrowserSessionStore.h
   BrowserTabModel.cpp
