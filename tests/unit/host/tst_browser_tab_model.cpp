@@ -6,6 +6,7 @@
 #include <QSignalSpy>
 #include <QTest>
 
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -918,12 +919,14 @@ void BrowserTabModelTest::reopenUsesFreshIdentityAndOnlyRestoresDescriptorState(
 void BrowserTabModelTest::titleIsBoundedSanitizedPlainText()
 {
     BrowserTabModel model;
-    const QString raw = QStringLiteral("<b>Hello</b>\u0001\n\u202e\u2066 world");
+    const QString raw = QStringLiteral("<b>A&B</b>\u0001\n\u202e\u2066");
+    const std::optional<QString> canonical = BrowserTabModel::canonicalTitle(raw);
+    QVERIFY(canonical.has_value());
+    QCOMPARE(*canonical, QStringLiteral("<b>A&B</b>"));
     const QString id = model.createTab(BrowserTabKind::Host, raw,
                                        QStringLiteral("qbrowser://newtab"));
     QVERIFY(!id.isEmpty());
-    QCOMPARE(model.snapshotAt(0).title,
-             QStringLiteral("<b>Hello</b> world"));
+    QCOMPARE(model.snapshotAt(0).title, *canonical);
 
     QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
     QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
@@ -966,8 +969,13 @@ void BrowserTabModelTest::titleSanitizerValidatesTheWholeLargeInput()
     QSignalSpy changed(&model, &BrowserTabModel::tabChanged);
     QSignalSpy persistence(&model, &BrowserTabModel::persistenceNeeded);
 
-    QString largeTitle(16 * 1024 * 1024, QLatin1Char('x'));
-    QVERIFY(model.setTitle(id, largeTitle));
+    const QString maximumInput(BrowserTabModel::MaxRawTitleCodeUnits,
+                               QLatin1Char('x'));
+    const std::optional<QString> maximumCanonical =
+        BrowserTabModel::canonicalTitle(maximumInput);
+    QVERIFY(maximumCanonical.has_value());
+    QCOMPARE(maximumCanonical->size(), BrowserTabModel::MaxTitleCodeUnits);
+    QVERIFY(model.setTitle(id, maximumInput));
     QCOMPARE(model.snapshotAt(0).title,
              QString(BrowserTabModel::MaxTitleCodeUnits,
                      QLatin1Char('x')));
@@ -977,9 +985,19 @@ void BrowserTabModelTest::titleSanitizerValidatesTheWholeLargeInput()
     const BrowserTabSnapshot beforeInvalid = model.snapshotAt(0);
     changed.clear();
     persistence.clear();
-    largeTitle.fill(QLatin1Char('y'));
-    largeTitle[largeTitle.size() - 1] = QChar(0xd800);
-    QVERIFY(!model.setTitle(id, largeTitle));
+    QString malformedAtBound(BrowserTabModel::MaxRawTitleCodeUnits,
+                             QLatin1Char('y'));
+    malformedAtBound[malformedAtBound.size() - 1] = QChar(0xd800);
+    QVERIFY(!BrowserTabModel::canonicalTitle(malformedAtBound).has_value());
+    QVERIFY(!model.setTitle(id, malformedAtBound));
+    QVERIFY(model.snapshotAt(0) == beforeInvalid);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(persistence.count(), 0);
+
+    const QString oversized(BrowserTabModel::MaxRawTitleCodeUnits + 1,
+                            QLatin1Char('z'));
+    QVERIFY(!BrowserTabModel::canonicalTitle(oversized).has_value());
+    QVERIFY(!model.setTitle(id, oversized));
     QVERIFY(model.snapshotAt(0) == beforeInvalid);
     QCOMPARE(changed.count(), 0);
     QCOMPARE(persistence.count(), 0);

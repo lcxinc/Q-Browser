@@ -27,8 +27,6 @@ constexpr auto CorruptLeaf = "browser-session.json.corrupt";
 constexpr auto SessionTemporaryLeaf = "browser-session.json.tmp";
 constexpr auto CorruptTemporaryLeaf = "browser-session.json.corrupt.tmp";
 constexpr quint64 MaximumSessionBytes = 16U * 1024U * 1024U;
-constexpr qsizetype MaximumRuntimeTitleInputCodeUnits =
-    BrowserTabModel::MaxTitleCodeUnits * 16;
 
 BrowserSessionLoadResult ioFailure()
 {
@@ -61,56 +59,16 @@ bool collectionIndexInRange(const int index, const qsizetype size) noexcept
     return index >= 0 && static_cast<qsizetype>(index) < size;
 }
 
-bool isBidiControl(const char16_t value) noexcept
+std::optional<QString> canonicalTitle(const QString &title)
 {
-    return value == 0x061c || value == 0x200e || value == 0x200f
-        || (value >= 0x202a && value <= 0x202e)
-        || (value >= 0x2066 && value <= 0x206f);
-}
-
-std::optional<QString> sanitizedTitle(const QString &title)
-{
-    if (title.size() > MaximumRuntimeTitleInputCodeUnits) {
+    if (title.size() > BrowserTabModel::MaxRawTitleCodeUnits) {
         return std::nullopt;
     }
 #ifdef Q_BROWSER_HOST_TESTING
     const auto hooks = qbrowser_host_testing::browserSessionStoreTestHooks();
     if (hooks.beforeTitleSanitize) hooks.beforeTitleSanitize();
 #endif
-    QString result;
-    result.reserve(BrowserTabModel::MaxTitleCodeUnits);
-    bool prefixComplete = false;
-    for (qsizetype index = 0; index < title.size(); ++index) {
-        const QChar value = title.at(index);
-        if (value.isHighSurrogate()) {
-            if (index + 1 >= title.size()
-                || !title.at(index + 1).isLowSurrogate()) {
-                return std::nullopt;
-            }
-            if (!prefixComplete
-                && result.size() + 2 <= BrowserTabModel::MaxTitleCodeUnits) {
-                result.append(value);
-                result.append(title.at(index + 1));
-                prefixComplete = result.size()
-                    == BrowserTabModel::MaxTitleCodeUnits;
-            } else if (!prefixComplete) {
-                prefixComplete = true;
-            }
-            ++index;
-            continue;
-        }
-        if (value.isLowSurrogate()) return std::nullopt;
-        if (value.category() == QChar::Other_Control
-            || isBidiControl(value.unicode())) {
-            continue;
-        }
-        if (!prefixComplete) {
-            result.append(value);
-            prefixComplete = result.size()
-                == BrowserTabModel::MaxTitleCodeUnits;
-        }
-    }
-    return result;
+    return BrowserTabModel::canonicalTitle(title);
 }
 
 bool isValidId(const QString &id) noexcept
@@ -220,7 +178,7 @@ std::optional<BrowserWindowSnapshot> normalizedSnapshot(
         ids.insert(tab.id);
         activeFound = activeFound || tab.id == normalized.activeTabId;
 
-        const std::optional<QString> title = sanitizedTitle(tab.title);
+        const std::optional<QString> title = canonicalTitle(tab.title);
         if (!title.has_value()
             || (requireCanonicalTitles && *title != tab.title)) {
             return std::nullopt;

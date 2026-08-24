@@ -151,7 +151,7 @@ QString BrowserTabModel::createTab(BrowserTabKind kind,
         || canonicalAddress.isEmpty()) {
         return {};
     }
-    const std::optional<QString> safeTitle = sanitizedTitle(title);
+    const std::optional<QString> safeTitle = canonicalTitle(title);
     if (!safeTitle.has_value()) return {};
 
     BrowserTabSnapshot snapshot;
@@ -369,7 +369,7 @@ bool BrowserTabModel::setTitle(const QString &id, const QString &untrustedTitle)
     QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
     const int index = indexOfId(id);
     if (index < 0) return false;
-    const std::optional<QString> safeTitle = sanitizedTitle(untrustedTitle);
+    const std::optional<QString> safeTitle = canonicalTitle(untrustedTitle);
     if (!safeTitle.has_value()) return false;
     if (tabs_.at(index).snapshot.title == *safeTitle) return true;
     tabs_[index].snapshot.title = *safeTitle;
@@ -566,22 +566,25 @@ bool BrowserTabModel::isValidVisualState(
     return false;
 }
 
-std::optional<QString> BrowserTabModel::sanitizedTitle(const QString &title)
+std::optional<QString> BrowserTabModel::canonicalTitle(
+    const QString &untrustedTitle)
 {
+    if (untrustedTitle.size() > MaxRawTitleCodeUnits) return std::nullopt;
+
     QString result;
     result.reserve(MaxTitleCodeUnits);
     bool prefixComplete = false;
-    for (qsizetype index = 0; index < title.size(); ++index) {
-        const QChar value = title.at(index);
+    for (qsizetype index = 0; index < untrustedTitle.size(); ++index) {
+        const QChar value = untrustedTitle.at(index);
         if (value.isHighSurrogate()) {
-            if (index + 1 >= title.size()
-                || !title.at(index + 1).isLowSurrogate()) {
+            if (index + 1 >= untrustedTitle.size()
+                || !untrustedTitle.at(index + 1).isLowSurrogate()) {
                 return std::nullopt;
             }
             if (!prefixComplete
                 && result.size() + 2 <= MaxTitleCodeUnits) {
                 result.append(value);
-                result.append(title.at(index + 1));
+                result.append(untrustedTitle.at(index + 1));
                 prefixComplete = result.size() == MaxTitleCodeUnits;
             } else if (!prefixComplete) {
                 prefixComplete = true;
@@ -659,6 +662,6 @@ bool BrowserTabModel::isValidRestoredSnapshot(
     for (const QString &entry : snapshot.history) {
         if (entry.isEmpty()) return false;
     }
-    const std::optional<QString> title = sanitizedTitle(snapshot.title);
+    const std::optional<QString> title = canonicalTitle(snapshot.title);
     return title.has_value() && *title == snapshot.title;
 }

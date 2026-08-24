@@ -614,6 +614,7 @@ void BrowserSessionStoreTest::sanitizesRuntimeTitleBeforeSave()
     BrowserWindowSnapshot snapshot = sampleSnapshot();
     snapshot.tabs[0].title = QString(255, u'a') + QString(QChar(0x0001))
         + QString::fromUcs4(U"\U0001f642") + QStringLiteral("ignored");
+    snapshot.tabs[1].title = QStringLiteral("<b>A&B</b>\u0001\n\u202e\u2066");
     BrowserSessionStore store(fixture.authority);
 
     QCOMPARE(store.save(snapshot).status, BrowserSessionSaveStatus::Saved);
@@ -621,6 +622,8 @@ void BrowserSessionStoreTest::sanitizesRuntimeTitleBeforeSave()
     QCOMPARE(loaded.status, BrowserSessionLoadStatus::Loaded);
     QVERIFY(loaded.snapshot.has_value());
     QCOMPARE(loaded.snapshot->tabs.at(0).title, QString(255, u'a'));
+    QCOMPARE(loaded.snapshot->tabs.at(1).title,
+             QStringLiteral("<b>A&B</b>"));
 #endif
 }
 
@@ -652,7 +655,7 @@ void BrowserSessionStoreTest::rejectsOversizedInMemoryTitleBeforeSanitization()
     titleSanitizations = 0;
     BrowserWindowSnapshot oversized = sampleSnapshot();
     oversized.tabs[0].title = QString(
-        BrowserTabModel::MaxTitleCodeUnits * 16 + 1, u'a');
+        BrowserTabModel::MaxRawTitleCodeUnits + 1, u'a');
     int resolverCalls = 0;
     const BrowserSessionSaveResult saved = store.save(oversized);
     const BrowserSessionResolveResult resolved = store.validateAndResolve(

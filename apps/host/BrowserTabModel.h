@@ -83,6 +83,7 @@ public:
     static constexpr int MaxOpenTabs = 16;
     static constexpr int MaxRecentlyClosed = 16;
     static constexpr int MaxHistoryEntries = 256;
+    static constexpr int MaxRawTitleCodeUnits = 4096;
     static constexpr int MaxTitleCodeUnits = 256;
 
     explicit BrowserTabModel(QObject *parent = nullptr);
@@ -92,6 +93,9 @@ public:
     [[nodiscard]] int activeIndex() const noexcept;
     [[nodiscard]] QString activeId() const;
     [[nodiscard]] int indexOfId(const QString &id) const noexcept;
+
+    [[nodiscard]] static std::optional<QString> canonicalTitle(
+        const QString &untrustedTitle);
 
     [[nodiscard]] BrowserTabSnapshot snapshotAt(int index) const;
     [[nodiscard]] QVector<BrowserTabSnapshot> snapshots() const;
@@ -159,8 +163,6 @@ private:
         BrowserTabLifecycle lifecycle) noexcept;
     [[nodiscard]] static bool isValidVisualState(
         BrowserVisualState visualState) noexcept;
-    [[nodiscard]] static std::optional<QString> sanitizedTitle(
-        const QString &title);
     [[nodiscard]] static BrowserContentIdentity contentIdentityFor(
         BrowserTabKind kind) noexcept;
     [[nodiscard]] static BrowserVisualState defaultVisualStateFor(

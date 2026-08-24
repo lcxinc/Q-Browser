@@ -1,20 +1,28 @@
 #include "NewTabPage.h"
 
 #include "BrowserAddress.h"
+#include "BrowserTabModel.h"
 
-#include <QChar>
+#include <QKeySequence>
 #include <QLabel>
+#include <QList>
 #include <QPushButton>
+#include <QScopedValueRollback>
 #include <QSet>
+#include <QTimer>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <array>
 #include <optional>
+#include <utility>
 
 namespace {
 
 constexpr qsizetype MaximumRecentRoutes = 16;
-constexpr qsizetype MaximumTitleCodeUnits = 256;
+// Four candidates per output slot bounds GUI-thread validation work while
+// leaving room for invalid and duplicate history entries.
+constexpr qsizetype MaximumInspectedRecentRouteCandidates = 64;
 
 struct FixedEntry final
 {
@@ -33,51 +41,6 @@ constexpr std::array<FixedEntry, 7> FixedEntries{{
     {"help", "Help", "app://pilot/web/help"},
 }};
 
-bool isBidiControl(const char16_t value) noexcept
-{
-    return value == 0x061c || value == 0x200e || value == 0x200f
-        || (value >= 0x202a && value <= 0x202e)
-        || (value >= 0x2066 && value <= 0x206f);
-}
-
-std::optional<QString> sanitizedTitle(const QString &title)
-{
-    QString result;
-    result.reserve(MaximumTitleCodeUnits);
-    bool prefixComplete = false;
-    for (qsizetype index = 0; index < title.size(); ++index) {
-        const QChar value = title.at(index);
-        if (value.isHighSurrogate()) {
-            if (index + 1 >= title.size()
-                || !title.at(index + 1).isLowSurrogate()) {
-                return std::nullopt;
-            }
-            if (!prefixComplete
-                && result.size() + 2 <= MaximumTitleCodeUnits) {
-                result.append(value);
-                result.append(title.at(index + 1));
-                prefixComplete = result.size() == MaximumTitleCodeUnits;
-            } else if (!prefixComplete) {
-                prefixComplete = true;
-            }
-            ++index;
-            continue;
-        }
-        if (value.isLowSurrogate()) {
-            return std::nullopt;
-        }
-        if (value.category() == QChar::Other_Control
-            || isBidiControl(value.unicode())) {
-            continue;
-        }
-        if (!prefixComplete) {
-            result.append(value);
-            prefixComplete = result.size() == MaximumTitleCodeUnits;
-        }
-    }
-    return result;
-}
-
 std::optional<QString> validatedAppAddress(const QString &address)
 {
     const BrowserAddress parsed = BrowserAddress::parse(address);
@@ -86,6 +49,43 @@ std::optional<QString> validatedAppAddress(const QString &address)
         return std::nullopt;
     }
     return parsed.canonical();
+}
+
+QVector<NewTabEntry> normalizedRecentRoutes(
+    const QVector<NewTabEntry> &untrustedRoutes)
+{
+    QVector<NewTabEntry> normalized;
+    normalized.reserve(MaximumRecentRoutes);
+    QSet<QString> seenAddresses;
+    const qsizetype inspectedCount = std::min(
+        untrustedRoutes.size(), MaximumInspectedRecentRouteCandidates);
+    for (qsizetype index = 0; index < inspectedCount; ++index) {
+        const NewTabEntry &entry = untrustedRoutes.at(index);
+        const std::optional<QString> canonicalAddress =
+            validatedAppAddress(entry.address);
+        if (!canonicalAddress.has_value()
+            || seenAddresses.contains(*canonicalAddress)) {
+            continue;
+        }
+        seenAddresses.insert(*canonicalAddress);
+
+        const std::optional<QString> title =
+            BrowserTabModel::canonicalTitle(entry.title);
+        if (!title.has_value()) continue;
+
+        normalized.append({title->isEmpty() ? QStringLiteral("Untitled route")
+                                            : *title,
+                           *canonicalAddress});
+        if (normalized.size() == MaximumRecentRoutes) break;
+    }
+    return normalized;
+}
+
+QString literalButtonText(const QString &title)
+{
+    QString literal = title;
+    literal.replace(u'&', QStringLiteral("&&"));
+    return literal;
 }
 
 QLabel *plainLabel(const QString &text,
@@ -161,44 +161,110 @@ NewTabPage::NewTabPage(QWidget *parent)
     rebuildFocusOrder();
 }
 
+NewTabPage::~NewTabPage()
+{
+    recentRoutesRebuildInProgress_ = true;
+    const QList<QPushButton *> childButtons = findChildren<QPushButton *>();
+    for (QPushButton *const routeButton : childButtons) {
+        QObject::disconnect(routeButton, nullptr, this, nullptr);
+    }
+}
+
 void NewTabPage::setRecentRoutes(const QVector<NewTabEntry> &validatedRoutes)
 {
-    for (QPushButton *routeButton : recentButtons_) {
-        recentRoutesLayout_->removeWidget(routeButton);
-        delete routeButton;
+    QVector<NewTabEntry> normalized = normalizedRecentRoutes(validatedRoutes);
+    if (recentRoutesRebuildInProgress_) {
+        pendingRecentRoutes_ = std::move(normalized);
+        recentRoutesUpdatePending_ = true;
+        schedulePendingRecentRoutes();
+        return;
     }
-    recentButtons_.clear();
 
-    QSet<QString> acceptedAddresses;
-    for (const NewTabEntry &entry : validatedRoutes) {
-        const std::optional<QString> canonicalAddress = validatedAppAddress(entry.address);
-        const std::optional<QString> title = sanitizedTitle(entry.title);
-        if (!canonicalAddress.has_value() || !title.has_value()
-            || acceptedAddresses.contains(*canonicalAddress)) {
-            continue;
-        }
+    pendingRecentRoutes_.clear();
+    recentRoutesUpdatePending_ = false;
+    applyRecentRoutes(normalized);
+}
 
-        const QString displayTitle = title->isEmpty()
-            ? QStringLiteral("Untitled route") : *title;
+void NewTabPage::applyRecentRoutes(
+    const QVector<NewTabEntry> &normalizedRoutes)
+{
+    Q_ASSERT(!recentRoutesRebuildInProgress_);
+    QScopedValueRollback<bool> rebuildGuard(
+        recentRoutesRebuildInProgress_, true);
+
+    QVector<QPointer<QPushButton>> previousButtons =
+        std::exchange(recentButtons_, {});
+    reusableRecentButtons_.erase(
+        std::remove_if(reusableRecentButtons_.begin(),
+                       reusableRecentButtons_.end(),
+                       [](const QPointer<QPushButton> &candidate) {
+                           return candidate.isNull();
+                       }),
+        reusableRecentButtons_.end());
+    for (const QPointer<QPushButton> &candidate : previousButtons) {
+        if (candidate.isNull()) continue;
+
+        recentRoutesLayout_->removeWidget(candidate.data());
+        QObject::disconnect(
+            candidate.data(), &QPushButton::clicked, this, nullptr);
+        candidate->hide();
+        if (candidate.isNull()) continue;
+        candidate->setEnabled(false);
+        if (candidate.isNull()) continue;
+        candidate->setFocusPolicy(Qt::NoFocus);
+        if (candidate.isNull()) continue;
+        candidate->setShortcut(QKeySequence());
+        if (candidate.isNull()) continue;
+        candidate->setText(QString());
+        if (candidate.isNull()) continue;
+        candidate->setAccessibleName(QString());
+        if (candidate.isNull()) continue;
+        candidate->setObjectName(QString());
+        if (!candidate.isNull()) reusableRecentButtons_.append(candidate);
+    }
+
+    for (const NewTabEntry &entry : normalizedRoutes) {
         const qsizetype index = recentButtons_.size();
-        QPushButton *const routeButton = createRouteButton(
-            displayTitle,
-            *canonicalAddress,
-            QStringLiteral("new-tab-recent-%1").arg(index),
-            QStringLiteral("Open recent route: %1").arg(displayTitle),
-            recentRoutesLayout_->parentWidget());
-        if (routeButton == nullptr) {
+        const QPointer<QPushButton> routeButton = acquireRecentButton();
+        if (!configureRouteButton(
+                routeButton.data(),
+                entry.title,
+                entry.address,
+                QStringLiteral("new-tab-recent-%1").arg(index),
+                QStringLiteral("Open recent route: %1").arg(entry.title))) {
+            if (!routeButton.isNull()) {
+                reusableRecentButtons_.append(routeButton);
+            }
             continue;
         }
-        acceptedAddresses.insert(*canonicalAddress);
-        recentRoutesLayout_->addWidget(routeButton);
+        recentRoutesLayout_->addWidget(routeButton.data());
         recentButtons_.append(routeButton);
-        if (recentButtons_.size() == MaximumRecentRoutes) {
-            break;
-        }
     }
 
+    Q_ASSERT(recentButtons_.size() + reusableRecentButtons_.size()
+             <= MaximumRecentRoutes);
     rebuildFocusOrder();
+}
+
+void NewTabPage::schedulePendingRecentRoutes()
+{
+    if (recentRoutesDispatchScheduled_) return;
+    recentRoutesDispatchScheduled_ = true;
+    QTimer::singleShot(0, this, [this] {
+        recentRoutesDispatchScheduled_ = false;
+        if (!recentRoutesUpdatePending_) return;
+
+        QVector<NewTabEntry> pending = std::move(pendingRecentRoutes_);
+        pendingRecentRoutes_.clear();
+        recentRoutesUpdatePending_ = false;
+        if (recentRoutesRebuildInProgress_) {
+            pendingRecentRoutes_ = std::move(pending);
+            recentRoutesUpdatePending_ = true;
+            schedulePendingRecentRoutes();
+            return;
+        }
+        applyRecentRoutes(pending);
+    });
 }
 
 QPushButton *NewTabPage::createRouteButton(const QString &title,
@@ -207,16 +273,53 @@ QPushButton *NewTabPage::createRouteButton(const QString &title,
                                            const QString &accessibleName,
                                            QWidget *parent)
 {
-    const std::optional<QString> validatedAddress = validatedAppAddress(canonicalAddress);
+    const std::optional<QString> validatedAddress =
+        validatedAppAddress(canonicalAddress);
     if (!validatedAddress.has_value()) {
         return nullptr;
     }
 
-    auto *routeButton = new QPushButton(title, parent);
-    routeButton->setObjectName(objectName);
-    routeButton->setAccessibleName(accessibleName);
-    routeButton->setFocusPolicy(Qt::StrongFocus);
-    connect(routeButton, &QPushButton::clicked, this,
+    const QPointer<QPushButton> routeButton = new QPushButton(parent);
+    const bool configured = configureRouteButton(
+        routeButton.data(),
+        title,
+        *validatedAddress,
+        objectName,
+        accessibleName);
+    Q_ASSERT(configured);
+    if (!configured) {
+        delete routeButton.data();
+        return nullptr;
+    }
+    return routeButton.data();
+}
+
+bool NewTabPage::configureRouteButton(QPushButton *routeButton,
+                                      const QString &title,
+                                      const QString &canonicalAddress,
+                                      const QString &objectName,
+                                      const QString &accessibleName)
+{
+    const std::optional<QString> validatedAddress =
+        validatedAppAddress(canonicalAddress);
+    if (routeButton == nullptr || !validatedAddress.has_value()) return false;
+
+    const QPointer<QPushButton> guardedButton = routeButton;
+    QObject::disconnect(
+        guardedButton.data(), &QPushButton::clicked, this, nullptr);
+    guardedButton->setText(literalButtonText(title));
+    if (guardedButton.isNull()) return false;
+    guardedButton->setShortcut(QKeySequence());
+    if (guardedButton.isNull()) return false;
+    guardedButton->setAccessibleName(accessibleName);
+    if (guardedButton.isNull()) return false;
+    guardedButton->setEnabled(true);
+    if (guardedButton.isNull()) return false;
+    guardedButton->setFocusPolicy(Qt::StrongFocus);
+    if (guardedButton.isNull()) return false;
+    guardedButton->show();
+    if (guardedButton.isNull()) return false;
+    connect(guardedButton.data(), &QPushButton::clicked, this,
             [this, address = *validatedAddress] {
                 // The owning window resolves current route/package authority after
                 // this syntax-only presentation boundary emits the logical address.
@@ -225,13 +328,48 @@ QPushButton *NewTabPage::createRouteButton(const QString &title,
                     emit addressActivated(*revalidated);
                 }
             });
+    guardedButton->setObjectName(objectName);
+    if (guardedButton.isNull()) return false;
+    return true;
+}
+
+QPushButton *NewTabPage::acquireRecentButton()
+{
+    while (!reusableRecentButtons_.isEmpty()) {
+        const QPointer<QPushButton> candidate =
+            reusableRecentButtons_.takeLast();
+        if (!candidate.isNull()) return candidate.data();
+    }
+    auto *routeButton = new QPushButton(recentRoutesLayout_->parentWidget());
+    connect(routeButton, &QObject::destroyed, this,
+            [this](QObject *destroyedObject) {
+                forgetDestroyedRecentButton(destroyedObject);
+            });
     return routeButton;
+}
+
+void NewTabPage::forgetDestroyedRecentButton(QObject *destroyedObject)
+{
+    const auto isDestroyed = [destroyedObject](
+                                 const QPointer<QPushButton> &candidate) {
+        return candidate.isNull() || candidate.data() == destroyedObject;
+    };
+    recentButtons_.erase(
+        std::remove_if(recentButtons_.begin(), recentButtons_.end(), isDestroyed),
+        recentButtons_.end());
+    reusableRecentButtons_.erase(
+        std::remove_if(reusableRecentButtons_.begin(),
+                       reusableRecentButtons_.end(),
+                       isDestroyed),
+        reusableRecentButtons_.end());
 }
 
 void NewTabPage::rebuildFocusOrder()
 {
     QVector<QPushButton *> focusOrder = fixedButtons_;
-    focusOrder.append(recentButtons_);
+    for (const QPointer<QPushButton> &candidate : recentButtons_) {
+        if (!candidate.isNull()) focusOrder.append(candidate.data());
+    }
     for (qsizetype index = 0; index + 1 < focusOrder.size(); ++index) {
         QWidget::setTabOrder(focusOrder.at(index), focusOrder.at(index + 1));
     }
