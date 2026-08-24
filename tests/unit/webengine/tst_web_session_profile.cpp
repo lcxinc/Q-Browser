@@ -180,6 +180,9 @@ private slots:
     void surfacesHaveIndependentPagesAndOneProfile();
     void sameOriginLocalStorageIsShared();
     void pageDomAndSessionStorageStayIndependentAcrossSwitches();
+    void reloadFromAFreshSurfaceLoadsTheRegisteredEntry();
+    void reloadFromTheTrustedErrorRetriesTheRegisteredEntry();
+    void reloadAtTheRegisteredEntryPreservesSessionStorage();
     void mainFrameIsPinnedToItsRegisteredEntry();
     void surfaceSignalsAndTrustedTitlesAreIndependent();
     void stopDoesNotLoadTheTrustedErrorPage();
@@ -336,6 +339,138 @@ void WebSessionProfileTest::pageDomAndSessionStorageStayIndependentAcrossSwitche
                            "sessionStorage.getItem('per-page')"));
     QVERIFY(secondState.has_value());
     QCOMPARE(*secondState, QJsonValue(QStringLiteral("two|two")));
+}
+
+void WebSessionProfileTest::reloadFromAFreshSurfaceLoadsTheRegisteredEntry()
+{
+    HttpServer server([](const QByteArray &, int) {
+        return std::optional<QByteArray>(
+            QByteArrayLiteral("<!doctype html><title>Fresh reload</title>"));
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/fresh-reload"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+
+    QVERIFY(surface.currentUrl() != entry);
+    QVERIFY(surface.reload());
+    QVERIFY(waitForLoad(surface, entry, finishedSpy, 5000));
+    QCOMPARE(surface.currentUrl(), entry);
+    QCOMPARE(surface.title(), QStringLiteral("Fresh reload"));
+    QCOMPARE(surface.loadProgress(), 100);
+    QVERIFY(!surface.isLoading());
+    QCOMPARE(server.requests().count(QByteArrayLiteral("/fresh-reload")), 1);
+    QCOMPARE(finishedSpy.count(), 1);
+    QCOMPARE(finishedSpy.at(0).at(0).toUrl(), entry);
+    QVERIFY(finishedSpy.at(0).at(1).toBool());
+}
+
+void WebSessionProfileTest::reloadFromTheTrustedErrorRetriesTheRegisteredEntry()
+{
+    HttpServer server([](const QByteArray &, int) {
+        return std::optional<QByteArray>(QByteArrayLiteral(
+            "<!doctype html><title>Recovered entry</title>"
+            "<body data-page='recovered'></body>"));
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/recover"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy errorFinishedSpy(&surface, &WebSurface::navigationFinished);
+
+    QVERIFY(!surface.navigate(QUrl(QStringLiteral("https://example.com/rejected"))));
+    QVERIFY(waitForLoad(surface, WebSurface::trustedErrorUrl(), errorFinishedSpy));
+    QCOMPARE(surface.currentUrl(), WebSurface::trustedErrorUrl());
+
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+    QSignalSpy loadingSpy(&surface, &WebSurface::loadingChanged);
+    QSignalSpy progressSpy(&surface, &WebSurface::loadProgressChanged);
+    QSignalSpy titleSpy(&surface, &WebSurface::titleChanged);
+    QSignalSpy rawLoadingSpy(surface.page(), &QWebEnginePage::loadingChanged);
+
+    QVERIFY(surface.reload());
+    QVERIFY(waitForLoad(surface, entry, finishedSpy, 5000));
+    QTest::qWait(250);
+
+    QCOMPARE(surface.currentUrl(), entry);
+    QCOMPARE(surface.title(), QStringLiteral("Recovered entry"));
+    QCOMPARE(surface.loadProgress(), 100);
+    QVERIFY(!surface.isLoading());
+    QCOMPARE(server.requests().count(QByteArrayLiteral("/recover")), 1);
+
+    QCOMPARE(finishedSpy.count(), 1);
+    QCOMPARE(finishedSpy.at(0).at(0).toUrl(), entry);
+    QVERIFY(finishedSpy.at(0).at(1).toBool());
+    QVERIFY(!loadingSpy.isEmpty());
+    QVERIFY(loadingSpy.at(0).at(0).toBool());
+    QVERIFY(!loadingSpy.last().at(0).toBool());
+    QVERIFY(!progressSpy.isEmpty());
+    QCOMPARE(progressSpy.at(0).at(0).toInt(), 0);
+    QCOMPARE(progressSpy.last().at(0).toInt(), 100);
+    QVERIFY(!titleSpy.isEmpty());
+    QCOMPARE(titleSpy.last().at(0).toString(), QStringLiteral("Recovered entry"));
+    for (const QList<QVariant> &arguments : titleSpy) {
+        QVERIFY(arguments.at(0).toString()
+                != QStringLiteral("Q-Browser navigation unavailable"));
+    }
+
+    bool sawEntryStarted = false;
+    bool sawEntrySucceeded = false;
+    for (const QList<QVariant> &arguments : rawLoadingSpy) {
+        const QWebEngineLoadingInfo information =
+            arguments.at(0).value<QWebEngineLoadingInfo>();
+        sawEntryStarted = sawEntryStarted
+            || (information.url() == entry
+                && information.status()
+                    == QWebEngineLoadingInfo::LoadStartedStatus);
+        sawEntrySucceeded = sawEntrySucceeded
+            || (information.url() == entry
+                && information.status()
+                    == QWebEngineLoadingInfo::LoadSucceededStatus);
+    }
+    QVERIFY(sawEntryStarted);
+    QVERIFY(sawEntrySucceeded);
+}
+
+void WebSessionProfileTest::reloadAtTheRegisteredEntryPreservesSessionStorage()
+{
+    HttpServer server([](const QByteArray &target, const int requestNumber) {
+        if (target == QByteArrayLiteral("/ordinary-reload")
+            && requestNumber > 1) {
+            return std::optional<QByteArray>(
+                QByteArrayLiteral("<!doctype html><title>Reloaded entry</title>"));
+        }
+        return std::optional<QByteArray>(
+            QByteArrayLiteral("<!doctype html><title>Initial entry</title>"));
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/ordinary-reload"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+
+    QVERIFY(navigateAndWait(surface, entry));
+    const auto stored = evaluateJavaScript(
+        surface.page(), QStringLiteral(
+                            "sessionStorage.setItem('reload-state','preserved');"
+                            "sessionStorage.getItem('reload-state')"));
+    QVERIFY(stored.has_value());
+    QCOMPARE(*stored, QJsonValue(QStringLiteral("preserved")));
+
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+    QVERIFY(surface.reload());
+    QVERIFY(waitForLoad(surface, entry, finishedSpy, 5000));
+    QCOMPARE(surface.currentUrl(), entry);
+    QCOMPARE(surface.title(), QStringLiteral("Reloaded entry"));
+    QCOMPARE(server.requests().count(QByteArrayLiteral("/ordinary-reload")), 2);
+    QCOMPARE(finishedSpy.count(), 1);
+    QCOMPARE(finishedSpy.at(0).at(0).toUrl(), entry);
+    QVERIFY(finishedSpy.at(0).at(1).toBool());
+
+    const auto preserved = evaluateJavaScript(
+        surface.page(), QStringLiteral("sessionStorage.getItem('reload-state')"));
+    QVERIFY(preserved.has_value());
+    QCOMPARE(*preserved, QJsonValue(QStringLiteral("preserved")));
 }
 
 void WebSessionProfileTest::mainFrameIsPinnedToItsRegisteredEntry()

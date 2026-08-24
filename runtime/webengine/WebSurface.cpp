@@ -274,8 +274,13 @@ bool WebSurface::navigate(const QUrl &url)
 bool WebSurface::reload()
 {
     if (!configurationValid_ || page_ == nullptr || view_ == nullptr) return false;
+    const bool reloadCurrentEntry = page_->url() == registeredMainFrameEntry_;
     beginNavigation(registeredMainFrameEntry_);
-    view_->reload();
+    if (reloadCurrentEntry) {
+        view_->reload();
+    } else {
+        view_->setUrl(registeredMainFrameEntry_);
+    }
     return true;
 }
 
