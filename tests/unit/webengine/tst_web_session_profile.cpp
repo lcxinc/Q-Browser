@@ -1,3 +1,7 @@
+#include "HostApplication.h"
+#include "MainWindow.h"
+#include "NavigationBar.h"
+#include "RouteRegistry.h"
 #include "WebSessionProfile.h"
 #include "WebSurface.h"
 
@@ -6,6 +10,7 @@
 #include <QEventLoop>
 #include <QHostAddress>
 #include <QJsonValue>
+#include <QLineEdit>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QTcpServer>
@@ -26,10 +31,20 @@
 
 namespace {
 
+struct HttpResponse final
+{
+    HttpResponse() = default;
+    HttpResponse(QByteArray responseBody) : body(std::move(responseBody)) {}
+
+    QByteArray status = QByteArrayLiteral("200 OK");
+    QByteArray body;
+    QList<QPair<QByteArray, QByteArray>> headers;
+};
+
 class HttpServer final : public QObject
 {
 public:
-    using Responder = std::function<std::optional<QByteArray>(const QByteArray &, int)>;
+    using Responder = std::function<std::optional<HttpResponse>(const QByteArray &, int)>;
 
     explicit HttpServer(Responder responder = {}, QObject *parent = nullptr)
         : QObject(parent), responder_(std::move(responder))
@@ -74,12 +89,18 @@ public:
     }
 
 private:
-    static void sendResponse(QTcpSocket *socket, const QByteArray &body)
+    static void sendResponse(QTcpSocket *socket, const HttpResponse &responseData)
     {
-        const QByteArray response = QByteArrayLiteral(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-            "Cache-Control: no-store\r\nConnection: close\r\nContent-Length: ")
-            + QByteArray::number(body.size()) + QByteArrayLiteral("\r\n\r\n") + body;
+        QByteArray response = QByteArrayLiteral("HTTP/1.1 ") + responseData.status
+            + QByteArrayLiteral("\r\nContent-Type: text/html; charset=utf-8\r\n"
+                                "Cache-Control: no-store\r\nConnection: close\r\n");
+        for (const auto &[name, value] : responseData.headers) {
+            response += name + QByteArrayLiteral(": ") + value
+                + QByteArrayLiteral("\r\n");
+        }
+        response += QByteArrayLiteral("Content-Length: ")
+            + QByteArray::number(responseData.body.size())
+            + QByteArrayLiteral("\r\n\r\n") + responseData.body;
         socket->write(response);
         socket->disconnectFromHost();
     }
@@ -104,15 +125,15 @@ private:
         const QByteArray target = requestLine.at(1);
         requests_.append(target);
         const int requestNumber = requests_.count(target);
-        const std::optional<QByteArray> body = responder_
+        const std::optional<HttpResponse> response = responder_
             ? responder_(target, requestNumber)
-            : std::optional<QByteArray>(
-                  QByteArrayLiteral("<!doctype html><title>ok</title>"));
-        if (!body.has_value()) {
+            : std::optional<HttpResponse>(
+                  HttpResponse{QByteArrayLiteral("<!doctype html><title>ok</title>")});
+        if (!response.has_value()) {
             held_.append(socket);
             return;
         }
-        sendResponse(socket, *body);
+        sendResponse(socket, *response);
     }
 
     QTcpServer server_;
@@ -168,6 +189,42 @@ std::optional<QJsonValue> evaluateJavaScript(QWebEnginePage *page,
     return result;
 }
 
+void drainQueuedEvents()
+{
+    for (int turn = 0; turn < 3; ++turn) {
+        QEventLoop loop;
+        QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+        loop.exec();
+    }
+}
+
+RouteRegistry webRoutes(const QUrl &entry)
+{
+    RouteRegistry registry;
+    const RouteRecord first{QStringLiteral("/first"), Engine::WebEngine,
+                            QStringLiteral("com.qbrowser.web"),
+                            entry.toString(QUrl::FullyEncoded)};
+    const RouteRecord second{QStringLiteral("/second"), Engine::WebEngine,
+                             QStringLiteral("com.qbrowser.web"),
+                             entry.toString(QUrl::FullyEncoded)};
+    if (registry.add(first) != RouteAddResult::Added
+        || registry.add(second) != RouteAddResult::Added) {
+        return {};
+    }
+    return registry;
+}
+
+class ObservableWebPage final : public QWebEnginePage
+{
+public:
+    using QWebEnginePage::QWebEnginePage;
+
+    [[nodiscard]] int destroyedReceiverCount() const
+    {
+        return receivers(SIGNAL(destroyed(QObject *)));
+    }
+};
+
 } // namespace
 
 class WebSessionProfileTest final : public QObject
@@ -183,12 +240,22 @@ private slots:
     void reloadFromAFreshSurfaceLoadsTheRegisteredEntry();
     void reloadFromTheTrustedErrorRetriesTheRegisteredEntry();
     void reloadAtTheRegisteredEntryPreservesSessionStorage();
+    void sameUrlReplacementRejectsQueuedOldCallbacks();
+    void rendererDrivenReloadStartsAFreshIncarnation();
+    void trustedTitlesAreBoundedAndUnicodeSafe();
+    void trustedTitlesRejectEncodedPhysicalAddresses();
     void mainFrameIsPinnedToItsRegisteredEntry();
+    void redirectedMainFrameMustRemainTheRegisteredEntry();
     void surfaceSignalsAndTrustedTitlesAreIndependent();
     void stopDoesNotLoadTheTrustedErrorPage();
     void aNewNavigationIncarnationIgnoresTheStoppedLoad();
     void backgroundLifecycleWaitsUntilFreezeIsRecommended();
+    void sessionRetirementSynchronouslyShutsDownItsSurfaces();
+    void unregisterDisconnectsThePageDestructionObserver();
     void shutdownFailsUntilEveryPageIsUnregistered();
+    void mainWindowShutdownCanBeRetriedAfterForeignSurfaceRetires();
+    void mainWindowRejectsCommandsAfterShutdown();
+    void hostApplicationDoesNotRestartARetiredWindow();
 };
 
 void WebSessionProfileTest::freshSessionIsEmptyAndEphemeral()
@@ -473,6 +540,172 @@ void WebSessionProfileTest::reloadAtTheRegisteredEntryPreservesSessionStorage()
     QCOMPARE(*preserved, QJsonValue(QStringLiteral("preserved")));
 }
 
+void WebSessionProfileTest::sameUrlReplacementRejectsQueuedOldCallbacks()
+{
+    HttpServer server([](const QByteArray &target, const int requestNumber)
+                          -> std::optional<HttpResponse> {
+        if (target != QByteArrayLiteral("/same-url")) {
+            return HttpResponse{QByteArrayLiteral("<!doctype html><title>other</title>")};
+        }
+        if (requestNumber == 2) return std::nullopt;
+        return HttpResponse{QByteArrayLiteral(
+            "<!doctype html><title>Initial document</title>"
+            "<script>addEventListener('beforeunload',()=>{"
+            "document.title='Stale old document'})</script>")};
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/same-url"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy rawLoadingSpy(surface.page(), &QWebEnginePage::loadingChanged);
+    QVERIFY(navigateAndWait(surface, entry));
+    QCOMPARE(surface.title(), QStringLiteral("Initial document"));
+
+    std::optional<QWebEngineLoadingInfo> staleSuccess;
+    for (const QList<QVariant> &arguments : rawLoadingSpy) {
+        const QWebEngineLoadingInfo information =
+            arguments.at(0).value<QWebEngineLoadingInfo>();
+        if (information.url() == entry
+            && information.status()
+                == QWebEngineLoadingInfo::LoadSucceededStatus) {
+            staleSuccess = information;
+        }
+    }
+    QVERIFY(staleSuccess.has_value());
+
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+    QSignalSpy titleSpy(&surface, &WebSurface::titleChanged);
+    QSignalSpy progressSpy(&surface, &WebSurface::loadProgressChanged);
+    QVERIFY(QMetaObject::invokeMethod(
+        surface.page(), "titleChanged", Qt::QueuedConnection,
+        Q_ARG(QString, QStringLiteral("Stale queued title"))));
+    QVERIFY(QMetaObject::invokeMethod(
+        surface.page(), "loadProgress", Qt::QueuedConnection,
+        Q_ARG(int, 73)));
+    QVERIFY(QMetaObject::invokeMethod(
+        surface.page(), "loadingChanged", Qt::QueuedConnection,
+        Q_ARG(QWebEngineLoadingInfo, *staleSuccess)));
+
+    QVERIFY(surface.reload());
+    QTRY_COMPARE_WITH_TIMEOUT(
+        server.requests().count(QByteArrayLiteral("/same-url")), 2, 5000);
+    drainQueuedEvents();
+
+    QVERIFY(finishedSpy.isEmpty());
+    QCOMPARE(surface.title(), QStringLiteral("Initial document"));
+    for (const QList<QVariant> &arguments : titleSpy) {
+        QVERIFY(arguments.at(0).toString() != QStringLiteral("Stale queued title"));
+        QVERIFY(arguments.at(0).toString() != QStringLiteral("Stale old document"));
+    }
+    for (const QList<QVariant> &arguments : progressSpy) {
+        QVERIFY(arguments.at(0).toInt() != 73);
+    }
+
+    server.releaseHeldResponses(
+        QByteArrayLiteral("<!doctype html><title>Replacement document</title>"));
+    QVERIFY(waitForLoad(surface, entry, finishedSpy));
+    QCOMPARE(finishedSpy.count(), 1);
+    QCOMPARE(finishedSpy.at(0).at(0).toUrl(), entry);
+    QVERIFY(finishedSpy.at(0).at(1).toBool());
+    QCOMPARE(surface.title(), QStringLiteral("Replacement document"));
+    QCOMPARE(surface.loadProgress(), 100);
+}
+
+void WebSessionProfileTest::rendererDrivenReloadStartsAFreshIncarnation()
+{
+    HttpServer server([](const QByteArray &target, const int requestNumber)
+                          -> std::optional<HttpResponse> {
+        if (target == QByteArrayLiteral("/renderer-reload")
+            && requestNumber == 2) {
+            return std::nullopt;
+        }
+        return HttpResponse{QByteArrayLiteral(
+            "<!doctype html><title>Renderer reload</title>"
+            "<script>sessionStorage.setItem('renderer-state','preserved')</script>")};
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/renderer-reload"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QVERIFY(navigateAndWait(surface, entry));
+    const quint64 previousIncarnation = surface.navigationIncarnationForTesting();
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+
+    surface.page()->runJavaScript(QStringLiteral("location.reload()"));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        server.requests().count(QByteArrayLiteral("/renderer-reload")), 2, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(surface.isLoading(), 5000);
+    QVERIFY(surface.navigationIncarnationForTesting() > previousIncarnation);
+
+    server.releaseHeldResponses(
+        QByteArrayLiteral("<!doctype html><title>Renderer replacement</title>"));
+    QVERIFY(waitForLoad(surface, entry, finishedSpy));
+    QCOMPARE(finishedSpy.count(), 1);
+    QCOMPARE(surface.title(), QStringLiteral("Renderer replacement"));
+    const auto state = evaluateJavaScript(
+        surface.page(), QStringLiteral("sessionStorage.getItem('renderer-state')"));
+    QVERIFY(state.has_value());
+    QCOMPARE(*state, QJsonValue(QStringLiteral("preserved")));
+}
+
+void WebSessionProfileTest::trustedTitlesAreBoundedAndUnicodeSafe()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/titles")));
+    const QString fallback = QStringLiteral("Restricted web");
+    const QString astral = QString::fromUcs4(U"\U0001F642");
+
+    QCOMPARE(surface.trustedTitleForTesting(QStringLiteral("A benign title")),
+             QStringLiteral("A benign title"));
+    QCOMPARE(surface.trustedTitleForTesting(QString(255, u'a')), QString(255, u'a'));
+    QCOMPARE(surface.trustedTitleForTesting(QString(256, u'a')), QString(256, u'a'));
+    QCOMPARE(surface.trustedTitleForTesting(QString(257, u'a')), QString(256, u'a'));
+
+    const QString exactlyBounded = QString(254, u'a') + astral;
+    QCOMPARE(exactlyBounded.size(), 256);
+    QCOMPARE(surface.trustedTitleForTesting(exactlyBounded), exactlyBounded);
+    const QString splitAtBoundary = QString(255, u'a') + astral;
+    QCOMPARE(splitAtBoundary.size(), 257);
+    QCOMPARE(surface.trustedTitleForTesting(splitAtBoundary), QString(255, u'a'));
+
+    QCOMPARE(surface.trustedTitleForTesting(QString(QChar(0xD800))), fallback);
+    QCOMPARE(surface.trustedTitleForTesting(QString(QChar(0xDC00))), fallback);
+    QCOMPARE(surface.trustedTitleForTesting(
+                 QStringLiteral("safe") + QChar(0x0001) + QStringLiteral("unsafe")),
+             fallback);
+    QCOMPARE(surface.trustedTitleForTesting(
+                 QStringLiteral("safe\u202Eunsafe")), fallback);
+    QCOMPARE(surface.trustedTitleForTesting(QString(4096, u'a')), QString(256, u'a'));
+    QCOMPARE(surface.trustedTitleForTesting(QString(4097, u'a')), fallback);
+}
+
+void WebSessionProfileTest::trustedTitlesRejectEncodedPhysicalAddresses()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/titles")));
+    const QString fallback = QStringLiteral("Restricted web");
+    const QStringList rejected{
+        QStringLiteral("http://127.0.0.1:43123/help"),
+        QStringLiteral("127.0.0.2"),
+        QStringLiteral("localhost:43123/help"),
+        QStringLiteral("[::1]:43123/help"),
+        QStringLiteral("::1"),
+        QStringLiteral("http%3A%2F%2F127.0.0.1%3A43123%2Fhelp"),
+        QStringLiteral("%5B%3A%3A1%5D%3A43123"),
+        QStringLiteral("%2568%2574%2574%2570%253A%252F%252F127.0.0.1")};
+    for (const QString &title : rejected) {
+        QCOMPARE(surface.trustedTitleForTesting(title), fallback);
+    }
+    QCOMPARE(surface.trustedTitleForTesting(QStringLiteral("Release notes 127")),
+             QStringLiteral("Release notes 127"));
+    QCOMPARE(surface.trustedTitleForTesting(QStringLiteral("Local development guide")),
+             QStringLiteral("Local development guide"));
+}
+
 void WebSessionProfileTest::mainFrameIsPinnedToItsRegisteredEntry()
 {
     HttpServer server([](const QByteArray &target, int) {
@@ -511,6 +744,38 @@ void WebSessionProfileTest::mainFrameIsPinnedToItsRegisteredEntry()
         surface.currentUrl() == WebSurface::trustedErrorUrl()
             && !surface.page()->isLoading(),
         10000);
+}
+
+void WebSessionProfileTest::redirectedMainFrameMustRemainTheRegisteredEntry()
+{
+    HttpServer server([](const QByteArray &target, int)
+                          -> std::optional<HttpResponse> {
+        if (target == QByteArrayLiteral("/redirect")) {
+            HttpResponse response;
+            response.status = QByteArrayLiteral("302 Found");
+            response.headers.append(
+                {QByteArrayLiteral("Location"), QByteArrayLiteral("/unregistered")});
+            return response;
+        }
+        return HttpResponse{QByteArrayLiteral(
+            "<!doctype html><title>Unregistered target</title>")};
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/redirect"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+
+    QVERIFY(surface.navigate(entry));
+    QTRY_VERIFY_WITH_TIMEOUT(!finishedSpy.isEmpty(), 10000);
+    QCOMPARE(surface.currentUrl(), WebSurface::trustedErrorUrl());
+    QVERIFY(!server.requests().contains(QByteArrayLiteral("/unregistered")));
+    bool sawTrustedTerminal = false;
+    for (const QList<QVariant> &arguments : finishedSpy) {
+        sawTrustedTerminal = sawTrustedTerminal
+            || arguments.at(0).toUrl() == WebSurface::trustedErrorUrl();
+    }
+    QVERIFY(sawTrustedTerminal);
 }
 
 void WebSessionProfileTest::surfaceSignalsAndTrustedTitlesAreIndependent()
@@ -711,6 +976,45 @@ void WebSessionProfileTest::backgroundLifecycleWaitsUntilFreezeIsRecommended()
     QCOMPARE(*state, QJsonValue(QStringLiteral("preserved|preserved")));
 }
 
+void WebSessionProfileTest::sessionRetirementSynchronouslyShutsDownItsSurfaces()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    auto session = std::make_unique<WebSessionProfile>(server.origin());
+    auto surface = std::make_unique<WebSurface>(
+        *session, server.url(QStringLiteral("/retirement")));
+    QVERIFY(surface->isConfigurationValid());
+    QCOMPARE(session->registeredPageCount(), 1);
+
+    session.reset();
+
+    QVERIFY(!surface->isConfigurationValid());
+    QVERIFY(surface->page() == nullptr);
+    QVERIFY(surface->view() == nullptr);
+    QVERIFY(surface->shutdown());
+    surface.reset();
+}
+
+void WebSessionProfileTest::unregisterDisconnectsThePageDestructionObserver()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    WebSessionProfile session(server.origin());
+    auto page = std::make_unique<ObservableWebPage>(session.profile());
+    const int baselineReceivers = page->destroyedReceiverCount();
+    QSignalSpy countSpy(&session, &WebSessionProfile::registeredPageCountChanged);
+
+    for (int cycle = 0; cycle < 4; ++cycle) {
+        QVERIFY(session.registerPage(page.get()));
+        QCOMPARE(page->destroyedReceiverCount(), baselineReceivers + 1);
+        QVERIFY(session.unregisterPage(page.get()));
+        QCOMPARE(page->destroyedReceiverCount(), baselineReceivers);
+    }
+    QCOMPARE(countSpy.count(), 8);
+    page.reset();
+    QCOMPARE(countSpy.count(), 8);
+}
+
 void WebSessionProfileTest::shutdownFailsUntilEveryPageIsUnregistered()
 {
     HttpServer server;
@@ -728,6 +1032,82 @@ void WebSessionProfileTest::shutdownFailsUntilEveryPageIsUnregistered()
     QVERIFY(session.shutdown());
     QVERIFY(session.profile() == nullptr);
     QVERIFY(session.requestInterceptor() == nullptr);
+}
+
+void WebSessionProfileTest::mainWindowShutdownCanBeRetriedAfterForeignSurfaceRetires()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/help"));
+    MainWindow window(webRoutes(entry), server.origin());
+    QVERIFY(window.isRunning());
+    WebSessionProfile *const session = window.webSessionProfile();
+    QVERIFY(session != nullptr);
+    auto extraSurface = std::make_unique<WebSurface>(
+        *session, server.url(QStringLiteral("/extra")));
+    QVERIFY(extraSurface->isConfigurationValid());
+    QCOMPARE(session->registeredPageCount(), 2);
+
+    QVERIFY(!window.shutdown());
+    QVERIFY(!window.isRunning());
+    QVERIFY(!window.isShutdownComplete());
+    QVERIFY(window.webSurface() == nullptr);
+    QCOMPARE(session->registeredPageCount(), 1);
+    QVERIFY(!window.shutdown());
+
+    QVERIFY(extraSurface->shutdown());
+    extraSurface.reset();
+    QCOMPARE(session->registeredPageCount(), 0);
+    QVERIFY(window.shutdown());
+    QVERIFY(window.isShutdownComplete());
+    QVERIFY(window.webSessionProfile() == nullptr);
+    QVERIFY(window.shutdown());
+}
+
+void WebSessionProfileTest::mainWindowRejectsCommandsAfterShutdown()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/help"));
+    MainWindow window(webRoutes(entry), server.origin());
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/first")));
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/second")));
+    const QString currentUrl = window.currentAppUrl();
+    const int historyCount = window.historyCount();
+    const int historyIndex = window.historyIndex();
+    QSignalSpy currentUrlSpy(&window, &MainWindow::currentUrlChanged);
+
+    QVERIFY(window.shutdown());
+    QVERIFY(!window.isRunning());
+    QVERIFY(!window.navigate(QStringLiteral("app://pilot/first")));
+    QVERIFY(!window.navigateFromWorker(QStringLiteral("com.qbrowser.web"),
+                                       QStringLiteral("/first")));
+    QVERIFY(!window.goBack());
+    QVERIFY(!window.goForward());
+    QVERIFY(!window.attachWorkerSurface({}));
+    window.detachWorkerSurface();
+    QVERIFY(QMetaObject::invokeMethod(
+        window.navigationBar(), "navigateRequested", Qt::DirectConnection,
+        Q_ARG(QString, QStringLiteral("app://pilot/first"))));
+
+    QCOMPARE(window.currentAppUrl(), currentUrl);
+    QCOMPARE(window.historyCount(), historyCount);
+    QCOMPARE(window.historyIndex(), historyIndex);
+    QVERIFY(currentUrlSpy.isEmpty());
+}
+
+void WebSessionProfileTest::hostApplicationDoesNotRestartARetiredWindow()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    HostApplication host(server.origin());
+    QVERIFY(host.start());
+    MainWindow *const window = host.mainWindow();
+    QVERIFY(window != nullptr);
+    QVERIFY(window->shutdown());
+    QVERIFY(window->isShutdownComplete());
+    QVERIFY(!host.start());
+    QVERIFY(!window->isVisible());
 }
 
 int main(int argc, char **argv)

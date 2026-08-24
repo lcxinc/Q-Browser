@@ -3,6 +3,7 @@ add_executable(tst_web_session_profile
 
 target_link_libraries(tst_web_session_profile
   PRIVATE
+    q_browser_host
     q_browser_webengine
     Qt6::Network
     Qt6::Test

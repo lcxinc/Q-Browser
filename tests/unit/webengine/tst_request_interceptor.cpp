@@ -161,6 +161,7 @@ private slots:
     void invalidOriginDoesNotInitializeWebEngine();
     void createsSharedEphemeralProfileWithRestrictiveSettings();
     void actualWebEngineBlocksCrossOriginSubresources();
+    void actualWebEngineBlocksQrcAndCrossOriginFramesAndResources();
     void actualWebEngineSharesLocalStorageBetweenSurfaces();
     void actualWebEngineDeniesPopupsDownloadsAndPermissions();
     void blockedAndFailedLoadsRenderTrustedQrcError();
@@ -281,6 +282,44 @@ void RequestInterceptorTest::actualWebEngineBlocksCrossOriginSubresources()
     QVERIFY(blocked.requests().isEmpty());
     QVERIFY(allowed.requests().contains(QByteArrayLiteral("/index")));
     QVERIFY(!titleSpy.isEmpty());
+}
+
+void RequestInterceptorTest::actualWebEngineBlocksQrcAndCrossOriginFramesAndResources()
+{
+    HttpServer blocked;
+    QVERIFY(blocked.listen());
+    const QByteArray blockedFrame = blocked.url(QStringLiteral("/frame")).toString().toUtf8();
+    const QByteArray blockedImage = blocked.url(QStringLiteral("/image")).toString().toUtf8();
+    HttpServer allowed([blockedFrame, blockedImage](const QByteArray &) {
+        return QByteArrayLiteral("<!doctype html><title>boundary</title>")
+            + QByteArrayLiteral("<iframe src='qrc:/web/error.html'></iframe>")
+            + QByteArrayLiteral("<script src='qrc:/web/error.html'></script>")
+            + QByteArrayLiteral("<iframe src='") + blockedFrame
+            + QByteArrayLiteral("'></iframe><img src='") + blockedImage
+            + QByteArrayLiteral("'>");
+    });
+    QVERIFY(allowed.listen());
+    const QUrl entry = allowed.url(QStringLiteral("/boundary"));
+    WebSessionProfile session(allowed.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy blockedSpy(session.requestInterceptor(),
+                          &PilotRequestInterceptor::requestBlocked);
+
+    QVERIFY(navigateAndWait(surface, entry, entry));
+    QTRY_VERIFY_WITH_TIMEOUT(blockedSpy.count() >= 2, 5000);
+    QVERIFY(blocked.requests().isEmpty());
+
+    bool blockedQrc = false;
+    bool blockedCrossOrigin = false;
+    for (const QList<QVariant> &arguments : blockedSpy) {
+        const QUrl url = arguments.at(0).toUrl();
+        blockedQrc = blockedQrc || url == WebSurface::trustedErrorUrl();
+        blockedCrossOrigin = blockedCrossOrigin
+            || url == blocked.url(QStringLiteral("/frame"))
+            || url == blocked.url(QStringLiteral("/image"));
+    }
+    QVERIFY(blockedQrc);
+    QVERIFY(blockedCrossOrigin);
 }
 
 void RequestInterceptorTest::actualWebEngineSharesLocalStorageBetweenSurfaces()

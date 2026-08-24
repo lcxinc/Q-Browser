@@ -5,6 +5,7 @@
 
 #include <QCoreApplication>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QVBoxLayout>
 #include <QWebEngineCertificateError>
 #include <QWebEngineFileSystemAccessRequest>
@@ -46,22 +47,86 @@ bool disablesSandbox(const QString &argument)
             && token.contains(QStringLiteral("sandbox")));
 }
 
+constexpr qsizetype maximumRawTitleLength = 4096;
+constexpr qsizetype maximumTrustedTitleLength = 256;
+constexpr int maximumPercentDecodePasses = 3;
+
+bool hasUnsafeTitleCodeUnits(const QString &title)
+{
+    for (qsizetype index = 0; index < title.size(); ++index) {
+        const QChar character = title.at(index);
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= title.size()
+                || !title.at(index + 1).isLowSurrogate()) {
+                return true;
+            }
+            ++index;
+            continue;
+        }
+        if (character.isLowSurrogate()
+            || character.category() == QChar::Other_Control) {
+            return true;
+        }
+        const char16_t value = character.unicode();
+        if (value == 0x061c || (value >= 0x200e && value <= 0x200f)
+            || (value >= 0x202a && value <= 0x202e)
+            || (value >= 0x2066 && value <= 0x2069)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool looksLikePhysicalAddress(const QString &title, const QString &physicalHost)
+{
+    const QString candidate = title.trimmed();
+    if (candidate.isEmpty() || candidate.contains(QStringLiteral("://"))) {
+        return true;
+    }
+    if (!physicalHost.isEmpty()
+        && candidate.contains(physicalHost, Qt::CaseInsensitive)) {
+        return true;
+    }
+
+    static const QRegularExpression scheme(
+        QStringLiteral(R"(^[A-Za-z][A-Za-z0-9+.-]*:)")
+    );
+    static const QRegularExpression localhost(
+        QStringLiteral(R"((?:^|[^A-Za-z0-9-])localhost(?:[^A-Za-z0-9-]|$))"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression ipv4Loopback(
+        QStringLiteral(R"((?:^|[^0-9])127(?:\.[0-9]{1,3}){3}(?:[^0-9]|$))"));
+    if (scheme.match(candidate).hasMatch()
+        || localhost.match(candidate).hasMatch()
+        || ipv4Loopback.match(candidate).hasMatch()
+        || candidate.contains(QStringLiteral("::1"), Qt::CaseInsensitive)
+        || candidate.contains(QStringLiteral("0:0:0:0:0:0:0:1"),
+                              Qt::CaseInsensitive)) {
+        return true;
+    }
+    const QUrl possibleUrl(candidate, QUrl::StrictMode);
+    return possibleUrl.isValid() && !possibleUrl.scheme().isEmpty();
+}
+
 class PilotWebPage final : public QWebEnginePage
 {
 public:
     using DeniedCallback = std::function<void()>;
+    using NavigationDeniedCallback = std::function<void(const QUrl &)>;
     using FileSelectionDeniedCallback = std::function<void(bool)>;
 
     PilotWebPage(QWebEngineProfile *profile,
                  const PilotRequestInterceptor *interceptor,
                  QUrl registeredMainFrameEntry,
                  DeniedCallback popupDenied,
+                 NavigationDeniedCallback navigationDenied,
                  FileSelectionDeniedCallback fileSelectionDenied,
                  QObject *parent)
         : QWebEnginePage(profile, parent)
         , interceptor_(interceptor)
         , registeredMainFrameEntry_(std::move(registeredMainFrameEntry))
         , popupDenied_(std::move(popupDenied))
+        , navigationDenied_(std::move(navigationDenied))
         , fileSelectionDenied_(std::move(fileSelectionDenied))
     {
     }
@@ -80,8 +145,11 @@ protected:
         const bool allowed = isMainFrame
             ? url == registeredMainFrameEntry_ || url == WebSurface::trustedErrorUrl()
             : interceptor_->isAllowed(url);
-        return allowed
-            && QWebEnginePage::acceptNavigationRequest(url, type, isMainFrame);
+        if (!allowed) {
+            if (isMainFrame) navigationDenied_(url);
+            return false;
+        }
+        return QWebEnginePage::acceptNavigationRequest(url, type, isMainFrame);
     }
 
     QStringList chooseFiles(FileSelectionMode mode,
@@ -96,6 +164,7 @@ private:
     const PilotRequestInterceptor *interceptor_ = nullptr;
     QUrl registeredMainFrameEntry_;
     DeniedCallback popupDenied_;
+    NavigationDeniedCallback navigationDenied_;
     FileSelectionDeniedCallback fileSelectionDenied_;
 };
 
@@ -109,22 +178,27 @@ WebSurface::WebSurface(WebSessionProfile &session,
     , registeredMainFrameEntry_(std::move(registeredMainFrameEntry))
 {
     initializeHostResources();
-    PilotRequestInterceptor *const interceptor = session_->requestInterceptor();
+    sessionRetirementConnection_ = connect(
+        session_, &WebSessionProfile::retirementRequested, this,
+        [this] { (void)shutdown(); }, Qt::DirectConnection);
+    PilotRequestInterceptor *const interceptor = session_->interceptorHandle();
     if (!session_->isConfigurationValid() || interceptor == nullptr
         || !registeredMainFrameEntry_.isValid()
         || registeredMainFrameEntry_ == trustedErrorUrl()
         || !interceptor->isAllowed(registeredMainFrameEntry_)) {
         return;
     }
+    physicalOriginHost_ = interceptor->mockOrigin().host();
 
     auto page = std::make_unique<PilotWebPage>(
-        session_->profile(), interceptor, registeredMainFrameEntry_,
+        session_->profileHandle(), interceptor, registeredMainFrameEntry_,
         [this] { emit popupDenied(); },
+        [this](const QUrl &url) { handleDeniedMainFrameNavigation(url); },
         [this](const bool directorySelection) {
             emit fileSelectionDenied(directorySelection);
         },
         nullptr);
-    if (!session_->registerPage(page.get())) return;
+    if (!session_->registerPageInternal(page.get())) return;
     page_ = std::move(page);
 
     QWebEngineSettings *const settings = page_->settings();
@@ -188,17 +262,21 @@ WebSurface::WebSurface(WebSessionProfile &session,
             [this](QWebEngineNewWindowRequest &) { emit popupDenied(); });
     connect(page_.get(), &QWebEnginePage::loadingChanged, this,
             &WebSurface::observeLoadingChange);
-    connect(page_.get(), &QWebEnginePage::loadProgress, this,
-            [this](const int progress) {
-                const quint64 incarnation = activeLoadIncarnation_;
-                if (incarnation == 0 || incarnation != navigationIncarnation_) return;
-                setLoadProgress(progress);
-            });
     connect(page_.get(), &QWebEnginePage::titleChanged, this,
-            [this](const QString &physicalTitle) {
+            [this](const QString &) {
                 const quint64 incarnation = activeLoadIncarnation_;
-                if (incarnation == 0 || incarnation != navigationIncarnation_) return;
-                updateTitle(physicalTitle);
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, incarnation] {
+                        if (shutdown_ || page_ == nullptr || incarnation == 0
+                            || incarnation != navigationIncarnation_
+                            || !titleUpdatesAllowed_ || activeLoadStarted_
+                            || page_->isLoading()) {
+                            return;
+                        }
+                        updateTitle(page_->title());
+                    },
+                    Qt::QueuedConnection);
             });
 
     configurationValid_ = true;
@@ -215,8 +293,16 @@ bool WebSurface::shutdown()
     shutdown_ = true;
     configurationValid_ = false;
     ++navigationIncarnation_;
+    awaitingLoadStart_ = false;
+    awaitingDifferentDocument_ = false;
+    activeLoadStarted_ = false;
+    titleUpdatesAllowed_ = false;
+    terminalPendingIncarnation_ = 0;
     disconnect(recommendedStateConnection_);
     recommendedStateConnection_ = {};
+    disconnect(sessionRetirementConnection_);
+    sessionRetirementConnection_ = {};
+    WebSessionProfile *const retiringSession = session_;
     if (page_ != nullptr) page_->triggerAction(QWebEnginePage::Stop);
     if (view_ != nullptr) {
         view_->hide();
@@ -225,10 +311,11 @@ bool WebSurface::shutdown()
     }
     if (page_ != nullptr) {
         page_->setVisible(false);
-        shutdownSucceeded_ = session_ != nullptr
-            && session_->unregisterPage(page_.get());
+        shutdownSucceeded_ = retiringSession != nullptr
+            && retiringSession->unregisterPageInternal(page_.get());
         page_.reset();
     }
+    session_ = nullptr;
     return shutdownSucceeded_;
 }
 
@@ -309,6 +396,11 @@ void WebSurface::setTabActive(const bool active)
     freezeWhenRecommended();
 }
 
+QString WebSurface::title() const { return title_; }
+int WebSurface::loadProgress() const noexcept { return loadProgress_; }
+bool WebSurface::isLoading() const noexcept { return loading_; }
+
+#ifdef Q_BROWSER_WEBENGINE_TESTING
 QUrl WebSurface::currentUrl() const
 {
     return page_ != nullptr ? page_->url() : QUrl();
@@ -319,13 +411,9 @@ QUrl WebSurface::registeredMainFrameEntry() const
     return registeredMainFrameEntry_;
 }
 
-QString WebSurface::title() const { return title_; }
-int WebSurface::loadProgress() const noexcept { return loadProgress_; }
-bool WebSurface::isLoading() const noexcept { return loading_; }
-
 QWebEngineProfile *WebSurface::profile() const noexcept
 {
-    return session_ != nullptr ? session_->profile() : nullptr;
+    return session_ != nullptr ? session_->profileHandle() : nullptr;
 }
 
 QWebEnginePage *WebSurface::page() const noexcept { return page_.get(); }
@@ -333,35 +421,84 @@ QWebEngineView *WebSurface::view() const noexcept { return view_.get(); }
 
 PilotRequestInterceptor *WebSurface::requestInterceptor() const noexcept
 {
-    return session_ != nullptr ? session_->requestInterceptor() : nullptr;
+    return session_ != nullptr ? session_->interceptorHandle() : nullptr;
 }
+
+quint64 WebSurface::navigationIncarnationForTesting() const noexcept
+{
+    return navigationIncarnation_;
+}
+
+QString WebSurface::trustedTitleForTesting(const QString &physicalTitle) const
+{
+    return trustedTitle(physicalTitle);
+}
+#endif
 
 void WebSurface::beginNavigation(const QUrl &url)
 {
     ++navigationIncarnation_;
     activeLoadIncarnation_ = navigationIncarnation_;
+    awaitingDifferentDocument_ = page_ != nullptr && page_->url() != url;
     expectedNavigationUrl_ = url;
     stopRequestedIncarnation_ = 0;
+    terminalPendingIncarnation_ = 0;
     awaitingLoadStart_ = true;
+    activeLoadStarted_ = false;
+    titleUpdatesAllowed_ = false;
+    setLoading(false);
+    setLoadProgress(0);
 }
 
 void WebSurface::observeLoadingChange(const QWebEngineLoadingInfo &information)
 {
     if (shutdown_ || page_ == nullptr) return;
-    quint64 incarnation = activeLoadIncarnation_;
+    quint64 incarnation = 0;
     if (information.status() == QWebEngineLoadingInfo::LoadStartedStatus) {
-        if (information.url() != expectedNavigationUrl_) return;
+        if (information.url() != registeredMainFrameEntry_
+            && information.url() != trustedErrorUrl()) {
+            return;
+        }
+        if (awaitingLoadStart_) {
+            if (information.url() != expectedNavigationUrl_) return;
+        } else {
+            ++navigationIncarnation_;
+            activeLoadIncarnation_ = navigationIncarnation_;
+            expectedNavigationUrl_ = information.url();
+            stopRequestedIncarnation_ = 0;
+            terminalPendingIncarnation_ = 0;
+            titleUpdatesAllowed_ = false;
+            setLoading(false);
+            setLoadProgress(0);
+        }
         activeLoadIncarnation_ = navigationIncarnation_;
         incarnation = activeLoadIncarnation_;
         awaitingLoadStart_ = false;
-    } else if (information.url() != expectedNavigationUrl_) {
-        return;
-    } else if (awaitingLoadStart_
-               && information.status() == QWebEngineLoadingInfo::LoadStoppedStatus
-               && stopRequestedIncarnation_ != navigationIncarnation_) {
-        return;
+        awaitingDifferentDocument_ = false;
+        activeLoadStarted_ = true;
+        terminalPendingIncarnation_ = 0;
     } else {
-        awaitingLoadStart_ = false;
+        if (information.url() != expectedNavigationUrl_ || page_->isLoading()) {
+            return;
+        }
+        if (awaitingLoadStart_) {
+            // Chromium can omit a distinct started notification when a live
+            // document is replaced by a different local document.  The URL
+            // transition makes that terminal notification unambiguous; a
+            // same-URL replacement must still wait for its own start so an
+            // older incarnation cannot complete it.
+            if (!awaitingDifferentDocument_
+                || page_->url() != expectedNavigationUrl_) {
+                return;
+            }
+            awaitingLoadStart_ = false;
+            awaitingDifferentDocument_ = false;
+        } else if (!activeLoadStarted_) {
+            return;
+        }
+        incarnation = activeLoadIncarnation_;
+        activeLoadStarted_ = false;
+        terminalPendingIncarnation_ = incarnation;
     }
     if (incarnation == 0) return;
     QMetaObject::invokeMethod(
@@ -383,29 +520,58 @@ void WebSurface::handleLoadingChange(const QWebEngineLoadingInfo &information,
         setLoading(true);
         break;
     case QWebEngineLoadingInfo::LoadStoppedStatus:
+        if (terminalPendingIncarnation_ != incarnation) return;
+        terminalPendingIncarnation_ = 0;
         setLoading(false);
         stopRequestedIncarnation_ = 0;
+        titleUpdatesAllowed_ = true;
+        updateTitle(page_->title());
         emit navigationFinished(information.url(), false);
         break;
     case QWebEngineLoadingInfo::LoadSucceededStatus:
+        if (terminalPendingIncarnation_ != incarnation) return;
+        terminalPendingIncarnation_ = 0;
         setLoadProgress(100);
         setLoading(false);
         stopRequestedIncarnation_ = 0;
+        titleUpdatesAllowed_ = true;
         updateTitle(page_->title());
         emit navigationFinished(information.url(), true);
         break;
     case QWebEngineLoadingInfo::LoadFailedStatus:
+        if (terminalPendingIncarnation_ != incarnation) return;
+        terminalPendingIncarnation_ = 0;
         setLoading(false);
         if (stopRequestedIncarnation_ == incarnation) {
             stopRequestedIncarnation_ = 0;
+            titleUpdatesAllowed_ = true;
+            updateTitle(page_->title());
             emit navigationFinished(information.url(), false);
         } else if (information.url() == trustedErrorUrl()) {
+            titleUpdatesAllowed_ = true;
+            updateTitle(page_->title());
             emit navigationFinished(information.url(), false);
         } else {
             loadTrustedError();
         }
         break;
     }
+}
+
+void WebSurface::handleDeniedMainFrameNavigation(const QUrl &)
+{
+    if (shutdown_ || page_ == nullptr || view_ == nullptr
+        || (!awaitingLoadStart_ && !activeLoadStarted_)) {
+        return;
+    }
+    const quint64 incarnation = navigationIncarnation_;
+    QMetaObject::invokeMethod(
+        this,
+        [this, incarnation] {
+            if (shutdown_ || incarnation != navigationIncarnation_) return;
+            loadTrustedError();
+        },
+        Qt::QueuedConnection);
 }
 
 void WebSurface::setLoading(const bool loading)
@@ -433,17 +599,26 @@ void WebSurface::updateTitle(const QString &physicalTitle)
 
 QString WebSurface::trustedTitle(const QString &physicalTitle) const
 {
-    constexpr qsizetype maximumTitleLength = 256;
+    const QString fallback = QStringLiteral("Restricted web");
+    if (physicalTitle.size() > maximumRawTitleLength) return fallback;
     const QString candidate = physicalTitle.trimmed();
-    const QString host = requestInterceptor() != nullptr
-        ? requestInterceptor()->mockOrigin().host() : QString{};
-    const QUrl possibleUrl(candidate, QUrl::StrictMode);
-    if (candidate.isEmpty() || candidate.contains(QStringLiteral("://"))
-        || (!host.isEmpty() && candidate.contains(host, Qt::CaseInsensitive))
-        || (possibleUrl.isValid() && !possibleUrl.scheme().isEmpty())) {
-        return QStringLiteral("Restricted web");
+    if (candidate.isEmpty() || hasUnsafeTitleCodeUnits(candidate)) return fallback;
+
+    QString inspected = candidate;
+    for (int pass = 0; pass <= maximumPercentDecodePasses; ++pass) {
+        if (hasUnsafeTitleCodeUnits(inspected)
+            || looksLikePhysicalAddress(inspected, physicalOriginHost_)) {
+            return fallback;
+        }
+        if (pass == maximumPercentDecodePasses) break;
+        const QString decoded = QUrl::fromPercentEncoding(inspected.toUtf8());
+        if (decoded == inspected) break;
+        inspected = decoded;
     }
-    return candidate.left(maximumTitleLength);
+
+    QString trusted = candidate.left(maximumTrustedTitleLength);
+    if (!trusted.isEmpty() && trusted.back().isHighSurrogate()) trusted.chop(1);
+    return trusted.isEmpty() ? fallback : trusted;
 }
 
 void WebSurface::loadTrustedError()

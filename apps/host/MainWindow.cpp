@@ -103,30 +103,30 @@ MainWindow::~MainWindow()
 
 bool MainWindow::shutdown()
 {
-    if (shutdown_) return shutdownSucceeded_;
-    shutdown_ = true;
-    hide();
-    if (webSurface_ != nullptr) {
-        webSurface_->stop();
-        if (surfaceStack_ != nullptr) surfaceStack_->removeWidget(webSurface_);
-        shutdownSucceeded_ = webSurface_->shutdown();
-        delete webSurface_;
-        webSurface_ = nullptr;
+    if (lifecycleState_ == LifecycleState::Complete) return true;
+    if (lifecycleState_ == LifecycleState::Running) {
+        lifecycleState_ = LifecycleState::Closing;
+        hide();
+        if (webSurface_ != nullptr) {
+            webSurface_->stop();
+            if (surfaceStack_ != nullptr) surfaceStack_->removeWidget(webSurface_);
+            (void)webSurface_->shutdown();
+            delete webSurface_;
+            webSurface_ = nullptr;
+        }
     }
     if (webSessionProfile_ != nullptr) {
-        if (webSessionProfile_->registeredPageCount() != 0) {
-            shutdownSucceeded_ = false;
-        }
         const bool profileShutdown = webSessionProfile_->shutdown();
-        shutdownSucceeded_ = profileShutdown && shutdownSucceeded_;
-        if (profileShutdown) webSessionProfile_.reset();
+        if (!profileShutdown) return false;
+        webSessionProfile_.reset();
     }
-    return shutdownSucceeded_;
+    lifecycleState_ = LifecycleState::Complete;
+    return true;
 }
 
 bool MainWindow::navigate(const QStringView input)
 {
-    if (navigationInProgress_) {
+    if (!isRunning() || navigationInProgress_ || navigationBar_ == nullptr) {
         return false;
     }
     QScopedValueRollback transaction(navigationInProgress_, true);
@@ -163,7 +163,7 @@ bool MainWindow::navigate(const QStringView input)
 
 bool MainWindow::navigateFromWorker(const QString &packageId, const QString &route)
 {
-    if (activeSurface_ != HostSurfaceKind::Worker || packageId.isEmpty()
+    if (!isRunning() || activeSurface_ != HostSurfaceKind::Worker || packageId.isEmpty()
         || packageId != activeWorkerPackageId_ || !route.startsWith(u'/')
         || route.startsWith(QStringLiteral("//"))) {
         return false;
@@ -183,7 +183,7 @@ bool MainWindow::navigateFromWorker(const QString &packageId, const QString &rou
 
 bool MainWindow::goBack()
 {
-    if (navigationInProgress_ || historyIndex_ <= 0) {
+    if (!isRunning() || navigationInProgress_ || historyIndex_ <= 0) {
         return false;
     }
     QScopedValueRollback transaction(navigationInProgress_, true);
@@ -199,7 +199,7 @@ bool MainWindow::goBack()
 
 bool MainWindow::goForward()
 {
-    if (navigationInProgress_
+    if (!isRunning() || navigationInProgress_
         || historyIndex_ < 0
         || historyIndex_ + 1 >= history_.size()) {
         return false;
@@ -217,7 +217,8 @@ bool MainWindow::goForward()
 
 bool MainWindow::attachWorkerSurface(std::unique_ptr<WorkerSurface> surface)
 {
-    if (workerSurface_ != nullptr || surface == nullptr || !surface->isValid()) {
+    if (!isRunning() || surfaceStack_ == nullptr || workerSurface_ != nullptr
+        || surface == nullptr || !surface->isValid()) {
         return false;
     }
     workerSurface_ = surface.release();
@@ -229,12 +230,28 @@ bool MainWindow::attachWorkerSurface(std::unique_ptr<WorkerSurface> surface)
 
 void MainWindow::detachWorkerSurface()
 {
-    if (workerSurface_ == nullptr) return;
+    if (!isRunning() || workerSurface_ == nullptr || surfaceStack_ == nullptr) return;
     if (surfaceStack_->currentWidget() == workerSurface_)
         showTrustedError(QStringLiteral("The package worker is unavailable."));
     surfaceStack_->removeWidget(workerSurface_);
     delete workerSurface_;
     workerSurface_ = nullptr;
+}
+
+bool MainWindow::isRunning() const noexcept
+{
+    return lifecycleState_ == LifecycleState::Running;
+}
+
+bool MainWindow::isShutdownComplete() const noexcept
+{
+    return lifecycleState_ == LifecycleState::Complete;
+}
+
+bool MainWindow::hasValidWebSession() const noexcept
+{
+    return isRunning() && webSessionProfile_ != nullptr
+        && webSessionProfile_->isConfigurationValid();
 }
 
 HostSurfaceKind MainWindow::activeSurface() const noexcept { return activeSurface_; }
@@ -266,6 +283,7 @@ WorkerSurface *MainWindow::workerSurface() const noexcept { return workerSurface
 
 bool MainWindow::activate(const QString &canonicalUrl)
 {
+    if (!isRunning() || surfaceStack_ == nullptr) return false;
     const AppUrl parsed = AppUrl::parse(canonicalUrl, QStringLiteral("pilot"));
     if (!parsed.isValid()) {
         showTrustedError(QStringLiteral("The address is not a valid Q-Browser route."));
@@ -283,6 +301,7 @@ bool MainWindow::activate(const QString &canonicalUrl)
             showTrustedError(QStringLiteral("The package worker is unavailable."));
             return false;
         }
+        if (webSurface_ == nullptr) return false;
         webSurface_->setTabActive(false);
         surfaceStack_->setCurrentWidget(workerSurface_);
         activeSurface_ = HostSurfaceKind::Worker;
@@ -293,6 +312,7 @@ bool MainWindow::activate(const QString &canonicalUrl)
                                   QUrl(canonicalUrl));
         return true;
     case Engine::WebEngine: {
+        if (webSurface_ == nullptr) return false;
         webSurface_->setTabActive(true);
         surfaceStack_->setCurrentWidget(webSurface_);
         activeSurface_ = HostSurfaceKind::Web;
@@ -316,6 +336,10 @@ bool MainWindow::activate(const QString &canonicalUrl)
 
 void MainWindow::showTrustedError(const QString &message)
 {
+    if (!isRunning() || trustedErrorLabel_ == nullptr
+        || trustedErrorSurface_ == nullptr || surfaceStack_ == nullptr) {
+        return;
+    }
     trustedErrorLabel_->setText(message);
     if (webSurface_ != nullptr) webSurface_->setTabActive(false);
     surfaceStack_->setCurrentWidget(trustedErrorSurface_);
@@ -325,12 +349,14 @@ void MainWindow::showTrustedError(const QString &message)
 
 void MainWindow::setCurrentAppUrl(const QString &url)
 {
+    if (!isRunning() || navigationBar_ == nullptr) return;
     currentAppUrl_ = url;
     navigationBar_->setAddressText(url);
 }
 
 void MainWindow::updateNavigationState()
 {
+    if (!isRunning() || navigationBar_ == nullptr) return;
     navigationBar_->setNavigationAvailability(historyIndex_ > 0,
                                                historyIndex_ >= 0
                                                    && historyIndex_ + 1 < history_.size());

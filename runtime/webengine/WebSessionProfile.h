@@ -1,7 +1,8 @@
 #pragma once
 
+#include <QHash>
+#include <QMetaObject>
 #include <QObject>
-#include <QSet>
 #include <QUrl>
 
 #include <memory>
@@ -9,6 +10,8 @@
 class PilotRequestInterceptor;
 class QWebEnginePage;
 class QWebEngineProfile;
+class QWebEngineUrlRequestInterceptor;
+class WebSurface;
 
 class WebSessionProfile final : public QObject
 {
@@ -24,23 +27,35 @@ public:
     WebSessionProfile &operator=(const WebSessionProfile &) = delete;
 
     [[nodiscard]] bool isConfigurationValid() const noexcept;
+    [[nodiscard]] qsizetype registeredPageCount() const noexcept;
+    [[nodiscard]] bool shutdown();
+
+#ifdef Q_BROWSER_WEBENGINE_TESTING
     [[nodiscard]] QWebEngineProfile *profile() const noexcept;
     [[nodiscard]] PilotRequestInterceptor *requestInterceptor() const noexcept;
-    [[nodiscard]] qsizetype registeredPageCount() const noexcept;
     [[nodiscard]] bool registerPage(QWebEnginePage *page);
     [[nodiscard]] bool unregisterPage(QWebEnginePage *page);
-    [[nodiscard]] bool shutdown();
+#endif
 
 signals:
     void registeredPageCountChanged(qsizetype count);
     void downloadDenied(QWebEnginePage *page, const QUrl &url);
 
 private:
+    friend class WebSurface;
+
+    Q_SIGNAL void retirementRequested();
+
+    [[nodiscard]] QWebEngineProfile *profileHandle() const noexcept;
+    [[nodiscard]] PilotRequestInterceptor *interceptorHandle() const noexcept;
+    [[nodiscard]] bool registerPageInternal(QWebEnginePage *page);
+    [[nodiscard]] bool unregisterPageInternal(QWebEnginePage *page);
     void detachProfile();
 
     std::unique_ptr<PilotRequestInterceptor> interceptor_;
+    std::unique_ptr<QWebEngineUrlRequestInterceptor> requestFilter_;
     std::unique_ptr<QWebEngineProfile> profile_;
-    QSet<QWebEnginePage *> registeredPages_;
+    QHash<QWebEnginePage *, QMetaObject::Connection> registeredPages_;
     bool configurationValid_ = false;
     bool acceptingPages_ = true;
     bool shutdown_ = false;

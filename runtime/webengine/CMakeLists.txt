@@ -23,4 +23,9 @@ target_link_libraries(q_browser_webengine
   PRIVATE
     Qt6::Network)
 
+if(BUILD_TESTING)
+  target_compile_definitions(q_browser_webengine
+    PUBLIC Q_BROWSER_WEBENGINE_TESTING)
+endif()
+
 q_browser_enable_strict_warnings(q_browser_webengine)

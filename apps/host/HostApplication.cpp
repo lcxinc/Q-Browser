@@ -431,6 +431,10 @@ bool HostApplication::start()
 {
     recordHostDiagnosticPhase("start-enter");
     if (mainWindow_) {
+        if (!mainWindow_->hasValidWebSession()) {
+            recordHostDiagnosticPhase("start-existing-window-retired");
+            return false;
+        }
         mainWindow_->show();
         recordHostDiagnosticPhase("start-existing-window-shown");
         return true;
@@ -444,8 +448,7 @@ bool HostApplication::start()
     recordHostDiagnosticPhase("start-routes-ready");
     auto window = std::make_unique<MainWindow>(std::move(*routes), mockOrigin_);
     recordHostDiagnosticPhase("start-main-window-created");
-    if (window->webSessionProfile() == nullptr
-        || !window->webSessionProfile()->isConfigurationValid()) {
+    if (!window->hasValidWebSession()) {
         return false;
     }
     window->resize(1100, 720);

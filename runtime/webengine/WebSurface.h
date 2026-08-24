@@ -39,15 +39,20 @@ public:
     void stop();
     void setTabActive(bool active);
     [[nodiscard]] bool shutdown();
-    [[nodiscard]] QUrl currentUrl() const;
-    [[nodiscard]] QUrl registeredMainFrameEntry() const;
     [[nodiscard]] QString title() const;
     [[nodiscard]] int loadProgress() const noexcept;
     [[nodiscard]] bool isLoading() const noexcept;
+
+#ifdef Q_BROWSER_WEBENGINE_TESTING
+    [[nodiscard]] QUrl currentUrl() const;
+    [[nodiscard]] QUrl registeredMainFrameEntry() const;
     [[nodiscard]] QWebEngineProfile *profile() const noexcept;
     [[nodiscard]] QWebEnginePage *page() const noexcept;
     [[nodiscard]] QWebEngineView *view() const noexcept;
     [[nodiscard]] PilotRequestInterceptor *requestInterceptor() const noexcept;
+    [[nodiscard]] quint64 navigationIncarnationForTesting() const noexcept;
+    [[nodiscard]] QString trustedTitleForTesting(const QString &physicalTitle) const;
+#endif
 
 signals:
     void navigationFinished(const QUrl &url, bool success);
@@ -70,6 +75,7 @@ private:
     void setLoadProgress(int progress);
     void updateTitle(const QString &physicalTitle);
     [[nodiscard]] QString trustedTitle(const QString &physicalTitle) const;
+    void handleDeniedMainFrameNavigation(const QUrl &url);
     void loadTrustedError();
     void freezeWhenRecommended();
 
@@ -78,14 +84,20 @@ private:
     std::unique_ptr<QWebEnginePage> page_;
     std::unique_ptr<QWebEngineView> view_;
     QMetaObject::Connection recommendedStateConnection_;
+    QMetaObject::Connection sessionRetirementConnection_;
+    QString physicalOriginHost_;
     QString title_ = QStringLiteral("Restricted web");
     int loadProgress_ = 0;
     quint64 navigationIncarnation_ = 0;
     quint64 activeLoadIncarnation_ = 0;
     quint64 stopRequestedIncarnation_ = 0;
+    quint64 terminalPendingIncarnation_ = 0;
     QUrl expectedNavigationUrl_;
     bool configurationValid_ = false;
     bool awaitingLoadStart_ = false;
+    bool awaitingDifferentDocument_ = false;
+    bool activeLoadStarted_ = false;
+    bool titleUpdatesAllowed_ = false;
     bool loading_ = false;
     bool tabActive_ = false;
     bool shutdown_ = false;

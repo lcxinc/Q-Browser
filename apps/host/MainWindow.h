@@ -42,6 +42,9 @@ public:
     [[nodiscard]] bool goForward();
     [[nodiscard]] bool attachWorkerSurface(std::unique_ptr<WorkerSurface> surface);
     void detachWorkerSurface();
+    [[nodiscard]] bool isRunning() const noexcept;
+    [[nodiscard]] bool isShutdownComplete() const noexcept;
+    [[nodiscard]] bool hasValidWebSession() const noexcept;
 
     [[nodiscard]] HostSurfaceKind activeSurface() const noexcept;
     [[nodiscard]] int activeSurfaceCount() const;
@@ -63,6 +66,13 @@ signals:
                               const QUrl &appUrl);
 
 private:
+    enum class LifecycleState
+    {
+        Running,
+        Closing,
+        Complete,
+    };
+
     [[nodiscard]] bool activate(const QString &canonicalUrl);
     void showTrustedError(const QString &message);
     void setCurrentAppUrl(const QString &url);
@@ -83,7 +93,6 @@ private:
     QString currentAppUrl_;
     HostSurfaceKind activeSurface_ = HostSurfaceKind::TrustedError;
     bool navigationInProgress_ = false;
-    bool shutdown_ = false;
-    bool shutdownSucceeded_ = true;
+    LifecycleState lifecycleState_ = LifecycleState::Running;
     QString activeWorkerPackageId_;
 };
