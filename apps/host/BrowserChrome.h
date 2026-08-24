@@ -71,6 +71,7 @@ private:
     [[nodiscard]] std::optional<PresentationBatch> batchFromModel(
         const BrowserTabModel &model) const;
     void applyBatch(const PresentationBatch &batch);
+    void reconcileTabBar(const PresentationBatch &batch);
     void applyBatchWithObserverSignalsBlocked(
         const PresentationBatch &batch);
     void updateActionAvailability(bool hasActiveTab,

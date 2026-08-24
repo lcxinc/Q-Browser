@@ -6,17 +6,21 @@
 #include <QAction>
 #include <QCoreApplication>
 #include <QEvent>
+#include <QEventLoop>
 #include <QLabel>
 #include <QLineEdit>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTabBar>
 #include <QTest>
+#include <QTimer>
 #include <QToolButton>
 #include <QVector>
 
 #include <concepts>
+#include <functional>
 #include <optional>
+#include <utility>
 
 namespace
 {
@@ -222,6 +226,47 @@ private:
     const BrowserTabModel *loadingModel_ = nullptr;
     int depth_ = 0;
 };
+
+enum class TabMutationObserver
+{
+    AddressTextChanged,
+    WindowTitleChanged,
+    ActionChanged,
+};
+
+class OneShotActionChangedObserver final : public QObject
+{
+public:
+    OneShotActionChangedObserver(BrowserChrome *chrome,
+                                 QAction *observedAction,
+                                 std::function<void()> callback)
+        : chrome_(chrome),
+          observedAction_(observedAction),
+          callback_(std::move(callback))
+    {
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (invoked_ || watched != chrome_
+            || event->type() != QEvent::ActionChanged) {
+            return false;
+        }
+        const auto *const actionEvent = static_cast<QActionEvent *>(event);
+        if (actionEvent->action() != observedAction_) return false;
+
+        invoked_ = true;
+        callback_();
+        return false;
+    }
+
+private:
+    BrowserChrome *chrome_ = nullptr;
+    QAction *observedAction_ = nullptr;
+    std::function<void()> callback_;
+    bool invoked_ = false;
+};
 }
 
 class BrowserChromeTest final : public QObject
@@ -246,6 +291,8 @@ private slots:
     void commandsAreInertDuringObservableSynchronization_data();
     void commandsAreInertDuringObservableSynchronization();
     void terminalSynchronizationRejectsUncommittedRequest();
+    void observableSynchronizationRepairsTabMutations_data();
+    void observableSynchronizationRepairsTabMutations();
     void standaloneNavigationBarStartsNeutral();
     void disabledForeignAndDirectDispatchIsInert();
     void tabMovesDoNotRequestRedundantActivation();
@@ -1394,6 +1441,168 @@ void BrowserChromeTest::terminalSynchronizationRejectsUncommittedRequest()
     QCOMPARE(reloadStop->defaultAction(),
              chrome.actionForCommand(BrowserCommand::Reload));
     QVERIFY(!stopAction->isEnabled());
+}
+
+void BrowserChromeTest::observableSynchronizationRepairsTabMutations_data()
+{
+    QTest::addColumn<int>("observerValue");
+    QTest::addColumn<bool>("nestedEventLoop");
+
+    const struct ObserverRow final {
+        const char *name;
+        TabMutationObserver observer;
+    } observers[] = {
+        {"address", TabMutationObserver::AddressTextChanged},
+        {"window-title", TabMutationObserver::WindowTitleChanged},
+        {"action", TabMutationObserver::ActionChanged},
+    };
+    for (const ObserverRow &row : observers) {
+        QTest::newRow(row.name)
+            << static_cast<int>(row.observer) << false;
+        QTest::newRow(qPrintable(QStringLiteral("%1-nested-loop")
+                                     .arg(QString::fromLatin1(row.name))))
+            << static_cast<int>(row.observer) << true;
+    }
+}
+
+void BrowserChromeTest::observableSynchronizationRepairsTabMutations()
+{
+    QFETCH(int, observerValue);
+    QFETCH(bool, nestedEventLoop);
+    const auto observer = static_cast<TabMutationObserver>(observerValue);
+
+    const QVector<BrowserTabSnapshot> tabs{
+        tab(tabId(u'1'),
+            BrowserTabKind::Host,
+            QStringLiteral("First batch"),
+            {QStringLiteral("qbrowser://first-batch")},
+            0),
+        tab(tabId(u'2'),
+            BrowserTabKind::Web,
+            QStringLiteral("Active batch"),
+            {QStringLiteral("app://pilot/web/active-batch/0"),
+             QStringLiteral("app://pilot/web/active-batch/1")},
+            1),
+        tab(tabId(u'3'),
+            BrowserTabKind::App,
+            QStringLiteral("Third batch"),
+            {QStringLiteral("app://pilot/third-batch")},
+            0),
+    };
+    const QVector<BrowserTabPresentation> presentations{
+        presentation(),
+        presentation(BrowserContentIdentity::RestrictedWeb, true, 68),
+        presentation(BrowserContentIdentity::SignedApplication),
+    };
+    BrowserTabModel model;
+    QVERIFY(restoreModel(model, tabs, presentations, tabs.at(1).id));
+
+    BrowserChrome chrome;
+    QTabBar *const tabBar = chrome.tabBar();
+    QLineEdit *const address = chrome.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QAction *const backAction = chrome.actionForCommand(BrowserCommand::Back);
+    QVERIFY(tabBar != nullptr);
+    QVERIFY(address != nullptr);
+    QVERIFY(backAction != nullptr);
+
+    QSignalSpy rawCurrentChanges(tabBar, &QTabBar::currentChanged);
+    QSignalSpy rawMoves(tabBar, &QTabBar::tabMoved);
+    QSignalSpy activationRequests(
+        &chrome, &BrowserChrome::tabActivationRequested);
+    QSignalSpy moveRequests(&chrome, &BrowserChrome::tabMoveRequested);
+    int observerInvocationCount = 0;
+    bool nestedLoopExited = !nestedEventLoop;
+    auto mutateTabs = [&] {
+        tabBar->moveTab(0, 2);
+        tabBar->setCurrentIndex(2);
+    };
+    auto runMutation = [&] {
+        if (observerInvocationCount != 0) return;
+        ++observerInvocationCount;
+        if (!nestedEventLoop) {
+            mutateTabs();
+            return;
+        }
+
+        QEventLoop loop;
+        QTimer::singleShot(0, &loop, [&] {
+            mutateTabs();
+            nestedLoopExited = true;
+            loop.quit();
+        });
+        QCOMPARE(loop.exec(QEventLoop::ExcludeUserInputEvents), 0);
+    };
+
+    OneShotActionChangedObserver actionObserver(
+        &chrome, backAction, runMutation);
+    switch (observer) {
+    case TabMutationObserver::AddressTextChanged:
+        connect(address, &QLineEdit::textChanged, &chrome,
+                [&](const QString &) { runMutation(); });
+        break;
+    case TabMutationObserver::WindowTitleChanged:
+        connect(&chrome, &QWidget::windowTitleChanged, &chrome,
+                [&](const QString &) { runMutation(); });
+        break;
+    case TabMutationObserver::ActionChanged:
+        chrome.installEventFilter(&actionObserver);
+        break;
+    }
+
+    QVERIFY(chrome.synchronizeTabs(model));
+    QCOMPARE(observerInvocationCount, 1);
+    QVERIFY(nestedLoopExited);
+    QCOMPARE(rawCurrentChanges.count(), 0);
+    QCOMPARE(rawMoves.count(), 0);
+    QCOMPARE(activationRequests.count(), 0);
+    QCOMPARE(moveRequests.count(), 0);
+
+    QStringList compactOrder;
+    for (int index = 0; index < tabBar->count(); ++index) {
+        compactOrder.append(tabBar->tabData(index).toString().left(1));
+    }
+    const QString currentId = tabBar->currentIndex() < 0
+        ? QStringLiteral("none")
+        : tabBar->tabData(tabBar->currentIndex()).toString().left(1);
+    const QString compactState = QStringLiteral("%1;current=%2")
+                                     .arg(compactOrder.join(u','), currentId);
+    QCOMPARE(compactState, QStringLiteral("1,2,3;current=2"));
+
+    QCOMPARE(tabBar->count(), tabs.size());
+    for (int index = 0; index < tabs.size(); ++index) {
+        QCOMPARE(tabBar->tabData(index).toString(), tabs.at(index).id);
+        QCOMPARE(tabBar->tabText(index), tabs.at(index).title);
+        QVERIFY(!tabBar->tabIcon(index).isNull());
+        const BrowserTabAccessiblePresentation accessible =
+            model.accessiblePresentationAt(index);
+        QCOMPARE(tabBar->accessibleTabName(index),
+                 QStringLiteral("%1, %2")
+                     .arg(accessible.name, accessible.description));
+    }
+    QCOMPARE(tabBar->currentIndex(), 1);
+    QCOMPARE(tabBar->tabData(tabBar->currentIndex()).toString(),
+             tabs.at(1).id);
+    QCOMPARE(address->text(), tabs.at(1).address);
+    QCOMPARE(chrome.windowTitle(), QStringLiteral("Active batch - Q-Browser"));
+    QVERIFY(backAction->isEnabled());
+    QVERIFY(!chrome.actionForCommand(BrowserCommand::Forward)->isEnabled());
+    QVERIFY(chrome.actionForCommand(BrowserCommand::Reload)->isEnabled());
+    QVERIFY(chrome.actionForCommand(BrowserCommand::Stop)->isEnabled());
+    QVERIFY(chrome.actionForCommand(BrowserCommand::Home)->isEnabled());
+    QCOMPARE(toolButton(chrome, QStringLiteral("navigation-reload-stop"))
+                 ->defaultAction(),
+             chrome.actionForCommand(BrowserCommand::Stop));
+
+    tabBar->setCurrentIndex(2);
+    QCOMPARE(activationRequests.count(), 1);
+    QCOMPARE(activationRequests.first().at(0).toString(), tabs.at(2).id);
+    tabBar->moveTab(0, 2);
+    QCOMPARE(moveRequests.count(), 1);
+    QCOMPARE(moveRequests.first().at(0).toString(), tabs.at(0).id);
+    QCOMPARE(moveRequests.first().at(1).toInt(), 0);
+    QCOMPARE(moveRequests.first().at(2).toInt(), 2);
+    QCOMPARE(activationRequests.count(), 1);
 }
 
 void BrowserChromeTest::standaloneNavigationBarStartsNeutral()

@@ -377,13 +377,42 @@ void BrowserChrome::applyBatch(const PresentationBatch &batch)
     Q_ASSERT(batch.tabCount >= 0
              && batch.tabCount <= BrowserTabModel::MaxOpenTabs
              && batch.tabs.size() == batch.tabCount);
+    const QSignalBlocker blockTabSignals(tabBar_);
+    reconcileTabBar(batch);
+
+    if (batch.activeIndex < 0) {
+        navigationBar_->clearActivePresentation();
+        window()->setWindowTitle(QStringLiteral("Q-Browser"));
+        updateActionAvailability(false, 0, false, false, false);
+        reconcileTabBar(batch);
+        return;
+    }
+
+    const OwnedTabPresentation &active = batch.tabs.at(batch.activeIndex);
+    const bool backAvailable = canGoBack(active.snapshot);
+    const bool forwardAvailable = canGoForward(active.snapshot);
+    navigationBar_->setAddressText(active.snapshot.address);
+    navigationBar_->setActivePresentation(active.presentation,
+                                           backAvailable,
+                                           forwardAvailable);
+    window()->setWindowTitle(QStringLiteral("%1 - Q-Browser")
+                                 .arg(active.displayTitle));
+    updateActionAvailability(true,
+                             batch.tabCount,
+                             backAvailable,
+                             forwardAvailable,
+                             active.presentation.loading);
+    reconcileTabBar(batch);
+}
+
+void BrowserChrome::reconcileTabBar(const PresentationBatch &batch)
+{
     QSet<QString> desiredIds;
     desiredIds.reserve(batch.tabs.size());
     for (const OwnedTabPresentation &tab : batch.tabs) {
         desiredIds.insert(tab.snapshot.id);
     }
 
-    const QSignalBlocker blockTabSignals(tabBar_);
     bool corruptView = tabBar_->count() > BrowserTabModel::MaxOpenTabs;
     QSet<QString> existingIds;
     for (int index = 0; !corruptView && index < tabBar_->count(); ++index) {
@@ -428,27 +457,6 @@ void BrowserChrome::applyBatch(const PresentationBatch &batch)
 
     selectedTabId_ = batch.activeTabId;
     tabBar_->setCurrentIndex(batch.activeIndex);
-    if (batch.activeIndex < 0) {
-        navigationBar_->clearActivePresentation();
-        window()->setWindowTitle(QStringLiteral("Q-Browser"));
-        updateActionAvailability(false, 0, false, false, false);
-        return;
-    }
-
-    const OwnedTabPresentation &active = batch.tabs.at(batch.activeIndex);
-    const bool backAvailable = canGoBack(active.snapshot);
-    const bool forwardAvailable = canGoForward(active.snapshot);
-    navigationBar_->setAddressText(active.snapshot.address);
-    navigationBar_->setActivePresentation(active.presentation,
-                                           backAvailable,
-                                           forwardAvailable);
-    window()->setWindowTitle(QStringLiteral("%1 - Q-Browser")
-                                 .arg(active.displayTitle));
-    updateActionAvailability(true,
-                             batch.tabCount,
-                             backAvailable,
-                             forwardAvailable,
-                             active.presentation.loading);
 }
 
 void BrowserChrome::applyBatchWithObserverSignalsBlocked(
