@@ -41,3 +41,14 @@ if(WIN32)
 endif()
 q_browser_enable_strict_warnings(tst_browser_session_store)
 q_browser_add_qt_test(NAME browser_session_store TARGET tst_browser_session_store)
+
+add_executable(tst_new_tab_page tst_new_tab_page.cpp)
+target_link_libraries(tst_new_tab_page
+  PRIVATE
+    q_browser_host
+    Qt6::Test
+    Qt6::WebEngineCore
+    Qt6::WebEngineWidgets
+    Qt6::Widgets)
+q_browser_enable_strict_warnings(tst_new_tab_page)
+q_browser_add_qt_test(NAME new_tab_page TARGET tst_new_tab_page)

@@ -34,7 +34,9 @@ add_library(q_browser_host STATIC
   MainWindow.cpp
   MainWindow.h
   NavigationBar.cpp
-  NavigationBar.h)
+  NavigationBar.h
+  NewTabPage.cpp
+  NewTabPage.h)
 
 target_include_directories(q_browser_host
   PUBLIC
