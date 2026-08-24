@@ -7,12 +7,13 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QToolButton>
+#include <QVariant>
 
-#include <algorithm>
+#include <optional>
 
 namespace
 {
-QString contentIdentityText(BrowserContentIdentity identity)
+std::optional<QString> contentIdentityText(BrowserContentIdentity identity)
 {
     switch (identity) {
     case BrowserContentIdentity::QBrowser:
@@ -22,16 +23,17 @@ QString contentIdentityText(BrowserContentIdentity identity)
     case BrowserContentIdentity::RestrictedWeb:
         return QStringLiteral("Restricted web");
     }
-    return QStringLiteral("Q-Browser");
+    return std::nullopt;
 }
 
-QString visualStateText(const BrowserTabPresentation &presentation)
+std::optional<QString> visualStateText(
+    const BrowserTabPresentation &presentation)
 {
     switch (presentation.visualState) {
     case BrowserVisualState::Normal:
         return presentation.loading
             ? QStringLiteral("Loading %1%").arg(
-                  std::clamp(presentation.progress, 0, 100))
+                  presentation.progress)
             : QStringLiteral("Ready");
     case BrowserVisualState::Recovering:
         return QStringLiteral("Recovering");
@@ -40,7 +42,7 @@ QString visualStateText(const BrowserTabPresentation &presentation)
     case BrowserVisualState::TrustedError:
         return QStringLiteral("Error");
     }
-    return QStringLiteral("Ready");
+    return std::nullopt;
 }
 
 void configureButton(QToolButton *button,
@@ -88,6 +90,8 @@ NavigationBar::NavigationBar(QWidget *parent) : QWidget(parent)
                     QStringLiteral("Reload"),
                     QStringLiteral("Reload the active tab"));
     reloadStopButton_->setProperty("loadProgress", 0);
+    reloadStopButton_->setEnabled(false);
+    reloadStopButton_->hide();
 
     homeButton_ = new QToolButton(this);
     configureButton(homeButton_,
@@ -95,15 +99,18 @@ NavigationBar::NavigationBar(QWidget *parent) : QWidget(parent)
                     QStringLiteral("Home"),
                     QStringLiteral("Home"),
                     QStringLiteral("Open the Q-Browser home page"));
+    homeButton_->setEnabled(false);
+    homeButton_->hide();
 
     contentIdentity_ = new QLabel(this);
     contentIdentity_->setObjectName(
         QStringLiteral("navigation-content-identity"));
     contentIdentity_->setTextFormat(Qt::PlainText);
-    contentIdentity_->setText(QStringLiteral("Q-Browser"));
+    contentIdentity_->clear();
     contentIdentity_->setAccessibleName(QStringLiteral("Content identity"));
     contentIdentity_->setAccessibleDescription(
-        QStringLiteral("Active content: Q-Browser, Ready"));
+        QStringLiteral("No active content"));
+    contentIdentity_->hide();
 
     address_ = new QLineEdit(this);
     address_->setObjectName(QStringLiteral("navigation-address"));
@@ -151,24 +158,49 @@ void NavigationBar::setActivePresentation(
     bool canGoBack,
     bool canGoForward)
 {
+    const std::optional<QString> identity =
+        contentIdentityText(presentation.contentIdentity);
+    const std::optional<QString> state = visualStateText(presentation);
+    if (!actionsBound_ || !identity.has_value() || !state.has_value()
+        || presentation.progress < 0 || presentation.progress > 100) {
+        clearActivePresentation();
+        return;
+    }
+
+    hasActivePresentation_ = true;
     setNavigationAvailability(canGoBack, canGoForward);
     loading_ = presentation.loading;
-    loadProgress_ = std::clamp(presentation.progress, 0, 100);
+    loadProgress_ = presentation.progress;
     applyReloadStopAction();
 
-    const QString identity = contentIdentityText(presentation.contentIdentity);
-    contentIdentity_->setText(identity);
+    reloadStopButton_->show();
+    homeButton_->show();
+    homeButton_->setEnabled(true);
+    contentIdentity_->show();
+    contentIdentity_->setText(*identity);
     contentIdentity_->setAccessibleDescription(
         QStringLiteral("Active content: %1, %2")
-            .arg(identity, visualStateText(presentation)));
+            .arg(*identity, *state));
     contentIdentity_->setProperty(
         "visualState", static_cast<int>(presentation.visualState));
 }
 
 void NavigationBar::clearActivePresentation()
 {
-    BrowserTabPresentation presentation;
-    setActivePresentation(presentation, false, false);
+    hasActivePresentation_ = false;
+    setNavigationAvailability(false, false);
+    loading_ = false;
+    loadProgress_ = 0;
+    applyReloadStopAction();
+    reloadStopButton_->setEnabled(false);
+    reloadStopButton_->hide();
+    homeButton_->setEnabled(false);
+    homeButton_->hide();
+    contentIdentity_->clear();
+    contentIdentity_->setAccessibleDescription(
+        QStringLiteral("No active content"));
+    contentIdentity_->setProperty("visualState", QVariant());
+    contentIdentity_->hide();
     setAddressText(QString());
 }
 
@@ -179,6 +211,7 @@ void NavigationBar::setReloadStopActions(QAction *reloadAction,
     Q_ASSERT(stopAction != nullptr);
     reloadAction_ = reloadAction;
     stopAction_ = stopAction;
+    actionsBound_ = true;
     applyReloadStopAction();
 }
 
@@ -193,6 +226,10 @@ void NavigationBar::applyReloadStopAction()
     QAction *const activeAction = loading_ ? stopAction_ : reloadAction_;
     if (activeAction != nullptr
         && reloadStopButton_->defaultAction() != activeAction) {
+        const QList<QAction *> existingActions = reloadStopButton_->actions();
+        for (QAction *const action : existingActions) {
+            if (action != activeAction) reloadStopButton_->removeAction(action);
+        }
         reloadStopButton_->setDefaultAction(activeAction);
     }
 
@@ -213,4 +250,5 @@ void NavigationBar::applyReloadStopAction()
     }
     reloadStopButton_->setToolTip(
         reloadStopButton_->accessibleDescription());
+    if (!hasActivePresentation_) reloadStopButton_->setEnabled(false);
 }

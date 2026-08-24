@@ -4,6 +4,7 @@
 
 #include <QAccessible>
 #include <QAction>
+#include <QCoreApplication>
 #include <QLabel>
 #include <QLineEdit>
 #include <QSet>
@@ -13,6 +14,7 @@
 #include <QToolButton>
 #include <QVector>
 
+#include <concepts>
 #include <optional>
 
 namespace
@@ -77,6 +79,89 @@ QStringList accessiblePageTabNames(QTabBar *tabBar)
     }
     return names;
 }
+
+bool collectUniqueAccessibleNodeIds(QAccessibleInterface *root,
+                                    QSet<QAccessible::Id> &ids,
+                                    int depth = 0)
+{
+    if (root == nullptr || depth > 64) return false;
+    const QAccessible::Id id = QAccessible::uniqueId(root);
+    if (id == 0 || ids.contains(id)) return false;
+    ids.insert(id);
+    for (int index = 0; index < root->childCount(); ++index) {
+        QAccessibleInterface *const child = root->child(index);
+        if (child != nullptr
+            && !collectUniqueAccessibleNodeIds(child, ids, depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Chrome>
+concept HasModelSynchronization = requires(
+    Chrome &chrome, const BrowserTabModel &model) {
+    { chrome.synchronizeTabs(model) } -> std::same_as<bool>;
+};
+
+template <typename Chrome>
+concept HasFreeVectorSynchronization = requires(
+    Chrome &chrome,
+    const QVector<BrowserTabSnapshot> &snapshots,
+    const QVector<BrowserTabPresentation> &presentations,
+    const QString &activeTabId) {
+    { chrome.synchronizeTabs(snapshots, presentations, activeTabId) }
+        -> std::same_as<bool>;
+};
+
+static_assert(HasModelSynchronization<BrowserChrome>);
+static_assert(!HasFreeVectorSynchronization<BrowserChrome>);
+
+bool restoreModel(BrowserTabModel &model,
+                  const QVector<BrowserTabSnapshot> &snapshots,
+                  const QVector<BrowserTabPresentation> &presentations,
+                  const QString &activeTabId)
+{
+    if (snapshots.size() != presentations.size()
+        || snapshots.size() > BrowserTabModel::MaxOpenTabs) {
+        return false;
+    }
+    const int snapshotCount = static_cast<int>(snapshots.size());
+    int activeIndex = -1;
+    for (int index = 0; index < snapshotCount; ++index) {
+        if (snapshots.at(index).id == activeTabId) activeIndex = index;
+    }
+    if ((snapshots.isEmpty() && !activeTabId.isEmpty())
+        || (!snapshots.isEmpty() && activeIndex < 0)
+        || !model.replaceFromValidatedSnapshot(snapshots, activeIndex)) {
+        return false;
+    }
+    for (int index = 0; index < model.count(); ++index) {
+        const BrowserTabPresentation expected = presentations.at(index);
+        if (expected.progress < 0 || expected.progress > 100
+            || model.presentationAt(index).contentIdentity
+                != expected.contentIdentity
+            || !model.setLoadState(model.snapshotAt(index).id,
+                                   expected.loading,
+                                   expected.progress)
+            || !model.setVisualState(model.snapshotAt(index).id,
+                                     expected.visualState)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool synchronizeChrome(
+    BrowserChrome &chrome,
+    const QVector<BrowserTabSnapshot> &snapshots,
+    const QVector<BrowserTabPresentation> &presentations,
+    const QString &activeTabId)
+{
+    BrowserTabModel model;
+    return restoreModel(model, snapshots, presentations, activeTabId)
+        && chrome.synchronizeTabs(model);
+}
 }
 
 class BrowserChromeTest final : public QObject
@@ -95,6 +180,15 @@ private slots:
     void chordTableIsUniqueAndSharedByRegisteredActions();
     void stableNamesPlainTextAndActualAccessibleRoles();
     void actualTabAccessibilityTracksLoadingRecoveryAndCrash();
+    void modelBoundSynchronizationValidatesCanonicalStateAtomically();
+    void nestedSynchronizationUsesOwnedLatestBatch();
+    void alternatingNestedSynchronizationIsBounded();
+    void standaloneNavigationBarStartsNeutral();
+    void disabledForeignAndDirectDispatchIsInert();
+    void tabMovesDoNotRequestRedundantActivation();
+    void corruptTabDataIsReconciledExactly();
+    void actionCapacityMatrixIsExact();
+    void accessibleTreeHasNoDuplicateReloadStopActions();
 };
 
 void BrowserChromeTest::initTestCase()
@@ -120,7 +214,7 @@ void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()
         tabId(u'3'), BrowserTabKind::Web, QStringLiteral("Inserted"),
         {QStringLiteral("app://pilot/web/help")}, 0);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {first, second},
         {presentation(),
          presentation(BrowserContentIdentity::SignedApplication)},
@@ -128,7 +222,7 @@ void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()
     QCOMPARE(tabBar->tabData(0).toString(), first.id);
     QCOMPARE(tabBar->tabData(1).toString(), second.id);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {inserted, first, second},
         {presentation(BrowserContentIdentity::RestrictedWeb),
          presentation(),
@@ -138,7 +232,7 @@ void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()
     QCOMPARE(tabBar->tabData(1).toString(), first.id);
     QCOMPARE(tabBar->tabData(2).toString(), second.id);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {second, inserted, first},
         {presentation(BrowserContentIdentity::SignedApplication),
          presentation(BrowserContentIdentity::RestrictedWeb),
@@ -148,7 +242,7 @@ void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()
     QCOMPARE(tabBar->tabData(1).toString(), inserted.id);
     QCOMPARE(tabBar->tabData(2).toString(), first.id);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {second, first},
         {presentation(BrowserContentIdentity::SignedApplication),
          presentation()},
@@ -201,13 +295,13 @@ void BrowserChromeTest::modelToViewSynchronizationBlocksAllViewRequests()
         tabId(u'c'), BrowserTabKind::Web, QStringLiteral("C"),
         {QStringLiteral("app://pilot/web/help")}, 0);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {first, second, third},
         {presentation(),
          presentation(BrowserContentIdentity::SignedApplication),
          presentation(BrowserContentIdentity::RestrictedWeb)},
         second.id));
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {third, first},
         {presentation(BrowserContentIdentity::RestrictedWeb, true, 71),
          presentation()},
@@ -225,9 +319,12 @@ void BrowserChromeTest::modelToViewSynchronizationBlocksAllViewRequests()
     const QVector<BrowserTabPresentation> beforePresentations{
         presentation(BrowserContentIdentity::RestrictedWeb, true, 71),
         presentation()};
-    QVERIFY(!chrome.synchronizeTabs(beforeTabs, {presentation()}, third.id));
-    QVERIFY(!chrome.synchronizeTabs(beforeTabs, beforePresentations,
-                                    QStringLiteral("missing")));
+    QVERIFY(!synchronizeChrome(
+        chrome, beforeTabs, {presentation()}, third.id));
+    QVERIFY(!synchronizeChrome(chrome,
+                               beforeTabs,
+                               beforePresentations,
+                               QStringLiteral("missing")));
     QCOMPARE(tabBar->count(), 2);
     QCOMPARE(tabBar->tabData(0).toString(), third.id);
     QCOMPARE(tabBar->tabData(1).toString(), first.id);
@@ -246,7 +343,7 @@ void BrowserChromeTest::navigationPresentationAndAddressEventsAreExplicit()
          QStringLiteral("app://pilot/orders"),
          QStringLiteral("app://pilot/orders/42")},
         1);
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {orders},
         {presentation(BrowserContentIdentity::SignedApplication)},
         orders.id));
@@ -291,7 +388,7 @@ void BrowserChromeTest::navigationPresentationAndAddressEventsAreExplicit()
     BrowserTabSnapshot atStart = orders;
     atStart.address = atStart.history.first();
     atStart.historyIndex = 0;
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {atStart},
         {presentation(BrowserContentIdentity::SignedApplication)},
         atStart.id));
@@ -307,7 +404,7 @@ void BrowserChromeTest::reloadStopUsesOneButtonAndChangesCommandWithLoading()
     const BrowserTabSnapshot page = tab(
         tabId(u'5'), BrowserTabKind::Web, QStringLiteral("Help"),
         {QStringLiteral("app://pilot/web/help")}, 0);
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {page},
         {presentation(BrowserContentIdentity::RestrictedWeb)},
         page.id));
@@ -328,7 +425,7 @@ void BrowserChromeTest::reloadStopUsesOneButtonAndChangesCommandWithLoading()
     QCOMPARE(commands.takeFirst().at(0).value<BrowserCommand>(),
              BrowserCommand::Reload);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {page},
         {presentation(BrowserContentIdentity::RestrictedWeb, true, 37)},
         page.id));
@@ -411,15 +508,19 @@ void BrowserChromeTest::shortcutDispatch()
         presentations.append(presentation(
             BrowserContentIdentity::SignedApplication, true, 50));
     }
-    QVERIFY(chrome.synchronizeTabs(tabs, presentations, tabs.at(4).id));
+    QVERIFY(synchronizeChrome(chrome, tabs, presentations, tabs.at(4).id));
     chrome.resize(900, 160);
     chrome.show();
     chrome.activateWindow();
     QVERIFY(QTest::qWaitForWindowActive(&chrome));
-    chrome.setFocus(Qt::OtherFocusReason);
+    QLineEdit *const address = chrome.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QVERIFY(address != nullptr);
+    address->setFocus(Qt::OtherFocusReason);
+    QVERIFY(address->hasFocus());
 
     QSignalSpy commands(&chrome, &BrowserChrome::commandRequested);
-    QTest::keyClick(&chrome, static_cast<Qt::Key>(key), modifiers);
+    QTest::keyClick(address, static_cast<Qt::Key>(key), modifiers);
 
     QCOMPARE(commands.count(), 1);
     QCOMPARE(commands.takeFirst().at(0).value<BrowserCommand>(), expected);
@@ -431,7 +532,7 @@ void BrowserChromeTest::focusAddressShortcutFocusesAndSelectsAll()
     const BrowserTabSnapshot page = tab(
         tabId(u'6'), BrowserTabKind::Host, QStringLiteral("New tab"),
         {QStringLiteral("qbrowser://newtab")}, 0);
-    QVERIFY(chrome.synchronizeTabs({page}, {presentation()}, page.id));
+    QVERIFY(synchronizeChrome(chrome, {page}, {presentation()}, page.id));
     chrome.resize(800, 160);
     chrome.show();
     chrome.activateWindow();
@@ -513,7 +614,7 @@ void BrowserChromeTest::stableNamesPlainTextAndActualAccessibleRoles()
     const BrowserTabSnapshot page = tab(
         tabId(u'7'), BrowserTabKind::App, QStringLiteral("<b>R&D</b>"),
         {QStringLiteral("app://pilot/orders")}, 0);
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {page},
         {presentation(BrowserContentIdentity::SignedApplication)},
         page.id));
@@ -545,6 +646,14 @@ void BrowserChromeTest::stableNamesPlainTextAndActualAccessibleRoles()
         QVERIFY2(object != nullptr, entry.objectName);
         QAccessibleInterface *const interface = accessibleInterface(object);
         QCOMPARE(interface->role(), entry.role);
+        QVERIFY2(!interface->text(QAccessible::Name).isEmpty(),
+                 entry.objectName);
+        // Qt's specialized PageTabList interface does not expose the
+        // QWidget description; all concrete controls must expose both.
+        if (entry.role != QAccessible::PageTabList) {
+            QVERIFY2(!interface->text(QAccessible::Description).isEmpty(),
+                     entry.objectName);
+        }
         const auto *const widget = qobject_cast<QWidget *>(object);
         QVERIFY(widget != nullptr);
         QVERIFY2(!widget->accessibleName().isEmpty(), entry.objectName);
@@ -582,7 +691,7 @@ void BrowserChromeTest::actualTabAccessibilityTracksLoadingRecoveryAndCrash()
         tabId(u'a'), BrowserTabKind::App, QStringLiteral("Customers"),
         {QStringLiteral("app://pilot/customers")}, 0);
 
-    QVERIFY(chrome.synchronizeTabs(
+    QVERIFY(synchronizeChrome(chrome,
         {loading, recovering, crashed},
         {presentation(BrowserContentIdentity::RestrictedWeb, true, 63),
          presentation(BrowserContentIdentity::SignedApplication,
@@ -609,6 +718,637 @@ void BrowserChromeTest::actualTabAccessibilityTracksLoadingRecoveryAndCrash()
     for (int index = 0; index < tabBar->count(); ++index) {
         QVERIFY(!tabBar->accessibleTabName(index).isEmpty());
     }
+}
+
+void BrowserChromeTest::modelBoundSynchronizationValidatesCanonicalStateAtomically()
+{
+    BrowserChrome chrome;
+    BrowserTabModel model;
+    const QString rawUnicodeTitle =
+        QStringLiteral("Safe & literal\u202e\u0001 \U0001f680 title");
+    const std::optional<QString> canonicalTitle =
+        BrowserTabModel::canonicalTitle(rawUnicodeTitle);
+    QVERIFY(canonicalTitle.has_value());
+    QVERIFY(*canonicalTitle != rawUnicodeTitle);
+
+    QVector<BrowserTabSnapshot> maximum;
+    maximum.reserve(BrowserTabModel::MaxOpenTabs);
+    for (int index = 0; index < BrowserTabModel::MaxOpenTabs; ++index) {
+        const BrowserTabKind kind = [&] {
+            switch (index % 4) {
+            case 0:
+                return BrowserTabKind::Host;
+            case 1:
+                return BrowserTabKind::App;
+            case 2:
+                return BrowserTabKind::Web;
+            default:
+                return BrowserTabKind::TrustedError;
+            }
+        }();
+        const QString address = QStringLiteral("app://pilot/%1/1").arg(index);
+        maximum.append(tab(
+            QString::number(index, 16).rightJustified(32, QLatin1Char('0')),
+            kind,
+            index == 10 ? *canonicalTitle
+                        : QStringLiteral("Tab %1").arg(index + 1),
+            {QStringLiteral("app://pilot/%1/0").arg(index),
+             address,
+             QStringLiteral("app://pilot/%1/2").arg(index)},
+            1));
+    }
+    constexpr int activeIndex = 10;
+    QVERIFY(model.replaceFromValidatedSnapshot(maximum, activeIndex));
+    QVERIFY(model.setLoadState(maximum.at(activeIndex).id, true, 58));
+    QVERIFY(model.setVisualState(maximum.at(3).id,
+                                 BrowserVisualState::Crashed));
+
+    QCOMPARE(model.presentationAt(0).contentIdentity,
+             BrowserContentIdentity::QBrowser);
+    QCOMPARE(model.presentationAt(1).contentIdentity,
+             BrowserContentIdentity::SignedApplication);
+    QCOMPARE(model.presentationAt(2).contentIdentity,
+             BrowserContentIdentity::RestrictedWeb);
+    QCOMPARE(model.presentationAt(3).contentIdentity,
+             BrowserContentIdentity::QBrowser);
+    QCOMPARE(model.accessiblePresentationAt(activeIndex).name,
+             *canonicalTitle);
+    QVERIFY(model.accessiblePresentationAt(activeIndex)
+                .description
+                .contains(QStringLiteral("Restricted web")));
+
+    QVERIFY(chrome.synchronizeTabs(model));
+    QCOMPARE(chrome.tabBar()->count(), BrowserTabModel::MaxOpenTabs);
+    QCOMPARE(chrome.tabBar()->currentIndex(), activeIndex);
+    QCOMPARE(chrome.tabBar()->tabText(activeIndex),
+             QString(*canonicalTitle).replace(u'&', QStringLiteral("&&")));
+    QCOMPARE(chrome.windowTitle(),
+             QStringLiteral("%1 - Q-Browser").arg(*canonicalTitle));
+    QVERIFY(chrome.actionForCommand(BrowserCommand::Back)->isEnabled());
+    QVERIFY(chrome.actionForCommand(BrowserCommand::Forward)->isEnabled());
+    QVERIFY(!chrome.actionForCommand(BrowserCommand::NewTab)->isEnabled());
+
+    const QString stableActiveId =
+        chrome.tabBar()->tabData(chrome.tabBar()->currentIndex()).toString();
+    const QString stableTitle = chrome.windowTitle();
+    const QString stableAddress = chrome.navigationBar()->addressText();
+
+    QVector<BrowserTabSnapshot> oversized = maximum;
+    oversized.append(tab(tabId(u'f'),
+                         BrowserTabKind::Host,
+                         QStringLiteral("Too many"),
+                         {QStringLiteral("qbrowser://too-many")},
+                         0));
+    BrowserTabModel rejected;
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(oversized, 0));
+
+    QVector<BrowserTabSnapshot> invalid{maximum.first()};
+    invalid[0].title = rawUnicodeTitle;
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(invalid, 0));
+    invalid[0] = maximum.first();
+    invalid[0].historyIndex = static_cast<int>(invalid[0].history.size());
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(invalid, 0));
+    invalid[0] = maximum.first();
+    invalid[0].address = QStringLiteral("app://pilot/not-current-history");
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(invalid, 0));
+    invalid[0] = maximum.first();
+    invalid[0].kind = static_cast<BrowserTabKind>(99);
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(invalid, 0));
+    QVERIFY(!rejected.replaceFromValidatedSnapshot(
+        {maximum.first(), maximum.first()}, 0));
+    QVERIFY(!rejected.replaceFromValidatedSnapshot({maximum.first()}, -1));
+    QVERIFY(!rejected.replaceFromValidatedSnapshot({maximum.first()}, 1));
+    QCOMPARE(rejected.count(), 0);
+
+    QCOMPARE(chrome.tabBar()->count(), BrowserTabModel::MaxOpenTabs);
+    QCOMPARE(chrome.tabBar()
+                 ->tabData(chrome.tabBar()->currentIndex())
+                 .toString(),
+             stableActiveId);
+    QCOMPARE(chrome.windowTitle(), stableTitle);
+    QCOMPARE(chrome.navigationBar()->addressText(), stableAddress);
+}
+
+void BrowserChromeTest::nestedSynchronizationUsesOwnedLatestBatch()
+{
+    BrowserChrome chrome;
+    QLineEdit *const address = chrome.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QAction *const backAction = chrome.actionForCommand(BrowserCommand::Back);
+    QLabel *const identity = chrome.findChild<QLabel *>(
+        QStringLiteral("navigation-content-identity"));
+    QVERIFY(address != nullptr);
+    QVERIFY(backAction != nullptr);
+    QVERIFY(identity != nullptr);
+
+    const QVector<BrowserTabSnapshot> outerTabs{tab(
+        tabId(u'1'), BrowserTabKind::App, QStringLiteral("Outer"),
+        {QStringLiteral("app://pilot/outer/0"),
+         QStringLiteral("app://pilot/outer/1")},
+        1)};
+    const QVector<BrowserTabPresentation> outerPresentations{
+        presentation(BrowserContentIdentity::SignedApplication)};
+    const QVector<BrowserTabSnapshot> addressTabs{tab(
+        tabId(u'2'), BrowserTabKind::Web, QStringLiteral("Address nested"),
+        {QStringLiteral("app://pilot/web/address")}, 0)};
+    const QVector<BrowserTabPresentation> addressPresentations{
+        presentation(BrowserContentIdentity::RestrictedWeb)};
+    const QVector<BrowserTabSnapshot> titleTabs{tab(
+        tabId(u'3'), BrowserTabKind::App, QStringLiteral("Title nested"),
+        {QStringLiteral("app://pilot/title/0"),
+         QStringLiteral("app://pilot/title/1")},
+        1)};
+    const QVector<BrowserTabPresentation> titlePresentations{
+        presentation(BrowserContentIdentity::SignedApplication, true, 42)};
+    const QVector<BrowserTabSnapshot> finalTabs{tab(
+        tabId(u'4'), BrowserTabKind::Web, QStringLiteral("Latest"),
+        {QStringLiteral("app://pilot/web/latest")}, 0)};
+    const QVector<BrowserTabPresentation> finalPresentations{
+        presentation(BrowserContentIdentity::RestrictedWeb,
+                     false,
+                     0,
+                     BrowserVisualState::Crashed)};
+
+    BrowserTabModel outerModel;
+    BrowserTabModel addressModel;
+    BrowserTabModel titleModel;
+    BrowserTabModel finalModel;
+    QVERIFY(restoreModel(outerModel,
+                         outerTabs,
+                         outerPresentations,
+                         outerTabs.first().id));
+    QVERIFY(restoreModel(addressModel,
+                         addressTabs,
+                         addressPresentations,
+                         addressTabs.first().id));
+    QVERIFY(restoreModel(titleModel,
+                         titleTabs,
+                         titlePresentations,
+                         titleTabs.first().id));
+    QVERIFY(restoreModel(finalModel,
+                         finalTabs,
+                         finalPresentations,
+                         finalTabs.first().id));
+
+    bool addressObserverRan = false;
+    bool titleObserverRan = false;
+    bool actionObserverRan = false;
+    bool nestedAccepted = true;
+    int observerDepth = 0;
+    int maximumObserverDepth = 0;
+    connect(address, &QLineEdit::textChanged, &chrome,
+            [&](const QString &) {
+                if (addressObserverRan) return;
+                addressObserverRan = true;
+                ++observerDepth;
+                maximumObserverDepth = qMax(maximumObserverDepth,
+                                            observerDepth);
+                // Mutate the source model while the observer is suspended.
+                // BrowserChrome must already own every value from its batch.
+                nestedAccepted = outerModel.setTitle(
+                    outerTabs.first().id,
+                    QStringLiteral("Aliased outer mutation"));
+                nestedAccepted = nestedAccepted
+                    && chrome.synchronizeTabs(addressModel);
+                --observerDepth;
+            });
+    connect(&chrome, &QWidget::windowTitleChanged, &chrome,
+            [&](const QString &) {
+                if (titleObserverRan) return;
+                titleObserverRan = true;
+                ++observerDepth;
+                maximumObserverDepth = qMax(maximumObserverDepth,
+                                            observerDepth);
+                nestedAccepted = nestedAccepted
+                    && chrome.synchronizeTabs(titleModel);
+                --observerDepth;
+            });
+    connect(backAction, &QAction::changed, &chrome, [&] {
+        if (actionObserverRan) return;
+        actionObserverRan = true;
+        ++observerDepth;
+        maximumObserverDepth = qMax(maximumObserverDepth, observerDepth);
+        nestedAccepted = nestedAccepted && chrome.synchronizeTabs(finalModel);
+        --observerDepth;
+    });
+
+    QVERIFY(chrome.synchronizeTabs(outerModel));
+    QVERIFY(nestedAccepted);
+    QVERIFY(addressObserverRan);
+    QVERIFY(titleObserverRan);
+    QVERIFY(actionObserverRan);
+    QCOMPARE(maximumObserverDepth, 1);
+
+    QCOMPARE(chrome.tabBar()->count(), 1);
+    QCOMPARE(chrome.tabBar()->tabData(0).toString(), finalTabs.first().id);
+    QCOMPARE(chrome.tabBar()->tabText(0), QStringLiteral("Latest"));
+    QCOMPARE(chrome.tabBar()->currentIndex(), 0);
+    QCOMPARE(address->text(), finalTabs.first().address);
+    QCOMPARE(identity->text(), QStringLiteral("Restricted web"));
+    QCOMPARE(chrome.windowTitle(), QStringLiteral("Latest - Q-Browser"));
+    QVERIFY(!backAction->isEnabled());
+    QCOMPARE(toolButton(chrome, QStringLiteral("navigation-reload-stop"))
+                 ->defaultAction(),
+             chrome.actionForCommand(BrowserCommand::Reload));
+}
+
+void BrowserChromeTest::alternatingNestedSynchronizationIsBounded()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot first = tab(
+        tabId(u'1'), BrowserTabKind::App, QStringLiteral("First"),
+        {QStringLiteral("app://pilot/first")}, 0);
+    const BrowserTabSnapshot second = tab(
+        tabId(u'2'), BrowserTabKind::Web, QStringLiteral("Second"),
+        {QStringLiteral("app://pilot/web/second")}, 0);
+    BrowserTabModel firstModel;
+    BrowserTabModel secondModel;
+    QVERIFY(restoreModel(
+        firstModel,
+        {first},
+        {presentation(BrowserContentIdentity::SignedApplication)},
+        first.id));
+    QVERIFY(restoreModel(
+        secondModel,
+        {second},
+        {presentation(BrowserContentIdentity::RestrictedWeb)},
+        second.id));
+
+    int requestCount = 0;
+    int observerDepth = 0;
+    int maximumObserverDepth = 0;
+    bool nestedAccepted = true;
+    connect(&chrome, &QWidget::windowTitleChanged, &chrome,
+            [&](const QString &) {
+                if (requestCount >= 64) return;
+                ++observerDepth;
+                maximumObserverDepth = qMax(maximumObserverDepth,
+                                            observerDepth);
+                ++requestCount;
+                nestedAccepted = nestedAccepted
+                    && chrome.synchronizeTabs(
+                        requestCount % 2 == 0 ? firstModel : secondModel);
+                --observerDepth;
+            });
+
+    QVERIFY(chrome.synchronizeTabs(firstModel));
+    QVERIFY(nestedAccepted);
+    QCOMPARE(requestCount, BrowserTabModel::MaxOpenTabs);
+    QCOMPARE(maximumObserverDepth, 1);
+    QCOMPARE(chrome.tabBar()->count(), 1);
+    QCOMPARE(chrome.tabBar()->tabData(0).toString(), first.id);
+    QCOMPARE(chrome.navigationBar()->addressText(), first.address);
+    QCOMPARE(chrome.windowTitle(), QStringLiteral("First - Q-Browser"));
+    QCOMPARE(chrome.actionForCommand(BrowserCommand::Reload)->isEnabled(),
+             true);
+}
+
+void BrowserChromeTest::standaloneNavigationBarStartsNeutral()
+{
+    NavigationBar navigation;
+    QToolButton *const reloadStop = navigation.findChild<QToolButton *>(
+        QStringLiteral("navigation-reload-stop"));
+    QToolButton *const home = navigation.findChild<QToolButton *>(
+        QStringLiteral("navigation-home"));
+    QLabel *const identity = navigation.findChild<QLabel *>(
+        QStringLiteral("navigation-content-identity"));
+    QLineEdit *const address = navigation.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QVERIFY(reloadStop != nullptr);
+    QVERIFY(home != nullptr);
+    QVERIFY(identity != nullptr);
+    QVERIFY(address != nullptr);
+
+    navigation.resize(800, 80);
+    navigation.show();
+    QCoreApplication::processEvents();
+    QVERIFY(navigation.isVisible());
+    QVERIFY(address->isVisible());
+
+    QVERIFY(!reloadStop->isVisible());
+    QVERIFY(!reloadStop->isEnabled());
+    QVERIFY(!home->isVisible());
+    QVERIFY(!home->isEnabled());
+    QVERIFY(!identity->isVisible());
+    QVERIFY(identity->text().isEmpty());
+    QVERIFY(!accessibleInterface(identity)
+                 ->text(QAccessible::Description)
+                 .contains(QStringLiteral("Active content: Q-Browser")));
+
+    QSignalSpy homeRequests(&navigation, &NavigationBar::homeRequested);
+    reloadStop->click();
+    home->click();
+    QCOMPARE(homeRequests.count(), 0);
+}
+
+void BrowserChromeTest::disabledForeignAndDirectDispatchIsInert()
+{
+    BrowserChrome chrome;
+    QLineEdit *const address = chrome.findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    QVERIFY(address != nullptr);
+    address->setText(QStringLiteral("retain-selection"));
+
+    const struct DisabledDispatch final {
+        BrowserCommand command;
+        std::optional<QKeyCombination> chord;
+    } disabled[] = {
+        {BrowserCommand::CloseTab,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_W)},
+        {BrowserCommand::NextTab,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_Tab)},
+        {BrowserCommand::PreviousTab,
+         QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier,
+                         Qt::Key_Tab)},
+        {BrowserCommand::SelectTab1,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_1)},
+        {BrowserCommand::SelectTab2,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_2)},
+        {BrowserCommand::SelectTab3,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_3)},
+        {BrowserCommand::SelectTab4,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_4)},
+        {BrowserCommand::SelectTab5,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_5)},
+        {BrowserCommand::SelectTab6,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_6)},
+        {BrowserCommand::SelectTab7,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_7)},
+        {BrowserCommand::SelectTab8,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_8)},
+        {BrowserCommand::SelectLastTab,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_9)},
+        {BrowserCommand::Back,
+         QKeyCombination(Qt::AltModifier, Qt::Key_Left)},
+        {BrowserCommand::Forward,
+         QKeyCombination(Qt::AltModifier, Qt::Key_Right)},
+        {BrowserCommand::Reload,
+         QKeyCombination(Qt::ControlModifier, Qt::Key_R)},
+        {BrowserCommand::Stop,
+         QKeyCombination(Qt::NoModifier, Qt::Key_Escape)},
+        {BrowserCommand::Home, std::nullopt},
+    };
+
+    QSignalSpy commands(&chrome, &BrowserChrome::commandRequested);
+    for (const DisabledDispatch &entry : disabled) {
+        QAction *const action = chrome.actionForCommand(entry.command);
+        QVERIFY(action != nullptr);
+        QVERIFY(!action->isEnabled());
+        if (entry.chord.has_value()) {
+            const std::optional<BrowserCommand> foreignCommand =
+                browserCommandForKeyCombination(*entry.chord);
+            QVERIFY(foreignCommand.has_value());
+            QCOMPARE(*foreignCommand, entry.command);
+            chrome.dispatchCommand(*foreignCommand);
+        } else {
+            chrome.dispatchCommand(entry.command);
+        }
+    }
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(!address->hasSelectedText());
+
+    QAction *const focusAction =
+        chrome.actionForCommand(BrowserCommand::FocusAddress);
+    QVERIFY(focusAction != nullptr);
+    focusAction->setEnabled(false);
+    chrome.dispatchCommand(*browserCommandForKeyCombination(
+        QKeyCombination(Qt::ControlModifier, Qt::Key_L)));
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(!address->hasFocus());
+    QVERIFY(!address->hasSelectedText());
+}
+
+void BrowserChromeTest::tabMovesDoNotRequestRedundantActivation()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot first = tab(
+        tabId(u'1'), BrowserTabKind::Host, QStringLiteral("First"),
+        {QStringLiteral("qbrowser://first")}, 0);
+    const BrowserTabSnapshot second = tab(
+        tabId(u'2'), BrowserTabKind::App, QStringLiteral("Second"),
+        {QStringLiteral("app://pilot/second")}, 0);
+    const BrowserTabSnapshot third = tab(
+        tabId(u'3'), BrowserTabKind::Web, QStringLiteral("Third"),
+        {QStringLiteral("app://pilot/web/third")}, 0);
+    QVERIFY(synchronizeChrome(chrome,
+        {first, second, third},
+        {presentation(),
+         presentation(BrowserContentIdentity::SignedApplication),
+         presentation(BrowserContentIdentity::RestrictedWeb)},
+        first.id));
+
+    QSignalSpy activations(&chrome, &BrowserChrome::tabActivationRequested);
+    QSignalSpy moves(&chrome, &BrowserChrome::tabMoveRequested);
+    chrome.tabBar()->moveTab(0, 2);
+    QCOMPARE(moves.count(), 1);
+    QCOMPARE(moves.takeFirst().at(0).toString(), first.id);
+    QCOMPARE(activations.count(), 0);
+    QCOMPARE(chrome.tabBar()
+                 ->tabData(chrome.tabBar()->currentIndex())
+                 .toString(),
+             first.id);
+
+    chrome.tabBar()->moveTab(0, 1);
+    QCOMPARE(moves.count(), 1);
+    QCOMPARE(moves.takeFirst().at(0).toString(), second.id);
+    QCOMPARE(activations.count(), 0);
+
+    chrome.tabBar()->setCurrentIndex(0);
+    QCOMPARE(activations.count(), 1);
+    QCOMPARE(activations.takeFirst().at(0).toString(), third.id);
+}
+
+void BrowserChromeTest::corruptTabDataIsReconciledExactly()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot first = tab(
+        tabId(u'1'), BrowserTabKind::Host, QStringLiteral("First"),
+        {QStringLiteral("qbrowser://first")}, 0);
+    const BrowserTabSnapshot second = tab(
+        tabId(u'2'), BrowserTabKind::App, QStringLiteral("Second"),
+        {QStringLiteral("app://pilot/second")}, 0);
+    const QVector<BrowserTabPresentation> presentations{
+        presentation(),
+        presentation(BrowserContentIdentity::SignedApplication)};
+    QVERIFY(synchronizeChrome(chrome,
+                              {first, second},
+                              presentations,
+                              first.id));
+
+    QTabBar *const tabBar = chrome.tabBar();
+    tabBar->setTabData(1, first.id);
+    const int staleIndex = tabBar->addTab(QStringLiteral("stale"));
+    tabBar->setTabData(staleIndex, tabId(u'f'));
+    tabBar->addTab(QStringLiteral("empty"));
+    QCOMPARE(tabBar->count(), 4);
+
+    QVERIFY(synchronizeChrome(chrome,
+                              {first, second},
+                              presentations,
+                              second.id));
+    QCOMPARE(tabBar->count(), 2);
+    QCOMPARE(tabBar->tabData(0).toString(), first.id);
+    QCOMPARE(tabBar->tabData(1).toString(), second.id);
+    QCOMPARE(tabBar->currentIndex(), 1);
+}
+
+void BrowserChromeTest::actionCapacityMatrixIsExact()
+{
+    BrowserChrome chrome;
+    auto enabled = [&](BrowserCommand command) {
+        QAction *const action = chrome.actionForCommand(command);
+        Q_ASSERT(action != nullptr);
+        return action->isEnabled();
+    };
+
+    QVERIFY(enabled(BrowserCommand::NewTab));
+    QVERIFY(enabled(BrowserCommand::ReopenClosedTab));
+    QVERIFY(enabled(BrowserCommand::FocusAddress));
+    QVERIFY(!enabled(BrowserCommand::CloseTab));
+    QVERIFY(!enabled(BrowserCommand::Reload));
+    QVERIFY(!enabled(BrowserCommand::Home));
+
+    const BrowserTabSnapshot one = tab(
+        tabId(u'1'), BrowserTabKind::Host, QStringLiteral("One"),
+        {QStringLiteral("qbrowser://one")}, 0);
+    QVERIFY(synchronizeChrome(chrome, {one}, {presentation()}, one.id));
+    QVERIFY(enabled(BrowserCommand::NewTab));
+    QVERIFY(enabled(BrowserCommand::ReopenClosedTab));
+    QVERIFY(enabled(BrowserCommand::CloseTab));
+    QVERIFY(enabled(BrowserCommand::Reload));
+    QVERIFY(enabled(BrowserCommand::Home));
+    QVERIFY(!enabled(BrowserCommand::NextTab));
+
+    BrowserTabModel emptyModel;
+    QVERIFY(chrome.synchronizeTabs(emptyModel));
+    QVERIFY(enabled(BrowserCommand::NewTab));
+    QVERIFY(enabled(BrowserCommand::ReopenClosedTab));
+    QVERIFY(!enabled(BrowserCommand::CloseTab));
+    QVERIFY(!enabled(BrowserCommand::Reload));
+    QVERIFY(!enabled(BrowserCommand::Home));
+    QToolButton *const emptyReloadStop = toolButton(
+        chrome, QStringLiteral("navigation-reload-stop"));
+    QToolButton *const emptyHome = toolButton(
+        chrome, QStringLiteral("navigation-home"));
+    QLabel *const emptyIdentity = chrome.findChild<QLabel *>(
+        QStringLiteral("navigation-content-identity"));
+    QVERIFY(emptyReloadStop != nullptr);
+    QVERIFY(emptyHome != nullptr);
+    QVERIFY(emptyIdentity != nullptr);
+    QVERIFY(emptyReloadStop->isHidden());
+    QVERIFY(!emptyReloadStop->isEnabled());
+    QVERIFY(emptyHome->isHidden());
+    QVERIFY(!emptyHome->isEnabled());
+    QVERIFY(emptyIdentity->isHidden());
+    QVERIFY(emptyIdentity->text().isEmpty());
+    QCOMPARE(chrome.navigationBar()->addressText(), QString());
+    QCOMPARE(chrome.windowTitle(), QStringLiteral("Q-Browser"));
+
+    QVector<BrowserTabSnapshot> tabs;
+    QVector<BrowserTabPresentation> presentations;
+    for (int index = 0; index < BrowserTabModel::MaxOpenTabs; ++index) {
+        const QString id = QString::number(index, 16)
+            .rightJustified(32, QLatin1Char('0'));
+        tabs.append(tab(id,
+                        BrowserTabKind::App,
+                        QStringLiteral("Tab %1").arg(index + 1),
+                        {QStringLiteral("app://pilot/%1").arg(index)},
+                        0));
+        presentations.append(presentation(
+            BrowserContentIdentity::SignedApplication));
+    }
+    QVERIFY(synchronizeChrome(chrome, tabs, presentations, tabs.first().id));
+    QVERIFY(!enabled(BrowserCommand::NewTab));
+    QVERIFY(!enabled(BrowserCommand::ReopenClosedTab));
+    QVERIFY(enabled(BrowserCommand::CloseTab));
+    QVERIFY(enabled(BrowserCommand::NextTab));
+
+    QSignalSpy commands(&chrome, &BrowserChrome::commandRequested);
+    chrome.dispatchCommand(*browserCommandForKeyCombination(
+        QKeyCombination(Qt::ControlModifier, Qt::Key_T)));
+    chrome.dispatchCommand(*browserCommandForKeyCombination(
+        QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier,
+                        Qt::Key_T)));
+    QCOMPARE(commands.count(), 0);
+}
+
+void BrowserChromeTest::accessibleTreeHasNoDuplicateReloadStopActions()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot page = tab(
+        tabId(u'1'), BrowserTabKind::Web, QStringLiteral("Help"),
+        {QStringLiteral("app://pilot/web/help")}, 0);
+    QVERIFY(synchronizeChrome(chrome,
+        {page},
+        {presentation(BrowserContentIdentity::RestrictedWeb)},
+        page.id));
+
+    QToolButton *const reloadStop = toolButton(
+        chrome, QStringLiteral("navigation-reload-stop"));
+    QVERIFY(reloadStop != nullptr);
+    QAccessibleInterface *const buttonInterface =
+        accessibleInterface(reloadStop);
+    QCOMPARE(buttonInterface->role(), QAccessible::Button);
+    QCOMPARE(buttonInterface->text(QAccessible::Name),
+             QStringLiteral("Reload"));
+    QCOMPARE(buttonInterface->text(QAccessible::Description),
+             QStringLiteral("Reload the active tab"));
+    QCOMPARE(buttonInterface->childCount(), 0);
+    QCOMPARE(reloadStop->actions().size(), 1);
+    QCOMPARE(reloadStop->actions().first(),
+             chrome.actionForCommand(BrowserCommand::Reload));
+    QSet<QAccessible::Id> beforeNodeIds;
+    QVERIFY(collectUniqueAccessibleNodeIds(accessibleInterface(&chrome),
+                                           beforeNodeIds));
+
+    QVERIFY(synchronizeChrome(chrome,
+        {page},
+        {presentation(BrowserContentIdentity::RestrictedWeb, true, 61)},
+        page.id));
+    QCOMPARE(buttonInterface->role(), QAccessible::Button);
+    QCOMPARE(buttonInterface->text(QAccessible::Name), QStringLiteral("Stop"));
+    QCOMPARE(buttonInterface->text(QAccessible::Description),
+             QStringLiteral("Stop loading the active tab (61%)"));
+    QCOMPARE(buttonInterface->childCount(), 0);
+    QCOMPARE(reloadStop->actions().size(), 1);
+    QCOMPARE(reloadStop->actions().first(),
+             chrome.actionForCommand(BrowserCommand::Stop));
+    QSet<QAccessible::Id> afterNodeIds;
+    QVERIFY(collectUniqueAccessibleNodeIds(accessibleInterface(&chrome),
+                                           afterNodeIds));
+    QCOMPARE(afterNodeIds.size(), beforeNodeIds.size());
+
+    QVERIFY(synchronizeChrome(
+        chrome,
+        {page},
+        {presentation(BrowserContentIdentity::RestrictedWeb)},
+        page.id));
+    QCOMPARE(buttonInterface->text(QAccessible::Name),
+             QStringLiteral("Reload"));
+    QCOMPARE(buttonInterface->text(QAccessible::Description),
+             QStringLiteral("Reload the active tab"));
+    QCOMPARE(reloadStop->actions().size(), 1);
+    QCOMPARE(reloadStop->actions().first(),
+             chrome.actionForCommand(BrowserCommand::Reload));
+    QSet<QAccessible::Id> restoredNodeIds;
+    QVERIFY(collectUniqueAccessibleNodeIds(accessibleInterface(&chrome),
+                                           restoredNodeIds));
+    QCOMPARE(restoredNodeIds.size(), beforeNodeIds.size());
+
+    QAccessibleInterface *const tabList = accessibleInterface(chrome.tabBar());
+    QCOMPARE(tabList->role(), QAccessible::PageTabList);
+    QSet<QString> pageTabNames;
+    int pageTabCount = 0;
+    for (int index = 0; index < tabList->childCount(); ++index) {
+        QAccessibleInterface *const child = tabList->child(index);
+        if (child == nullptr || child->role() != QAccessible::PageTab) continue;
+        ++pageTabCount;
+        QVERIFY(!pageTabNames.contains(child->text(QAccessible::Name)));
+        pageTabNames.insert(child->text(QAccessible::Name));
+        QCOMPARE(tabList->indexOfChild(child), index);
+    }
+    QCOMPARE(pageTabCount, 1);
+    QCOMPARE(pageTabNames.size(), pageTabCount);
 }
 
 QTEST_MAIN(BrowserChromeTest)

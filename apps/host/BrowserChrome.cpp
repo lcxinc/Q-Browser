@@ -5,6 +5,8 @@
 #include <QAction>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QLineEdit>
+#include <QScopedValueRollback>
 #include <QSet>
 #include <QSignalBlocker>
 #include <QStyle>
@@ -13,30 +15,11 @@
 #include <QVBoxLayout>
 #include <QVariant>
 
-#include <algorithm>
+#include <vector>
 
 namespace
 {
-QString fallbackTitle(BrowserTabKind kind)
-{
-    switch (kind) {
-    case BrowserTabKind::Host:
-        return QStringLiteral("New tab");
-    case BrowserTabKind::App:
-        return QStringLiteral("Application");
-    case BrowserTabKind::Web:
-        return QStringLiteral("Restricted web");
-    case BrowserTabKind::TrustedError:
-        return QStringLiteral("Error");
-    }
-    return QStringLiteral("New tab");
-}
-
-QString displayTitle(const BrowserTabSnapshot &snapshot)
-{
-    return snapshot.title.isEmpty() ? fallbackTitle(snapshot.kind)
-                                    : snapshot.title;
-}
+constexpr int MaxSynchronizationPasses = BrowserTabModel::MaxOpenTabs;
 
 QString literalTabText(const QString &title)
 {
@@ -45,44 +28,67 @@ QString literalTabText(const QString &title)
     return literal;
 }
 
-QString identityText(BrowserContentIdentity identity)
+bool isValidId(const QString &id) noexcept
 {
-    switch (identity) {
-    case BrowserContentIdentity::QBrowser:
-        return QStringLiteral("Q-Browser");
-    case BrowserContentIdentity::SignedApplication:
-        return QStringLiteral("Signed application");
-    case BrowserContentIdentity::RestrictedWeb:
-        return QStringLiteral("Restricted web");
+    if (id.size() != 32) return false;
+    for (const QChar value : id) {
+        if ((value < QLatin1Char('0') || value > QLatin1Char('9'))
+            && (value < QLatin1Char('a') || value > QLatin1Char('f'))) {
+            return false;
+        }
     }
-    return QStringLiteral("Q-Browser");
+    return true;
 }
 
-QString stateText(const BrowserTabPresentation &presentation)
+std::optional<BrowserContentIdentity> identityForKind(
+    BrowserTabKind kind) noexcept
 {
-    switch (presentation.visualState) {
+    switch (kind) {
+    case BrowserTabKind::Host:
+    case BrowserTabKind::TrustedError:
+        return BrowserContentIdentity::QBrowser;
+    case BrowserTabKind::App:
+        return BrowserContentIdentity::SignedApplication;
+    case BrowserTabKind::Web:
+        return BrowserContentIdentity::RestrictedWeb;
+    }
+    return std::nullopt;
+}
+
+bool isValidVisualState(BrowserVisualState state) noexcept
+{
+    switch (state) {
     case BrowserVisualState::Normal:
-        return presentation.loading
-            ? QStringLiteral("Loading %1%").arg(
-                  std::clamp(presentation.progress, 0, 100))
-            : QStringLiteral("Ready");
     case BrowserVisualState::Recovering:
-        return QStringLiteral("Recovering");
     case BrowserVisualState::Crashed:
-        return QStringLiteral("Crashed");
     case BrowserVisualState::TrustedError:
-        return QStringLiteral("Error");
+        return true;
     }
-    return QStringLiteral("Ready");
+    return false;
 }
 
-QString accessibleTabName(const BrowserTabSnapshot &snapshot,
-                          const BrowserTabPresentation &presentation)
+bool isValidSnapshot(const BrowserTabSnapshot &snapshot)
 {
-    return QStringLiteral("%1, %2, %3")
-        .arg(displayTitle(snapshot),
-             identityText(presentation.contentIdentity),
-             stateText(presentation));
+    const std::optional<BrowserContentIdentity> identity =
+        identityForKind(snapshot.kind);
+    if (!identity.has_value() || !isValidId(snapshot.id)
+        || snapshot.address.isEmpty()
+        || snapshot.history.isEmpty()
+        || snapshot.history.size() > BrowserTabModel::MaxHistoryEntries
+        || snapshot.historyIndex < 0) {
+        return false;
+    }
+    const int historyCount = static_cast<int>(snapshot.history.size());
+    if (snapshot.historyIndex >= historyCount
+        || snapshot.address != snapshot.history.at(snapshot.historyIndex)) {
+        return false;
+    }
+    for (const QString &entry : snapshot.history) {
+        if (entry.isEmpty()) return false;
+    }
+    const std::optional<QString> canonical =
+        BrowserTabModel::canonicalTitle(snapshot.title);
+    return canonical.has_value() && *canonical == snapshot.title;
 }
 
 bool canGoBack(const BrowserTabSnapshot &snapshot) noexcept
@@ -92,15 +98,14 @@ bool canGoBack(const BrowserTabSnapshot &snapshot) noexcept
 
 bool canGoForward(const BrowserTabSnapshot &snapshot) noexcept
 {
-    return snapshot.historyIndex >= 0
-        && snapshot.historyIndex + 1
-            < static_cast<int>(snapshot.history.size());
+    return static_cast<qsizetype>(snapshot.historyIndex) + 1
+        < snapshot.history.size();
 }
 
 QIcon tabIcon(QWidget *owner,
               const BrowserTabPresentation &presentation)
 {
-    QStyle::StandardPixmap icon = QStyle::SP_FileIcon;
+    QStyle::StandardPixmap icon;
     switch (presentation.visualState) {
     case BrowserVisualState::Crashed:
         icon = QStyle::SP_MessageBoxCritical;
@@ -125,9 +130,13 @@ QIcon tabIcon(QWidget *owner,
             case BrowserContentIdentity::RestrictedWeb:
                 icon = QStyle::SP_DriveNetIcon;
                 break;
+            default:
+                Q_UNREACHABLE_RETURN(QIcon());
             }
         }
         break;
+    default:
+        Q_UNREACHABLE_RETURN(QIcon());
     }
     return owner->style()->standardIcon(icon, nullptr, owner);
 }
@@ -224,9 +233,14 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
         actionForCommand(BrowserCommand::Stop));
 
     connect(tabBar_, &QTabBar::currentChanged, this, [this](int index) {
-        if (index < 0) return;
+        if (index < 0) {
+            selectedTabId_.clear();
+            return;
+        }
         const QString id = tabBar_->tabData(index).toString();
-        if (!id.isEmpty()) emit tabActivationRequested(id);
+        if (id.isEmpty() || id == selectedTabId_) return;
+        selectedTabId_ = id;
+        emit tabActivationRequested(id);
     });
     connect(tabBar_, &QTabBar::tabMoved, this, [this](int from, int to) {
         const QString id = tabBar_->tabData(to).toString();
@@ -249,28 +263,134 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     navigationBar_->clearActivePresentation();
 }
 
-bool BrowserChrome::synchronizeTabs(
-    const QVector<BrowserTabSnapshot> &snapshots,
-    const QVector<BrowserTabPresentation> &presentations,
-    const QString &activeTabId)
+bool BrowserChrome::synchronizeTabs(const BrowserTabModel &model)
 {
-    if (snapshots.size() != presentations.size()) return false;
+    std::optional<PresentationBatch> batch = batchFromModel(model);
+    if (!batch.has_value()) return false;
 
-    QSet<QString> desiredIds;
-    desiredIds.reserve(snapshots.size());
-    int activeIndex = -1;
-    for (qsizetype index = 0; index < snapshots.size(); ++index) {
-        const QString &id = snapshots.at(index).id;
-        if (id.isEmpty() || desiredIds.contains(id)) return false;
-        desiredIds.insert(id);
-        if (id == activeTabId) activeIndex = static_cast<int>(index);
+    if (synchronizationInProgress_) {
+        pendingBatch_ = std::move(*batch);
+        return true;
     }
-    if ((snapshots.isEmpty() && !activeTabId.isEmpty())
-        || (!snapshots.isEmpty() && activeIndex < 0)) {
-        return false;
+
+    QScopedValueRollback<bool> synchronizationGuard(
+        synchronizationInProgress_, true);
+    PresentationBatch next = std::move(*batch);
+    for (int pass = 0; pass < MaxSynchronizationPasses; ++pass) {
+        pendingBatch_.reset();
+        applyBatch(next);
+        if (!pendingBatch_.has_value()) return true;
+        next = std::move(*pendingBatch_);
+    }
+
+    // A signal observer that continually requests alternating states must not
+    // turn presentation into unbounded recursion or a livelock. Apply the
+    // newest bounded pending batch once with the three observable re-entry
+    // sources suppressed.
+    pendingBatch_.reset();
+    applyBatchWithObserverSignalsBlocked(next);
+    pendingBatch_.reset();
+    return true;
+}
+
+std::optional<BrowserChrome::PresentationBatch> BrowserChrome::batchFromModel(
+    const BrowserTabModel &model) const
+{
+    const int modelCount = model.count();
+    if (modelCount < 0 || modelCount > BrowserTabModel::MaxOpenTabs) {
+        return std::nullopt;
+    }
+
+    const QVector<BrowserTabSnapshot> snapshots = model.snapshots();
+    const QString activeTabId = model.activeId();
+    const int activeIndex = model.activeIndex();
+    if (snapshots.size() > BrowserTabModel::MaxOpenTabs
+        || snapshots.size() != modelCount
+        || (modelCount == 0
+            && (activeIndex != -1 || !activeTabId.isEmpty()))
+        || (modelCount > 0
+            && (activeIndex < 0 || activeIndex >= modelCount))) {
+        return std::nullopt;
+    }
+
+    PresentationBatch batch;
+    batch.tabs.reserve(modelCount);
+    batch.activeTabId = activeTabId;
+    batch.tabCount = modelCount;
+    batch.activeIndex = activeIndex;
+    QSet<QString> ids;
+    ids.reserve(modelCount);
+    for (int index = 0; index < modelCount; ++index) {
+        BrowserTabSnapshot snapshot = snapshots.at(index);
+        if (!isValidSnapshot(snapshot) || ids.contains(snapshot.id)
+            || !identityForKind(snapshot.kind).has_value()) {
+            return std::nullopt;
+        }
+        ids.insert(snapshot.id);
+
+        OwnedTabPresentation owned;
+        owned.snapshot = std::move(snapshot);
+        batch.tabs.append(std::move(owned));
+    }
+
+    if (modelCount > 0
+        && (activeTabId.isEmpty()
+            || batch.tabs.at(activeIndex).snapshot.id != activeTabId)) {
+        return std::nullopt;
+    }
+
+    for (int index = 0; index < modelCount; ++index) {
+        OwnedTabPresentation &owned = batch.tabs[index];
+        const std::optional<BrowserContentIdentity> expectedIdentity =
+            identityForKind(owned.snapshot.kind);
+        const BrowserTabPresentation presentation = model.presentationAt(index);
+        if (!expectedIdentity.has_value()
+            || presentation.contentIdentity != *expectedIdentity
+            || !isValidVisualState(presentation.visualState)
+            || presentation.progress < 0 || presentation.progress > 100) {
+            return std::nullopt;
+        }
+        BrowserTabAccessiblePresentation accessible =
+            model.accessiblePresentationAt(index);
+        if (accessible.name.isEmpty() || accessible.description.isEmpty()) {
+            return std::nullopt;
+        }
+        owned.presentation = presentation;
+        owned.accessiblePresentation = std::move(accessible);
+        owned.displayTitle = owned.accessiblePresentation.name;
+        owned.accessibleTabName = QStringLiteral("%1, %2")
+                                      .arg(owned.accessiblePresentation.name,
+                                           owned.accessiblePresentation
+                                               .description);
+    }
+    return batch;
+}
+
+void BrowserChrome::applyBatch(const PresentationBatch &batch)
+{
+    Q_ASSERT(batch.tabCount >= 0
+             && batch.tabCount <= BrowserTabModel::MaxOpenTabs
+             && batch.tabs.size() == batch.tabCount);
+    QSet<QString> desiredIds;
+    desiredIds.reserve(batch.tabs.size());
+    for (const OwnedTabPresentation &tab : batch.tabs) {
+        desiredIds.insert(tab.snapshot.id);
     }
 
     const QSignalBlocker blockTabSignals(tabBar_);
+    bool corruptView = tabBar_->count() > BrowserTabModel::MaxOpenTabs;
+    QSet<QString> existingIds;
+    for (int index = 0; !corruptView && index < tabBar_->count(); ++index) {
+        const QString id = tabBar_->tabData(index).toString();
+        if (id.isEmpty() || existingIds.contains(id)) {
+            corruptView = true;
+            break;
+        }
+        existingIds.insert(id);
+    }
+    if (corruptView) {
+        while (tabBar_->count() > 0) tabBar_->removeTab(0);
+    }
 
     for (int index = tabBar_->count() - 1; index >= 0; --index) {
         if (!desiredIds.contains(tabBar_->tabData(index).toString())) {
@@ -278,52 +398,68 @@ bool BrowserChrome::synchronizeTabs(
         }
     }
 
-    for (int desiredIndex = 0; desiredIndex < snapshots.size(); ++desiredIndex) {
-        const BrowserTabSnapshot &snapshot = snapshots.at(desiredIndex);
-        const BrowserTabPresentation &presentation =
-            presentations.at(desiredIndex);
-        int currentIndex = tabIndexForId(snapshot.id);
+    for (int desiredIndex = 0; desiredIndex < batch.tabCount;
+         ++desiredIndex) {
+        const OwnedTabPresentation &tab = batch.tabs.at(desiredIndex);
+        int currentIndex = tabIndexForId(tab.snapshot.id);
         if (currentIndex < 0) {
             currentIndex = tabBar_->insertTab(
-                desiredIndex, literalTabText(displayTitle(snapshot)));
-            tabBar_->setTabData(currentIndex, snapshot.id);
+                desiredIndex, literalTabText(tab.displayTitle));
+            tabBar_->setTabData(currentIndex, tab.snapshot.id);
         } else if (currentIndex != desiredIndex) {
             tabBar_->moveTab(currentIndex, desiredIndex);
             currentIndex = desiredIndex;
         }
 
-        tabBar_->setTabData(currentIndex, snapshot.id);
-        tabBar_->setTabText(
-            currentIndex, literalTabText(displayTitle(snapshot)));
-        tabBar_->setTabIcon(currentIndex, tabIcon(this, presentation));
-        tabBar_->setAccessibleTabName(
-            currentIndex, accessibleTabName(snapshot, presentation));
+        tabBar_->setTabData(currentIndex, tab.snapshot.id);
+        tabBar_->setTabText(currentIndex,
+                            literalTabText(tab.displayTitle));
+        tabBar_->setTabIcon(currentIndex,
+                            tabIcon(this, tab.presentation));
+        tabBar_->setAccessibleTabName(currentIndex,
+                                      tab.accessibleTabName);
     }
 
-    tabBar_->setCurrentIndex(activeIndex);
-    if (activeIndex < 0) {
+    selectedTabId_ = batch.activeTabId;
+    tabBar_->setCurrentIndex(batch.activeIndex);
+    if (batch.activeIndex < 0) {
         navigationBar_->clearActivePresentation();
         window()->setWindowTitle(QStringLiteral("Q-Browser"));
         updateActionAvailability(false, 0, false, false, false);
-        return true;
+        return;
     }
 
-    const BrowserTabSnapshot &activeSnapshot = snapshots.at(activeIndex);
-    const BrowserTabPresentation &activePresentation =
-        presentations.at(activeIndex);
-    const bool backAvailable = canGoBack(activeSnapshot);
-    const bool forwardAvailable = canGoForward(activeSnapshot);
-    navigationBar_->setAddressText(activeSnapshot.address);
-    navigationBar_->setActivePresentation(
-        activePresentation, backAvailable, forwardAvailable);
-    window()->setWindowTitle(
-        QStringLiteral("%1 - Q-Browser").arg(displayTitle(activeSnapshot)));
+    const OwnedTabPresentation &active = batch.tabs.at(batch.activeIndex);
+    const bool backAvailable = canGoBack(active.snapshot);
+    const bool forwardAvailable = canGoForward(active.snapshot);
+    navigationBar_->setAddressText(active.snapshot.address);
+    navigationBar_->setActivePresentation(active.presentation,
+                                           backAvailable,
+                                           forwardAvailable);
+    window()->setWindowTitle(QStringLiteral("%1 - Q-Browser")
+                                 .arg(active.displayTitle));
     updateActionAvailability(true,
-                             static_cast<int>(snapshots.size()),
+                             batch.tabCount,
                              backAvailable,
                              forwardAvailable,
-                             activePresentation.loading);
-    return true;
+                             active.presentation.loading);
+}
+
+void BrowserChrome::applyBatchWithObserverSignalsBlocked(
+    const PresentationBatch &batch)
+{
+    const QSignalBlocker windowSignals(window());
+    const QSignalBlocker navigationSignals(navigationBar_);
+    QLineEdit *const address = navigationBar_->findChild<QLineEdit *>(
+        QStringLiteral("navigation-address"));
+    std::optional<QSignalBlocker> addressSignals;
+    if (address != nullptr) addressSignals.emplace(address);
+    std::vector<QSignalBlocker> actionSignals;
+    actionSignals.reserve(static_cast<std::size_t>(commandActions_.size()));
+    for (const CommandAction &mapping : commandActions_) {
+        actionSignals.emplace_back(mapping.action);
+    }
+    applyBatch(batch);
 }
 
 QTabBar *BrowserChrome::tabBar() const noexcept
@@ -346,7 +482,8 @@ QAction *BrowserChrome::actionForCommand(BrowserCommand command) const noexcept
 
 void BrowserChrome::dispatchCommand(BrowserCommand command)
 {
-    if (actionForCommand(command) == nullptr) return;
+    QAction *const action = actionForCommand(command);
+    if (action == nullptr || !action->isEnabled()) return;
     if (command == BrowserCommand::FocusAddress) {
         navigationBar_->focusAddressAndSelectAll();
     }
@@ -391,6 +528,8 @@ void BrowserChrome::updateActionAvailability(bool hasActiveTab,
             switch (mapping.command) {
             case BrowserCommand::NewTab:
             case BrowserCommand::ReopenClosedTab:
+                enabled = tabCount < BrowserTabModel::MaxOpenTabs;
+                break;
             case BrowserCommand::FocusAddress:
                 enabled = true;
                 break;

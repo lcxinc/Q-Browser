@@ -42,6 +42,8 @@ private:
     QLineEdit *address_ = nullptr;
     QAction *reloadAction_ = nullptr;
     QAction *stopAction_ = nullptr;
+    bool actionsBound_ = false;
+    bool hasActivePresentation_ = false;
     bool loading_ = false;
     int loadProgress_ = 0;
 };

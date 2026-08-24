@@ -6,6 +6,8 @@
 #include <QVector>
 #include <QWidget>
 
+#include <optional>
+
 class QAction;
 class NavigationBar;
 class QTabBar;
@@ -18,10 +20,7 @@ class BrowserChrome final : public QWidget
 public:
     explicit BrowserChrome(QWidget *parent = nullptr);
 
-    [[nodiscard]] bool synchronizeTabs(
-        const QVector<BrowserTabSnapshot> &snapshots,
-        const QVector<BrowserTabPresentation> &presentations,
-        const QString &activeTabId);
+    [[nodiscard]] bool synchronizeTabs(const BrowserTabModel &model);
 
     [[nodiscard]] QTabBar *tabBar() const noexcept;
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
@@ -44,8 +43,36 @@ private:
         QAction *action = nullptr;
     };
 
+    struct OwnedTabPresentation final
+    {
+        BrowserTabSnapshot snapshot;
+        BrowserTabPresentation presentation;
+        BrowserTabAccessiblePresentation accessiblePresentation;
+        QString displayTitle;
+        QString accessibleTabName;
+
+        friend bool operator==(const OwnedTabPresentation &,
+                               const OwnedTabPresentation &) = default;
+    };
+
+    struct PresentationBatch final
+    {
+        QVector<OwnedTabPresentation> tabs;
+        QString activeTabId;
+        int tabCount = 0;
+        int activeIndex = -1;
+
+        friend bool operator==(const PresentationBatch &,
+                               const PresentationBatch &) = default;
+    };
+
     void createActions();
     void triggerAction(BrowserCommand command);
+    [[nodiscard]] std::optional<PresentationBatch> batchFromModel(
+        const BrowserTabModel &model) const;
+    void applyBatch(const PresentationBatch &batch);
+    void applyBatchWithObserverSignalsBlocked(
+        const PresentationBatch &batch);
     void updateActionAvailability(bool hasActiveTab,
                                   int tabCount,
                                   bool canGoBack,
@@ -57,4 +84,7 @@ private:
     QToolButton *newTabButton_ = nullptr;
     NavigationBar *navigationBar_ = nullptr;
     QVector<CommandAction> commandActions_;
+    QString selectedTabId_;
+    bool synchronizationInProgress_ = false;
+    std::optional<PresentationBatch> pendingBatch_;
 };
