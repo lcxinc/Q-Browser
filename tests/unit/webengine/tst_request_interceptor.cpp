@@ -1,4 +1,5 @@
 #include "PilotRequestInterceptor.h"
+#include "WebSessionProfile.h"
 #include "WebSurface.h"
 
 #include <QApplication>
@@ -158,9 +159,9 @@ private slots:
     void policyAllowsOnlyExactLoopbackOriginAndTrustedError();
     void rejectsUnsafeSandboxConfiguration();
     void invalidOriginDoesNotInitializeWebEngine();
-    void createsDedicatedEphemeralProfileWithRestrictiveSettings();
+    void createsSharedEphemeralProfileWithRestrictiveSettings();
     void actualWebEngineBlocksCrossOriginSubresources();
-    void actualWebEngineIsolatesLocalStorageBetweenSurfaces();
+    void actualWebEngineSharesLocalStorageBetweenSurfaces();
     void actualWebEngineDeniesPopupsDownloadsAndPermissions();
     void blockedAndFailedLoadsRenderTrustedQrcError();
     void rendererTerminationRendersTrustedQrcError();
@@ -208,9 +209,12 @@ void RequestInterceptorTest::rejectsUnsafeSandboxConfiguration()
 
 void RequestInterceptorTest::invalidOriginDoesNotInitializeWebEngine()
 {
-    WebSurface surface(QUrl(QStringLiteral("https://example.com/")));
+    WebSessionProfile session(QUrl(QStringLiteral("https://example.com/")));
+    WebSurface surface(session, QUrl(QStringLiteral("https://example.com/help")));
 
+    QVERIFY(!session.isConfigurationValid());
     QVERIFY(!surface.isConfigurationValid());
+    QVERIFY(session.profile() == nullptr);
     QVERIFY(surface.profile() == nullptr);
     QVERIFY(surface.page() == nullptr);
     QVERIFY(surface.view() == nullptr);
@@ -218,11 +222,12 @@ void RequestInterceptorTest::invalidOriginDoesNotInitializeWebEngine()
     QVERIFY(surface.currentUrl().isEmpty());
 }
 
-void RequestInterceptorTest::createsDedicatedEphemeralProfileWithRestrictiveSettings()
+void RequestInterceptorTest::createsSharedEphemeralProfileWithRestrictiveSettings()
 {
     HttpServer server;
     QVERIFY(server.listen());
-    WebSurface surface(server.origin());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/entry")));
 
     QVERIFY(surface.isConfigurationValid());
     QVERIFY(surface.profile() != QWebEngineProfile::defaultProfile());
@@ -234,6 +239,8 @@ void RequestInterceptorTest::createsDedicatedEphemeralProfileWithRestrictiveSett
              QWebEngineProfile::PersistentPermissionsPolicy::AskEveryTime);
     QVERIFY(surface.profile()->storageName().isEmpty());
     QCOMPARE(surface.page()->profile(), surface.profile());
+    QCOMPARE(surface.requestInterceptor(), session.requestInterceptor());
+    QCOMPARE(session.registeredPageCount(), 1);
     QVERIFY(!surface.page()->settings()->testAttribute(
         QWebEngineSettings::JavascriptCanOpenWindows));
     QVERIFY(!surface.page()->settings()->testAttribute(
@@ -260,7 +267,8 @@ void RequestInterceptorTest::actualWebEngineBlocksCrossOriginSubresources()
             + QByteArrayLiteral("onload=\"document.title='leaked'\">");
     });
     QVERIFY(allowed.listen());
-    WebSurface surface(allowed.origin());
+    WebSessionProfile session(allowed.origin());
+    WebSurface surface(session, allowed.url(QStringLiteral("/index")));
     QSignalSpy blockedSpy(surface.requestInterceptor(),
                           &PilotRequestInterceptor::requestBlocked);
     QSignalSpy titleSpy(surface.page(), &QWebEnginePage::titleChanged);
@@ -275,14 +283,15 @@ void RequestInterceptorTest::actualWebEngineBlocksCrossOriginSubresources()
     QVERIFY(!titleSpy.isEmpty());
 }
 
-void RequestInterceptorTest::actualWebEngineIsolatesLocalStorageBetweenSurfaces()
+void RequestInterceptorTest::actualWebEngineSharesLocalStorageBetweenSurfaces()
 {
     HttpServer server([](const QByteArray &) {
         return QByteArrayLiteral("<!doctype html><title>storage</title>");
     });
     QVERIFY(server.listen());
-    WebSurface first(server.origin());
-    WebSurface second(server.origin());
+    WebSessionProfile session(server.origin());
+    WebSurface first(session, server.url(QStringLiteral("/first")));
+    WebSurface second(session, server.url(QStringLiteral("/second")));
 
     QVERIFY(navigateAndWait(first,
                             server.url(QStringLiteral("/first")),
@@ -296,10 +305,10 @@ void RequestInterceptorTest::actualWebEngineIsolatesLocalStorageBetweenSurfaces(
     QVERIFY(navigateAndWait(second,
                             server.url(QStringLiteral("/second")),
                             server.url(QStringLiteral("/second"))));
-    const auto isolated = evaluateJavaScript(
+    const auto shared = evaluateJavaScript(
         second.page(), QStringLiteral("localStorage.getItem('pilot-secret')"));
-    QVERIFY(isolated.has_value());
-    QVERIFY(isolated->isNull());
+    QVERIFY(shared.has_value());
+    QCOMPARE(*shared, QJsonValue(QStringLiteral("one")));
 }
 
 void RequestInterceptorTest::actualWebEngineDeniesPopupsDownloadsAndPermissions()
@@ -314,9 +323,19 @@ void RequestInterceptorTest::actualWebEngineDeniesPopupsDownloadsAndPermissions(
             "<a id='download' href='/download' download='blocked.txt'>download</a>");
     });
     QVERIFY(server.listen());
-    WebSurface surface(server.origin());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/actions")));
+    WebSurface otherSurface(session, server.url(QStringLiteral("/other")));
     QSignalSpy downloadSpy(&surface, &WebSurface::downloadDenied);
+    QSignalSpy otherDownloadSpy(&otherSurface, &WebSurface::downloadDenied);
     QSignalSpy permissionSpy(&surface, &WebSurface::permissionDenied);
+    QWebEnginePage *downloadPage = nullptr;
+    QUrl downloadUrl;
+    connect(&session, &WebSessionProfile::downloadDenied, &surface,
+            [&](QWebEnginePage *page, const QUrl &url) {
+                downloadPage = page;
+                downloadUrl = url;
+            });
 
     QVERIFY(navigateAndWait(surface,
                             server.url(QStringLiteral("/actions")),
@@ -336,6 +355,14 @@ void RequestInterceptorTest::actualWebEngineDeniesPopupsDownloadsAndPermissions(
         surface.page(), QStringLiteral("document.getElementById('download').click()"));
     QVERIFY(downloadClick.has_value());
     QTRY_VERIFY_WITH_TIMEOUT(!downloadSpy.isEmpty(), 5000);
+    QVERIFY(otherDownloadSpy.isEmpty());
+    QCOMPARE(downloadPage, surface.page());
+    QCOMPARE(downloadUrl, server.url(QStringLiteral("/download")));
+
+    const QUrl beforeExternalProtocol = surface.currentUrl();
+    surface.page()->setUrl(QUrl(QStringLiteral("pilot-unsafe://external")));
+    QTest::qWait(250);
+    QCOMPARE(surface.currentUrl(), beforeExternalProtocol);
 
     const auto permissionRequest = evaluateJavaScript(
         surface.page(), QStringLiteral(
@@ -351,7 +378,9 @@ void RequestInterceptorTest::blockedAndFailedLoadsRenderTrustedQrcError()
 {
     HttpServer server;
     QVERIFY(server.listen());
-    WebSurface surface(server.origin());
+    const QUrl offlineUrl = server.url(QStringLiteral("/offline"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, offlineUrl);
 
     QVERIFY(navigateAndWait(surface,
                             QUrl(QStringLiteral("https://example.com/")),
@@ -359,7 +388,6 @@ void RequestInterceptorTest::blockedAndFailedLoadsRenderTrustedQrcError()
     QCOMPARE(surface.currentUrl(), WebSurface::trustedErrorUrl());
     QCOMPARE(surface.page()->title(), QStringLiteral("Q-Browser navigation unavailable"));
 
-    const QUrl offlineUrl = server.url(QStringLiteral("/offline"));
     server.close();
     QVERIFY(navigateAndWait(surface, offlineUrl, WebSurface::trustedErrorUrl(), true, 15000));
     QCOMPARE(surface.currentUrl(), WebSurface::trustedErrorUrl());
@@ -369,10 +397,12 @@ void RequestInterceptorTest::rendererTerminationRendersTrustedQrcError()
 {
     HttpServer server;
     QVERIFY(server.listen());
-    WebSurface surface(server.origin());
+    const QUrl entry = server.url(QStringLiteral("/before-crash"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
     QVERIFY(navigateAndWait(surface,
-                            server.url(QStringLiteral("/before-crash")),
-                            server.url(QStringLiteral("/before-crash"))));
+                            entry,
+                            entry));
     QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
 
     QVERIFY(QMetaObject::invokeMethod(

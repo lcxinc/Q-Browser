@@ -5,6 +5,8 @@ endif()
 add_library(q_browser_webengine STATIC
   PilotRequestInterceptor.cpp
   PilotRequestInterceptor.h
+  WebSessionProfile.cpp
+  WebSessionProfile.h
   WebSurface.cpp
   WebSurface.h
   "${PROJECT_SOURCE_DIR}/resources/host.qrc")

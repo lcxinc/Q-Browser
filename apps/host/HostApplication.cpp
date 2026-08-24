@@ -15,7 +15,7 @@
 
 #include "PilotRoutes.h"
 #include "RouteRegistry.h"
-#include "WebSurface.h"
+#include "WebSessionProfile.h"
 
 #include <QPointer>
 #include <QRegularExpression>
@@ -444,7 +444,10 @@ bool HostApplication::start()
     recordHostDiagnosticPhase("start-routes-ready");
     auto window = std::make_unique<MainWindow>(std::move(*routes), mockOrigin_);
     recordHostDiagnosticPhase("start-main-window-created");
-    if (!window->webSurface()->isConfigurationValid()) return false;
+    if (window->webSessionProfile() == nullptr
+        || !window->webSessionProfile()->isConfigurationValid()) {
+        return false;
+    }
     window->resize(1100, 720);
     window->show();
     recordHostDiagnosticPhase("start-main-window-shown");

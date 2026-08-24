@@ -2,15 +2,14 @@
 
 #include "AppUrl.h"
 #include "NavigationBar.h"
+#include "WebSessionProfile.h"
 #include "WebSurface.h"
 #include "WorkerSurface.h"
 
 #include <QLabel>
 #include <QCoreApplication>
-#include <QElapsedTimer>
 #include <QScopedValueRollback>
 #include <QStackedWidget>
-#include <QThread>
 #include <QVBoxLayout>
 #include <QVariantMap>
 #include <QWebEnginePage>
@@ -45,6 +44,7 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
                        QWidget *parent)
     : QMainWindow(parent)
     , routes_(std::move(routeRegistry))
+    , webSessionProfile_(std::make_unique<WebSessionProfile>(mockOrigin))
     , workerSurface_(workerSurface)
 {
     setObjectName(QStringLiteral("qbrowser-main-window"));
@@ -58,7 +58,9 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     navigationBar_ = new NavigationBar(central);
     surfaceStack_ = new QStackedWidget(central);
     surfaceStack_->setObjectName(QStringLiteral("surface-stack"));
-    webSurface_ = new WebSurface(mockOrigin, surfaceStack_);
+    webSurface_ = new WebSurface(*webSessionProfile_,
+                                 mockOrigin.resolved(QUrl(QStringLiteral("help"))),
+                                 surfaceStack_);
     webSurface_->setObjectName(QStringLiteral("web-surface"));
 
     trustedErrorSurface_ = new QWidget(surfaceStack_);
@@ -77,6 +79,7 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     surfaceStack_->addWidget(webSurface_);
     surfaceStack_->addWidget(trustedErrorSurface_);
     surfaceStack_->setCurrentWidget(trustedErrorSurface_);
+    webSurface_->setTabActive(false);
 
     layout->addWidget(navigationBar_);
     layout->addWidget(surfaceStack_, 1);
@@ -93,20 +96,30 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     updateNavigationState();
 }
 
+MainWindow::~MainWindow()
+{
+    (void)shutdown();
+}
+
 bool MainWindow::shutdown()
 {
     if (shutdown_) return shutdownSucceeded_;
     shutdown_ = true;
     hide();
-    QElapsedTimer windowDrain;
-    windowDrain.start();
-    while (windowDrain.elapsed() < 250) {
-        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-        QThread::msleep(10);
-    }
     if (webSurface_ != nullptr) {
+        webSurface_->stop();
+        if (surfaceStack_ != nullptr) surfaceStack_->removeWidget(webSurface_);
         shutdownSucceeded_ = webSurface_->shutdown();
+        delete webSurface_;
+        webSurface_ = nullptr;
+    }
+    if (webSessionProfile_ != nullptr) {
+        if (webSessionProfile_->registeredPageCount() != 0) {
+            shutdownSucceeded_ = false;
+        }
+        const bool profileShutdown = webSessionProfile_->shutdown();
+        shutdownSucceeded_ = profileShutdown && shutdownSucceeded_;
+        if (profileShutdown) webSessionProfile_.reset();
     }
     return shutdownSucceeded_;
 }
@@ -244,6 +257,10 @@ int MainWindow::historyIndex() const noexcept { return historyIndex_; }
 QString MainWindow::trustedErrorText() const { return trustedErrorLabel_->text(); }
 NavigationBar *MainWindow::navigationBar() const noexcept { return navigationBar_; }
 QStackedWidget *MainWindow::surfaceStack() const noexcept { return surfaceStack_; }
+WebSessionProfile *MainWindow::webSessionProfile() const noexcept
+{
+    return webSessionProfile_.get();
+}
 WebSurface *MainWindow::webSurface() const noexcept { return webSurface_; }
 WorkerSurface *MainWindow::workerSurface() const noexcept { return workerSurface_; }
 
@@ -266,10 +283,8 @@ bool MainWindow::activate(const QString &canonicalUrl)
             showTrustedError(QStringLiteral("The package worker is unavailable."));
             return false;
         }
+        webSurface_->setTabActive(false);
         surfaceStack_->setCurrentWidget(workerSurface_);
-        if (webSurface_->page() != nullptr) {
-            webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Frozen);
-        }
         activeSurface_ = HostSurfaceKind::Worker;
         activeWorkerPackageId_ = match.record.packageId;
         emit workerRouteRequested(match.record.packageId,
@@ -278,12 +293,10 @@ bool MainWindow::activate(const QString &canonicalUrl)
                                   QUrl(canonicalUrl));
         return true;
     case Engine::WebEngine: {
+        webSurface_->setTabActive(true);
         surfaceStack_->setCurrentWidget(webSurface_);
         activeSurface_ = HostSurfaceKind::Web;
         activeWorkerPackageId_.clear();
-        if (webSurface_->page() != nullptr) {
-            webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Active);
-        }
         const QUrl target(match.record.entryPoint, QUrl::StrictMode);
         if (!webSurface_->navigate(target)) {
             showTrustedError(QStringLiteral("The web content is unavailable."));
@@ -304,12 +317,10 @@ bool MainWindow::activate(const QString &canonicalUrl)
 void MainWindow::showTrustedError(const QString &message)
 {
     trustedErrorLabel_->setText(message);
+    if (webSurface_ != nullptr) webSurface_->setTabActive(false);
     surfaceStack_->setCurrentWidget(trustedErrorSurface_);
     activeSurface_ = HostSurfaceKind::TrustedError;
     activeWorkerPackageId_.clear();
-    if (webSurface_->page() != nullptr) {
-        webSurface_->page()->setLifecycleState(QWebEnginePage::LifecycleState::Frozen);
-    }
 }
 
 void MainWindow::setCurrentAppUrl(const QString &url)

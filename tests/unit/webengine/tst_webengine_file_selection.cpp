@@ -1,3 +1,4 @@
+#include "WebSessionProfile.h"
 #include "WebSurface.h"
 
 #include <QApplication>
@@ -127,7 +128,8 @@ void WebEngineFileSelectionTest::actualInputsNeverOpenFileDialogOrReceiveFiles()
 {
     FileInputServer server;
     QVERIFY(server.listen());
-    WebSurface surface(server.origin());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url());
     surface.resize(500, 300);
     surface.move(-10000, -10000);
     surface.show();

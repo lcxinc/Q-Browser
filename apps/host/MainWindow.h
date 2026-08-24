@@ -10,6 +10,7 @@
 class QLabel;
 class NavigationBar;
 class QStackedWidget;
+class WebSessionProfile;
 class WebSurface;
 class WorkerSurface;
 
@@ -31,6 +32,7 @@ public:
                const QUrl &mockOrigin,
                WorkerSurface *workerSurface = nullptr,
                QWidget *parent = nullptr);
+    ~MainWindow() override;
 
     [[nodiscard]] bool navigate(QStringView input);
     [[nodiscard]] bool shutdown();
@@ -49,6 +51,7 @@ public:
     [[nodiscard]] QString trustedErrorText() const;
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
     [[nodiscard]] QStackedWidget *surfaceStack() const noexcept;
+    [[nodiscard]] WebSessionProfile *webSessionProfile() const noexcept;
     [[nodiscard]] WebSurface *webSurface() const noexcept;
     [[nodiscard]] WorkerSurface *workerSurface() const noexcept;
 
@@ -68,6 +71,7 @@ private:
     static constexpr int maximumHistoryEntries = 256;
 
     RouteRegistry routes_;
+    std::unique_ptr<WebSessionProfile> webSessionProfile_;
     NavigationBar *navigationBar_ = nullptr;
     QStackedWidget *surfaceStack_ = nullptr;
     WorkerSurface *workerSurface_ = nullptr;

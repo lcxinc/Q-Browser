@@ -1,3 +1,25 @@
+add_executable(tst_web_session_profile
+  tst_web_session_profile.cpp)
+
+target_link_libraries(tst_web_session_profile
+  PRIVATE
+    q_browser_webengine
+    Qt6::Network
+    Qt6::Test
+    Qt6::WebEngineCore
+    Qt6::WebEngineWidgets
+    Qt6::Widgets)
+
+q_browser_enable_strict_warnings(tst_web_session_profile)
+q_browser_add_qt_test(
+  NAME web_session_profile
+  TARGET tst_web_session_profile)
+
+set_property(
+  TEST web_session_profile
+  APPEND PROPERTY ENVIRONMENT
+    "QT_QPA_PLATFORM=offscreen")
+
 add_executable(tst_request_interceptor
   tst_request_interceptor.cpp)
 
