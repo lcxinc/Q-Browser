@@ -104,6 +104,8 @@ MainWindow::~MainWindow()
 bool MainWindow::shutdown()
 {
     if (lifecycleState_ == LifecycleState::Complete) return true;
+    if (shutdownInProgress_) return false;
+    QScopedValueRollback shutdownTransaction(shutdownInProgress_, true);
     if (lifecycleState_ == LifecycleState::Running) {
         lifecycleState_ = LifecycleState::Closing;
         hide();

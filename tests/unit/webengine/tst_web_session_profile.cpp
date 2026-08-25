@@ -23,6 +23,7 @@
 #include <QWebEngineSettings>
 #include <QWebEngineView>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -240,6 +241,8 @@ private slots:
     void reloadFromAFreshSurfaceLoadsTheRegisteredEntry();
     void reloadFromTheTrustedErrorRetriesTheRegisteredEntry();
     void reloadAtTheRegisteredEntryPreservesSessionStorage();
+    void currentLoadForwardsIntermediateProgress();
+    void replacementRejectsQueuedPriorLoadProgress();
     void sameUrlReplacementRejectsQueuedOldCallbacks();
     void rendererDrivenReloadStartsAFreshIncarnation();
     void trustedTitlesAreBoundedAndUnicodeSafe();
@@ -254,6 +257,7 @@ private slots:
     void unregisterDisconnectsThePageDestructionObserver();
     void shutdownFailsUntilEveryPageIsUnregistered();
     void mainWindowShutdownCanBeRetriedAfterForeignSurfaceRetires();
+    void reentrantZeroCountShutdownRetiresThePageBeforeTheProfile();
     void mainWindowRejectsCommandsAfterShutdown();
     void hostApplicationDoesNotRestartARetiredWindow();
 };
@@ -538,6 +542,109 @@ void WebSessionProfileTest::reloadAtTheRegisteredEntryPreservesSessionStorage()
         surface.page(), QStringLiteral("sessionStorage.getItem('reload-state')"));
     QVERIFY(preserved.has_value());
     QCOMPARE(*preserved, QJsonValue(QStringLiteral("preserved")));
+}
+
+void WebSessionProfileTest::currentLoadForwardsIntermediateProgress()
+{
+    HttpServer server([](const QByteArray &target, int)
+                          -> std::optional<HttpResponse> {
+        if (target.startsWith(QByteArrayLiteral("/held-progress-"))) {
+            return std::nullopt;
+        }
+        return HttpResponse{QByteArrayLiteral(
+            "<!doctype html><title>Live progress</title>"
+            "<img src='/held-progress-a'>"
+            "<img src='/held-progress-b'>"
+            "<img src='/held-progress-c'>")};
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/live-progress"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QSignalSpy rawProgressSpy(surface.page(), &QWebEnginePage::loadProgress);
+    QSignalSpy surfaceProgressSpy(&surface, &WebSurface::loadProgressChanged);
+    QSignalSpy finishedSpy(&surface, &WebSurface::navigationFinished);
+
+    QVERIFY(surface.navigate(entry));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        server.requests().contains(QByteArrayLiteral("/held-progress-a")), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        server.requests().contains(QByteArrayLiteral("/held-progress-b")), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        server.requests().contains(QByteArrayLiteral("/held-progress-c")), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        std::any_of(rawProgressSpy.cbegin(), rawProgressSpy.cend(),
+                    [](const QList<QVariant> &arguments) {
+                        const int progress = arguments.at(0).toInt();
+                        return progress > 0 && progress < 100;
+                    }),
+        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        std::any_of(surfaceProgressSpy.cbegin(), surfaceProgressSpy.cend(),
+                    [&rawProgressSpy](const QList<QVariant> &arguments) {
+                        const int progress = arguments.at(0).toInt();
+                        return progress > 0 && progress < 100
+                            && std::any_of(
+                                rawProgressSpy.cbegin(), rawProgressSpy.cend(),
+                                [progress](const QList<QVariant> &rawArguments) {
+                                    return rawArguments.at(0).toInt() == progress;
+                                });
+                    }),
+        1000);
+    QVERIFY(surface.loadProgress() > 0 && surface.loadProgress() < 100);
+    QVERIFY(std::any_of(rawProgressSpy.cbegin(), rawProgressSpy.cend(),
+                        [&surface](const QList<QVariant> &arguments) {
+                            return arguments.at(0).toInt()
+                                == surface.loadProgress();
+                        }));
+
+    server.releaseHeldResponses();
+    QVERIFY(waitForLoad(surface, entry, finishedSpy));
+    QCOMPARE(surface.loadProgress(), 100);
+}
+
+void WebSessionProfileTest::replacementRejectsQueuedPriorLoadProgress()
+{
+    HttpServer server([](const QByteArray &, const int requestNumber)
+                          -> std::optional<HttpResponse> {
+        if (requestNumber > 1) return std::nullopt;
+        return HttpResponse{QByteArrayLiteral(
+            "<!doctype html><title>Progress incarnation</title>")};
+    });
+    QVERIFY(server.listen());
+    const QUrl entry = server.url(QStringLiteral("/progress-incarnation"));
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, entry);
+    QVERIFY(navigateAndWait(surface, entry));
+
+    QVERIFY(surface.reload());
+    QTRY_COMPARE_WITH_TIMEOUT(
+        server.requests().count(QByteArrayLiteral("/progress-incarnation")), 2,
+        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(surface.isLoading(), 5000);
+    QSignalSpy progressSpy(&surface, &WebSurface::loadProgressChanged);
+    QVERIFY(QMetaObject::invokeMethod(
+        surface.page(), "loadProgress", Qt::DirectConnection, Q_ARG(int, 37)));
+    QTRY_COMPARE_WITH_TIMEOUT(surface.loadProgress(), 37, 1000);
+    QVERIFY(std::any_of(progressSpy.cbegin(), progressSpy.cend(),
+                        [](const QList<QVariant> &arguments) {
+                            return arguments.at(0).toInt() == 37;
+                        }));
+
+    progressSpy.clear();
+    QVERIFY(QMetaObject::invokeMethod(
+        surface.page(), "loadProgress", Qt::DirectConnection, Q_ARG(int, 73)));
+    QVERIFY(surface.reload());
+    QTRY_COMPARE_WITH_TIMEOUT(
+        server.requests().count(QByteArrayLiteral("/progress-incarnation")), 3,
+        5000);
+    drainQueuedEvents();
+
+    QCOMPARE(surface.loadProgress(), 0);
+    QVERIFY(std::none_of(progressSpy.cbegin(), progressSpy.cend(),
+                         [](const QList<QVariant> &arguments) {
+                             return arguments.at(0).toInt() == 73;
+                         }));
 }
 
 void WebSessionProfileTest::sameUrlReplacementRejectsQueuedOldCallbacks()
@@ -1061,6 +1168,61 @@ void WebSessionProfileTest::mainWindowShutdownCanBeRetriedAfterForeignSurfaceRet
     QVERIFY(window.shutdown());
     QVERIFY(window.isShutdownComplete());
     QVERIFY(window.webSessionProfile() == nullptr);
+    QVERIFY(window.shutdown());
+}
+
+void WebSessionProfileTest::reentrantZeroCountShutdownRetiresThePageBeforeTheProfile()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(webRoutes(server.url(QStringLiteral("/help"))),
+                      server.origin());
+    WebSessionProfile *const session = window.webSessionProfile();
+    QVERIFY(session != nullptr);
+    QVERIFY(window.webSurface() != nullptr);
+    QPointer<QWebEnginePage> page(window.webSurface()->page());
+    QPointer<QWebEngineProfile> profile(session->profile());
+    QVERIFY(!page.isNull());
+    QVERIFY(!profile.isNull());
+
+    QStringList destructionOrder;
+    bool zeroCountObserved = false;
+    bool pageWasGoneAtZero = false;
+    bool profileWasAliveAtZero = false;
+    bool profileSurvivedRecursiveShutdown = false;
+    std::optional<bool> recursiveShutdownResult;
+    connect(page.data(), &QObject::destroyed, &window,
+            [&destructionOrder] { destructionOrder.append(QStringLiteral("page")); });
+    connect(profile.data(), &QObject::destroyed, &window,
+            [&destructionOrder] {
+                destructionOrder.append(QStringLiteral("profile"));
+            });
+    connect(session, &WebSessionProfile::registeredPageCountChanged, &window,
+            [&](const qsizetype count) {
+                if (count != 0) return;
+                zeroCountObserved = true;
+                destructionOrder.append(QStringLiteral("zero"));
+                pageWasGoneAtZero = page.isNull();
+                profileWasAliveAtZero = !profile.isNull();
+                recursiveShutdownResult = window.shutdown();
+                profileSurvivedRecursiveShutdown = !profile.isNull();
+            },
+            Qt::DirectConnection);
+
+    QVERIFY(window.shutdown());
+
+    QVERIFY(zeroCountObserved);
+    QVERIFY(recursiveShutdownResult.has_value());
+    QVERIFY(!*recursiveShutdownResult);
+    QVERIFY(pageWasGoneAtZero);
+    QVERIFY(profileWasAliveAtZero);
+    QVERIFY(profileSurvivedRecursiveShutdown);
+    QVERIFY(page.isNull());
+    QVERIFY(profile.isNull());
+    QCOMPARE(destructionOrder,
+             QStringList({QStringLiteral("page"), QStringLiteral("zero"),
+                          QStringLiteral("profile")}));
+    QVERIFY(window.isShutdownComplete());
     QVERIFY(window.shutdown());
 }
 

@@ -298,6 +298,7 @@ bool WebSurface::shutdown()
     activeLoadStarted_ = false;
     titleUpdatesAllowed_ = false;
     terminalPendingIncarnation_ = 0;
+    releaseLoadProgress();
     disconnect(recommendedStateConnection_);
     recommendedStateConnection_ = {};
     disconnect(sessionRetirementConnection_);
@@ -312,8 +313,7 @@ bool WebSurface::shutdown()
     if (page_ != nullptr) {
         page_->setVisible(false);
         shutdownSucceeded_ = retiringSession != nullptr
-            && retiringSession->unregisterPageInternal(page_.get());
-        page_.reset();
+            && retiringSession->retirePageInternal(page_);
     }
     session_ = nullptr;
     return shutdownSucceeded_;
@@ -437,6 +437,7 @@ QString WebSurface::trustedTitleForTesting(const QString &physicalTitle) const
 
 void WebSurface::beginNavigation(const QUrl &url)
 {
+    releaseLoadProgress();
     ++navigationIncarnation_;
     activeLoadIncarnation_ = navigationIncarnation_;
     awaitingDifferentDocument_ = page_ != nullptr && page_->url() != url;
@@ -477,6 +478,7 @@ void WebSurface::observeLoadingChange(const QWebEngineLoadingInfo &information)
         awaitingDifferentDocument_ = false;
         activeLoadStarted_ = true;
         terminalPendingIncarnation_ = 0;
+        armLoadProgress(incarnation);
     } else {
         if (information.url() != expectedNavigationUrl_ || page_->isLoading()) {
             return;
@@ -498,6 +500,7 @@ void WebSurface::observeLoadingChange(const QWebEngineLoadingInfo &information)
         }
         incarnation = activeLoadIncarnation_;
         activeLoadStarted_ = false;
+        releaseLoadProgress();
         terminalPendingIncarnation_ = incarnation;
     }
     if (incarnation == 0) return;
@@ -507,6 +510,32 @@ void WebSurface::observeLoadingChange(const QWebEngineLoadingInfo &information)
             handleLoadingChange(information, incarnation);
         },
         Qt::QueuedConnection);
+}
+
+void WebSurface::armLoadProgress(const quint64 incarnation)
+{
+    releaseLoadProgress();
+    if (page_ == nullptr || incarnation == 0) return;
+    QWebEnginePage *const progressPage = page_.get();
+    loadProgressConnection_ = connect(
+        progressPage, &QWebEnginePage::loadProgress, this,
+        [this, progressPage, incarnation](const int progress) {
+            if (shutdown_ || page_.get() != progressPage
+                || incarnation != navigationIncarnation_
+                || incarnation != activeLoadIncarnation_
+                || awaitingLoadStart_ || !activeLoadStarted_
+                || !progressPage->isLoading()) {
+                return;
+            }
+            setLoadProgress(progress);
+        },
+        Qt::QueuedConnection);
+}
+
+void WebSurface::releaseLoadProgress()
+{
+    disconnect(loadProgressConnection_);
+    loadProgressConnection_ = {};
 }
 
 void WebSurface::handleLoadingChange(const QWebEngineLoadingInfo &information,

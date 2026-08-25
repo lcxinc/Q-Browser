@@ -142,14 +142,22 @@ bool WebSessionProfile::registerPageInternal(QWebEnginePage *page)
     return true;
 }
 
-bool WebSessionProfile::unregisterPageInternal(QWebEnginePage *page)
+bool WebSessionProfile::retirePageInternal(
+    std::unique_ptr<QWebEnginePage> &page)
 {
-    if (page == nullptr) return false;
-    const auto iterator = registeredPages_.find(page);
+    if (page == nullptr || retiringPage_ != nullptr) return false;
+    QWebEnginePage *const pageAddress = page.get();
+    const auto iterator = registeredPages_.find(pageAddress);
     if (iterator == registeredPages_.end()) return false;
     const QMetaObject::Connection destructionConnection = iterator.value();
-    registeredPages_.erase(iterator);
     disconnect(destructionConnection);
+    retiringPage_ = pageAddress;
+    page.reset();
+    const qsizetype removed = registeredPages_.remove(pageAddress);
+    retiringPage_ = nullptr;
+    if (removed != 1) {
+        qFatal("WebSessionProfile lost a retiring page registration");
+    }
     emit registeredPageCountChanged(registeredPages_.size());
     return true;
 }
@@ -162,14 +170,21 @@ bool WebSessionProfile::registerPage(QWebEnginePage *page)
 
 bool WebSessionProfile::unregisterPage(QWebEnginePage *page)
 {
-    return unregisterPageInternal(page);
+    if (page == nullptr || page == retiringPage_) return false;
+    const auto iterator = registeredPages_.find(page);
+    if (iterator == registeredPages_.end()) return false;
+    const QMetaObject::Connection destructionConnection = iterator.value();
+    registeredPages_.erase(iterator);
+    disconnect(destructionConnection);
+    emit registeredPageCountChanged(registeredPages_.size());
+    return true;
 }
 #endif
 
 bool WebSessionProfile::shutdown()
 {
     acceptingPages_ = false;
-    if (!registeredPages_.isEmpty()) return false;
+    if (retiringPage_ != nullptr || !registeredPages_.isEmpty()) return false;
     if (shutdown_) return true;
     shutdown_ = true;
     configurationValid_ = false;

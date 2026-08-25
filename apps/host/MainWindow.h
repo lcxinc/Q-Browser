@@ -93,6 +93,7 @@ private:
     QString currentAppUrl_;
     HostSurfaceKind activeSurface_ = HostSurfaceKind::TrustedError;
     bool navigationInProgress_ = false;
+    bool shutdownInProgress_ = false;
     LifecycleState lifecycleState_ = LifecycleState::Running;
     QString activeWorkerPackageId_;
 };

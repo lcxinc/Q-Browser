@@ -71,6 +71,8 @@ private:
     void observeLoadingChange(const QWebEngineLoadingInfo &information);
     void handleLoadingChange(const QWebEngineLoadingInfo &information,
                              quint64 incarnation);
+    void armLoadProgress(quint64 incarnation);
+    void releaseLoadProgress();
     void setLoading(bool loading);
     void setLoadProgress(int progress);
     void updateTitle(const QString &physicalTitle);
@@ -85,6 +87,7 @@ private:
     std::unique_ptr<QWebEngineView> view_;
     QMetaObject::Connection recommendedStateConnection_;
     QMetaObject::Connection sessionRetirementConnection_;
+    QMetaObject::Connection loadProgressConnection_;
     QString physicalOriginHost_;
     QString title_ = QStringLiteral("Restricted web");
     int loadProgress_ = 0;

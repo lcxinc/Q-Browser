@@ -49,13 +49,15 @@ private:
     [[nodiscard]] QWebEngineProfile *profileHandle() const noexcept;
     [[nodiscard]] PilotRequestInterceptor *interceptorHandle() const noexcept;
     [[nodiscard]] bool registerPageInternal(QWebEnginePage *page);
-    [[nodiscard]] bool unregisterPageInternal(QWebEnginePage *page);
+    [[nodiscard]] bool retirePageInternal(
+        std::unique_ptr<QWebEnginePage> &page);
     void detachProfile();
 
     std::unique_ptr<PilotRequestInterceptor> interceptor_;
     std::unique_ptr<QWebEngineUrlRequestInterceptor> requestFilter_;
     std::unique_ptr<QWebEngineProfile> profile_;
     QHash<QWebEnginePage *, QMetaObject::Connection> registeredPages_;
+    QWebEnginePage *retiringPage_ = nullptr;
     bool configurationValid_ = false;
     bool acceptingPages_ = true;
     bool shutdown_ = false;
