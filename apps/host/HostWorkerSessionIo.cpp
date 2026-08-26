@@ -159,6 +159,12 @@ void HostWorkerSessionIo::pollSession()
         case ProtocolType::Heartbeat:
             emit heartbeatObserved(generation_);
             break;
+        case ProtocolType::PageMetadata:
+            emit pageMetadataReceived(
+                generation_,
+                message.payload().value(QStringLiteral("title")).toString(),
+                message.payload().value(QStringLiteral("status")).toString());
+            break;
         case ProtocolType::Ready:
         case ProtocolType::SurfaceReady:
         case ProtocolType::StructuredLog:

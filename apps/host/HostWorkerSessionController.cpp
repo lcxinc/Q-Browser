@@ -6,7 +6,6 @@
 #include "MainWindow.h"
 
 #include <QJsonObject>
-#include <QScopedValueRollback>
 #include <QThread>
 
 #include <utility>
@@ -65,30 +64,27 @@ std::optional<QString> canonicalPageTitle(const QString &untrusted)
                                : std::optional<QString>(std::move(canonical));
 }
 
-QString routeFromAppUrl(const QUrl &url)
-{
-    if (!url.isValid() || url.scheme() != QStringLiteral("app")
-        || url.host() != QStringLiteral("pilot") || !url.fragment().isEmpty()) {
-        return {};
-    }
-    QString route = url.path(QUrl::FullyEncoded);
-    const QString query = url.query(QUrl::FullyEncoded);
-    if (!query.isEmpty()) route += u'?' + query;
-    return route.startsWith(u'/') && !route.startsWith(QStringLiteral("//"))
-        ? route : QString{};
-}
 } // namespace
+
+HostWorkerSessionController::HostWorkerSessionController(
+    NavigationCallback navigate, QObject *const parent)
+    : QObject(parent), navigate_(std::move(navigate))
+{
+}
 
 HostWorkerSessionController::HostWorkerSessionController(MainWindow *window,
                                                          QObject *parent)
-    : QObject(parent), window_(window)
-{
-    if (window_ != nullptr) {
-        connect(window_, &MainWindow::workerRouteRequested, this,
-                &HostWorkerSessionController::handleHostWorkerRoute,
-                Qt::DirectConnection);
-    }
-}
+    : HostWorkerSessionController(
+          window == nullptr
+              ? NavigationCallback{}
+              : NavigationCallback{
+                    [window = QPointer<MainWindow>(window)](
+                        const QString &appId, const QString &route) {
+                        return !window.isNull()
+                            && window->navigateFromWorker(appId, route);
+                    }},
+          parent)
+{}
 
 HostWorkerSessionController::~HostWorkerSessionController()
 {
@@ -102,7 +98,7 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
         lastErrorCode_ = QStringLiteral("host.worker_session.wrong_thread");
         return false;
     }
-    if (window_ == nullptr || session == nullptr || !session->isAuthenticated()
+    if (!navigate_ || session == nullptr || !session->isAuthenticated()
         || session->isClosed()
         || session->appIdentity().isEmpty()) {
         lastErrorCode_ = QStringLiteral("host.worker_session.invalid_attachment");
@@ -127,21 +123,6 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
     ++generation_;
     const quint64 attachedGeneration = generation_;
-    const QPointer<HostWorkerSessionController> controller(this);
-    session->setPageMetadataHandler(
-        [controller, attachedGeneration](const QString &title,
-                                         const QString &status) {
-            if (controller.isNull()) return;
-            QMetaObject::invokeMethod(
-                controller.data(),
-                [controller, attachedGeneration, title, status] {
-                    if (!controller.isNull()) {
-                        controller->handlePageMetadata(attachedGeneration,
-                                                       title, status);
-                    }
-                },
-                Qt::QueuedConnection);
-        });
     appIdentity_ = session->appIdentity();
     pendingRouteLoads_.clear();
     outbound_.clear();
@@ -171,6 +152,9 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
             }, Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::navigationRequested, this,
             &HostWorkerSessionController::handleNavigationRequest, Qt::QueuedConnection);
+    connect(io_.data(), &HostWorkerSessionIo::pageMetadataReceived, this,
+            &HostWorkerSessionController::handlePageMetadata,
+            Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::routeLoadResponse, this,
             &HostWorkerSessionController::handleRouteLoadResponse, Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::commandFinished, this,
@@ -183,7 +167,7 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
             [this](const quint64 generation) {
                 if (generation == generation_
                     && state_ == HostWorkerSessionState::Running) {
-                    emit heartbeatObserved();
+                    emit heartbeatObserved(generation);
                 }
             }, Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::capabilityRequested, this,
@@ -239,6 +223,18 @@ bool HostWorkerSessionController::shutdown(const QString &reason)
     return true;
 }
 
+bool HostWorkerSessionController::requestRouteLoad(const QString &route)
+{
+    return QThread::currentThread() == thread()
+        && state_ == HostWorkerSessionState::Running
+        && enqueueRouteLoad(route);
+}
+
+quint64 HostWorkerSessionController::generation() const noexcept
+{
+    return generation_;
+}
+
 HostWorkerSessionState HostWorkerSessionController::state() const noexcept { return state_; }
 QString HostWorkerSessionController::lastErrorCode() const { return lastErrorCode_; }
 qsizetype HostWorkerSessionController::pendingRouteLoadCount() const noexcept
@@ -263,20 +259,6 @@ bool HostWorkerSessionController::ioThreadRunning() const noexcept
     return ioThread_ != nullptr && ioThread_->isRunning();
 }
 
-void HostWorkerSessionController::handleHostWorkerRoute(
-    const QString &packageId, const QString &entryPoint,
-    const QVariantMap &parameters, const QUrl &appUrl)
-{
-    Q_UNUSED(entryPoint)
-    Q_UNUSED(parameters)
-    if (QThread::currentThread() != thread() || suppressHostRoute_
-        || state_ != HostWorkerSessionState::Running
-        || packageId != appIdentity_) return;
-    const QString route = routeFromAppUrl(appUrl);
-    if (!route.isEmpty() && !enqueueRouteLoad(route))
-        failClosed(QStringLiteral("host.worker_session.outbound_queue_full"));
-}
-
 void HostWorkerSessionController::handleNavigationRequest(
     const quint64 generation, const QString &requestId, const QString &route)
 {
@@ -289,11 +271,7 @@ void HostWorkerSessionController::handleNavigationRequest(
             failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
         return;
     }
-    bool navigated = false;
-    {
-        QScopedValueRollback suppression(suppressHostRoute_, true);
-        navigated = window_ != nullptr && window_->navigateFromWorker(appIdentity_, route);
-    }
+    const bool navigated = navigate_ && navigate_(appIdentity_, route);
     if (generation != generation_ || state_ != HostWorkerSessionState::Running) return;
     if (!navigated) {
         const auto response = ProtocolMessage::errorResponse(
@@ -330,7 +308,7 @@ void HostWorkerSessionController::handleRouteLoadResponse(
         return;
     }
     pendingRouteLoads_.erase(iterator);
-    emit routeLoadAcknowledged(route);
+    emit routeLoadAcknowledged(route, generation);
     if (generation == generation_ && state_ == HostWorkerSessionState::Running)
         resumeIoPolling();
 }
@@ -342,7 +320,8 @@ void HostWorkerSessionController::handleCapabilityRequest(
 {
     if (generation != generation_ || state_ != HostWorkerSessionState::Running)
         return;
-    emit capabilityRequestObserved(capability, operation, payload.toVariantMap());
+    emit capabilityRequestObserved(capability, operation, payload.toVariantMap(),
+                                   generation);
     if (!activeCapabilityRequestId_.isEmpty()) {
         const auto busy = ProtocolMessage::errorResponse(
             requestId, QStringLiteral("capability.busy"),
@@ -384,7 +363,8 @@ void HostWorkerSessionController::completeCapability(
     if (!outbound_.isEmpty()) outbound_.back().capabilityRequestId = requestId;
     else if (activeCommand_.has_value())
         activeCommand_->capabilityRequestId = requestId;
-    emit capabilityResponseQueued(requestId, result.ok, result.errorCode);
+    emit capabilityResponseQueued(requestId, result.ok, result.errorCode,
+                                  generation);
 }
 
 void HostWorkerSessionController::handleCommandFinished(
@@ -404,7 +384,7 @@ void HostWorkerSessionController::handleCommandFinished(
     if (!completedCapability.isEmpty()
         && completedCapability == activeCapabilityRequestId_) {
         activeCapabilityRequestId_.clear();
-        emit capabilityResponseSent(completedCapability);
+        emit capabilityResponseSent(completedCapability, generation);
     }
     pumpOutbound();
     if (resume && generation == generation_ && state_ == HostWorkerSessionState::Running)
@@ -482,7 +462,7 @@ void HostWorkerSessionController::failClosed(const QString &errorCode)
     appIdentity_.clear();
     cleanupFinalState_ = HostWorkerSessionState::Failed;
     requestIoStop();
-    emit failed(lastErrorCode_);
+    emit failed(lastErrorCode_, generation_);
 }
 
 void HostWorkerSessionController::setCapabilityRuntime(
@@ -541,7 +521,7 @@ void HostWorkerSessionController::handleIoThreadFinished(
         if (!startSession(std::move(replacement))) {
             state_ = HostWorkerSessionState::Failed;
             lastErrorCode_ = QStringLiteral("host.worker_session.reattach_failed");
-            emit failed(lastErrorCode_);
+            emit failed(lastErrorCode_, generation_);
         }
         return;
     }

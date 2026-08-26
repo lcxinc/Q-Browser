@@ -6,9 +6,9 @@
 #include <QObject>
 #include <QQueue>
 #include <QPointer>
-#include <QUrl>
 #include <QVariantMap>
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -26,11 +26,18 @@ class HostWorkerSessionController final : public QObject
 {
     Q_OBJECT
 public:
+    using NavigationCallback =
+        std::function<bool(const QString &appId, const QString &route)>;
+
+    explicit HostWorkerSessionController(NavigationCallback navigate,
+                                         QObject *parent = nullptr);
     explicit HostWorkerSessionController(MainWindow *window, QObject *parent = nullptr);
     ~HostWorkerSessionController() override;
 
     [[nodiscard]] bool attach(std::unique_ptr<IpcSession> session);
+    [[nodiscard]] bool requestRouteLoad(const QString &route);
     [[nodiscard]] bool shutdown(const QString &reason);
+    [[nodiscard]] quint64 generation() const noexcept;
     [[nodiscard]] HostWorkerSessionState state() const noexcept;
     [[nodiscard]] QString lastErrorCode() const;
     [[nodiscard]] qsizetype pendingRouteLoadCount() const noexcept;
@@ -43,16 +50,18 @@ public:
                             const BrokerResult &result);
 
 signals:
-    void failed(const QString &errorCode);
-    void routeLoadAcknowledged(const QString &route);
-    void heartbeatObserved();
+    void failed(const QString &errorCode, quint64 generation);
+    void routeLoadAcknowledged(const QString &route, quint64 generation);
+    void heartbeatObserved(quint64 generation);
     void capabilityRequestObserved(const QString &capability,
                                    const QString &operation,
-                                   const QVariantMap &payload);
+                                   const QVariantMap &payload,
+                                   quint64 generation);
     void capabilityResponseQueued(const QString &requestId,
                                   bool ok,
-                                  const QString &errorCode);
-    void capabilityResponseSent(const QString &requestId);
+                                  const QString &errorCode,
+                                  quint64 generation);
+    void capabilityResponseSent(const QString &requestId, quint64 generation);
     void pageMetadataChanged(quint64 generation,
                              const QString &title,
                              const QString &status);
@@ -61,6 +70,9 @@ private slots:
     void handlePageMetadata(quint64 generation,
                             const QString &title,
                             const QString &status);
+    void handleNavigationRequest(quint64 generation,
+                                 const QString &requestId,
+                                 const QString &route);
 
 private:
     struct OutboundCommand final {
@@ -72,13 +84,6 @@ private:
         QString capabilityRequestId;
     };
 
-    void handleHostWorkerRoute(const QString &packageId,
-                               const QString &entryPoint,
-                               const QVariantMap &parameters,
-                               const QUrl &appUrl);
-    void handleNavigationRequest(quint64 generation,
-                                 const QString &requestId,
-                                 const QString &route);
     void handleRouteLoadResponse(quint64 generation,
                                  const QString &requestId,
                                  const QJsonObject &payload);
@@ -106,7 +111,7 @@ private:
 
     static constexpr qsizetype maximumQueuedCommands = 64;
 
-    MainWindow *window_ = nullptr;
+    NavigationCallback navigate_;
     QPointer<HostWorkerSessionIo> io_;
     QPointer<HostCapabilityRuntime> capabilityRuntime_;
     QThread *ioThread_ = nullptr;
@@ -122,6 +127,5 @@ private:
     quint64 generation_ = 0;
     quint64 nextCommandId_ = 0;
     quint64 nextRouteLoadId_ = 0;
-    bool suppressHostRoute_ = false;
     bool stopRequested_ = false;
 };

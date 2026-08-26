@@ -121,6 +121,7 @@ private slots:
     void authenticatesNonceAndUsesHostAssignedIdentity();
     void rejectsWrongNonceAndMalformedPeer();
     void correlatesResponsesAndRejectsDuplicateRequestIds();
+    void repeatedRequestIdsDoNotCorrelateAcrossSessions();
     void correlatesRouteLoadAcknowledgement();
     void correlatesWorkerNavigationAndRejectsReplay();
     void rejectsUnknownProtocolAndDuplicateInboundRequests();
@@ -380,6 +381,90 @@ void IpcSessionTest::correlatesResponsesAndRejectsDuplicateRequestIds()
                                                         QJsonObject{})));
     QCOMPARE(worker.receive(1000).status, SessionStatus::Failed);
     QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.unknown_response"));
+#endif
+}
+
+void IpcSessionTest::repeatedRequestIdsDoNotCorrelateAcrossSessions()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair firstPair = WinPipeTransport::createHostPair();
+    WinPipePair secondPair = WinPipeTransport::createHostPair();
+    QVERIFY(firstPair.isValid());
+    QVERIFY(secondPair.isValid());
+    IpcSession firstHost(
+        firstPair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("first-session"),
+                          QStringLiteral("com.qbrowser.same-app")});
+    IpcSession firstWorker(
+        WinPipeTransport::adoptWorkerEnds(firstPair.takeWorkerEnds()),
+        IpcRole::Worker);
+    IpcSession secondHost(
+        secondPair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("second-session"),
+                          QStringLiteral("com.qbrowser.same-app")});
+    IpcSession secondWorker(
+        WinPipeTransport::adoptWorkerEnds(secondPair.takeWorkerEnds()),
+        IpcRole::Worker);
+
+    QVERIFY(firstWorker.send(*ProtocolMessage::handshake(
+        QStringLiteral("first-session"))));
+    QVERIFY(secondWorker.send(*ProtocolMessage::handshake(
+        QStringLiteral("second-session"))));
+    QCOMPARE(firstHost.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(secondHost.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(firstWorker.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(secondWorker.receive(1000).status, SessionStatus::MessageReady);
+
+    const QString repeatedId = QStringLiteral("same-request-id");
+    QVERIFY(firstWorker.sendRequest(
+        repeatedId, QStringLiteral("storage"), QStringLiteral("get"),
+        QJsonObject{{QStringLiteral("key"), QStringLiteral("first")}},
+        1000));
+    QVERIFY(secondWorker.sendRequest(
+        repeatedId, QStringLiteral("storage"), QStringLiteral("get"),
+        QJsonObject{{QStringLiteral("key"), QStringLiteral("second")}},
+        1000));
+    QCOMPARE(firstHost.receive(1000).message->requestId(), repeatedId);
+    QCOMPARE(secondHost.receive(1000).message->requestId(), repeatedId);
+    QCOMPARE(firstWorker.pendingRequestCount(), qsizetype(1));
+    QCOMPARE(secondWorker.pendingRequestCount(), qsizetype(1));
+
+    const auto firstResponse = ProtocolMessage::successResponse(
+        repeatedId,
+        QJsonObject{{QStringLiteral("owner"), QStringLiteral("first")}});
+    QVERIFY(firstResponse.has_value());
+    QVERIFY(firstHost.send(*firstResponse));
+    const SessionReceiveResult firstReceived = firstWorker.receive(1000);
+    QCOMPARE(firstReceived.status, SessionStatus::MessageReady);
+    QCOMPARE(firstReceived.message->payload()
+                 .value(QStringLiteral("result")).toObject()
+                 .value(QStringLiteral("owner")).toString(),
+             QStringLiteral("first"));
+    QCOMPARE(firstWorker.pendingRequestCount(), qsizetype(0));
+    QCOMPARE(secondWorker.pendingRequestCount(), qsizetype(1));
+    QCOMPARE(secondWorker.poll(0).status, SessionStatus::TimedOut);
+    QVERIFY(!secondWorker.isClosed());
+
+    const auto secondResponse = ProtocolMessage::successResponse(
+        repeatedId,
+        QJsonObject{{QStringLiteral("owner"), QStringLiteral("second")}});
+    QVERIFY(secondResponse.has_value());
+    QVERIFY(secondHost.send(*secondResponse));
+    const SessionReceiveResult secondReceived = secondWorker.receive(1000);
+    QCOMPARE(secondReceived.status, SessionStatus::MessageReady);
+    QCOMPARE(secondReceived.message->payload()
+                 .value(QStringLiteral("result")).toObject()
+                 .value(QStringLiteral("owner")).toString(),
+             QStringLiteral("second"));
+    QCOMPARE(secondWorker.pendingRequestCount(), qsizetype(0));
+
+    firstHost.close();
+    QVERIFY(secondWorker.send(ProtocolMessage::heartbeat(), 1000));
+    const SessionReceiveResult secondHeartbeat = secondHost.receive(1000);
+    QCOMPARE(secondHeartbeat.status, SessionStatus::MessageReady);
+    QCOMPARE(secondHeartbeat.message->type(), ProtocolType::Heartbeat);
 #endif
 }
 

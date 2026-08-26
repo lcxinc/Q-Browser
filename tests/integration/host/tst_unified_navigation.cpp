@@ -43,8 +43,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <semaphore>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -268,6 +270,47 @@ std::optional<AuthenticatedSessions> authenticatedSessions(const QString &appIde
     return AuthenticatedSessions{std::move(host), std::move(worker)};
 }
 
+using TestNavigationCallback =
+    std::function<bool(const QString &appId, const QString &route)>;
+
+template <typename Controller>
+std::unique_ptr<Controller> makeSessionController(
+    MainWindow *const legacyWindow, TestNavigationCallback navigate)
+{
+    if constexpr (std::is_constructible_v<Controller, TestNavigationCallback>) {
+        return std::make_unique<Controller>(std::move(navigate));
+    } else {
+        Q_UNUSED(navigate)
+        return std::make_unique<Controller>(legacyWindow);
+    }
+}
+
+template <typename Controller>
+bool requestOwnedRoute(Controller &controller, MainWindow &legacyWindow,
+                       const QString &appId, const QString &route)
+{
+    if constexpr (requires { controller.requestRouteLoad(route); }) {
+        return controller.requestRouteLoad(route);
+    } else {
+        return QMetaObject::invokeMethod(
+            &legacyWindow, "workerRouteRequested", Qt::DirectConnection,
+            Q_ARG(QString, appId),
+            Q_ARG(QString, QStringLiteral("qml/Main.qml")),
+            Q_ARG(QVariantMap, QVariantMap{}),
+            Q_ARG(QUrl, QUrl(QStringLiteral("app://pilot") + route)));
+    }
+}
+
+template <typename Controller>
+quint64 sessionGeneration(const Controller &controller)
+{
+    if constexpr (requires { controller.generation(); }) {
+        return controller.generation();
+    } else {
+        return 0;
+    }
+}
+
 } // namespace
 
 class UnifiedNavigationTest final : public QObject
@@ -292,6 +335,10 @@ private slots:
     void navigationTransactionsRejectReentrantCommands();
     void trustedShellRuntimeConfigKeepsPilotRouteIdentity();
     void pageMetadataUsesOnlyCurrentGenerationAndResanitizes();
+    void sameAppSessionsRouteOnlyTheirOwnTab();
+    void backgroundWorkerNavigationUpdatesOnlyOwningHistory();
+    void retiredSessionRejectsLateTabNavigation();
+    void pageMetadataFromOneSessionUpdatesOnlyOwningTab();
 };
 
 void UnifiedNavigationTest::trustedShellRuntimeConfigKeepsPilotRouteIdentity()
@@ -311,7 +358,10 @@ void UnifiedNavigationTest::pageMetadataUsesOnlyCurrentGenerationAndResanitizes(
     HelpServer server;
     QVERIFY(server.listen());
     MainWindow window(routes(server.helpUrl()), server.origin());
-    HostWorkerSessionController controller(&window);
+    HostWorkerSessionController controller(
+        [&window](const QString &appId, const QString &route) {
+            return window.navigateFromWorker(appId, route);
+        });
     QSignalSpy metadataSpy(&controller,
                            &HostWorkerSessionController::pageMetadataChanged);
 
@@ -379,6 +429,322 @@ void UnifiedNavigationTest::pageMetadataUsesOnlyCurrentGenerationAndResanitizes(
         Q_ARG(QString, QString())));
     QCOMPARE(metadataSpy.count(), 3);
     QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::sameAppSessionsRouteOnlyTheirOwnTab()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    auto firstController = makeSessionController<HostWorkerSessionController>(
+        &window, [](const QString &, const QString &) { return false; });
+    auto secondController = makeSessionController<HostWorkerSessionController>(
+        &window, [](const QString &, const QString &) { return false; });
+    auto first = authenticatedSessions(appId);
+    auto second = authenticatedSessions(appId);
+    QVERIFY(first.has_value());
+    QVERIFY(second.has_value());
+    QVERIFY(firstController->attach(std::move(first->host)));
+    QVERIFY(secondController->attach(std::move(second->host)));
+
+    QSignalSpy firstAcknowledged(
+        firstController.get(),
+        &HostWorkerSessionController::routeLoadAcknowledged);
+    QSignalSpy firstHeartbeats(
+        firstController.get(),
+        &HostWorkerSessionController::heartbeatObserved);
+    QSignalSpy secondHeartbeats(
+        secondController.get(),
+        &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(firstAcknowledged.isValid());
+    QVERIFY(firstHeartbeats.isValid());
+    QVERIFY(secondHeartbeats.isValid());
+
+    const QString route = QStringLiteral("/orders");
+    QVERIFY(requestOwnedRoute(*firstController, window, appId, route));
+    const SessionReceiveResult firstRoute = first->worker->receive(1000);
+    QCOMPARE(firstRoute.status, SessionStatus::MessageReady);
+    QVERIFY(firstRoute.message.has_value());
+    QCOMPARE(firstRoute.message->type(), ProtocolType::RouteLoad);
+    QCOMPARE(firstRoute.message->payload()
+                 .value(QStringLiteral("route")).toString(),
+             route);
+
+    QTest::qWait(100);
+    const SessionReceiveResult siblingRoute = second->worker->poll(0);
+    QCOMPARE(siblingRoute.status, SessionStatus::TimedOut);
+    QVERIFY(!second->worker->isClosed());
+
+    QCOMPARE(firstController->pendingRouteLoadCount(), qsizetype(1));
+    QVERIFY(first->worker->send(ProtocolMessage::heartbeat(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(firstHeartbeats.count(), 1, 3000);
+    QCOMPARE(firstHeartbeats.at(0).at(0).toULongLong(),
+             sessionGeneration(*firstController));
+    QCOMPARE(firstController->pendingRouteLoadCount(), qsizetype(1));
+
+    const auto routeAcknowledgement = ProtocolMessage::successResponse(
+        firstRoute.message->requestId(),
+        QJsonObject{{QStringLiteral("route"), route}});
+    QVERIFY(routeAcknowledgement.has_value());
+    QVERIFY(first->worker->send(*routeAcknowledgement, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(firstAcknowledged.count(), 1, 3000);
+    QCOMPARE(firstAcknowledged.at(0).at(0).toString(), route);
+    QCOMPARE(firstAcknowledged.at(0).at(1).toULongLong(),
+             sessionGeneration(*firstController));
+
+    QVERIFY(firstController->shutdown(QStringLiteral("first.retired")));
+    const SessionReceiveResult firstShutdown = first->worker->receive(1000);
+    QCOMPARE(firstShutdown.status, SessionStatus::MessageReady);
+    QCOMPARE(firstShutdown.message->type(), ProtocolType::Shutdown);
+    const auto firstShutdownAck = ProtocolMessage::shutdown(
+        QStringLiteral("first.retired.ack"));
+    QVERIFY(firstShutdownAck.has_value());
+    QVERIFY(first->worker->send(*firstShutdownAck, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(firstController->state(),
+                              HostWorkerSessionState::Detached, 3000);
+    QCOMPARE(secondController->state(), HostWorkerSessionState::Running);
+    QVERIFY(second->worker->send(ProtocolMessage::heartbeat(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(secondHeartbeats.count(), 1, 3000);
+    QCOMPARE(secondHeartbeats.at(0).at(0).toULongLong(),
+             sessionGeneration(*secondController));
+
+    QVERIFY(secondController->shutdown(QStringLiteral("second.complete")));
+    const SessionReceiveResult secondShutdown = second->worker->receive(1000);
+    QCOMPARE(secondShutdown.status, SessionStatus::MessageReady);
+    QCOMPARE(secondShutdown.message->type(), ProtocolType::Shutdown);
+    const auto secondShutdownAck = ProtocolMessage::shutdown(
+        QStringLiteral("second.complete.ack"));
+    QVERIFY(secondShutdownAck.has_value());
+    QVERIFY(second->worker->send(*secondShutdownAck, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(secondController->state(),
+                              HostWorkerSessionState::Detached, 3000);
+}
+
+void UnifiedNavigationTest::backgroundWorkerNavigationUpdatesOnlyOwningHistory()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
+    BrowserTabModel model;
+    const QString firstTab = model.createTab(
+        BrowserTabKind::App, QStringLiteral("First"),
+        QStringLiteral("app://pilot/web-shaped-worker/1"));
+    const QString secondTab = model.createTab(
+        BrowserTabKind::App, QStringLiteral("Second"),
+        QStringLiteral("app://pilot/web-shaped-worker/2"));
+    QVERIFY(!firstTab.isEmpty());
+    QVERIFY(!secondTab.isEmpty());
+    QCOMPARE(model.activeId(), secondTab);
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    auto firstController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow,
+        [&model, firstTab, appId](const QString &callbackAppId,
+                                  const QString &route) {
+            return callbackAppId == appId
+                && model.navigateTab(firstTab, BrowserTabKind::App,
+                                     QStringLiteral("app://pilot") + route);
+        });
+    auto secondController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow,
+        [&model, secondTab, appId](const QString &callbackAppId,
+                                   const QString &route) {
+            return callbackAppId == appId
+                && model.navigateTab(secondTab, BrowserTabKind::App,
+                                     QStringLiteral("app://pilot") + route);
+        });
+    auto first = authenticatedSessions(appId);
+    auto second = authenticatedSessions(appId);
+    QVERIFY(first.has_value());
+    QVERIFY(second.has_value());
+    QVERIFY(firstController->attach(std::move(first->host)));
+    QVERIFY(secondController->attach(std::move(second->host)));
+
+    const BrowserTabSnapshot firstBefore = model.snapshotAt(
+        model.indexOfId(firstTab));
+    const BrowserTabSnapshot secondBefore = model.snapshotAt(
+        model.indexOfId(secondTab));
+    const QString route = QStringLiteral("/orders");
+    QVERIFY(first->worker->sendNavigationRequest(
+        QStringLiteral("background-navigation"), route, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        model.snapshotAt(model.indexOfId(firstTab)).address,
+        QStringLiteral("app://pilot/orders"), 3000);
+
+    const SessionReceiveResult navigationResponse = first->worker->receive(1000);
+    QCOMPARE(navigationResponse.status, SessionStatus::MessageReady);
+    QCOMPARE(navigationResponse.message->type(), ProtocolType::Response);
+    QVERIFY(navigationResponse.message->payload()
+                .value(QStringLiteral("ok")).toBool(false));
+    const SessionReceiveResult routeLoad = first->worker->receive(1000);
+    QCOMPARE(routeLoad.status, SessionStatus::MessageReady);
+    QCOMPARE(routeLoad.message->type(), ProtocolType::RouteLoad);
+    QCOMPARE(routeLoad.message->payload()
+                 .value(QStringLiteral("route")).toString(),
+             route);
+    const auto routeAcknowledgement = ProtocolMessage::successResponse(
+        routeLoad.message->requestId(),
+        QJsonObject{{QStringLiteral("route"), route}});
+    QVERIFY(routeAcknowledgement.has_value());
+    QVERIFY(first->worker->send(*routeAcknowledgement, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(firstController->pendingRouteLoadCount(),
+                              qsizetype(0), 3000);
+
+    const BrowserTabSnapshot firstAfter = model.snapshotAt(
+        model.indexOfId(firstTab));
+    const BrowserTabSnapshot secondAfter = model.snapshotAt(
+        model.indexOfId(secondTab));
+    QCOMPARE(firstAfter.history.size(), firstBefore.history.size() + 1);
+    QCOMPARE(firstAfter.history.constLast(),
+             QStringLiteral("app://pilot/orders"));
+    QCOMPARE(secondAfter, secondBefore);
+    QCOMPARE(model.activeId(), secondTab);
+
+    first->worker->close();
+    second->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!firstController->hasIoThread(), 6000);
+    QTRY_VERIFY_WITH_TIMEOUT(!secondController->hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::retiredSessionRejectsLateTabNavigation()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    int navigationCount = 0;
+    auto controller = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow,
+        [&navigationCount, appId](const QString &callbackAppId,
+                                  const QString &) {
+            if (callbackAppId != appId) return false;
+            ++navigationCount;
+            return true;
+        });
+    auto retired = authenticatedSessions(appId);
+    auto current = authenticatedSessions(appId);
+    QVERIFY(retired.has_value());
+    QVERIFY(current.has_value());
+    QVERIFY(!controller->requestRouteLoad(QStringLiteral("/orders")));
+    QVERIFY(controller->attach(std::move(retired->host)));
+    const quint64 retiredGeneration = sessionGeneration(*controller);
+    QCOMPARE(retiredGeneration, quint64(1));
+
+    const QString repeatedId = QStringLiteral("same-navigation-id");
+    QVERIFY(retired->worker->sendNavigationRequest(
+        repeatedId, QStringLiteral("/orders"), 1000));
+    QVERIFY(controller->shutdown(QStringLiteral("generation.retired")));
+    QVERIFY(!controller->requestRouteLoad(QStringLiteral("/orders")));
+    QVERIFY(controller->attach(std::move(current->host)));
+    retired->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller->state(),
+                              HostWorkerSessionState::Running, 6000);
+    QCOMPARE(sessionGeneration(*controller), retiredGeneration + 1);
+    QTest::qWait(100);
+    QCOMPARE(navigationCount, 0);
+
+    QVERIFY(QMetaObject::invokeMethod(
+        controller.get(), "handleNavigationRequest", Qt::DirectConnection,
+        Q_ARG(quint64, retiredGeneration), Q_ARG(QString, repeatedId),
+        Q_ARG(QString, QStringLiteral("/orders"))));
+    QCOMPARE(navigationCount, 0);
+    QCOMPARE(current->worker->poll(0).status, SessionStatus::TimedOut);
+    QVERIFY(!current->worker->isClosed());
+
+    const QString route = QStringLiteral("/orders");
+    QVERIFY(current->worker->sendNavigationRequest(repeatedId, route, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(navigationCount, 1, 3000);
+    const SessionReceiveResult navigationResponse = current->worker->receive(1000);
+    QCOMPARE(navigationResponse.status, SessionStatus::MessageReady);
+    QCOMPARE(navigationResponse.message->type(), ProtocolType::Response);
+    QVERIFY(navigationResponse.message->payload()
+                .value(QStringLiteral("ok")).toBool(false));
+    const SessionReceiveResult routeLoad = current->worker->receive(1000);
+    QCOMPARE(routeLoad.status, SessionStatus::MessageReady);
+    QCOMPARE(routeLoad.message->type(), ProtocolType::RouteLoad);
+    const auto routeAcknowledgement = ProtocolMessage::successResponse(
+        routeLoad.message->requestId(),
+        QJsonObject{{QStringLiteral("route"), route}});
+    QVERIFY(routeAcknowledgement.has_value());
+    QVERIFY(current->worker->send(*routeAcknowledgement, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(controller->pendingRouteLoadCount(),
+                              qsizetype(0), 3000);
+    current->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller->hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::pageMetadataFromOneSessionUpdatesOnlyOwningTab()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
+    BrowserTabModel model;
+    const QString firstTab = model.createTab(
+        BrowserTabKind::App, QStringLiteral("First"),
+        QStringLiteral("app://pilot/web-shaped-worker/1"));
+    const QString secondTab = model.createTab(
+        BrowserTabKind::App, QStringLiteral("Second"),
+        QStringLiteral("app://pilot/web-shaped-worker/2"));
+    QVERIFY(!firstTab.isEmpty());
+    QVERIFY(!secondTab.isEmpty());
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    auto firstController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, [](const QString &, const QString &) { return false; });
+    auto secondController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, [](const QString &, const QString &) { return false; });
+    auto first = authenticatedSessions(appId);
+    auto second = authenticatedSessions(appId);
+    QVERIFY(first.has_value());
+    QVERIFY(second.has_value());
+    QVERIFY(firstController->attach(std::move(first->host)));
+    QVERIFY(secondController->attach(std::move(second->host)));
+    QCOMPARE(sessionGeneration(*firstController), quint64(1));
+    QCOMPARE(sessionGeneration(*secondController), quint64(1));
+
+    connect(firstController.get(),
+            &HostWorkerSessionController::pageMetadataChanged, &model,
+            [&model, firstTab, controller = firstController.get()](
+                const quint64 generation, const QString &title,
+                const QString &) {
+                if (generation == sessionGeneration(*controller)) {
+                    (void)model.setTitle(firstTab, title);
+                }
+            });
+    connect(secondController.get(),
+            &HostWorkerSessionController::pageMetadataChanged, &model,
+            [&model, secondTab, controller = secondController.get()](
+                const quint64 generation, const QString &title,
+                const QString &) {
+                if (generation == sessionGeneration(*controller)) {
+                    (void)model.setTitle(secondTab, title);
+                }
+            });
+    QSignalSpy firstMetadata(
+        firstController.get(),
+        &HostWorkerSessionController::pageMetadataChanged);
+    QSignalSpy secondMetadata(
+        secondController.get(),
+        &HostWorkerSessionController::pageMetadataChanged);
+    QVERIFY(firstMetadata.isValid());
+    QVERIFY(secondMetadata.isValid());
+
+    QVERIFY(first->worker->send(ProtocolMessage::ready()));
+    QVERIFY(second->worker->send(ProtocolMessage::ready()));
+    const auto metadata = ProtocolMessage::pageMetadata(
+        QStringLiteral("First orders"), QStringLiteral("ready"));
+    QVERIFY(metadata.has_value());
+    QVERIFY(first->worker->send(*metadata, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(firstMetadata.count(), 1, 3000);
+    QCOMPARE(secondMetadata.count(), 0);
+    QCOMPARE(model.snapshotAt(model.indexOfId(firstTab)).title,
+             QStringLiteral("First orders"));
+    QCOMPARE(model.snapshotAt(model.indexOfId(secondTab)).title,
+             QStringLiteral("Second"));
+
+    first->worker->close();
+    second->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!firstController->hasIoThread(), 6000);
+    QTRY_VERIFY_WITH_TIMEOUT(!secondController->hasIoThread(), 6000);
 }
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()
@@ -724,11 +1090,14 @@ Rectangle {
                                        QStringLiteral("/worker-shaped-web")));
     QCOMPARE(window.historyCount(), 3);
     QVERIFY(window.goBack());
+    QVERIFY(controller.requestRouteLoad(
+        QStringLiteral("/web-shaped-worker/42")));
     QTRY_COMPARE_WITH_TIMEOUT(routeLoadSpy.count(), 2, 5000);
     QCOMPARE(routeLoadSpy.at(1).at(0).toString(),
              QStringLiteral("/web-shaped-worker/42"));
     QCOMPARE(window.currentAppUrl(), initial);
     QVERIFY(window.goForward());
+    QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders")));
     QTRY_COMPARE_WITH_TIMEOUT(routeLoadSpy.count(), 3, 5000);
     QCOMPARE(routeLoadSpy.at(2).at(0).toString(), QStringLiteral("/orders"));
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
@@ -765,24 +1134,33 @@ void UnifiedNavigationTest::hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavi
                       server.origin(), surface);
     window.resize(900, 600);
     window.show();
-    HostWorkerSessionController controller(&window);
+    HostWorkerSessionController controller(
+        [&window](const QString &appId, const QString &route) {
+            return window.navigateFromWorker(appId, route);
+        });
     QVERIFY(controller.attach(std::make_unique<IpcSession>(
         std::move(launch->hostSession))));
     QSignalSpy acknowledged(&controller,
                             &HostWorkerSessionController::routeLoadAcknowledged);
 
     QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/7")));
+    QVERIFY(controller.requestRouteLoad(
+        QStringLiteral("/web-shaped-worker/7")));
     QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 1, 5000);
     QCOMPARE(acknowledged.at(0).at(0).toString(),
              QStringLiteral("/web-shaped-worker/7"));
     QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
+    QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders")));
     QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 2, 5000);
     QCOMPARE(acknowledged.at(1).at(0).toString(), QStringLiteral("/orders"));
     QVERIFY(window.goBack());
+    QVERIFY(controller.requestRouteLoad(
+        QStringLiteral("/web-shaped-worker/7")));
     QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 3, 5000);
     QCOMPARE(acknowledged.at(2).at(0).toString(),
              QStringLiteral("/web-shaped-worker/7"));
     QVERIFY(window.goForward());
+    QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders")));
     QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 4, 5000);
     QCOMPARE(acknowledged.at(3).at(0).toString(), QStringLiteral("/orders"));
 
@@ -793,9 +1171,12 @@ void UnifiedNavigationTest::hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavi
             if (!reentered && route == QStringLiteral("/web-shaped-worker/9")) {
                 reentered = true;
                 QVERIFY(window.goBack());
+                QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders")));
             }
         }, Qt::DirectConnection);
     QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/9")));
+    QVERIFY(controller.requestRouteLoad(
+        QStringLiteral("/web-shaped-worker/9")));
     QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 6, 5000);
     QVERIFY(reentered);
     QCOMPARE(acknowledged.at(4).at(0).toString(),
@@ -929,6 +1310,8 @@ void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondReques
         second->requestId(), QStringLiteral("storage"), QStringLiteral("get"),
         second->payload().value(QStringLiteral("payload")).toObject(), 1000));
     QTRY_VERIFY_WITH_TIMEOUT(heartbeats.count() > 0, 3000);
+    QCOMPARE(heartbeats.constLast().at(0).toULongLong(),
+             controller.generation());
 
     std::optional<ProtocolMessage> busy;
     QTRY_VERIFY_WITH_TIMEOUT(([&] {

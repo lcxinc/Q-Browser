@@ -37,6 +37,9 @@ signals:
     void navigationRequested(quint64 generation,
                              const QString &requestId,
                              const QString &route);
+    void pageMetadataReceived(quint64 generation,
+                              const QString &title,
+                              const QString &status);
     void routeLoadResponse(quint64 generation,
                            const QString &requestId,
                            const QJsonObject &payload);
