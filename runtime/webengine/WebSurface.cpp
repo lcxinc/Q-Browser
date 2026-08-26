@@ -49,7 +49,7 @@ bool disablesSandbox(const QString &argument)
 
 constexpr qsizetype maximumRawTitleLength = 4096;
 constexpr qsizetype maximumTrustedTitleLength = 256;
-constexpr int maximumPercentDecodePasses = 3;
+constexpr qsizetype maximumPercentDecodeWork = maximumRawTitleLength * 2;
 
 bool hasUnsafeTitleCodeUnits(const QString &title)
 {
@@ -634,14 +634,23 @@ QString WebSurface::trustedTitle(const QString &physicalTitle) const
     if (candidate.isEmpty() || hasUnsafeTitleCodeUnits(candidate)) return fallback;
 
     QString inspected = candidate;
-    for (int pass = 0; pass <= maximumPercentDecodePasses; ++pass) {
+    qsizetype remainingDecodeWork = maximumPercentDecodeWork;
+    for (;;) {
+        // A full-size title may be decoded once and checked again.  If a
+        // smaller title needs more layers, it shares the same deterministic
+        // 8192-code-unit work budget; exhaustion rejects instead of surfacing
+        // text that could still decode to a physical address.
+        if (inspected.size() > remainingDecodeWork) return fallback;
+        remainingDecodeWork -= inspected.size();
         if (hasUnsafeTitleCodeUnits(inspected)
             || looksLikePhysicalAddress(inspected, physicalOriginHost_)) {
             return fallback;
         }
-        if (pass == maximumPercentDecodePasses) break;
         const QString decoded = QUrl::fromPercentEncoding(inspected.toUtf8());
         if (decoded == inspected) break;
+        // Strict shrinking proves termination inside the work budget.  Reject
+        // a changed non-shrinking transform instead of risking a cycle.
+        if (decoded.size() >= inspected.size()) return fallback;
         inspected = decoded;
     }
 

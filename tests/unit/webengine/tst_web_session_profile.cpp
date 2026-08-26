@@ -199,6 +199,24 @@ void drainQueuedEvents()
     }
 }
 
+QString deeplyPercentEncodedTitle(const QString &plainText, const int layers)
+{
+    Q_ASSERT(layers >= 1);
+    const QByteArray bytes = plainText.toUtf8();
+    QByteArray encoded;
+    encoded.reserve(bytes.size() * 3);
+    constexpr char hex[] = "0123456789ABCDEF";
+    for (const unsigned char byte : bytes) {
+        encoded.append('%');
+        encoded.append(hex[byte >> 4]);
+        encoded.append(hex[byte & 0x0f]);
+    }
+    for (int layer = 1; layer < layers; ++layer) {
+        encoded.replace("%", "%25");
+    }
+    return QString::fromLatin1(encoded);
+}
+
 RouteRegistry webRoutes(const QUrl &entry)
 {
     RouteRegistry registry;
@@ -246,6 +264,9 @@ private slots:
     void sameUrlReplacementRejectsQueuedOldCallbacks();
     void rendererDrivenReloadStartsAFreshIncarnation();
     void trustedTitlesAreBoundedAndUnicodeSafe();
+    void maximumLengthNestedPercentTitleHasBoundedDecodeWork();
+    void trustedTitlesRejectDeeplyEncodedPhysicalAddresses_data();
+    void trustedTitlesRejectDeeplyEncodedPhysicalAddresses();
     void trustedTitlesRejectEncodedPhysicalAddresses();
     void mainFrameIsPinnedToItsRegisteredEntry();
     void redirectedMainFrameMustRemainTheRegisteredEntry();
@@ -786,6 +807,62 @@ void WebSessionProfileTest::trustedTitlesAreBoundedAndUnicodeSafe()
                  QStringLiteral("safe\u202Eunsafe")), fallback);
     QCOMPARE(surface.trustedTitleForTesting(QString(4096, u'a')), QString(256, u'a'));
     QCOMPARE(surface.trustedTitleForTesting(QString(4097, u'a')), fallback);
+}
+
+void WebSessionProfileTest::maximumLengthNestedPercentTitleHasBoundedDecodeWork()
+{
+    HttpServer server;
+    QVERIFY(server.listen());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/titles")));
+    const QString maximumLengthTitle = QStringLiteral("a")
+        + deeplyPercentEncodedTitle(QStringLiteral("%"), 2047);
+    QCOMPARE(maximumLengthTitle.size(), 4096);
+    QString trusted;
+
+    QBENCHMARK {
+        trusted = surface.trustedTitleForTesting(maximumLengthTitle);
+    }
+
+    QCOMPARE(trusted, QStringLiteral("Restricted web"));
+}
+
+void WebSessionProfileTest::trustedTitlesRejectDeeplyEncodedPhysicalAddresses_data()
+{
+    QTest::addColumn<QString>("title");
+    QTest::addColumn<bool>("exceedsOutputBound");
+
+    QTest::newRow("ipv4-reviewer-four-layers")
+        << QStringLiteral(
+               "%25252568%25252574%25252574%25252570%2525253A%2525252F"
+               "%2525252F%25252531%25252532%25252537%2525252E%25252530"
+               "%2525252E%25252530%2525252E%25252531%2525253A%25252534"
+               "%25252533%25252531%25252532%25252533%2525252F%25252568"
+               "%25252565%2525256C%25252570")
+        << false;
+    QTest::newRow("ipv6-five-layers")
+        << deeplyPercentEncodedTitle(
+               QStringLiteral("http://[::1]:43123/help"), 5)
+        << false;
+    QTest::newRow("localhost-near-raw-bound")
+        << deeplyPercentEncodedTitle(
+               QStringLiteral("http://localhost:43123/help"), 70)
+        << true;
+}
+
+void WebSessionProfileTest::trustedTitlesRejectDeeplyEncodedPhysicalAddresses()
+{
+    QFETCH(QString, title);
+    QFETCH(bool, exceedsOutputBound);
+    QVERIFY(title.size() <= 4096);
+    QCOMPARE(title.size() > 256, exceedsOutputBound);
+
+    HttpServer server;
+    QVERIFY(server.listen());
+    WebSessionProfile session(server.origin());
+    WebSurface surface(session, server.url(QStringLiteral("/titles")));
+    QCOMPARE(surface.trustedTitleForTesting(title),
+             QStringLiteral("Restricted web"));
 }
 
 void WebSessionProfileTest::trustedTitlesRejectEncodedPhysicalAddresses()
