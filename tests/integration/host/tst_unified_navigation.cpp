@@ -44,9 +44,12 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <semaphore>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -311,6 +314,61 @@ quint64 sessionGeneration(const Controller &controller)
     }
 }
 
+struct DestroyingNavigationCallbackState final {
+    std::unique_ptr<HostWorkerSessionController> *owner = nullptr;
+    int nextTargetId = 0;
+    int executingTargetId = 0;
+    int invocationCount = 0;
+    bool executingTargetDestroyed = false;
+};
+
+class DestroyingNavigationCallback final
+{
+public:
+    explicit DestroyingNavigationCallback(
+        std::shared_ptr<DestroyingNavigationCallbackState> state)
+        : state_(std::move(state)), targetId_(++state_->nextTargetId)
+    {
+    }
+
+    DestroyingNavigationCallback(const DestroyingNavigationCallback &other)
+        : state_(other.state_), targetId_(++state_->nextTargetId)
+    {
+    }
+
+    DestroyingNavigationCallback(DestroyingNavigationCallback &&other) noexcept
+        : state_(std::move(other.state_)), targetId_(std::exchange(other.targetId_, 0))
+    {
+    }
+
+    ~DestroyingNavigationCallback()
+    {
+        if (state_ != nullptr && targetId_ != 0
+            && state_->executingTargetId == targetId_) {
+            state_->executingTargetDestroyed = true;
+        }
+    }
+
+    bool operator()(const QString &, const QString &) const
+    {
+        const std::shared_ptr<DestroyingNavigationCallbackState> state = state_;
+        const int executingTargetId = targetId_;
+        state->executingTargetId = executingTargetId;
+        ++state->invocationCount;
+        if (state->owner != nullptr && *state->owner != nullptr) {
+            (void)(*state->owner)->shutdown(
+                QStringLiteral("navigation.callback.destroy"));
+            state->owner->reset();
+        }
+        state->executingTargetId = 0;
+        return true;
+    }
+
+private:
+    std::shared_ptr<DestroyingNavigationCallbackState> state_;
+    int targetId_ = 0;
+};
+
 } // namespace
 
 class UnifiedNavigationTest final : public QObject
@@ -335,10 +393,13 @@ private slots:
     void navigationTransactionsRejectReentrantCommands();
     void trustedShellRuntimeConfigKeepsPilotRouteIdentity();
     void pageMetadataUsesOnlyCurrentGenerationAndResanitizes();
+    void preinstalledPageMetadataHandlerIsClearedBeforeIoTransfer();
     void sameAppSessionsRouteOnlyTheirOwnTab();
     void backgroundWorkerNavigationUpdatesOnlyOwningHistory();
     void retiredSessionRejectsLateTabNavigation();
     void pageMetadataFromOneSessionUpdatesOnlyOwningTab();
+    void navigationCallbackExceptionFailsClosedWithoutAffectingSibling();
+    void navigationCallbackMayDestroyOwningController();
 };
 
 void UnifiedNavigationTest::trustedShellRuntimeConfigKeepsPilotRouteIdentity()
@@ -429,6 +490,64 @@ void UnifiedNavigationTest::pageMetadataUsesOnlyCurrentGenerationAndResanitizes(
         Q_ARG(QString, QString())));
     QCOMPARE(metadataSpy.count(), 3);
     QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::preinstalledPageMetadataHandlerIsClearedBeforeIoTransfer()
+{
+    HostWorkerSessionController controller(
+        [](const QString &, const QString &) { return false; });
+    QThread *const controllerThread = controller.thread();
+    std::atomic<int> oldHandlerCount{0};
+    std::atomic<QThread *> oldHandlerThread{nullptr};
+    int metadataSignalCount = 0;
+    QThread *metadataSignalThread = nullptr;
+    quint64 metadataGeneration = 0;
+    QString metadataTitle;
+    QString metadataStatus;
+    connect(&controller, &HostWorkerSessionController::pageMetadataChanged,
+            &controller,
+            [&](const quint64 generation, const QString &title,
+                const QString &status) {
+                ++metadataSignalCount;
+                metadataSignalThread = QThread::currentThread();
+                metadataGeneration = generation;
+                metadataTitle = title;
+                metadataStatus = status;
+            },
+            Qt::DirectConnection);
+    QSignalSpy heartbeatSpy(&controller,
+                            &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(heartbeatSpy.isValid());
+
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+    sessions->host->setPageMetadataHandler(
+        [&](const QString &, const QString &) {
+            oldHandlerThread.store(QThread::currentThread(),
+                                   std::memory_order_relaxed);
+            oldHandlerCount.fetch_add(1, std::memory_order_relaxed);
+        });
+    QVERIFY(controller.attach(std::move(sessions->host)));
+    const quint64 attachedGeneration = controller.generation();
+
+    QVERIFY(sessions->worker->send(ProtocolMessage::ready()));
+    const auto metadata = ProtocolMessage::pageMetadata(
+        QStringLiteral("Transferred Session"), QStringLiteral("ready"));
+    QVERIFY(metadata.has_value());
+    QVERIFY(sessions->worker->send(*metadata));
+    QVERIFY(sessions->worker->send(ProtocolMessage::heartbeat(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(metadataSignalCount, 1, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(heartbeatSpy.count(), 1, 3000);
+
+    sessions->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
+    QCOMPARE(metadataSignalCount, 1);
+    QCOMPARE(metadataSignalThread, controllerThread);
+    QCOMPARE(metadataGeneration, attachedGeneration);
+    QCOMPARE(metadataTitle, QStringLiteral("Transferred Session"));
+    QCOMPARE(metadataStatus, QStringLiteral("ready"));
+    QCOMPARE(oldHandlerCount.load(std::memory_order_relaxed), 0);
+    QCOMPARE(oldHandlerThread.load(std::memory_order_relaxed), nullptr);
 }
 
 void UnifiedNavigationTest::sameAppSessionsRouteOnlyTheirOwnTab()
@@ -745,6 +864,133 @@ void UnifiedNavigationTest::pageMetadataFromOneSessionUpdatesOnlyOwningTab()
     second->worker->close();
     QTRY_VERIFY_WITH_TIMEOUT(!firstController->hasIoThread(), 6000);
     QTRY_VERIFY_WITH_TIMEOUT(!secondController->hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::navigationCallbackExceptionFailsClosedWithoutAffectingSibling()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    auto throwingController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, [](const QString &, const QString &) -> bool {
+            throw std::runtime_error("navigation callback failure");
+        });
+    auto siblingController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, [](const QString &, const QString &) { return false; });
+    auto throwingSession = authenticatedSessions(appId);
+    auto siblingSession = authenticatedSessions(appId);
+    QVERIFY(throwingSession.has_value());
+    QVERIFY(siblingSession.has_value());
+    QVERIFY(throwingController->attach(std::move(throwingSession->host)));
+    QVERIFY(siblingController->attach(std::move(siblingSession->host)));
+
+    QSignalSpy failures(throwingController.get(),
+                        &HostWorkerSessionController::failed);
+    QSignalSpy siblingHeartbeats(siblingController.get(),
+                                 &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(failures.isValid());
+    QVERIFY(siblingHeartbeats.isValid());
+    const quint64 throwingGeneration = throwingController->generation();
+
+    bool callbackEscaped = false;
+    bool invoked = false;
+    try {
+        invoked = QMetaObject::invokeMethod(
+            throwingController.get(), "handleNavigationRequest",
+            Qt::DirectConnection, Q_ARG(quint64, throwingGeneration),
+            Q_ARG(QString, QStringLiteral("throwing-navigation")),
+            Q_ARG(QString, QStringLiteral("/orders")));
+    } catch (...) {
+        callbackEscaped = true;
+    }
+
+    QVERIFY2(!callbackEscaped,
+             "NavigationCallback exceptions must not escape the Qt handler");
+    QVERIFY(invoked);
+    QCOMPARE(throwingController->state(), HostWorkerSessionState::Failed);
+    QCOMPARE(throwingController->lastErrorCode(),
+             QStringLiteral("host.worker_session.navigation_callback_failed"));
+    QCOMPARE(failures.count(), 1);
+    QCOMPARE(failures.at(0).at(0).toString(),
+             QStringLiteral("host.worker_session.navigation_callback_failed"));
+    QCOMPARE(failures.at(0).at(1).toULongLong(), throwingGeneration);
+    QTRY_VERIFY_WITH_TIMEOUT(!throwingController->hasIoThread(), 6000);
+
+    QCOMPARE(siblingController->state(), HostWorkerSessionState::Running);
+    QVERIFY(siblingSession->worker->send(ProtocolMessage::heartbeat(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(siblingHeartbeats.count(), 1, 3000);
+    QCOMPARE(siblingHeartbeats.at(0).at(0).toULongLong(),
+             siblingController->generation());
+    siblingSession->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!siblingController->hasIoThread(), 6000);
+}
+
+void UnifiedNavigationTest::navigationCallbackMayDestroyOwningController()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
+    const QString appId = QStringLiteral("com.qbrowser.pilot");
+    auto callbackState = std::make_shared<DestroyingNavigationCallbackState>();
+    std::unique_ptr<HostWorkerSessionController> owningController;
+    callbackState->owner = &owningController;
+    owningController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, DestroyingNavigationCallback(callbackState));
+    QPointer<HostWorkerSessionController> owningGuard(owningController.get());
+    auto siblingController = makeSessionController<HostWorkerSessionController>(
+        &legacyWindow, [](const QString &, const QString &) { return false; });
+    auto owningSession = authenticatedSessions(appId);
+    auto siblingSession = authenticatedSessions(appId);
+    QVERIFY(owningSession.has_value());
+    QVERIFY(siblingSession.has_value());
+    QVERIFY(owningController->attach(std::move(owningSession->host)));
+    QVERIFY(siblingController->attach(std::move(siblingSession->host)));
+    QSignalSpy siblingHeartbeats(siblingController.get(),
+                                 &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(siblingHeartbeats.isValid());
+    const quint64 owningGeneration = owningController->generation();
+
+    const bool invoked = QMetaObject::invokeMethod(
+        owningController.get(), "handleNavigationRequest", Qt::DirectConnection,
+        Q_ARG(quint64, owningGeneration),
+        Q_ARG(QString, QStringLiteral("destroying-navigation")),
+        Q_ARG(QString, QStringLiteral("/orders")));
+
+    QVERIFY(invoked);
+    QCOMPARE(callbackState->invocationCount, 1);
+    QVERIFY(owningGuard.isNull());
+    QVERIFY(owningController == nullptr);
+    QVERIFY2(!callbackState->executingTargetDestroyed,
+             "The executing NavigationCallback target was destroyed in-place");
+
+    bool sawNavigationReply = false;
+    bool owningSessionClosed = false;
+    QElapsedTimer closeWait;
+    closeWait.start();
+    while (closeWait.elapsed() < 3000 && !owningSessionClosed) {
+        const SessionReceiveResult received = owningSession->worker->poll(0);
+        if (received.status == SessionStatus::MessageReady
+            && received.message.has_value()) {
+            sawNavigationReply = sawNavigationReply
+                || received.message->type() == ProtocolType::Response
+                || received.message->type() == ProtocolType::RouteLoad;
+        } else if (received.status == SessionStatus::PeerClosed
+                   || received.status == SessionStatus::Failed) {
+            owningSessionClosed = true;
+        }
+        if (!owningSessionClosed) QTest::qWait(10);
+    }
+    QVERIFY(!sawNavigationReply);
+    QVERIFY(owningSessionClosed);
+
+    QCOMPARE(siblingController->state(), HostWorkerSessionState::Running);
+    QVERIFY(siblingSession->worker->send(ProtocolMessage::heartbeat(), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(siblingHeartbeats.count(), 1, 3000);
+    QCOMPARE(siblingHeartbeats.at(0).at(0).toULongLong(),
+             siblingController->generation());
+    siblingSession->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!siblingController->hasIoThread(), 6000);
 }
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()

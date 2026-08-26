@@ -121,6 +121,7 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
 bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> session)
 {
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
+    session->setPageMetadataHandler({});
     ++generation_;
     const quint64 attachedGeneration = generation_;
     appIdentity_ = session->appIdentity();
@@ -271,24 +272,44 @@ void HostWorkerSessionController::handleNavigationRequest(
             failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
         return;
     }
-    const bool navigated = navigate_ && navigate_(appIdentity_, route);
-    if (generation != generation_ || state_ != HostWorkerSessionState::Running) return;
+    const QPointer<HostWorkerSessionController> self(this);
+    bool navigated = false;
+    try {
+        const NavigationCallback navigate = navigate_;
+        const QString appIdentity = appIdentity_;
+        navigated = navigate && navigate(appIdentity, route);
+    } catch (...) {
+        if (HostWorkerSessionController *const controller = self.data();
+            controller != nullptr) {
+            controller->failClosed(
+                QStringLiteral("host.worker_session.navigation_callback_failed"));
+        }
+        return;
+    }
+    HostWorkerSessionController *const controller = self.data();
+    if (controller == nullptr) return;
+    if (generation != controller->generation_
+        || controller->state_ != HostWorkerSessionState::Running) return;
     if (!navigated) {
         const auto response = ProtocolMessage::errorResponse(
             requestId, QStringLiteral("navigation.denied"),
             QStringLiteral("The requested route is not assigned to this worker."));
-        if (!response.has_value() || !enqueueMessage(*response, true))
-            failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
+        if (!response.has_value() || !controller->enqueueMessage(*response, true))
+            controller->failClosed(
+                QStringLiteral("host.worker_session.response_queue_failed"));
         return;
     }
     const auto response = ProtocolMessage::successResponse(
         requestId, QJsonObject{{QStringLiteral("route"), route}});
-    if (!response.has_value() || !enqueueMessage(*response) || !enqueueRouteLoad(route)) {
-        failClosed(QStringLiteral("host.worker_session.outbound_queue_full"));
+    if (!response.has_value() || !controller->enqueueMessage(*response)
+        || !controller->enqueueRouteLoad(route)) {
+        controller->failClosed(QStringLiteral("host.worker_session.outbound_queue_full"));
         return;
     }
-    if (!outbound_.isEmpty()) outbound_.back().resumePollingAfter = true;
-    else if (activeCommand_.has_value()) activeCommand_->resumePollingAfter = true;
+    if (!controller->outbound_.isEmpty())
+        controller->outbound_.back().resumePollingAfter = true;
+    else if (controller->activeCommand_.has_value())
+        controller->activeCommand_->resumePollingAfter = true;
 }
 
 void HostWorkerSessionController::handleRouteLoadResponse(
