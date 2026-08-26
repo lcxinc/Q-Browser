@@ -1,4 +1,6 @@
 #include "HostApplication.h"
+#include "BrowserChrome.h"
+#include "BrowserCommand.h"
 #include "HostCapabilityRuntime.h"
 #include "HostOwnedFileAuthority.h"
 #include "MainWindow.h"
@@ -24,6 +26,7 @@
 #include <QSignalSpy>
 #include <QScopeGuard>
 #include <QStackedWidget>
+#include <QTabBar>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
@@ -273,6 +276,8 @@ class UnifiedNavigationTest final : public QObject
 
 private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
+    void legacyWorkerAdapterRejectsASecondAppTab();
+    void legacyWorkerDetachDuringRouteStartWinsTransition();
     void workerNavigationIsSameAppAndHistoryAware();
     void hostApplicationOwnsAttachableWorkerSessionController();
     void hostApplicationBindsWorkerContextLifecycle();
@@ -419,16 +424,15 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
     QCOMPARE(window.activeSurfaceCount(), 1);
     QCOMPARE(window.currentAppUrl(), workerAppUrl);
-    QCOMPARE(window.historyCount(), 1);
-    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyIndex(), 1);
     QCOMPARE(workerRouteSpy.count(), 1);
     QCOMPARE(workerRouteSpy.first().at(1).toString(), QStringLiteral("qml/Main.qml"));
     QCOMPARE(workerRouteSpy.first().at(2).toMap().value(QStringLiteral("id")).toString(),
              QStringLiteral("order 42"));
     QCOMPARE(window.surfaceStack()->currentWidget(), workerSurface);
     QVERIFY(workerSurface->isVisible());
-    QVERIFY(!window.webSurface()->page()->isVisible());
-    QCOMPARE(window.webSurface()->page()->renderProcessPid(), 0);
+    QCOMPARE(window.webSurface(), nullptr);
 
     const int workerCurrentUrlSignals = currentUrlSpy.count();
     address->setText(QStringLiteral("https://example.com/not-an-app-route"));
@@ -437,26 +441,26 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QCOMPARE(window.surfaceStack()->currentWidget()->objectName(),
              QStringLiteral("trusted-error-surface"));
     QCOMPARE(window.currentAppUrl(), workerAppUrl);
-    QCOMPARE(window.historyCount(), 1);
-    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyIndex(), 1);
     QCOMPARE(address->text(), workerAppUrl);
-    QVERIFY(!backButton->isEnabled());
+    QVERIFY(backButton->isEnabled());
     QVERIFY(!forwardButton->isEnabled());
     QCOMPARE(currentUrlSpy.count(), workerCurrentUrlSignals);
 
     QVERIFY(window.navigate(workerAppUrl));
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
-    QCOMPARE(window.historyCount(), 1);
-    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyIndex(), 1);
 
     const QString webAppUrl = QStringLiteral("app://pilot/worker-shaped-web");
-    QSignalSpy webNavigationSpy(window.webSurface(), &WebSurface::navigationFinished);
     QVERIFY(window.navigate(webAppUrl));
+    QSignalSpy webNavigationSpy(window.webSurface(), &WebSurface::navigationFinished);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
     QCOMPARE(window.activeSurfaceCount(), 1);
     QCOMPARE(window.currentAppUrl(), webAppUrl);
-    QCOMPARE(window.historyCount(), 2);
-    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 2);
     QCOMPARE(window.surfaceStack()->currentWidget(), window.webSurface());
     QVERIFY(!workerSurface->isVisible());
     QCOMPARE(window.webSurface()->page()->lifecycleState(),
@@ -469,48 +473,47 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QVERIFY(!window.navigate(missingAppUrl));
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
     QCOMPARE(window.activeSurfaceCount(), 1);
-    QCOMPARE(window.currentAppUrl(), missingAppUrl);
+    QCOMPARE(window.currentAppUrl(), webAppUrl);
     QCOMPARE(window.historyCount(), 3);
     QCOMPARE(window.historyIndex(), 2);
     QVERIFY(window.trustedErrorText().contains(QStringLiteral("not found"),
                                                Qt::CaseInsensitive));
     QCOMPARE(window.surfaceStack()->currentWidget()->objectName(),
              QStringLiteral("trusted-error-surface"));
-    QCOMPARE(window.webSurface()->page()->lifecycleState(),
-             QWebEnginePage::LifecycleState::Frozen);
+    QVERIFY(window.webSurface() != nullptr);
+    QVERIFY(!window.webSurface()->page()->isVisible());
 
-    QVERIFY(window.goBack());
-    QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
-    QCOMPARE(window.currentAppUrl(), webAppUrl);
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 1);
     QVERIFY(window.goBack());
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
     QCOMPARE(window.currentAppUrl(), workerAppUrl);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 1);
+    QVERIFY(window.goBack());
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Host);
+    QCOMPARE(window.currentAppUrl(), QStringLiteral("qbrowser://newtab"));
     QCOMPARE(window.historyIndex(), 0);
-    QCOMPARE(window.webSurface()->page()->lifecycleState(),
-             QWebEnginePage::LifecycleState::Frozen);
+    QCOMPARE(window.webSurface(), nullptr);
     QVERIFY(!window.goBack());
     QVERIFY(window.goForward());
-    QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
-    QCOMPARE(window.currentAppUrl(), webAppUrl);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QCOMPARE(window.currentAppUrl(), workerAppUrl);
     QCOMPARE(window.historyIndex(), 1);
 
     address->setText(missingAppUrl);
     QTest::keyClick(address, Qt::Key_Return);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
-    QCOMPARE(window.currentAppUrl(), missingAppUrl);
+    QCOMPARE(window.currentAppUrl(), workerAppUrl);
     QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 2);
-    QCOMPARE(address->text(), missingAppUrl);
+    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(address->text(), workerAppUrl);
 
     const int stableHistoryCount = window.historyCount();
     address->setText(QStringLiteral("https://example.com/"));
     QTest::keyClick(address, Qt::Key_Return);
     QCOMPARE(window.historyCount(), stableHistoryCount);
-    QCOMPARE(window.currentAppUrl(), missingAppUrl);
-    QCOMPARE(address->text(), missingAppUrl);
-    QVERIFY(currentUrlSpy.count() >= 6);
+    QCOMPARE(window.currentAppUrl(), workerAppUrl);
+    QCOMPARE(address->text(), workerAppUrl);
+    QVERIFY(currentUrlSpy.count() >= 5);
 
     window.close();
     launch->hostSession.close();
@@ -518,6 +521,149 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::legacyWorkerAdapterRejectsASecondAppTab()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+
+    WorkerTestEnvironment workerEnvironment;
+    QVERIFY2(workerEnvironment.isValid(), qPrintable(workerEnvironment.error()));
+    auto launch = workerEnvironment.launch(QStringLiteral("legacy-owner-nonce"),
+                                           QStringLiteral("legacy-owner-nonce"),
+                                           100);
+    QVERIFY2(launch.has_value(), qPrintable(workerEnvironment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceReady = receiveUntil(
+        launch->hostSession, ProtocolType::SurfaceReady);
+    QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+
+    WorkerSurface *const workerSurface = WorkerSurface::create(
+        surfaceReady.message->payload()
+            .value(QStringLiteral("windowHandle"))
+            .toString(),
+        launch->process.nativeProcessHandle(), WorkerAttemptId{102});
+    QVERIFY(workerSurface != nullptr);
+
+    MainWindow window(routes(server.helpUrl()), server.origin(), workerSurface);
+    QSignalSpy workerRouteSpy(&window, &MainWindow::workerRouteRequested);
+    const QString ownerId = window.tabModel()->activeId();
+    const QString firstRoute = QStringLiteral(
+        "app://pilot/web-shaped-worker/owner");
+    QVERIFY(window.navigate(firstRoute));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QCOMPARE(window.workerSurface(), workerSurface);
+    QCOMPARE(workerRouteSpy.count(), 1);
+
+    window.browserChrome()->dispatchCommand(BrowserCommand::NewTab);
+    const QString rejectedId = window.tabModel()->activeId();
+    QVERIFY(rejectedId != ownerId);
+    QVERIFY(!window.navigate(firstRoute));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
+    QCOMPARE(window.workerSurface(), nullptr);
+    QCOMPARE(workerRouteSpy.count(), 1);
+    QCOMPARE(window.tabController(ownerId)->workerSurface(), workerSurface);
+    QCOMPARE(window.tabController(ownerId)->surfaceKind(),
+             HostSurfaceKind::Worker);
+
+    window.browserChrome()->tabBar()->setCurrentIndex(
+        window.tabModel()->indexOfId(ownerId));
+    QTRY_COMPARE_WITH_TIMEOUT(window.tabModel()->activeId(), ownerId, 2'000);
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QCOMPARE(window.workerSurface(), workerSurface);
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
+    QCOMPARE(window.workerSurface(), workerSurface);
+    QCOMPARE(workerRouteSpy.count(), 2);
+    QCOMPARE(workerRouteSpy.last().at(1).toString(),
+             QStringLiteral("qml/Main.qml"));
+
+    bool retirementObserved = false;
+    bool retirementSawClosingController = false;
+    bool retirementReentryChangedModel = false;
+    connect(&window, &MainWindow::legacyWorkerRetirementRequested, this,
+            [&](const QString &retiringId) {
+                retirementObserved = retiringId == ownerId;
+                TabController *const retiring = window.tabController(ownerId);
+                retirementSawClosingController = retiring != nullptr
+                    && retiring->lifecycle() == BrowserTabLifecycle::Closing;
+                const int tabCountBeforeReentry = window.tabModel()->count();
+                window.browserChrome()->dispatchCommand(BrowserCommand::NewTab);
+                retirementReentryChangedModel =
+                    window.tabModel()->count() != tabCountBeforeReentry;
+            }, Qt::DirectConnection);
+    window.browserChrome()->dispatchCommand(BrowserCommand::CloseTab);
+    QVERIFY(retirementObserved);
+    QVERIFY(retirementSawClosingController);
+    QVERIFY(!retirementReentryChangedModel);
+    QCOMPARE(window.tabModel()->count(), 1);
+    QCOMPARE(window.tabController(ownerId), nullptr);
+
+    window.close();
+    launch->hostSession.close();
+    launch->process.terminate(ERROR_PROCESS_ABORTED);
+    QVERIFY(launch->process.waitForFinished(5000));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::legacyWorkerDetachDuringRouteStartWinsTransition()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment workerEnvironment;
+    QVERIFY2(workerEnvironment.isValid(), qPrintable(workerEnvironment.error()));
+    auto launch = workerEnvironment.launch(QStringLiteral("legacy-detach-nonce"),
+                                           QStringLiteral("legacy-detach-nonce"),
+                                           100);
+    QVERIFY2(launch.has_value(), qPrintable(workerEnvironment.error()));
+    [[maybe_unused]] const auto cleanup = qScopeGuard([&] {
+        launch->hostSession.close();
+        if (launch->process.isValid()) {
+            launch->process.terminate(ERROR_PROCESS_ABORTED);
+            (void)launch->process.waitForFinished(5'000);
+            (void)launch->process.close();
+        }
+    });
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto surfaceReady = receiveUntil(
+        launch->hostSession, ProtocolType::SurfaceReady);
+    QCOMPARE(surfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+
+    WorkerSurface *const workerSurface = WorkerSurface::create(
+        surfaceReady.message->payload()
+            .value(QStringLiteral("windowHandle"))
+            .toString(),
+        launch->process.nativeProcessHandle(), WorkerAttemptId{104});
+    QVERIFY(workerSurface != nullptr);
+    MainWindow window(routes(server.helpUrl()), server.origin(), workerSurface);
+    const QString tabId = window.tabModel()->activeId();
+    TabController *const controller = window.tabController(tabId);
+    QVERIFY(controller != nullptr);
+    bool detachObserved = false;
+    connect(&window, &MainWindow::workerRouteRequested, this,
+            [&](const QString &, const QString &, const QVariantMap &,
+                const QUrl &) {
+                detachObserved = true;
+                window.detachWorkerSurface();
+            }, Qt::DirectConnection);
+
+    QVERIFY(!window.navigate(QStringLiteral("app://pilot/orders")));
+    QVERIFY(detachObserved);
+    QCOMPARE(window.workerSurface(), nullptr);
+    QCOMPARE(controller->workerSurface(), nullptr);
+    QCOMPARE(controller->surfaceKind(), HostSurfaceKind::TrustedError);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::TrustedError);
+    QCOMPARE(window.tabModel()->lifecycleAt(
+                 window.tabModel()->indexOfId(tabId)),
+             BrowserTabLifecycle::TrustedError);
+    QVERIFY(!window.trustedErrorText().isEmpty());
 }
 
 void UnifiedNavigationTest::workerNavigationIsSameAppAndHistoryAware()
@@ -559,7 +705,7 @@ Rectangle {
                             &HostWorkerSessionController::routeLoadAcknowledged);
     QTest::qWait(250);
     QCOMPARE(window.currentAppUrl(), initial);
-    QCOMPARE(window.historyCount(), 1);
+    QCOMPARE(window.historyCount(), 2);
     QCOMPARE(controller.state(), HostWorkerSessionState::Running);
     QTRY_COMPARE_WITH_TIMEOUT(window.currentAppUrl(), QStringLiteral("app://pilot/orders"),
                               5000);
@@ -568,15 +714,15 @@ Rectangle {
     QCOMPARE(routeLoadSpy.at(0).at(0).toString(), QStringLiteral("/orders"));
     QCOMPARE(controller.state(), HostWorkerSessionState::Running);
     QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/orders"));
-    QCOMPARE(window.historyCount(), 2);
-    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 2);
     QVERIFY(!window.navigateFromWorker(QStringLiteral("com.qbrowser.other"),
                                        QStringLiteral("/orders")));
     QVERIFY(!window.navigateFromWorker(workerEnvironment.appId(),
                                        QStringLiteral("https://evil.test/orders")));
     QVERIFY(!window.navigateFromWorker(workerEnvironment.appId(),
                                        QStringLiteral("/worker-shaped-web")));
-    QCOMPARE(window.historyCount(), 2);
+    QCOMPARE(window.historyCount(), 3);
     QVERIFY(window.goBack());
     QTRY_COMPARE_WITH_TIMEOUT(routeLoadSpy.count(), 2, 5000);
     QCOMPARE(routeLoadSpy.at(1).at(0).toString(),
@@ -1175,7 +1321,11 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     QCOMPARE(application.workerSessionController()->state(),
              HostWorkerSessionState::Running);
 
-    application.detachWorkerContext(QStringLiteral("context.test.complete"));
+    QSignalSpy retirementRequested(
+        application.mainWindow(),
+        &MainWindow::legacyWorkerRetirementRequested);
+    QVERIFY(application.mainWindow()->shutdown());
+    QCOMPARE(retirementRequested.count(), 1);
     QVERIFY(!application.hasWorkerContext());
     QCOMPARE(application.mainWindow()->workerSurface(), nullptr);
     QVERIFY(process->waitForFinished(5000));
@@ -1262,7 +1412,7 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
 
     QVERIFY(window.navigate(webAppUrl));
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
-    QCOMPARE(window.historyCount(), 1);
+    QCOMPARE(window.historyCount(), 2);
 
     bool navigateReceiverRan = false;
     bool navigateReceiverSawCommittedState = false;
@@ -1276,8 +1426,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
             navigateReceiverRan = true;
             navigateReceiverSawCommittedState =
                 window.currentAppUrl() == unavailableWorkerAppUrl
-                && window.historyCount() == 2
-                && window.historyIndex() == 1
+                && window.historyCount() == 3
+                && window.historyIndex() == 2
                 && window.activeSurface() == HostSurfaceKind::TrustedError;
             reentrantNavigateResult = window.navigate(unavailableWorkerAppUrl);
         },
@@ -1288,8 +1438,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QVERIFY(navigateReceiverSawCommittedState);
     QVERIFY(!reentrantNavigateResult);
     QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
-    QCOMPARE(window.historyCount(), 2);
-    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.historyCount(), 3);
+    QCOMPARE(window.historyIndex(), 2);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
     disconnect(navigateConnection);
 
@@ -1299,8 +1449,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QCOMPARE(window.historyIndex(), historyBeforeDuplicate - 1);
 
     QVERIFY(window.navigate(webAppUrl));
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 2);
+    QCOMPARE(window.historyCount(), 4);
+    QCOMPARE(window.historyIndex(), 3);
 
     bool backReceiverRan = false;
     bool backReceiverSawCommittedState = false;
@@ -1314,8 +1464,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
             backReceiverRan = true;
             backReceiverSawCommittedState =
                 window.currentAppUrl() == unavailableWorkerAppUrl
-                && window.historyCount() == 3
-                && window.historyIndex() == 1
+                && window.historyCount() == 4
+                && window.historyIndex() == 2
                 && window.activeSurface() == HostSurfaceKind::TrustedError;
             reentrantBackResult = window.goBack();
         },
@@ -1326,14 +1476,14 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QVERIFY(backReceiverSawCommittedState);
     QVERIFY(!reentrantBackResult);
     QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.historyCount(), 4);
+    QCOMPARE(window.historyIndex(), 2);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
     disconnect(backConnection);
 
     QVERIFY(window.goBack());
     QCOMPARE(window.currentAppUrl(), webAppUrl);
-    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.historyIndex(), 1);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
 
     QSignalSpy invalidInputUrlSpy(&window, &MainWindow::currentUrlChanged);
@@ -1343,18 +1493,18 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QCOMPARE(window.surfaceStack()->currentWidget()->objectName(),
              QStringLiteral("trusted-error-surface"));
     QCOMPARE(window.currentAppUrl(), webAppUrl);
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 0);
+    QCOMPARE(window.historyCount(), 4);
+    QCOMPARE(window.historyIndex(), 1);
     QCOMPARE(address->text(), webAppUrl);
-    QVERIFY(!backButton->isEnabled());
+    QVERIFY(backButton->isEnabled());
     QVERIFY(forwardButton->isEnabled());
     QCOMPARE(invalidInputUrlSpy.count(), 0);
 
     QVERIFY(window.navigate(webAppUrl));
     QCOMPARE(window.activeSurface(), HostSurfaceKind::Web);
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 0);
-    QVERIFY(!backButton->isEnabled());
+    QCOMPARE(window.historyCount(), 4);
+    QCOMPARE(window.historyIndex(), 1);
+    QVERIFY(backButton->isEnabled());
     QVERIFY(forwardButton->isEnabled());
 
     bool forwardReceiverRan = false;
@@ -1369,8 +1519,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
             forwardReceiverRan = true;
             forwardReceiverSawCommittedState =
                 window.currentAppUrl() == unavailableWorkerAppUrl
-                && window.historyCount() == 3
-                && window.historyIndex() == 1
+                && window.historyCount() == 4
+                && window.historyIndex() == 2
                 && window.activeSurface() == HostSurfaceKind::TrustedError;
             reentrantForwardResult = window.goForward();
         },
@@ -1381,8 +1531,8 @@ void UnifiedNavigationTest::navigationTransactionsRejectReentrantCommands()
     QVERIFY(forwardReceiverSawCommittedState);
     QVERIFY(!reentrantForwardResult);
     QCOMPARE(window.currentAppUrl(), unavailableWorkerAppUrl);
-    QCOMPARE(window.historyCount(), 3);
-    QCOMPARE(window.historyIndex(), 1);
+    QCOMPARE(window.historyCount(), 4);
+    QCOMPARE(window.historyIndex(), 2);
     QCOMPARE(window.activeSurface(), HostSurfaceKind::TrustedError);
     disconnect(forwardConnection);
 }

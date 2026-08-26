@@ -22,9 +22,11 @@ void WebFallbackE2eTest::productionHostSwitchesQmlWebQml()
     QVERIFY(window->navigate(QStringLiteral("app://pilot/dashboard")));
     QCOMPARE(window->activeSurface(), HostSurfaceKind::Worker);
 
-    QSignalSpy loaded(window->webSurface(), &WebSurface::navigationFinished);
     QVERIFY(window->navigate(QStringLiteral("app://pilot/web/help")));
     QCOMPARE(window->activeSurface(), HostSurfaceKind::Web);
+    WebSurface *webSurface = window->webSurface();
+    QVERIFY(webSurface != nullptr);
+    QSignalSpy loaded(webSurface, &WebSurface::navigationFinished);
     QTRY_VERIFY_WITH_TIMEOUT(!loaded.isEmpty(), 15'000);
     const QList<QVariant> completion = loaded.takeLast();
     QCOMPARE(completion.at(0).toUrl(), QUrl(environment.mockOrigin() + QStringLiteral("/help")));

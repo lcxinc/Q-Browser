@@ -1225,8 +1225,11 @@ void WebSessionProfileTest::mainWindowShutdownCanBeRetriedAfterForeignSurfaceRet
     const QUrl entry = server.url(QStringLiteral("/help"));
     MainWindow window(webRoutes(entry), server.origin());
     QVERIFY(window.isRunning());
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/first")));
+    QVERIFY(window.webSurface() != nullptr);
     WebSessionProfile *const session = window.webSessionProfile();
     QVERIFY(session != nullptr);
+    QCOMPARE(session->registeredPageCount(), 1);
     auto extraSurface = std::make_unique<WebSurface>(
         *session, server.url(QStringLiteral("/extra")));
     QVERIFY(extraSurface->isConfigurationValid());
@@ -1254,9 +1257,11 @@ void WebSessionProfileTest::reentrantZeroCountShutdownRetiresThePageBeforeThePro
     QVERIFY(server.listen());
     MainWindow window(webRoutes(server.url(QStringLiteral("/help"))),
                       server.origin());
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/first")));
     WebSessionProfile *const session = window.webSessionProfile();
     QVERIFY(session != nullptr);
     QVERIFY(window.webSurface() != nullptr);
+    QCOMPARE(session->registeredPageCount(), 1);
     QPointer<QWebEnginePage> page(window.webSurface()->page());
     QPointer<QWebEngineProfile> profile(session->profile());
     QVERIFY(!page.isNull());

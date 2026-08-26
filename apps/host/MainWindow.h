@@ -1,27 +1,24 @@
 #pragma once
 
+#include "BrowserTabModel.h"
+#include "BrowserCommand.h"
 #include "RouteRegistry.h"
+#include "TabController.h"
 
+#include <QHash>
 #include <QMainWindow>
 #include <QUrl>
+#include <QVariantMap>
 
 #include <memory>
+#include <optional>
 
-class QLabel;
+class BrowserChrome;
 class NavigationBar;
 class QStackedWidget;
 class WebSessionProfile;
 class WebSurface;
 class WorkerSurface;
-
-enum class HostSurfaceKind
-{
-    Worker,
-    Web,
-    TrustedError,
-};
-
-Q_DECLARE_METATYPE(HostSurfaceKind)
 
 class MainWindow final : public QMainWindow
 {
@@ -53,6 +50,9 @@ public:
     [[nodiscard]] int historyIndex() const noexcept;
     [[nodiscard]] QString trustedErrorText() const;
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
+    [[nodiscard]] BrowserChrome *browserChrome() const noexcept;
+    [[nodiscard]] BrowserTabModel *tabModel() const noexcept;
+    [[nodiscard]] TabController *tabController(const QString &tabId) const noexcept;
     [[nodiscard]] QStackedWidget *surfaceStack() const noexcept;
     [[nodiscard]] WebSessionProfile *webSessionProfile() const noexcept;
     [[nodiscard]] WebSurface *webSurface() const noexcept;
@@ -64,6 +64,7 @@ signals:
                               const QString &entryPoint,
                               const QVariantMap &parameters,
                               const QUrl &appUrl);
+    void legacyWorkerRetirementRequested(const QString &tabId);
 
 private:
     enum class LifecycleState
@@ -73,27 +74,60 @@ private:
         Complete,
     };
 
-    [[nodiscard]] bool activate(const QString &canonicalUrl);
-    void showTrustedError(const QString &message);
-    void setCurrentAppUrl(const QString &url);
-    void updateNavigationState();
+    struct ResolvedNavigation final
+    {
+        QString canonicalAddress;
+        BrowserTabKind kind = BrowserTabKind::Host;
+        Engine engine = Engine::Invalid;
+        QString packageId;
+        QString entryPoint;
+        QVariantMap parameters;
+        QUrl physicalEntry;
+    };
 
-    static constexpr int maximumHistoryEntries = 256;
+    [[nodiscard]] std::optional<ResolvedNavigation> resolveAddress(
+        QStringView input,
+        QString *plainError = nullptr) const;
+    [[nodiscard]] bool navigateTab(const QString &stableTabId,
+                                   QStringView input);
+    [[nodiscard]] bool traverseHistory(const QString &stableTabId,
+                                       bool forward);
+    [[nodiscard]] bool startResolved(const QString &stableTabId,
+                                     const ResolvedNavigation &resolved,
+                                     quint64 navigationIncarnation,
+                                     bool reloadExisting = false);
+    [[nodiscard]] bool startCurrentDescriptor(const QString &stableTabId,
+                                              bool reloadExisting = false);
+    void showTrustedError(const QString &stableTabId,
+                          const QString &message,
+                          bool retireWebSurface = false);
+    void publishCommittedTabChange(const QString &stableTabId);
+    void emitPersistenceAfterTransition();
+
+    void createController(const QString &stableTabId);
+    void removeController(const QString &stableTabId);
+    void activateStableTab(const QString &stableTabId);
+    void closeStableTab(const QString &stableTabId);
+    void moveStableTab(const QString &stableTabId, int destinationIndex);
+    void handleCommand(BrowserCommand command);
+    void synchronizeChrome();
+
+    [[nodiscard]] QString activeStableId() const;
+    [[nodiscard]] BrowserTabSnapshot activeSnapshot() const;
+    [[nodiscard]] bool tabMutationInProgress() const noexcept;
+    [[nodiscard]] static int numberedTabIndex(BrowserCommand command) noexcept;
 
     RouteRegistry routes_;
+    QUrl mockOrigin_;
     std::unique_ptr<WebSessionProfile> webSessionProfile_;
-    NavigationBar *navigationBar_ = nullptr;
+    std::unique_ptr<BrowserTabModel> tabModel_;
+    BrowserChrome *browserChrome_ = nullptr;
     QStackedWidget *surfaceStack_ = nullptr;
-    WorkerSurface *workerSurface_ = nullptr;
-    WebSurface *webSurface_ = nullptr;
-    QWidget *trustedErrorSurface_ = nullptr;
-    QLabel *trustedErrorLabel_ = nullptr;
-    QStringList history_;
-    int historyIndex_ = -1;
-    QString currentAppUrl_;
-    HostSurfaceKind activeSurface_ = HostSurfaceKind::TrustedError;
+    QHash<QString, TabController *> controllers_;
+    QString visibleTabId_;
+    QString legacyWorkerOwnerId_;
     bool navigationInProgress_ = false;
+    int resourceMutationDepth_ = 0;
     bool shutdownInProgress_ = false;
     LifecycleState lifecycleState_ = LifecycleState::Running;
-    QString activeWorkerPackageId_;
 };

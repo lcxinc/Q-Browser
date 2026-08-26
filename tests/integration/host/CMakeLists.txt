@@ -33,3 +33,20 @@ q_browser_enable_strict_warnings(tst_unified_navigation)
 q_browser_add_qt_test(
   NAME unified_navigation
   TARGET tst_unified_navigation)
+
+add_executable(tst_browser_shell
+  tst_browser_shell.cpp)
+
+target_link_libraries(tst_browser_shell
+  PRIVATE
+    q_browser_host
+    Qt6::Network
+    Qt6::Test
+    Qt6::WebEngineCore
+    Qt6::WebEngineWidgets
+    Qt6::Widgets)
+
+q_browser_enable_strict_warnings(tst_browser_shell)
+q_browser_add_qt_test(
+  NAME browser_shell
+  TARGET tst_browser_shell)

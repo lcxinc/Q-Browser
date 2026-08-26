@@ -27,6 +27,8 @@ add_library(q_browser_host STATIC
   InstalledPackageWorkerLauncherTestHooks.h
   RuntimePackageAuthority.cpp
   RuntimePackageAuthority.h
+  TabController.cpp
+  TabController.h
   WorkerRetirementManager.cpp
   WorkerRetirementManager.h
   HostWorkerSessionController.cpp

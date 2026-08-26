@@ -455,6 +455,11 @@ bool HostApplication::start()
     window->show();
     recordHostDiagnosticPhase("start-main-window-shown");
     mainWindow_ = std::move(window);
+    connect(mainWindow_.get(), &MainWindow::legacyWorkerRetirementRequested,
+            this, [this](const QString &) {
+                detachWorkerContext(
+                    QStringLiteral("host.worker_context.tab_retired"));
+            }, Qt::DirectConnection);
     workerSessionController_ = std::make_unique<HostWorkerSessionController>(
         mainWindow_.get());
     recordHostDiagnosticPhase("start-session-controller-ready");

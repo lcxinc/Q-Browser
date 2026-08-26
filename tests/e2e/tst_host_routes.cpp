@@ -51,7 +51,8 @@ void HostRoutesE2eTest::productionHostNavigatesTenPilotRoutes()
             QCOMPARE(controller->state(), HostWorkerSessionState::Running);
         }
     }
-    QCOMPARE(window->historyCount(), routes.size());
+    QCOMPARE(window->historyCount(), routes.size() + 1);
+    QCOMPARE(window->historyIndex(), routes.size());
     QVERIFY(environment.host()->hasWorkerContext());
     QVERIFY2(environment.shutdown(), qPrintable(environment.error()));
 }
