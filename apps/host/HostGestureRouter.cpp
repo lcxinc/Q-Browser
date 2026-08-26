@@ -523,6 +523,7 @@ bool HostGestureRouter::routeKeyboard(
     const int key = static_cast<int>(observedKey);
     if (!keyDown && state_->suppressedKeys.remove(key)) return true;
     if (!keyDown) return false;
+    if (state_->suppressedKeys.contains(key)) return true;
     if (observedKey == Qt::Key_Shift || observedKey == Qt::Key_Control
         || observedKey == Qt::Key_Alt || observedKey == Qt::Key_Meta) {
         return false;
@@ -535,9 +536,7 @@ bool HostGestureRouter::routeKeyboard(
     const std::optional<BrowserCommand> command =
         browserCommandForKeyCombination(combination);
     if (command.has_value() && trustedFocus) {
-        const bool firstKeyDown = !state_->suppressedKeys.contains(key);
         state_->suppressedKeys.insert(key);
-        if (!firstKeyDown) return true;
         if (binding->token == nullptr) {
             (void)clearEvidence(binding);
             return true;
@@ -551,14 +550,41 @@ bool HostGestureRouter::routeKeyboard(
             return true;
         }
         const BrowserCommand queuedCommand = *command;
-        if (!guard->publishIfStillAdmitted([this, queuedCommand] {
-                return QMetaObject::invokeMethod(
-                    this,
-                    [this, queuedCommand] {
-                        emit browserCommandRequested(queuedCommand);
-                    },
-                    Qt::QueuedConnection);
-            })) {
+        const TabCapabilityAuthority queuedAuthority = binding->authority;
+        if (!guard->publishIfStillAdmitted(
+                [this, binding, queuedAuthority, queuedCommand] {
+                    return QMetaObject::invokeMethod(
+                        this,
+                        [this, binding, queuedAuthority, queuedCommand] {
+                            if (binding->token == nullptr) {
+                                (void)clearEvidence(binding);
+                                return;
+                            }
+                            auto queuedGuard = binding->token->tryAcquireUse();
+                            if (!queuedGuard.has_value()) {
+                                (void)clearEvidence(binding);
+                                return;
+                            }
+                            const bool emitted =
+                                queuedGuard->publishIfStillAdmitted(
+                                    [this, binding, queuedAuthority,
+                                     queuedCommand] {
+                                        if (state_->activeBinding != binding
+                                            || binding->authority
+                                                != queuedAuthority
+                                            || !validSystemEvidence(
+                                                systemEvidence(queuedAuthority),
+                                                queuedAuthority)) {
+                                            return false;
+                                        }
+                                        emit browserCommandRequested(
+                                            queuedCommand);
+                                        return true;
+                                    });
+                            if (!emitted) (void)clearEvidence(binding);
+                        },
+                        Qt::QueuedConnection);
+                })) {
             (void)clearEvidence(binding);
         }
         return true;

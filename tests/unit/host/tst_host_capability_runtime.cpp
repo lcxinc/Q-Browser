@@ -100,6 +100,9 @@ private slots:
     void mainWindowDeactivationRevokesGestureEvidence();
     void backgroundFocusAndDispatchStateCannotAuthorize();
     void browserCommandIsSuppressedAndNeverBecomesGesture();
+    void staleQueuedBrowserCommandIsDropped_data();
+    void staleQueuedBrowserCommandIsDropped();
+    void heldBrowserChordRemainsSuppressedAcrossBindingSwitch();
     void revocationClosesUseAndPublicationUntilGuardDrains();
     void retiringRuntimeLeavesSiblingGestureStorageAndCompletionActive();
     void repeatedRetireClaimsWorkerExactlyOnce();
@@ -514,6 +517,103 @@ void HostCapabilityRuntimeTest::browserCommandIsSuppressedAndNeverBecomesGesture
     QCoreApplication::processEvents();
     QCOMPARE(commands.count(), 0);
     QVERIFY(!router->activateBinding(binding));
+}
+
+void HostCapabilityRuntimeTest::staleQueuedBrowserCommandIsDropped_data()
+{
+    QTest::addColumn<bool>("retireOriginal");
+    QTest::newRow("switch") << false;
+    QTest::newRow("retire-and-switch") << true;
+}
+
+void HostCapabilityRuntimeTest::staleQueuedBrowserCommandIsDropped()
+{
+    QFETCH(bool, retireOriginal);
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority first = authority(
+        QStringLiteral("tab-a"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority second = authority(
+        QStringLiteral("tab-b"), 2, 42, 402, 9, 12);
+    auto firstToken = std::make_shared<AuthorityAdmissionToken>();
+    auto secondToken = std::make_shared<AuthorityAdmissionToken>();
+    auto firstStore = std::make_shared<UserGestureGrantStore>();
+    auto secondStore = std::make_shared<UserGestureGrantStore>();
+    auto firstSession = firstStore->openSession(first.appIdentity);
+    auto secondSession = secondStore->openSession(second.appIdentity);
+    QVERIFY(firstSession.has_value());
+    QVERIFY(secondSession.has_value());
+    QVERIFY(router->registerBinding(
+        first, firstToken, firstStore, std::move(*firstSession)));
+    QVERIFY(router->registerBinding(
+        second, secondToken, secondStore, std::move(*secondSession)));
+    QVERIFY(router->activateBinding(first));
+    router->setSystemEvidenceForTesting(validEvidence(first, 1'000));
+    QSignalSpy commands(router.get(),
+                        &HostGestureRouter::browserCommandRequested);
+    QVERIFY(commands.isValid());
+    const QKeyCombination ctrlTab(Qt::ControlModifier, Qt::Key_Tab);
+
+    QVERIFY(router->routeKeyboardForTesting(ctrlTab, true, 900));
+    QCOMPARE(commands.count(), 0);
+    if (retireOriginal) router->unregisterBinding(first);
+    QVERIFY(router->activateBinding(second));
+    router->setSystemEvidenceForTesting(validEvidence(second, 1'100));
+    QCoreApplication::sendPostedEvents(router.get(), QEvent::MetaCall);
+
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(router->routeKeyboardForTesting(ctrlTab, false, 1'101));
+}
+
+void HostCapabilityRuntimeTest::heldBrowserChordRemainsSuppressedAcrossBindingSwitch()
+{
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority first = authority(
+        QStringLiteral("tab-a"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority second = authority(
+        QStringLiteral("tab-b"), 2, 42, 402, 9, 12);
+    auto firstToken = std::make_shared<AuthorityAdmissionToken>();
+    auto secondToken = std::make_shared<AuthorityAdmissionToken>();
+    auto firstStore = std::make_shared<UserGestureGrantStore>();
+    auto secondStore = std::make_shared<UserGestureGrantStore>();
+    auto firstSession = firstStore->openSession(first.appIdentity);
+    auto secondSession = secondStore->openSession(second.appIdentity);
+    QVERIFY(firstSession.has_value());
+    QVERIFY(secondSession.has_value());
+    QVERIFY(router->registerBinding(
+        first, firstToken, firstStore, std::move(*firstSession)));
+    QVERIFY(router->registerBinding(
+        second, secondToken, secondStore, std::move(*secondSession)));
+    QVERIFY(router->activateBinding(first));
+    router->setSystemEvidenceForTesting(validEvidence(first, 1'000));
+    QSignalSpy commands(router.get(),
+                        &HostGestureRouter::browserCommandRequested);
+    QVERIFY(commands.isValid());
+
+    QVERIFY(!router->routeKeyboardForTesting(
+        QKeyCombination(Qt::ControlModifier, Qt::Key_Control), true, 890));
+    QVERIFY(router->routeKeyboardForTesting(
+        QKeyCombination(Qt::ControlModifier, Qt::Key_Tab), true, 900));
+    QVERIFY(router->activateBinding(second));
+    router->setSystemEvidenceForTesting(validEvidence(second, 1'100));
+    QVERIFY(!router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_Control), false, 1'040));
+
+    QVERIFY(router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_Tab), true, 1'050));
+    QVERIFY(!router->issueGrant(
+        second, QStringLiteral("held-tab-repeat"), 250).has_value());
+    QVERIFY(router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_Tab), false, 1'051));
+    QCoreApplication::sendPostedEvents(router.get(), QEvent::MetaCall);
+    QCOMPARE(commands.count(), 0);
+
+    router->setSystemEvidenceForTesting(validEvidence(second, 1'200));
+    QVERIFY(!router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_Tab), true, 1'150));
+    QVERIFY(router->issueGrant(
+        second, QStringLiteral("new-tab-keydown"), 250).has_value());
 }
 
 void HostCapabilityRuntimeTest::revocationClosesUseAndPublicationUntilGuardDrains()
