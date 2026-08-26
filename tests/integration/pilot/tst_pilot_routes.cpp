@@ -178,8 +178,32 @@ void PilotRoutesTest::realWorkerLoadsPilotAndEmitsTypedCapability()
              SessionStatus::MessageReady);
     QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
              SessionStatus::MessageReady);
+    const SessionReceiveResult initialMetadata = receiveUntil(
+        launch->hostSession, ProtocolType::PageMetadata, 5000);
+    QCOMPARE(initialMetadata.status, SessionStatus::MessageReady);
+    QVERIFY(initialMetadata.message.has_value());
+    QCOMPARE(initialMetadata.message->type(), ProtocolType::PageMetadata);
+    QVERIFY(initialMetadata.message->requestId().isEmpty());
+    const QJsonObject initialMetadataPayload = initialMetadata.message->payload();
+    QCOMPARE(initialMetadataPayload.keys(),
+             QStringList{QStringLiteral("title")});
+    QCOMPARE(initialMetadataPayload.value(QStringLiteral("title")).toString(),
+             QStringLiteral("Page not found"));
+
     QVERIFY(launch->hostSession.sendRouteLoad(QStringLiteral("route-dashboard"),
                                               QStringLiteral("/dashboard"), 5000));
+    const SessionReceiveResult dashboardMetadata = receiveUntil(
+        launch->hostSession, ProtocolType::PageMetadata, 5000);
+    QCOMPARE(dashboardMetadata.status, SessionStatus::MessageReady);
+    QVERIFY(dashboardMetadata.message.has_value());
+    QCOMPARE(dashboardMetadata.message->type(), ProtocolType::PageMetadata);
+    QVERIFY(dashboardMetadata.message->requestId().isEmpty());
+    const QJsonObject dashboardMetadataPayload = dashboardMetadata.message->payload();
+    QCOMPARE(dashboardMetadataPayload.keys(),
+             QStringList{QStringLiteral("title")});
+    QCOMPARE(dashboardMetadataPayload.value(QStringLiteral("title")).toString(),
+             QStringLiteral("Dashboard"));
+
     const SessionReceiveResult request = receiveUntil(launch->hostSession,
                                                        ProtocolType::Request, 10000);
     QCOMPARE(request.status, SessionStatus::MessageReady);
