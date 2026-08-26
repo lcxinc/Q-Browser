@@ -5,6 +5,7 @@
 #include "IpcSession.h"
 #include "MainWindow.h"
 
+#include <QCoreApplication>
 #include <QJsonObject>
 #include <QThread>
 
@@ -121,6 +122,13 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
 bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> session)
 {
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
+    QCoreApplication *const navigationDispatchContext =
+        QCoreApplication::instance();
+    if (navigationDispatchContext == nullptr
+        || navigationDispatchContext->thread() != thread()) {
+        lastErrorCode_ = QStringLiteral("host.worker_session.invalid_dispatch_context");
+        return false;
+    }
     session->setPageMetadataHandler({});
     ++generation_;
     const quint64 attachedGeneration = generation_;
@@ -151,8 +159,19 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
                 handleIoThreadFinished(attachedIo, attachedThread,
                                        attachedGeneration);
             }, Qt::QueuedConnection);
-    connect(io_.data(), &HostWorkerSessionIo::navigationRequested, this,
-            &HostWorkerSessionController::handleNavigationRequest, Qt::QueuedConnection);
+    const QPointer<HostWorkerSessionController> navigationController(this);
+    connect(io_.data(), &HostWorkerSessionIo::navigationRequested,
+            navigationDispatchContext,
+            [navigationController](const quint64 generation,
+                                   const QString &requestId,
+                                   const QString &route) {
+                HostWorkerSessionController *const controller =
+                    navigationController.data();
+                if (controller != nullptr) {
+                    controller->handleNavigationRequest(generation, requestId, route);
+                }
+            },
+            Qt::QueuedConnection);
     connect(io_.data(), &HostWorkerSessionIo::pageMetadataReceived, this,
             &HostWorkerSessionController::handlePageMetadata,
             Qt::QueuedConnection);

@@ -17,6 +17,7 @@
 
 #include <QApplication>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -314,12 +315,37 @@ quint64 sessionGeneration(const Controller &controller)
     }
 }
 
+class ControllerMetaCallProbe;
+
 struct DestroyingNavigationCallbackState final {
     std::unique_ptr<HostWorkerSessionController> *owner = nullptr;
+    const ControllerMetaCallProbe *controllerMetaCallProbe = nullptr;
     int nextTargetId = 0;
     int executingTargetId = 0;
     int invocationCount = 0;
     bool executingTargetDestroyed = false;
+    bool invokedFromControllerMetaCallDelivery = false;
+    bool ownerDestroyedByCallback = false;
+};
+
+class ControllerMetaCallProbe final : public QObject
+{
+public:
+    void arm() noexcept { armed_ = true; }
+
+    bool hasObservedDelivery() const noexcept { return deliveryCount_ != 0; }
+    int deliveryCount() const noexcept { return deliveryCount_; }
+
+protected:
+    bool eventFilter(QObject *, QEvent *event) override
+    {
+        if (armed_ && event->type() == QEvent::MetaCall) ++deliveryCount_;
+        return false;
+    }
+
+private:
+    bool armed_ = false;
+    int deliveryCount_ = 0;
 };
 
 class DestroyingNavigationCallback final
@@ -355,10 +381,16 @@ public:
         const int executingTargetId = targetId_;
         state->executingTargetId = executingTargetId;
         ++state->invocationCount;
+        state->invokedFromControllerMetaCallDelivery =
+            state->controllerMetaCallProbe != nullptr
+            && state->controllerMetaCallProbe->hasObservedDelivery();
         if (state->owner != nullptr && *state->owner != nullptr) {
             (void)(*state->owner)->shutdown(
                 QStringLiteral("navigation.callback.destroy"));
-            state->owner->reset();
+            if (!state->invokedFromControllerMetaCallDelivery) {
+                state->owner->reset();
+                state->ownerDestroyedByCallback = true;
+            }
         }
         state->executingTargetId = 0;
         return true;
@@ -932,11 +964,14 @@ void UnifiedNavigationTest::navigationCallbackMayDestroyOwningController()
     QVERIFY(server.listen());
     MainWindow legacyWindow(routes(server.helpUrl()), server.origin());
     const QString appId = QStringLiteral("com.qbrowser.pilot");
+    ControllerMetaCallProbe controllerMetaCallProbe;
     auto callbackState = std::make_shared<DestroyingNavigationCallbackState>();
+    callbackState->controllerMetaCallProbe = &controllerMetaCallProbe;
     std::unique_ptr<HostWorkerSessionController> owningController;
     callbackState->owner = &owningController;
     owningController = makeSessionController<HostWorkerSessionController>(
         &legacyWindow, DestroyingNavigationCallback(callbackState));
+    owningController->installEventFilter(&controllerMetaCallProbe);
     QPointer<HostWorkerSessionController> owningGuard(owningController.get());
     auto siblingController = makeSessionController<HostWorkerSessionController>(
         &legacyWindow, [](const QString &, const QString &) { return false; });
@@ -949,16 +984,16 @@ void UnifiedNavigationTest::navigationCallbackMayDestroyOwningController()
     QSignalSpy siblingHeartbeats(siblingController.get(),
                                  &HostWorkerSessionController::heartbeatObserved);
     QVERIFY(siblingHeartbeats.isValid());
-    const quint64 owningGeneration = owningController->generation();
+    QCoreApplication::sendPostedEvents(owningController.get(), QEvent::MetaCall);
+    controllerMetaCallProbe.arm();
 
-    const bool invoked = QMetaObject::invokeMethod(
-        owningController.get(), "handleNavigationRequest", Qt::DirectConnection,
-        Q_ARG(quint64, owningGeneration),
-        Q_ARG(QString, QStringLiteral("destroying-navigation")),
-        Q_ARG(QString, QStringLiteral("/orders")));
-
-    QVERIFY(invoked);
-    QCOMPARE(callbackState->invocationCount, 1);
+    QVERIFY(owningSession->worker->sendNavigationRequest(
+        QStringLiteral("destroying-navigation"), QStringLiteral("/orders"), 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(callbackState->invocationCount, 1, 3000);
+    if (callbackState->invokedFromControllerMetaCallDelivery
+        && owningController != nullptr) {
+        owningController.reset();
+    }
     QVERIFY(owningGuard.isNull());
     QVERIFY(owningController == nullptr);
     QVERIFY2(!callbackState->executingTargetDestroyed,
@@ -991,6 +1026,12 @@ void UnifiedNavigationTest::navigationCallbackMayDestroyOwningController()
              siblingController->generation());
     siblingSession->worker->close();
     QTRY_VERIFY_WITH_TIMEOUT(!siblingController->hasIoThread(), 6000);
+    QVERIFY2(!callbackState->invokedFromControllerMetaCallDelivery,
+             "NavigationCallback ran while its owning controller was the "
+             "QMetaCallEvent receiver");
+    QVERIFY2(callbackState->ownerDestroyedByCallback,
+             "NavigationCallback did not synchronously destroy its owner");
+    QCOMPARE(controllerMetaCallProbe.deliveryCount(), 0);
 }
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()
