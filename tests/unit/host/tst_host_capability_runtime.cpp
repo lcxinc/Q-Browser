@@ -1,12 +1,15 @@
 #include "AuthorityAdmissionToken.h"
 #include "BrowserCommand.h"
+#include "HostApplication.h"
 #include "HostCapabilityRuntime.h"
 #include "HostGestureRouter.h"
+#include "MainWindow.h"
 #include "TabCapabilityAuthority.h"
 #include "WorkerRetirementManager.h"
 
 #include <QClipboard>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QGuiApplication>
 #include <QHostAddress>
 #include <QJsonObject>
@@ -94,6 +97,7 @@ private slots:
     void clipboardRuntimesCanCoexist();
     void onlyActiveAuthorityCanIssueAndConsumeGesture();
     void authorityTransitionsRevokeUnconsumedEvidence();
+    void mainWindowDeactivationRevokesGestureEvidence();
     void backgroundFocusAndDispatchStateCannotAuthorize();
     void browserCommandIsSuppressedAndNeverBecomesGesture();
     void revocationClosesUseAndPublicationUntilGuardDrains();
@@ -363,6 +367,47 @@ void HostCapabilityRuntimeTest::authorityTransitionsRevokeUnconsumedEvidence()
     }
 }
 
+void HostCapabilityRuntimeTest::mainWindowDeactivationRevokesGestureEvidence()
+{
+    HostApplication host(QUrl(QStringLiteral("http://127.0.0.1:8080/")));
+    QVERIFY(host.start());
+    QVERIFY(host.mainWindow() != nullptr);
+    HostGestureRouter *const router = host.gestureRouterForTesting();
+    QVERIFY(router != nullptr);
+
+    const TabCapabilityAuthority binding = authority(
+        host.mainWindow()->tabModel()->activeId(), 1, 41, 401, 7, 11);
+    auto token = std::make_shared<AuthorityAdmissionToken>();
+    auto store = std::make_shared<UserGestureGrantStore>();
+    auto session = store->openSession(binding.appIdentity);
+    QVERIFY(session.has_value());
+    QVERIFY(router->registerBinding(
+        binding, token, store, std::move(*session)));
+    QVERIFY(router->activateBinding(binding));
+    router->setSystemEvidenceForTesting(validEvidence(binding, 1'000));
+    QVERIFY(!router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_A), true, 900));
+    auto grant = router->issueGrant(
+        binding, QStringLiteral("before-window-deactivate"), 5'000);
+    QVERIFY(grant.has_value());
+
+    QEvent deactivate(QEvent::WindowDeactivate);
+    QVERIFY(QCoreApplication::sendEvent(host.mainWindow(), &deactivate));
+    QVERIFY(!store->consume(*grant, binding.appIdentity,
+                            QStringLiteral("before-window-deactivate")));
+
+    QVERIFY(router->activateBinding(binding));
+    router->setSystemEvidenceForTesting(validEvidence(binding, 1'100));
+    QVERIFY(!router->routeKeyboardForTesting(
+        QKeyCombination(Qt::NoModifier, Qt::Key_B), true, 1'050));
+    QEvent activate(QEvent::WindowActivate);
+    QVERIFY(QCoreApplication::sendEvent(host.mainWindow(), &activate));
+    QVERIFY(!store->consume(*grant, binding.appIdentity,
+                            QStringLiteral("before-window-deactivate")));
+    QVERIFY(!router->issueGrant(
+        binding, QStringLiteral("after-window-activate"), 250).has_value());
+}
+
 void HostCapabilityRuntimeTest::backgroundFocusAndDispatchStateCannotAuthorize()
 {
     auto router = HostGestureRouter::createForTesting(100);
@@ -503,6 +548,13 @@ void HostCapabilityRuntimeTest::revocationClosesUseAndPublicationUntilGuardDrain
             std::chrono::milliseconds(20)));
     });
     QVERIFY(!timed.get());
+    QVERIFY(!ticket.isDrained());
+    bool publicationAfterDeadlineRan = false;
+    QVERIFY(!guard->publishIfStillAdmitted([&publicationAfterDeadlineRan] {
+        publicationAfterDeadlineRan = true;
+        return true;
+    }));
+    QVERIFY(!publicationAfterDeadlineRan);
     auto drained = std::async(std::launch::async, [ticket] {
         ticket.waitUntilDrained();
         return ticket.isDrained();

@@ -16,6 +16,29 @@
 #include <memory>
 #include <utility>
 
+#ifndef Q_BROWSER_HOST_TESTING
+template <typename Runtime>
+concept ExposesAuthoritylessFactory = requires(
+    const QString &appIdentity,
+    const ManifestPermissions &permissions,
+    const QUrl &mockOrigin,
+    const QString &storageDirectory,
+    QString *errorCode) {
+    Runtime::create(appIdentity, permissions, mockOrigin, storageDirectory,
+                    quintptr{}, quintptr{}, quint32{}, errorCode);
+};
+
+template <typename Runtime>
+concept ExposesAuthoritylessCompletion = requires {
+    &Runtime::completed;
+};
+
+static_assert(!ExposesAuthoritylessFactory<HostCapabilityRuntime>,
+              "production must not expose an authorityless factory");
+static_assert(!ExposesAuthoritylessCompletion<HostCapabilityRuntime>,
+              "production must not expose an authorityless completion signal");
+#endif
+
 namespace {
 constexpr quint32 maximumGestureAgeMs = 1'000;
 constexpr int issuedGestureLifetimeMs = 250;
@@ -121,12 +144,17 @@ HostCapabilityRuntime::HostCapabilityRuntime(
     TabCapabilityAuthority authority,
     std::shared_ptr<AuthorityAdmissionToken> admissionToken,
     HostGestureRouter *gestureRouter,
+#ifdef Q_BROWSER_HOST_TESTING
     const bool authorityEnforced,
+#endif
     EffectivePolicy policy,
     const quintptr hostWindowId)
     : authority_(std::move(authority)),
       admissionToken_(std::move(admissionToken)),
-      gestureRouter_(gestureRouter), authorityEnforced_(authorityEnforced),
+      gestureRouter_(gestureRouter),
+#ifdef Q_BROWSER_HOST_TESTING
+      authorityEnforced_(authorityEnforced),
+#endif
       policy_(std::move(policy)), hostWindowId_(hostWindowId)
 {
 }
@@ -137,6 +165,7 @@ HostCapabilityRuntime::~HostCapabilityRuntime()
     delete std::exchange(workerThread_, nullptr);
 }
 
+#ifdef Q_BROWSER_HOST_TESTING
 std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
     const QString &appIdentity,
     const ManifestPermissions &permissions,
@@ -169,6 +198,7 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
     if (errorCode != nullptr) errorCode->clear();
     return runtime;
 }
+#endif
 
 std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
     const TabCapabilityAuthority &authority,
@@ -192,7 +222,10 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
         permissions, hostPolicyFor(mockOrigin));
     auto runtime = std::shared_ptr<HostCapabilityRuntime>(
         new HostCapabilityRuntime(
-            authority, std::move(admissionToken), gestureRouter, true,
+            authority, std::move(admissionToken), gestureRouter,
+#ifdef Q_BROWSER_HOST_TESTING
+            true,
+#endif
             std::move(effective), hostWindowId));
     if (!runtime->initialize(storageDirectory, errorCode)) return nullptr;
     if (errorCode != nullptr) errorCode->clear();
@@ -262,7 +295,9 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
     clipboardBackend_ = std::make_unique<QtClipboardBackend>();
     fileBackend_ = std::make_unique<QtFileDialogBackend>();
     gestureGrants_ = std::make_shared<UserGestureGrantStore>();
+#ifdef Q_BROWSER_HOST_TESTING
     if (authorityEnforced_) {
+#endif
         auto gestureSession = gestureGrants_->openSession(authority_.appIdentity);
         QString gestureError;
         if (!gestureSession.has_value()
@@ -281,7 +316,9 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
             return false;
         }
         gestureBindingRegistered_ = true;
+#ifdef Q_BROWSER_HOST_TESTING
     }
+#endif
     if (policy_.clipboard.has_value()) {
         clipboard_ = std::make_unique<ClipboardBroker>(
             *policy_.clipboard, *clipboardBackend_, *gestureGrants_);
@@ -320,8 +357,13 @@ void HostCapabilityRuntime::dispatch(const quint64 generation,
         weak_from_this().lock();
     if (lifetime == nullptr) return;
     if (!accepting_ || admissionToken_ == nullptr
+#ifdef Q_BROWSER_HOST_TESTING
         || (authorityEnforced_
-            && generation != authority_.sessionGeneration)) {
+            && generation != authority_.sessionGeneration)
+#else
+        || generation != authority_.sessionGeneration
+#endif
+        ) {
         return;
     }
     auto acquired = admissionToken_->tryAcquireUse();
@@ -352,7 +394,11 @@ void HostCapabilityRuntime::dispatch(const quint64 generation,
     std::optional<UserGestureGrant> grant;
     if (capability == QStringLiteral("clipboard")
         && operation == QStringLiteral("read")
-        && authorityEnforced_ && gestureRouter_ != nullptr) {
+        && gestureRouter_ != nullptr
+#ifdef Q_BROWSER_HOST_TESTING
+        && authorityEnforced_
+#endif
+        ) {
         grant = gestureRouter_->issueGrant(
             authority_, requestId, issuedGestureLifetimeMs);
     }
@@ -380,7 +426,9 @@ bool HostCapabilityRuntime::queueCompletion(
                     if (!accepting_ || immutableAuthority != authority_) return;
                     emit authorityCompleted(immutableAuthority, generation,
                                             requestId, result);
+#ifdef Q_BROWSER_HOST_TESTING
                     emit completed(generation, requestId, result);
+#endif
                 },
                 Qt::QueuedConnection);
         });

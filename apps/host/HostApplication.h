@@ -21,6 +21,7 @@ class HostCapabilityRuntime;
 class HostGestureRouter;
 class WorkerSurface;
 class UpdateLifecycleCoordinator;
+class QEvent;
 class QTimer;
 class QThread;
 
@@ -58,6 +59,7 @@ public:
 #ifdef Q_BROWSER_HOST_TESTING
     void forceLifecycleQueueFullForTesting(bool full) noexcept;
     [[nodiscard]] bool retryWorkerCleanupForTesting();
+    [[nodiscard]] HostGestureRouter *gestureRouterForTesting() const noexcept;
 #endif
 
 signals:
@@ -74,6 +76,7 @@ signals:
                                          const QVariantMap &payload);
 
 private:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     [[nodiscard]] bool requestPackageInstall(
         const QString &packagePath,
         std::shared_ptr<const HostOwnedFileAuthority> sourceAuthority);

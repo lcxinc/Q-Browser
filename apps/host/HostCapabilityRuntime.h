@@ -53,6 +53,7 @@ public:
     HostCapabilityRuntime(const HostCapabilityRuntime &) = delete;
     HostCapabilityRuntime &operator=(const HostCapabilityRuntime &) = delete;
 
+#ifdef Q_BROWSER_HOST_TESTING
     [[nodiscard]] static std::shared_ptr<HostCapabilityRuntime> create(
         const QString &appIdentity,
         const ManifestPermissions &permissions,
@@ -62,6 +63,7 @@ public:
         quintptr workerWindowId,
         quint32 workerProcessId,
         QString *errorCode = nullptr);
+#endif
     [[nodiscard]] static std::shared_ptr<HostCapabilityRuntime> create(
         const TabCapabilityAuthority &authority,
         std::shared_ptr<AuthorityAdmissionToken> admissionToken,
@@ -83,9 +85,11 @@ public:
     void invalidate() noexcept;
 
 signals:
+#ifdef Q_BROWSER_HOST_TESTING
     void completed(quint64 generation,
                    const QString &requestId,
                    const BrokerResult &result);
+#endif
     void authorityCompleted(const TabCapabilityAuthority &authority,
                             quint64 generation,
                             const QString &requestId,
@@ -95,7 +99,9 @@ private:
     HostCapabilityRuntime(TabCapabilityAuthority authority,
                           std::shared_ptr<AuthorityAdmissionToken> admissionToken,
                           HostGestureRouter *gestureRouter,
+#ifdef Q_BROWSER_HOST_TESTING
                           bool authorityEnforced,
+#endif
                           EffectivePolicy policy,
                           quintptr hostWindowId);
     [[nodiscard]] bool initialize(const QString &storageDirectory,
@@ -109,7 +115,9 @@ private:
     const TabCapabilityAuthority authority_;
     const std::shared_ptr<AuthorityAdmissionToken> admissionToken_;
     QPointer<HostGestureRouter> gestureRouter_;
+#ifdef Q_BROWSER_HOST_TESTING
     const bool authorityEnforced_ = false;
+#endif
     EffectivePolicy policy_;
     quintptr hostWindowId_ = 0;
     QThread *workerThread_ = nullptr;

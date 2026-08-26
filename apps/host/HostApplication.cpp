@@ -21,6 +21,7 @@
 #include "WebSessionProfile.h"
 
 #include <QPointer>
+#include <QEvent>
 #include <QGuiApplication>
 #include <QRegularExpression>
 #include <QFile>
@@ -205,6 +206,11 @@ bool HostApplication::retryWorkerCleanupForTesting()
 {
     return installedPackageLauncher_ != nullptr
         && installedPackageLauncher_->retryFatalCleanupForTesting();
+}
+
+HostGestureRouter *HostApplication::gestureRouterForTesting() const noexcept
+{
+    return gestureRouter_.get();
 }
 #endif
 
@@ -462,6 +468,7 @@ bool HostApplication::start()
     mainWindow_ = std::move(window);
     gestureRouter_ = std::make_unique<HostGestureRouter>(
         static_cast<quintptr>(mainWindow_->winId()));
+    mainWindow_->installEventFilter(this);
     connect(gestureRouter_.get(), &HostGestureRouter::browserCommandRequested,
             mainWindow_->browserChrome(), &BrowserChrome::dispatchCommand);
     connect(mainWindow_->tabModel(), &BrowserTabModel::activeTabChanged,
@@ -551,6 +558,26 @@ bool HostApplication::start()
     }
     recordHostDiagnosticPhase("start-complete");
     return true;
+}
+
+bool HostApplication::eventFilter(QObject *const watched, QEvent *const event)
+{
+    if (watched == mainWindow_.get() && event != nullptr
+        && gestureRouter_ != nullptr) {
+        switch (event->type()) {
+        case QEvent::WindowDeactivate:
+        case QEvent::Hide:
+        case QEvent::Close:
+            gestureRouter_->hostDeactivated();
+            break;
+        case QEvent::WindowActivate:
+            synchronizeGestureAuthority();
+            break;
+        default:
+            break;
+        }
+    }
+    return QObject::eventFilter(watched, event);
 }
 
 bool HostApplication::attachWorkerSession(std::unique_ptr<IpcSession> session)
