@@ -53,6 +53,14 @@ signals:
                                   bool ok,
                                   const QString &errorCode);
     void capabilityResponseSent(const QString &requestId);
+    void pageMetadataChanged(quint64 generation,
+                             const QString &title,
+                             const QString &status);
+
+private slots:
+    void handlePageMetadata(quint64 generation,
+                            const QString &title,
+                            const QString &status);
 
 private:
     struct OutboundCommand final {

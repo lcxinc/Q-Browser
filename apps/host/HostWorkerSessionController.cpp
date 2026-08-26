@@ -12,6 +12,76 @@
 #include <utility>
 
 namespace {
+
+constexpr qsizetype maximumRawPageTitleCodeUnits = 4096;
+constexpr qsizetype maximumPageTitleCodeUnits = 256;
+constexpr qsizetype maximumPageStatusBytes = 32;
+
+bool isBidiControl(const char16_t value)
+{
+    return value == 0x061c || (value >= 0x200e && value <= 0x200f)
+        || (value >= 0x202a && value <= 0x202e)
+        || (value >= 0x2066 && value <= 0x206f);
+}
+
+std::optional<QString> canonicalPageTitle(const QString &untrusted)
+{
+    if (untrusted.isEmpty() || untrusted.size() > maximumRawPageTitleCodeUnits) {
+        return std::nullopt;
+    }
+    QString canonical;
+    canonical.reserve(maximumPageTitleCodeUnits);
+    bool prefixComplete = false;
+    for (qsizetype index = 0; index < untrusted.size(); ++index) {
+        const QChar character = untrusted.at(index);
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= untrusted.size()
+                || !untrusted.at(index + 1).isLowSurrogate()) {
+                return std::nullopt;
+            }
+            if (!prefixComplete
+                && canonical.size() + 2 <= maximumPageTitleCodeUnits) {
+                canonical.append(character);
+                canonical.append(untrusted.at(index + 1));
+                prefixComplete = canonical.size() == maximumPageTitleCodeUnits;
+            } else if (!prefixComplete) {
+                prefixComplete = true;
+            }
+            ++index;
+            continue;
+        }
+        if (character.isLowSurrogate() || character == u'<' || character == u'>') {
+            return std::nullopt;
+        }
+        if (character.category() == QChar::Other_Control
+            || isBidiControl(character.unicode())) {
+            continue;
+        }
+        if (!prefixComplete) {
+            canonical.append(character);
+            prefixComplete = canonical.size() == maximumPageTitleCodeUnits;
+        }
+    }
+    return canonical.isEmpty() ? std::nullopt
+                               : std::optional<QString>(std::move(canonical));
+}
+
+bool validPageStatus(const QString &status)
+{
+    if (status.isEmpty()) return true;
+    if (status.size() > maximumPageStatusBytes) return false;
+    for (const QChar character : status) {
+        const char16_t codeUnit = character.unicode();
+        if (!((codeUnit >= u'a' && codeUnit <= u'z')
+              || (codeUnit >= u'A' && codeUnit <= u'Z')
+              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
+              || codeUnit == u'_' || codeUnit == u'.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 QString routeFromAppUrl(const QUrl &url)
 {
     if (!url.isValid() || url.scheme() != QStringLiteral("app")
@@ -73,6 +143,22 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
 {
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
     ++generation_;
+    const quint64 attachedGeneration = generation_;
+    const QPointer<HostWorkerSessionController> controller(this);
+    session->setPageMetadataHandler(
+        [controller, attachedGeneration](const QString &title,
+                                         const QString &status) {
+            if (controller.isNull()) return;
+            QMetaObject::invokeMethod(
+                controller.data(),
+                [controller, attachedGeneration, title, status] {
+                    if (!controller.isNull()) {
+                        controller->handlePageMetadata(attachedGeneration,
+                                                       title, status);
+                    }
+                },
+                Qt::QueuedConnection);
+        });
     appIdentity_ = session->appIdentity();
     pendingRouteLoads_.clear();
     outbound_.clear();
@@ -84,7 +170,6 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
     io_ = new HostWorkerSessionIo(std::move(session), generation_, thread());
     const QPointer<HostWorkerSessionIo> attachedIo = io_;
     QThread *const attachedThread = ioThread_;
-    const quint64 attachedGeneration = generation_;
     if (!io_->moveToThread(ioThread_)) {
         delete io_.data();
         io_ = nullptr;
@@ -137,6 +222,19 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
     state_ = HostWorkerSessionState::Running;
     ioThread_->start();
     return true;
+}
+
+void HostWorkerSessionController::handlePageMetadata(
+    const quint64 generation, const QString &title, const QString &status)
+{
+    if (generation != generation_ || state_ != HostWorkerSessionState::Running) {
+        return;
+    }
+    const std::optional<QString> canonicalTitle = canonicalPageTitle(title);
+    if (!canonicalTitle.has_value() || !validPageStatus(status)) return;
+    const auto validated = ProtocolMessage::pageMetadata(*canonicalTitle, status);
+    if (!validated.has_value()) return;
+    emit pageMetadataChanged(generation, *canonicalTitle, status);
 }
 
 bool HostWorkerSessionController::shutdown(const QString &reason)

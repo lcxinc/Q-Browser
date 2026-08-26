@@ -16,6 +16,7 @@ private slots:
     void rejectsTypedPayloadViolations();
     void factoriesAreValidByConstruction();
     void factoriesRejectInvalidArguments();
+    void versionOneUnknownAdditionsStillFailClosed();
 };
 
 void ProtocolMessageTest::parsesValidMessages_data()
@@ -80,6 +81,22 @@ void ProtocolMessageTest::parsesValidMessages_data()
                                     {QStringLiteral("category"), QStringLiteral("qml")},
                                     {QStringLiteral("message"), QStringLiteral("binding failed")}}}}
         << ProtocolType::StructuredLog;
+    QTest::newRow("page-metadata-title")
+        << QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                       {QStringLiteral("type"), QStringLiteral("pageMetadata")},
+                       {QStringLiteral("payload"),
+                        QJsonObject{{QStringLiteral("title"),
+                                     QStringLiteral("Orders")}}}}
+        << ProtocolType::PageMetadata;
+    QTest::newRow("page-metadata-status")
+        << QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                       {QStringLiteral("type"), QStringLiteral("pageMetadata")},
+                       {QStringLiteral("payload"),
+                        QJsonObject{{QStringLiteral("title"),
+                                     QStringLiteral("Order details")},
+                                    {QStringLiteral("status"),
+                                     QStringLiteral("ready")}}}}
+        << ProtocolType::PageMetadata;
 }
 
 void ProtocolMessageTest::parsesValidMessages()
@@ -140,6 +157,13 @@ void ProtocolMessageTest::rejectsEnvelopeViolations_data()
                        {QStringLiteral("payload"), QJsonObject{}},
                        {QStringLiteral("extra"), true}}
         << ProtocolError::InvalidEnvelope;
+    QTest::newRow("page-metadata-with-request-id")
+        << QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                       {QStringLiteral("type"), QStringLiteral("pageMetadata")},
+                       {QStringLiteral("requestId"), QStringLiteral("forbidden")},
+                       {QStringLiteral("payload"),
+                        QJsonObject{{QStringLiteral("title"), QStringLiteral("Orders")}}}}
+        << ProtocolError::UnexpectedRequestId;
 }
 
 void ProtocolMessageTest::rejectsEnvelopeViolations()
@@ -157,6 +181,9 @@ void ProtocolMessageTest::rejectsEnvelopeViolations()
 void ProtocolMessageTest::rejectsTypedPayloadViolations_data()
 {
     QTest::addColumn<QJsonObject>("object");
+
+    QString loneHighSurrogate;
+    loneHighSurrogate.append(QChar(0xd800));
 
     QTest::newRow("handshake-empty-nonce")
         << QJsonObject{{QStringLiteral("protocolVersion"), 1},
@@ -189,6 +216,44 @@ void ProtocolMessageTest::rejectsTypedPayloadViolations_data()
         << QJsonObject{{QStringLiteral("protocolVersion"), 1},
                        {QStringLiteral("type"), QStringLiteral("heartbeat")},
                        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("x"), 1}}}};
+    const auto pageMetadata = [](const QJsonObject &payload) {
+        return QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                           {QStringLiteral("type"), QStringLiteral("pageMetadata")},
+                           {QStringLiteral("payload"), payload}};
+    };
+    QTest::newRow("page-metadata-missing-title") << pageMetadata({});
+    QTest::newRow("page-metadata-unknown-key")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("route"), QStringLiteral("/orders")}});
+    QTest::newRow("page-metadata-non-string-title")
+        << pageMetadata({{QStringLiteral("title"), 7}});
+    QTest::newRow("page-metadata-overlong-title")
+        << pageMetadata({{QStringLiteral("title"), QString(257, u'x')}});
+    QTest::newRow("page-metadata-control-title")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders\n")}});
+    QTest::newRow("page-metadata-bidi-title")
+        << pageMetadata({{QStringLiteral("title"),
+                          QStringLiteral("Orders\u202e")}});
+    QTest::newRow("page-metadata-deprecated-bidi-title")
+        << pageMetadata({{QStringLiteral("title"),
+                          QStringLiteral("Orders\u206f")}});
+    QTest::newRow("page-metadata-html-title")
+        << pageMetadata({{QStringLiteral("title"),
+                          QStringLiteral("<b>Orders</b>")}});
+    QTest::newRow("page-metadata-lone-surrogate")
+        << pageMetadata({{QStringLiteral("title"), loneHighSurrogate}});
+    QTest::newRow("page-metadata-empty-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QString()}});
+    QTest::newRow("page-metadata-overlong-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QString(33, u'a')}});
+    QTest::newRow("page-metadata-non-ascii-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("r\u00e9ady")}});
+    QTest::newRow("page-metadata-non-token-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("not ready")}});
 }
 
 void ProtocolMessageTest::rejectsTypedPayloadViolations()
@@ -219,6 +284,11 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
     const ProtocolMessage structuredLog = *ProtocolMessage::structuredLog(
         QStringLiteral("info"), QStringLiteral("worker"), QStringLiteral("ready"));
     const ProtocolMessage shutdown = *ProtocolMessage::shutdown(QStringLiteral("host.request"));
+    const ProtocolMessage pageMetadata = *ProtocolMessage::pageMetadata(
+        QString(254, u'x') + QString::fromUcs4(U"\U0001f680"),
+        QStringLiteral("loading-1"));
+    const ProtocolMessage pageMetadataWithoutStatus = *ProtocolMessage::pageMetadata(
+        QStringLiteral("Orders"));
 
     for (const auto &message : {handshake,
                                 request,
@@ -228,6 +298,8 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
                                 routeLoad,
                                 navigationRequest,
                                 structuredLog,
+                                pageMetadata,
+                                pageMetadataWithoutStatus,
                                 shutdown}) {
         const auto reparsed = ProtocolMessage::parse(message.toJson());
         QVERIFY(reparsed.message.has_value());
@@ -238,6 +310,8 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
 
 void ProtocolMessageTest::factoriesRejectInvalidArguments()
 {
+    QString loneHighSurrogate;
+    loneHighSurrogate.append(QChar(0xd800));
     QVERIFY(!ProtocolMessage::handshake(QString()).has_value());
     QVERIFY(!ProtocolMessage::handshake(QString(257, u'x')).has_value());
     QVERIFY(!ProtocolMessage::request(QString(), QStringLiteral("storage"),
@@ -264,6 +338,29 @@ void ProtocolMessageTest::factoriesRejectInvalidArguments()
     QVERIFY(!ProtocolMessage::structuredLog(QStringLiteral("fatal"), QStringLiteral("qml"),
                                             QStringLiteral("message"))
                  .has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QString()).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QString(257, u'x')).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders\n")).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders\u202e")).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders\u206f")).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("<b>Orders</b>")).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(loneHighSurrogate).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders"),
+                                           QString(33, u'a')).has_value());
+    QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders"),
+                                           QStringLiteral("not ready")).has_value());
+}
+
+void ProtocolMessageTest::versionOneUnknownAdditionsStillFailClosed()
+{
+    QCOMPARE(ProtocolMessage::currentVersion(), 1);
+    const ProtocolParseResult result = ProtocolMessage::parse(
+        QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                    {QStringLiteral("type"), QStringLiteral("futurePageMetadata")},
+                    {QStringLiteral("payload"), QJsonObject{}}});
+    QVERIFY(!result.message.has_value());
+    QCOMPARE(result.error, ProtocolError::UnknownType);
+    QCOMPARE(result.errorCode, QStringLiteral("ipc.protocol.unknown_type"));
 }
 
 QTEST_MAIN(ProtocolMessageTest)

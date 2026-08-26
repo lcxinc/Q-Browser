@@ -15,6 +15,7 @@ bool outgoingTypeAllowed(const IpcRole role, const ProtocolType type)
     return type == ProtocolType::Handshake || type == ProtocolType::SurfaceReady
         || type == ProtocolType::Ready || type == ProtocolType::Request
         || type == ProtocolType::NavigationRequest
+        || type == ProtocolType::PageMetadata
         || type == ProtocolType::Response || type == ProtocolType::Heartbeat
         || type == ProtocolType::StructuredLog || type == ProtocolType::Shutdown;
 }
@@ -73,6 +74,11 @@ bool IpcSession::sendInternal(const ProtocolMessage &message,
         lastErrorCode_ = QStringLiteral("ipc.session.unexpected_message_direction");
         return false;
     }
+    if (role_ == IpcRole::Worker && message.type() == ProtocolType::PageMetadata
+        && !readySent_) {
+        lastErrorCode_ = QStringLiteral("ipc.session.ready_required");
+        return false;
+    }
     const ProtocolParseResult validated = ProtocolMessage::parse(message.toJson());
     if (!validated.message.has_value()) {
         lastErrorCode_ = validated.errorCode;
@@ -92,6 +98,8 @@ bool IpcSession::sendInternal(const ProtocolMessage &message,
     }
     if (role_ == IpcRole::Worker && message.type() == ProtocolType::Handshake) {
         outboundNonce_ = message.payload().value(QStringLiteral("nonce")).toString();
+    } else if (role_ == IpcRole::Worker && message.type() == ProtocolType::Ready) {
+        readySent_ = true;
     }
     return true;
 }
@@ -131,6 +139,18 @@ SessionReceiveResult IpcSession::receive(const int timeoutMs)
 SessionReceiveResult IpcSession::poll(const int timeoutMs)
 {
     return receiveImpl(timeoutMs, false);
+}
+
+void IpcSession::setPageMetadataHandler(PageMetadataHandler handler)
+{
+    pageMetadataHandler_ = std::move(handler);
+    if (role_ != IpcRole::Host || !pageMetadataHandler_) return;
+    for (const ProtocolMessage &message : receivedMessages_) {
+        if (message.type() != ProtocolType::PageMetadata) continue;
+        const QJsonObject payload = message.payload();
+        pageMetadataHandler_(payload.value(QStringLiteral("title")).toString(),
+                             payload.value(QStringLiteral("status")).toString());
+    }
 }
 
 SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
@@ -246,6 +266,7 @@ void IpcSession::close() noexcept
     transport_.close();
     receivedMessages_.clear();
     pendingRequests_.clear();
+    pageMetadataHandler_ = {};
 }
 
 SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
@@ -300,6 +321,14 @@ SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
                     QStringLiteral("ipc.session.unexpected_message_direction"));
     }
 
+    if (role_ == IpcRole::Host && message.type() == ProtocolType::PageMetadata
+        && !peerReady_) {
+        return fail(SessionStatus::Failed, QStringLiteral("ipc.session.ready_required"));
+    }
+    if (role_ == IpcRole::Host && message.type() == ProtocolType::Ready) {
+        peerReady_ = true;
+    }
+
     if (message.type() == ProtocolType::Request || message.type() == ProtocolType::RouteLoad
         || message.type() == ProtocolType::NavigationRequest) {
         if (receivedRequestIds_.contains(message.requestId())) {
@@ -316,6 +345,12 @@ SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
         if (!pendingRequests_.remove(message.requestId())) {
             return fail(SessionStatus::Failed, QStringLiteral("ipc.session.unknown_response"));
         }
+    }
+    if (role_ == IpcRole::Host && message.type() == ProtocolType::PageMetadata
+        && pageMetadataHandler_) {
+        const QJsonObject payload = message.payload();
+        pageMetadataHandler_(payload.value(QStringLiteral("title")).toString(),
+                             payload.value(QStringLiteral("status")).toString());
     }
 
     lastPeerActivityMs_ = std::max<qint64>(1, clock_.elapsed());

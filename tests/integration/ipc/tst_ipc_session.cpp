@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QTest>
+#include <QtEndian>
 
 #include <chrono>
 #include <future>
@@ -13,6 +14,15 @@
 #endif
 
 namespace {
+
+QByteArray rawJsonFrame(const QByteArray &json)
+{
+    QByteArray frame(4, '\0');
+    qToBigEndian(static_cast<quint32>(json.size()),
+                 reinterpret_cast<uchar *>(frame.data()));
+    frame.append(json);
+    return frame;
+}
 
 #ifdef Q_OS_WIN
 class ChildProcess final
@@ -116,6 +126,8 @@ private slots:
     void rejectsUnknownProtocolAndDuplicateInboundRequests();
     void expiresPendingRequests();
     void reportsTimeoutPeerCloseAndHeartbeat();
+    void pageMetadataRequiresWorkerReadyAndIsOneWay();
+    void prematureMalformedAndUnknownMetadataFailClosed();
 };
 
 void IpcSessionTest::anonymousPipeEndsHaveLeastInheritance()
@@ -547,6 +559,138 @@ void IpcSessionTest::reportsTimeoutPeerCloseAndHeartbeat()
         QCOMPARE(host.receive(1000).status, SessionStatus::PeerClosed);
         QCOMPARE(host.lastErrorCode(), QStringLiteral("ipc.session.peer_closed"));
         QVERIFY(host.isClosed());
+    }
+#endif
+}
+
+void IpcSessionTest::pageMetadataRequiresWorkerReadyAndIsOneWay()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    IpcSession host(pair.takeHost(), IpcRole::Host,
+                    HostLaunchContext{QStringLiteral("metadata-nonce"),
+                                      QStringLiteral("com.qbrowser.metadata")});
+    IpcSession worker(WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+                      IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(QStringLiteral("metadata-nonce"))));
+    QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
+
+    const auto metadata = ProtocolMessage::pageMetadata(
+        QStringLiteral("Orders"), QStringLiteral("ready"));
+    QVERIFY(metadata.has_value());
+    QVERIFY(!host.send(*metadata));
+    QCOMPARE(host.lastErrorCode(),
+             QStringLiteral("ipc.session.unexpected_message_direction"));
+    QVERIFY(!worker.send(*metadata));
+    QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.ready_required"));
+    QCOMPARE(host.poll().status, SessionStatus::TimedOut);
+    QVERIFY(!host.isClosed());
+
+    int observed = 0;
+    QString observedTitle;
+    QString observedStatus;
+    host.setPageMetadataHandler([&](const QString &title, const QString &status) {
+        ++observed;
+        observedTitle = title;
+        observedStatus = status;
+    });
+    QVERIFY(worker.send(ProtocolMessage::ready()));
+    const SessionReceiveResult ready = host.receive(1000);
+    QCOMPARE(ready.status, SessionStatus::MessageReady);
+    QCOMPARE(ready.message->type(), ProtocolType::Ready);
+    QVERIFY(worker.send(*metadata));
+    const SessionReceiveResult received = host.receive(1000);
+    QCOMPARE(received.status, SessionStatus::MessageReady);
+    QCOMPARE(received.message->type(), ProtocolType::PageMetadata);
+    QVERIFY(received.message->requestId().isEmpty());
+    QCOMPARE(observed, 1);
+    QCOMPARE(observedTitle, QStringLiteral("Orders"));
+    QCOMPARE(observedStatus, QStringLiteral("ready"));
+#endif
+}
+
+void IpcSessionTest::prematureMalformedAndUnknownMetadataFailClosed()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    const auto authenticatedRaw = [] {
+        WinPipePair pair = WinPipeTransport::createHostPair();
+        auto host = std::make_unique<IpcSession>(
+            pair.takeHost(), IpcRole::Host,
+            HostLaunchContext{QStringLiteral("raw-metadata"),
+                              QStringLiteral("com.qbrowser.metadata")});
+        WinPipeTransport peer = WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+        const auto handshake = ProtocolMessage::handshake(QStringLiteral("raw-metadata"));
+        if (!handshake.has_value()
+            || !peer.writeAll(FrameCodec::encode(handshake->toJson()), 1000)
+            || host->receive(1000).status != SessionStatus::MessageReady) {
+            return std::pair<std::unique_ptr<IpcSession>, WinPipeTransport>{};
+        }
+        return std::pair{std::move(host), std::move(peer)};
+    };
+
+    {
+        auto [host, peer] = authenticatedRaw();
+        QVERIFY(host != nullptr);
+        const auto metadata = ProtocolMessage::pageMetadata(QStringLiteral("Too soon"));
+        QVERIFY(metadata.has_value());
+        QVERIFY(peer.writeAll(FrameCodec::encode(metadata->toJson()), 1000));
+        QCOMPARE(host->receive(1000).status, SessionStatus::Failed);
+        QCOMPARE(host->lastErrorCode(), QStringLiteral("ipc.session.ready_required"));
+    }
+    {
+        auto [host, peer] = authenticatedRaw();
+        QVERIFY(host != nullptr);
+        const QJsonObject future{{QStringLiteral("protocolVersion"), 1},
+                                 {QStringLiteral("type"),
+                                  QStringLiteral("futurePageMetadata")},
+                                 {QStringLiteral("payload"), QJsonObject{}}};
+        QVERIFY(peer.writeAll(FrameCodec::encode(future), 1000));
+        QCOMPARE(host->receive(1000).status, SessionStatus::Failed);
+        QCOMPARE(host->lastErrorCode(), QStringLiteral("ipc.protocol.unknown_type"));
+        QVERIFY(host->isClosed());
+    }
+    {
+        auto [host, peer] = authenticatedRaw();
+        QVERIFY(host != nullptr);
+        QVERIFY(peer.writeAll(FrameCodec::encode(ProtocolMessage::ready().toJson()), 1000));
+        QCOMPARE(host->receive(1000).status, SessionStatus::MessageReady);
+        const QByteArray invalid = QByteArrayLiteral(
+            R"({"protocolVersion":1,"type":"pageMetadata","payload":{"title":"\uD800"}})");
+        QVERIFY(peer.writeAll(rawJsonFrame(invalid), 1000));
+        QCOMPARE(host->receive(1000).status, SessionStatus::Failed);
+        QCOMPARE(host->lastErrorCode(), QStringLiteral("ipc.frame.invalid_json"));
+    }
+    {
+        auto [host, peer] = authenticatedRaw();
+        QVERIFY(host != nullptr);
+        const auto metadata = ProtocolMessage::pageMetadata(
+            QStringLiteral("Buffered title"), QStringLiteral("ready"));
+        QVERIFY(metadata.has_value());
+        const QByteArray readyAndMetadata =
+            FrameCodec::encode(ProtocolMessage::ready().toJson())
+            + FrameCodec::encode(metadata->toJson());
+        QVERIFY(peer.writeAll(readyAndMetadata, 1000));
+        const SessionReceiveResult ready = host->receive(1000);
+        QCOMPARE(ready.status, SessionStatus::MessageReady);
+        QCOMPARE(ready.message->type(), ProtocolType::Ready);
+
+        int observed = 0;
+        host->setPageMetadataHandler(
+            [&](const QString &title, const QString &status) {
+                ++observed;
+                QCOMPARE(title, QStringLiteral("Buffered title"));
+                QCOMPARE(status, QStringLiteral("ready"));
+            });
+        QCOMPARE(observed, 1);
+        const SessionReceiveResult queued = host->receive(1000);
+        QCOMPARE(queued.status, SessionStatus::MessageReady);
+        QCOMPARE(queued.message->type(), ProtocolType::PageMetadata);
+        QCOMPARE(observed, 1);
     }
 #endif
 }

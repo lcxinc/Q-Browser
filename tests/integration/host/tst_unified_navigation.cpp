@@ -286,6 +286,7 @@ private slots:
     void destroyAfterIoThreadFinishedBeforeGuiCleanup();
     void navigationTransactionsRejectReentrantCommands();
     void trustedShellRuntimeConfigKeepsPilotRouteIdentity();
+    void pageMetadataUsesOnlyCurrentGenerationAndResanitizes();
 };
 
 void UnifiedNavigationTest::trustedShellRuntimeConfigKeepsPilotRouteIdentity()
@@ -298,6 +299,69 @@ void UnifiedNavigationTest::trustedShellRuntimeConfigKeepsPilotRouteIdentity()
     HostApplication host(std::move(*parsed.value));
     QVERIFY(host.start());
     QVERIFY(host.mainWindow() != nullptr);
+}
+
+void UnifiedNavigationTest::pageMetadataUsesOnlyCurrentGenerationAndResanitizes()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    QSignalSpy metadataSpy(&controller,
+                           &HostWorkerSessionController::pageMetadataChanged);
+
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(controller.attach(std::move(first->host)));
+    QVERIFY(first->worker->send(ProtocolMessage::ready()));
+    QVERIFY(first->worker->send(*ProtocolMessage::pageMetadata(
+        QStringLiteral("Orders"), QStringLiteral("ready"))));
+    QTRY_COMPARE_WITH_TIMEOUT(metadataSpy.count(), 1, 3000);
+    QCOMPARE(metadataSpy.at(0).at(0).toULongLong(), quint64(1));
+    QCOMPARE(metadataSpy.at(0).at(1).toString(), QStringLiteral("Orders"));
+    QCOMPARE(metadataSpy.at(0).at(2).toString(), QStringLiteral("ready"));
+
+    QString recanonicalized = QStringLiteral("Safe");
+    recanonicalized.append(QChar(0x202e));
+    recanonicalized.append(QChar(0x206f));
+    recanonicalized.append(QStringLiteral(" title"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &controller, "handlePageMetadata", Qt::DirectConnection,
+        Q_ARG(quint64, quint64(1)), Q_ARG(QString, recanonicalized),
+        Q_ARG(QString, QStringLiteral("loading"))));
+    QCOMPARE(metadataSpy.count(), 2);
+    QCOMPARE(metadataSpy.at(1).at(1).toString(), QStringLiteral("Safe title"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &controller, "handlePageMetadata", Qt::DirectConnection,
+        Q_ARG(quint64, quint64(1)),
+        Q_ARG(QString, QStringLiteral("<b>Forged</b>")),
+        Q_ARG(QString, QStringLiteral("ready"))));
+    QCOMPARE(metadataSpy.count(), 2);
+
+    auto replacement = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(replacement.has_value());
+    QVERIFY(controller.attach(std::move(replacement->host)));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Running, 5000);
+    QVERIFY(replacement->worker->send(ProtocolMessage::ready()));
+    QVERIFY(replacement->worker->send(*ProtocolMessage::pageMetadata(
+        QStringLiteral("Customers"))));
+    QTRY_COMPARE_WITH_TIMEOUT(metadataSpy.count(), 3, 3000);
+    QCOMPARE(metadataSpy.at(2).at(0).toULongLong(), quint64(2));
+    QCOMPARE(metadataSpy.at(2).at(1).toString(), QStringLiteral("Customers"));
+
+    QVERIFY(QMetaObject::invokeMethod(
+        &controller, "handlePageMetadata", Qt::DirectConnection,
+        Q_ARG(quint64, quint64(1)), Q_ARG(QString, QStringLiteral("Stale")),
+        Q_ARG(QString, QString())));
+    QCOMPARE(metadataSpy.count(), 3);
+    replacement->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Failed, 3000);
+    QVERIFY(QMetaObject::invokeMethod(
+        &controller, "handlePageMetadata", Qt::DirectConnection,
+        Q_ARG(quint64, quint64(2)), Q_ARG(QString, QStringLiteral("Closed")),
+        Q_ARG(QString, QString())));
+    QCOMPARE(metadataSpy.count(), 3);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
 }
 
 void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory()

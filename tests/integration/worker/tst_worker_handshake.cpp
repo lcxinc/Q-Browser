@@ -37,6 +37,7 @@ private slots:
     void receiveUntilMissingTargetHonorsAbsoluteDeadline();
     void receiveUntilBoundsOverBudgetHeartbeatFlood();
     void wrongNonceFailsClosed();
+    void eagerPageMetadataWaitsForReadyAndKeepsOnlyLastValue();
 };
 
 void WorkerHandshakeTest::directLaunchWithoutInheritedHandlesFailsClosed()
@@ -244,6 +245,47 @@ void WorkerHandshakeTest::wrongNonceFailsClosed()
     QCOMPARE(result.errorCode, QStringLiteral("ipc.session.nonce_mismatch"));
     QVERIFY(launch->process.waitForFinished(5000));
     QVERIFY(launch->process.exitCode() != DWORD(0));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void WorkerHandshakeTest::eagerPageMetadataWaitsForReadyAndKeepsOnlyLastValue()
+{
+    const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
+Item {
+    Component.onCompleted: {
+        Runtime.setPageMetadata("Starting orders", "loading")
+        Runtime.setPageMetadata("Orders", "ready")
+    }
+}
+)QML");
+    WorkerTestEnvironment environment(qml);
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto launch = environment.launch(QStringLiteral("metadata-nonce"),
+                                     QStringLiteral("metadata-nonce"), 1000);
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+
+    const SessionReceiveResult surface = launch->hostSession.receive(10'000);
+    QCOMPARE(surface.status, SessionStatus::MessageReady);
+    QCOMPARE(surface.message->type(), ProtocolType::SurfaceReady);
+    const SessionReceiveResult ready = launch->hostSession.receive(10'000);
+    QCOMPARE(ready.status, SessionStatus::MessageReady);
+    QCOMPARE(ready.message->type(), ProtocolType::Ready);
+    const SessionReceiveResult metadata = launch->hostSession.receive(10'000);
+    QCOMPARE(metadata.status, SessionStatus::MessageReady);
+    QCOMPARE(metadata.message->type(), ProtocolType::PageMetadata);
+    QCOMPARE(metadata.message->payload().value(QStringLiteral("title")).toString(),
+             QStringLiteral("Orders"));
+    QCOMPARE(metadata.message->payload().value(QStringLiteral("status")).toString(),
+             QStringLiteral("ready"));
+
+    QVERIFY(launch->hostSession.send(
+        *ProtocolMessage::shutdown(QStringLiteral("metadata.complete")), 5000));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
 }

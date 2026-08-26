@@ -9,6 +9,8 @@
 #include <QQueue>
 #include <QSet>
 
+#include <functional>
+
 enum class IpcRole {
     Host,
     Worker,
@@ -35,6 +37,9 @@ struct SessionReceiveResult {
 class IpcSession final
 {
 public:
+    using PageMetadataHandler =
+        std::function<void(const QString &title, const QString &status)>;
+
     IpcSession(WinPipeTransport transport,
                IpcRole role,
                HostLaunchContext hostContext = {});
@@ -56,6 +61,7 @@ public:
                                int timeoutMs);
     SessionReceiveResult receive(int timeoutMs);
     SessionReceiveResult poll(int timeoutMs = 0);
+    void setPageMetadataHandler(PageMetadataHandler handler);
 
     bool isAuthenticated() const noexcept;
     QString appIdentity() const;
@@ -91,7 +97,10 @@ private:
     QString lastErrorCode_;
     QString outboundNonce_;
     QString peerAssignedIdentity_;
+    PageMetadataHandler pageMetadataHandler_;
     qint64 lastPeerActivityMs_ = 0;
+    bool readySent_ = false;
+    bool peerReady_ = false;
 };
 
 Q_DECLARE_METATYPE(SessionStatus)

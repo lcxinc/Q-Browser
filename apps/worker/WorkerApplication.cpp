@@ -45,6 +45,8 @@ WorkerApplication::WorkerApplication(QObject *parent)
             this, &WorkerApplication::sendCapabilityRequest);
     connect(&runtimeFacade_, &RuntimeFacade::navigationRequested,
             this, &WorkerApplication::sendNavigationRequest);
+    connect(&runtimeFacade_, &RuntimeFacade::pageMetadataChanged,
+            this, &WorkerApplication::sendPageMetadata);
 }
 
 WorkerApplication::~WorkerApplication() = default;
@@ -149,11 +151,21 @@ bool WorkerApplication::finishAuthentication()
         return false;
     }
     state_ = State::Ready;
-    if (!flushPendingCapabilities()) {
+    if (!flushPendingPageMetadata() || !flushPendingCapabilities()) {
         return false;
     }
     heartbeatTimer_.start();
     return true;
+}
+
+bool WorkerApplication::flushPendingPageMetadata()
+{
+    const auto pending = runtimeFacade_.takePendingPageMetadata();
+    if (!pending.has_value()) return true;
+    const auto message = ProtocolMessage::pageMetadata(pending->title,
+                                                       pending->status);
+    return message.has_value() && session_ != nullptr
+        && session_->send(*message, 5000);
 }
 
 bool WorkerApplication::flushPendingCapabilities()
@@ -244,6 +256,18 @@ void WorkerApplication::sendNavigationRequest(const QString &requestId,
 {
     if (session_ == nullptr || state_ != State::Ready
         || !session_->sendNavigationRequest(requestId, route, 5000)) {
+        failClosed();
+    }
+}
+
+void WorkerApplication::sendPageMetadata(const QString &title,
+                                         const QString &status)
+{
+    Q_UNUSED(title)
+    Q_UNUSED(status)
+    if (state_ == State::Loading) return;
+    if (session_ == nullptr || state_ != State::Ready
+        || !flushPendingPageMetadata()) {
         failClosed();
     }
 }

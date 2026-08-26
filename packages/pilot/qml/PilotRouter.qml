@@ -45,6 +45,39 @@ Item {
         default: return "NotFoundPage"
         }
     }
+    property string publishedPageName: ""
+    onCurrentPageNameChanged: publishPageMetadata()
+    onRuntimeChanged: {
+        publishedPageName = ""
+        publishPageMetadata()
+    }
+    Component.onCompleted: publishPageMetadata()
+
+    function fixedPageTitle(pageName) {
+        switch (pageName) {
+        case "LoginPage": return "Sign in"
+        case "DashboardPage": return "Dashboard"
+        case "OrdersPage": return "Orders"
+        case "OrderDetailPage": return "Order details"
+        case "OrderEditPage": return "Edit order"
+        case "CustomersPage": return "Customers"
+        case "CustomerDetailPage": return "Customer details"
+        case "FilesPage": return "Files"
+        case "SettingsPage": return "Settings"
+        default: return "Page not found"
+        }
+    }
+
+    function publishPageMetadata() {
+        if (currentPageName === publishedPageName || !runtime
+                || typeof runtime.setPageMetadata !== "function") {
+            return false
+        }
+        if (runtime.setPageMetadata(fixedPageTitle(currentPageName)) === false)
+            return false
+        publishedPageName = currentPageName
+        return true
+    }
 
     function navigate(target) {
         if (typeof target !== "string" || target.length === 0)

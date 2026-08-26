@@ -11,6 +11,7 @@ enum class ProtocolType {
     SurfaceReady,
     RouteLoad,
     NavigationRequest,
+    PageMetadata,
     Ready,
     Request,
     Response,
@@ -45,6 +46,8 @@ public:
                                                     const QString &route);
     static std::optional<ProtocolMessage> navigationRequest(const QString &requestId,
                                                             const QString &route);
+    static std::optional<ProtocolMessage> pageMetadata(const QString &title,
+                                                       const QString &status = {});
     static ProtocolMessage ready();
     static std::optional<ProtocolMessage> request(const QString &requestId,
                                                  const QString &capability,

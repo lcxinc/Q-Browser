@@ -30,6 +30,7 @@ private slots:
                                const QString &operation,
                                const QJsonObject &payload);
     void sendNavigationRequest(const QString &requestId, const QString &route);
+    void sendPageMetadata(const QString &title, const QString &status);
 
 private:
     enum class State {
@@ -52,6 +53,7 @@ private:
     static std::optional<LaunchArguments> parseArguments(const QStringList &arguments);
     bool finishAuthentication();
     bool flushPendingCapabilities();
+    bool flushPendingPageMetadata();
     void handleMessage(const ProtocolMessage &message);
     void failClosed(int exitCode = 70);
 

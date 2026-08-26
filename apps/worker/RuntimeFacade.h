@@ -4,6 +4,10 @@
 #include <QObject>
 #include <QSet>
 
+#include <optional>
+
+class WorkerApplication;
+
 class RuntimeFacade final : public QObject
 {
     Q_OBJECT
@@ -25,6 +29,8 @@ public:
                                const QString &operation,
                                const QJsonObject &payload = {});
     Q_INVOKABLE QString navigate(const QString &route);
+    Q_INVOKABLE bool setPageMetadata(const QString &title,
+                                     const QString &status = {});
     void complete(const QString &requestId, const QJsonObject &response);
 
 signals:
@@ -38,10 +44,21 @@ signals:
     void capabilityFinished(const QString &requestId, const QJsonObject &response);
     void navigationRequested(const QString &requestId, const QString &route);
     void navigationFinished(const QString &requestId, const QJsonObject &response);
+    void pageMetadataChanged(const QString &title, const QString &status);
 
 private:
+    struct PendingPageMetadata final {
+        QString title;
+        QString status;
+    };
+
+    std::optional<PendingPageMetadata> takePendingPageMetadata();
+
+    friend class WorkerApplication;
+
     QString appIdentity_;
     QString apiOrigin_;
     QString route_ = QStringLiteral("/");
     QSet<QString> pendingNavigationRequests_;
+    std::optional<PendingPageMetadata> pendingPageMetadata_;
 };

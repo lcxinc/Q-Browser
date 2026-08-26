@@ -23,6 +23,9 @@ TestCase {
             property var lastPayload: ({})
             property int routeCalls: 0
             property string lastRoute: ""
+            property int metadataCalls: 0
+            property string lastMetadataTitle: ""
+            property string lastMetadataStatus: ""
             signal capabilityFinished(string requestId, var response)
             function invoke(capability, operation, payload) {
                 ++calls; lastRequestId = "r" + calls; lastCapability = capability
@@ -37,6 +40,19 @@ TestCase {
                 navigationRequested(requestId, route)
                 return requestId
             }
+            function setPageMetadata(title, status) {
+                ++metadataCalls
+                lastMetadataTitle = title
+                lastMetadataStatus = status || ""
+                return true
+            }
+        }
+    }
+    Component {
+        id: runtimeWithoutMetadataComponent
+        QtObject {
+            readonly property string route: "/login"
+            function navigate(route) { return "" }
         }
     }
     Component { id: ordersComponent; Pages.OrdersPage { width: 800; height: 600 } }
@@ -102,6 +118,36 @@ TestCase {
             router.route = entry[0]
             compare(router.currentPageName, entry[1])
         }
+    }
+
+    function test_routerPublishesOnlyFixedPageMetadataAndGuardsTestDoubles() {
+        const runtime = createTemporaryObject(runtimeComponent, this)
+        const router = createTemporaryObject(routerComponent, this, { runtime: runtime })
+        verify(runtime && router)
+        tryVerify(function() { return runtime.metadataCalls > 0 })
+        compare(runtime.lastMetadataTitle, "Sign in")
+        compare(runtime.lastMetadataStatus, "")
+
+        router.route = "/orders/SECRET-ORDER"
+        tryCompare(runtime, "lastMetadataTitle", "Order details")
+        verify(runtime.lastMetadataTitle.indexOf("SECRET") < 0)
+        const detailCalls = runtime.metadataCalls
+        router.route = "/orders/OTHER-SECRET"
+        compare(runtime.metadataCalls, detailCalls)
+        router.route = "/orders/SECRET-ORDER/edit?form=PRIVATE"
+        tryCompare(runtime, "lastMetadataTitle", "Edit order")
+        verify(runtime.lastMetadataTitle.indexOf("SECRET") < 0)
+        verify(runtime.lastMetadataTitle.indexOf("PRIVATE") < 0)
+        router.route = "/customers/SECRET-CUSTOMER"
+        tryCompare(runtime, "lastMetadataTitle", "Customer details")
+        verify(runtime.lastMetadataTitle.indexOf("SECRET") < 0)
+
+        const guardedRuntime = createTemporaryObject(runtimeWithoutMetadataComponent, this)
+        const guardedRouter = createTemporaryObject(routerComponent, this,
+                                                    { runtime: guardedRuntime })
+        verify(guardedRuntime && guardedRouter)
+        guardedRouter.route = "/dashboard"
+        compare(guardedRouter.currentPageName, "DashboardPage")
     }
 
     function test_navigationSelectionTracksRouteFamiliesWithoutDuplicateLoads() {

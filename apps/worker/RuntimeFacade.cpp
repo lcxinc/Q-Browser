@@ -5,6 +5,79 @@
 #include <QUrl>
 #include <QUuid>
 
+namespace {
+
+constexpr qsizetype maximumRawPageTitleCodeUnits = 4096;
+constexpr qsizetype maximumPageTitleCodeUnits = 256;
+constexpr qsizetype maximumPageStatusBytes = 32;
+
+bool isBidiControl(const char16_t value)
+{
+    return value == 0x061c || (value >= 0x200e && value <= 0x200f)
+        || (value >= 0x202a && value <= 0x202e)
+        || (value >= 0x2066 && value <= 0x206f);
+}
+
+std::optional<QString> canonicalPageTitle(const QString &untrusted)
+{
+    if (untrusted.isEmpty() || untrusted.size() > maximumRawPageTitleCodeUnits) {
+        return std::nullopt;
+    }
+    QString canonical;
+    canonical.reserve(maximumPageTitleCodeUnits);
+    bool prefixComplete = false;
+    for (qsizetype index = 0; index < untrusted.size(); ++index) {
+        const QChar character = untrusted.at(index);
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= untrusted.size()
+                || !untrusted.at(index + 1).isLowSurrogate()) {
+                return std::nullopt;
+            }
+            if (!prefixComplete
+                && canonical.size() + 2 <= maximumPageTitleCodeUnits) {
+                canonical.append(character);
+                canonical.append(untrusted.at(index + 1));
+                prefixComplete = canonical.size() == maximumPageTitleCodeUnits;
+            } else if (!prefixComplete) {
+                prefixComplete = true;
+            }
+            ++index;
+            continue;
+        }
+        if (character.isLowSurrogate() || character == u'<' || character == u'>') {
+            return std::nullopt;
+        }
+        if (character.category() == QChar::Other_Control
+            || isBidiControl(character.unicode())) {
+            continue;
+        }
+        if (!prefixComplete) {
+            canonical.append(character);
+            prefixComplete = canonical.size() == maximumPageTitleCodeUnits;
+        }
+    }
+    return canonical.isEmpty() ? std::nullopt
+                               : std::optional<QString>(std::move(canonical));
+}
+
+bool validPageStatus(const QString &status)
+{
+    if (status.isEmpty()) return true;
+    if (status.size() > maximumPageStatusBytes) return false;
+    for (const QChar character : status) {
+        const char16_t codeUnit = character.unicode();
+        if (!((codeUnit >= u'a' && codeUnit <= u'z')
+              || (codeUnit >= u'A' && codeUnit <= u'Z')
+              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
+              || codeUnit == u'_' || codeUnit == u'.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 RuntimeFacade::RuntimeFacade(QObject *parent) : QObject(parent) {}
 
 QString RuntimeFacade::appIdentity() const { return appIdentity_; }
@@ -61,6 +134,23 @@ QString RuntimeFacade::navigate(const QString &route)
     pendingNavigationRequests_.insert(requestId);
     emit navigationRequested(requestId, route);
     return requestId;
+}
+
+bool RuntimeFacade::setPageMetadata(const QString &title, const QString &status)
+{
+    const std::optional<QString> canonicalTitle = canonicalPageTitle(title);
+    if (!canonicalTitle.has_value() || !validPageStatus(status)) return false;
+    pendingPageMetadata_ = PendingPageMetadata{*canonicalTitle, status};
+    emit pageMetadataChanged(*canonicalTitle, status);
+    return true;
+}
+
+std::optional<RuntimeFacade::PendingPageMetadata>
+RuntimeFacade::takePendingPageMetadata()
+{
+    std::optional<PendingPageMetadata> pending = std::move(pendingPageMetadata_);
+    pendingPageMetadata_.reset();
+    return pending;
 }
 
 void RuntimeFacade::complete(const QString &requestId, const QJsonObject &response)

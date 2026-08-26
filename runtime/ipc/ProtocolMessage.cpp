@@ -9,6 +9,15 @@
 namespace {
 
 constexpr qsizetype maximumTokenCharacters = 256;
+constexpr qsizetype maximumPageTitleCodeUnits = 256;
+constexpr qsizetype maximumPageStatusBytes = 32;
+
+bool isBidiControl(const char16_t value)
+{
+    return value == 0x061c || (value >= 0x200e && value <= 0x200f)
+        || (value >= 0x202a && value <= 0x202e)
+        || (value >= 0x2066 && value <= 0x206f);
+}
 
 QString typeName(const ProtocolType type)
 {
@@ -23,6 +32,8 @@ QString typeName(const ProtocolType type)
         return QStringLiteral("routeLoad");
     case ProtocolType::NavigationRequest:
         return QStringLiteral("navigationRequest");
+    case ProtocolType::PageMetadata:
+        return QStringLiteral("pageMetadata");
     case ProtocolType::Ready:
         return QStringLiteral("ready");
     case ProtocolType::Request:
@@ -46,6 +57,7 @@ std::optional<ProtocolType> parseType(const QString &name)
                                     ProtocolType::SurfaceReady,
                                     ProtocolType::RouteLoad,
                                     ProtocolType::NavigationRequest,
+                                    ProtocolType::PageMetadata,
                                     ProtocolType::Ready,
                                     ProtocolType::Request,
                                     ProtocolType::Response,
@@ -100,6 +112,47 @@ bool validText(const QJsonValue &value, const qsizetype maximumCharacters)
     return true;
 }
 
+bool validPageTitle(const QJsonValue &value)
+{
+    if (!value.isString()) return false;
+    const QString title = value.toString();
+    if (title.isEmpty() || title.size() > maximumPageTitleCodeUnits) return false;
+    for (qsizetype index = 0; index < title.size(); ++index) {
+        const QChar character = title.at(index);
+        if (character.isHighSurrogate()) {
+            if (index + 1 >= title.size() || !title.at(index + 1).isLowSurrogate()) {
+                return false;
+            }
+            ++index;
+            continue;
+        }
+        if (character.isLowSurrogate()
+            || character.category() == QChar::Other_Control
+            || isBidiControl(character.unicode()) || character == u'<'
+            || character == u'>') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validPageStatus(const QJsonValue &value)
+{
+    if (!value.isString()) return false;
+    const QString status = value.toString();
+    if (status.isEmpty() || status.size() > maximumPageStatusBytes) return false;
+    for (const QChar character : status) {
+        const char16_t codeUnit = character.unicode();
+        if (!((codeUnit >= u'a' && codeUnit <= u'z')
+              || (codeUnit >= u'A' && codeUnit <= u'Z')
+              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
+              || codeUnit == u'_' || codeUnit == u'.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool validPayload(const ProtocolType type, const QJsonObject &payload)
 {
     switch (type) {
@@ -132,6 +185,15 @@ bool validPayload(const ProtocolType type, const QJsonObject &payload)
         const QString value = route.toString();
         return validText(route, 2048) && value.startsWith(u'/')
                && !value.startsWith(QStringLiteral("//")) && !value.contains(u'#');
+    }
+    case ProtocolType::PageMetadata: {
+        const bool titleOnly = hasExactKeys(payload, {QStringLiteral("title")});
+        const bool withStatus = hasExactKeys(
+            payload, {QStringLiteral("title"), QStringLiteral("status")});
+        return (titleOnly || withStatus)
+            && validPageTitle(payload.value(QStringLiteral("title")))
+            && (!withStatus
+                || validPageStatus(payload.value(QStringLiteral("status"))));
     }
     case ProtocolType::Request:
         return hasExactKeys(payload,
@@ -298,6 +360,14 @@ std::optional<ProtocolMessage> ProtocolMessage::navigationRequest(const QString 
     return validated(ProtocolType::NavigationRequest,
                      requestId,
                      QJsonObject{{QStringLiteral("route"), route}});
+}
+
+std::optional<ProtocolMessage> ProtocolMessage::pageMetadata(const QString &title,
+                                                             const QString &status)
+{
+    QJsonObject payload{{QStringLiteral("title"), title}};
+    if (!status.isEmpty()) payload.insert(QStringLiteral("status"), status);
+    return validated(ProtocolType::PageMetadata, {}, std::move(payload));
 }
 
 ProtocolMessage ProtocolMessage::ready()
