@@ -113,10 +113,10 @@ void WorkerApiSurfaceTest::runtimeFacadeAddsOnlyBoundedPageMetadata()
     unsafe.append(u'\n');
     unsafe.append(QChar(0x202e));
     unsafe.append(QChar(0x206f));
-    QVERIFY(facade.setPageMetadata(unsafe, QStringLiteral("loading-1")));
+    QVERIFY(facade.setPageMetadata(unsafe, QStringLiteral("loading")));
     QCOMPARE(metadataSpy.count(), 1);
     QCOMPARE(metadataSpy.at(0).at(0).toString(), QStringLiteral("Orders"));
-    QCOMPARE(metadataSpy.at(0).at(1).toString(), QStringLiteral("loading-1"));
+    QCOMPARE(metadataSpy.at(0).at(1).toString(), QStringLiteral("loading"));
 
     QVERIFY(facade.setPageMetadata(QString(257, u'x')));
     QCOMPARE(metadataSpy.count(), 2);
@@ -129,6 +129,13 @@ void WorkerApiSurfaceTest::runtimeFacadeAddsOnlyBoundedPageMetadata()
     QVERIFY(!facade.setPageMetadata(QStringLiteral("<b>Orders</b>")));
     QVERIFY(!facade.setPageMetadata(QStringLiteral("Orders"),
                                     QStringLiteral("not ready")));
+    for (const QString &status : {QStringLiteral("admin"),
+                                  QStringLiteral("trusted"),
+                                  QStringLiteral("loading-1"),
+                                  QStringLiteral("READY"),
+                                  QStringLiteral("Loading")}) {
+        QVERIFY(!facade.setPageMetadata(QStringLiteral("Orders"), status));
+    }
     QVERIFY(!facade.setPageMetadata(QString(4097, u'x')));
     QCOMPARE(metadataSpy.count(), 2);
 

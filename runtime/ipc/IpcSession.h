@@ -72,8 +72,14 @@ public:
     void close() noexcept;
 
 private:
+    struct QueuedMessage final {
+        ProtocolMessage message;
+        bool pageMetadataDelivered = false;
+    };
+
     SessionReceiveResult processFrame(const QJsonObject &object);
     SessionReceiveResult receiveImpl(int timeoutMs, bool closeOnCallerTimeout);
+    void deliverQueuedPageMetadata();
     SessionReceiveResult fail(SessionStatus status, const QString &code);
     bool pendingRequestExpired() const;
     std::optional<qint64> nearestPendingDeadline() const;
@@ -88,7 +94,7 @@ private:
     IpcRole role_;
     HostLaunchContext hostContext_;
     FrameCodec codec_;
-    QQueue<ProtocolMessage> receivedMessages_;
+    QQueue<QueuedMessage> receivedMessages_;
     QHash<QString, qint64> pendingRequests_;
     QSet<QString> receivedRequestIds_;
     QElapsedTimer clock_;
@@ -98,6 +104,7 @@ private:
     QString outboundNonce_;
     QString peerAssignedIdentity_;
     PageMetadataHandler pageMetadataHandler_;
+    bool deliveringPageMetadata_ = false;
     qint64 lastPeerActivityMs_ = 0;
     bool readySent_ = false;
     bool peerReady_ = false;

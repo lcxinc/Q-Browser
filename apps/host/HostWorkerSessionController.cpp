@@ -15,7 +15,6 @@ namespace {
 
 constexpr qsizetype maximumRawPageTitleCodeUnits = 4096;
 constexpr qsizetype maximumPageTitleCodeUnits = 256;
-constexpr qsizetype maximumPageStatusBytes = 32;
 
 bool isBidiControl(const char16_t value)
 {
@@ -64,22 +63,6 @@ std::optional<QString> canonicalPageTitle(const QString &untrusted)
     }
     return canonical.isEmpty() ? std::nullopt
                                : std::optional<QString>(std::move(canonical));
-}
-
-bool validPageStatus(const QString &status)
-{
-    if (status.isEmpty()) return true;
-    if (status.size() > maximumPageStatusBytes) return false;
-    for (const QChar character : status) {
-        const char16_t codeUnit = character.unicode();
-        if (!((codeUnit >= u'a' && codeUnit <= u'z')
-              || (codeUnit >= u'A' && codeUnit <= u'Z')
-              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
-              || codeUnit == u'_' || codeUnit == u'.')) {
-            return false;
-        }
-    }
-    return true;
 }
 
 QString routeFromAppUrl(const QUrl &url)
@@ -231,7 +214,7 @@ void HostWorkerSessionController::handlePageMetadata(
         return;
     }
     const std::optional<QString> canonicalTitle = canonicalPageTitle(title);
-    if (!canonicalTitle.has_value() || !validPageStatus(status)) return;
+    if (!canonicalTitle.has_value()) return;
     const auto validated = ProtocolMessage::pageMetadata(*canonicalTitle, status);
     if (!validated.has_value()) return;
     emit pageMetadataChanged(generation, *canonicalTitle, status);

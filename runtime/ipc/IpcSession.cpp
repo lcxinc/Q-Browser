@@ -1,5 +1,7 @@
 #include "IpcSession.h"
 
+#include <QScopedValueRollback>
+
 #include <algorithm>
 #include <limits>
 
@@ -144,12 +146,37 @@ SessionReceiveResult IpcSession::poll(const int timeoutMs)
 void IpcSession::setPageMetadataHandler(PageMetadataHandler handler)
 {
     pageMetadataHandler_ = std::move(handler);
-    if (role_ != IpcRole::Host || !pageMetadataHandler_) return;
-    for (const ProtocolMessage &message : receivedMessages_) {
-        if (message.type() != ProtocolType::PageMetadata) continue;
-        const QJsonObject payload = message.payload();
-        pageMetadataHandler_(payload.value(QStringLiteral("title")).toString(),
-                             payload.value(QStringLiteral("status")).toString());
+    deliverQueuedPageMetadata();
+}
+
+void IpcSession::deliverQueuedPageMetadata()
+{
+    if (role_ != IpcRole::Host || closed_ || deliveringPageMetadata_
+        || !pageMetadataHandler_) {
+        return;
+    }
+    QScopedValueRollback deliveryGuard(deliveringPageMetadata_, true);
+    for (;;) {
+        if (closed_ || !pageMetadataHandler_) return;
+        qsizetype pendingIndex = -1;
+        for (qsizetype index = 0; index < receivedMessages_.size(); ++index) {
+            const QueuedMessage &queued = receivedMessages_.at(index);
+            if (queued.message.type() == ProtocolType::PageMetadata
+                && !queued.pageMetadataDelivered) {
+                pendingIndex = index;
+                break;
+            }
+        }
+        if (pendingIndex < 0) return;
+
+        QueuedMessage &queued = receivedMessages_[pendingIndex];
+        queued.pageMetadataDelivered = true;
+        const QJsonObject payload = queued.message.payload();
+        const QString title = payload.value(QStringLiteral("title")).toString();
+        const QString status = payload.value(QStringLiteral("status")).toString();
+        const PageMetadataHandler handler = pageMetadataHandler_;
+        if (!handler) return;
+        handler(title, status);
     }
 }
 
@@ -166,7 +193,8 @@ SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
         return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.request_timeout"));
     }
     if (!receivedMessages_.isEmpty()) {
-        return {SessionStatus::MessageReady, receivedMessages_.dequeue(), {}};
+        QueuedMessage queued = receivedMessages_.dequeue();
+        return {SessionStatus::MessageReady, std::move(queued.message), {}};
     }
 
     QElapsedTimer receiveTimer;
@@ -215,10 +243,15 @@ SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
             if (processed.status != SessionStatus::MessageReady) {
                 return processed;
             }
-            receivedMessages_.enqueue(*processed.message);
+            receivedMessages_.enqueue(QueuedMessage{*processed.message});
+            deliverQueuedPageMetadata();
+            if (closed_) {
+                return {SessionStatus::Failed, std::nullopt, lastErrorCode_};
+            }
         }
         if (!receivedMessages_.isEmpty()) {
-            return {SessionStatus::MessageReady, receivedMessages_.dequeue(), {}};
+            QueuedMessage queued = receivedMessages_.dequeue();
+            return {SessionStatus::MessageReady, std::move(queued.message), {}};
         }
         if (receiveTimer.elapsed() >= timeoutMs) {
             if (closeOnCallerTimeout) {
@@ -346,13 +379,6 @@ SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
             return fail(SessionStatus::Failed, QStringLiteral("ipc.session.unknown_response"));
         }
     }
-    if (role_ == IpcRole::Host && message.type() == ProtocolType::PageMetadata
-        && pageMetadataHandler_) {
-        const QJsonObject payload = message.payload();
-        pageMetadataHandler_(payload.value(QStringLiteral("title")).toString(),
-                             payload.value(QStringLiteral("status")).toString());
-    }
-
     lastPeerActivityMs_ = std::max<qint64>(1, clock_.elapsed());
     return {SessionStatus::MessageReady, message, {}};
 }

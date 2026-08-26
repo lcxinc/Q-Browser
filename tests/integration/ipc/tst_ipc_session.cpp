@@ -128,6 +128,7 @@ private slots:
     void reportsTimeoutPeerCloseAndHeartbeat();
     void pageMetadataRequiresWorkerReadyAndIsOneWay();
     void prematureMalformedAndUnknownMetadataFailClosed();
+    void pageMetadataHandlerDeliveryIsAtMostOnceAndReentrantSafe();
 };
 
 void IpcSessionTest::anonymousPipeEndsHaveLeastInheritance()
@@ -691,6 +692,142 @@ void IpcSessionTest::prematureMalformedAndUnknownMetadataFailClosed()
         QCOMPARE(queued.status, SessionStatus::MessageReady);
         QCOMPARE(queued.message->type(), ProtocolType::PageMetadata);
         QCOMPARE(observed, 1);
+    }
+#endif
+}
+
+void IpcSessionTest::pageMetadataHandlerDeliveryIsAtMostOnceAndReentrantSafe()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    const auto authenticatedRaw = [](const QString &nonce) {
+        WinPipePair pair = WinPipeTransport::createHostPair();
+        auto host = std::make_unique<IpcSession>(
+            pair.takeHost(), IpcRole::Host,
+            HostLaunchContext{nonce, QStringLiteral("com.qbrowser.metadata")});
+        WinPipeTransport peer = WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+        const auto handshake = ProtocolMessage::handshake(nonce);
+        if (!handshake.has_value()
+            || !peer.writeAll(FrameCodec::encode(handshake->toJson()), 1000)
+            || host->receive(1000).status != SessionStatus::MessageReady) {
+            return std::pair<std::unique_ptr<IpcSession>, WinPipeTransport>{};
+        }
+        return std::pair{std::move(host), std::move(peer)};
+    };
+
+    {
+        auto [host, peer] = authenticatedRaw(QStringLiteral("metadata-at-most-once"));
+        QVERIFY(host != nullptr);
+        const auto buffered = ProtocolMessage::pageMetadata(
+            QStringLiteral("Buffered title"), QStringLiteral("ready"));
+        QVERIFY(buffered.has_value());
+        QVERIFY(peer.writeAll(FrameCodec::encode(ProtocolMessage::ready().toJson())
+                                  + FrameCodec::encode(buffered->toJson()),
+                              1000));
+        const SessionReceiveResult ready = host->receive(1000);
+        QCOMPARE(ready.status, SessionStatus::MessageReady);
+        QCOMPARE(ready.message->type(), ProtocolType::Ready);
+
+        int handlerACalls = 0;
+        int handlerBCalls = 0;
+        IpcSession::PageMetadataHandler handlerA =
+            [&](const QString &, const QString &) { ++handlerACalls; };
+        IpcSession::PageMetadataHandler handlerB =
+            [&](const QString &title, const QString &status) {
+                ++handlerBCalls;
+                QCOMPARE(title, QStringLiteral("Later title"));
+                QCOMPARE(status, QStringLiteral("loading"));
+            };
+        host->setPageMetadataHandler(handlerA);
+        QCOMPARE(handlerACalls, 1);
+        host->setPageMetadataHandler(handlerA);
+        QCOMPARE(handlerACalls, 1);
+        host->setPageMetadataHandler(handlerB);
+        QCOMPARE(handlerBCalls, 0);
+
+        const SessionReceiveResult queued = host->receive(1000);
+        QCOMPARE(queued.status, SessionStatus::MessageReady);
+        QCOMPARE(queued.message->type(), ProtocolType::PageMetadata);
+        QCOMPARE(queued.message->payload().value(QStringLiteral("title")).toString(),
+                 QStringLiteral("Buffered title"));
+        QCOMPARE(handlerACalls, 1);
+        QCOMPARE(handlerBCalls, 0);
+
+        const auto later = ProtocolMessage::pageMetadata(
+            QStringLiteral("Later title"), QStringLiteral("loading"));
+        QVERIFY(later.has_value());
+        QVERIFY(peer.writeAll(FrameCodec::encode(later->toJson()), 1000));
+        const SessionReceiveResult received = host->receive(1000);
+        QCOMPARE(received.status, SessionStatus::MessageReady);
+        QCOMPARE(received.message->type(), ProtocolType::PageMetadata);
+        QCOMPARE(handlerBCalls, 1);
+    }
+
+    {
+        auto [host, peer] = authenticatedRaw(QStringLiteral("metadata-clear-handler"));
+        QVERIFY(host != nullptr);
+        const auto first = ProtocolMessage::pageMetadata(QStringLiteral("First"));
+        const auto second = ProtocolMessage::pageMetadata(QStringLiteral("Second"));
+        QVERIFY(first.has_value());
+        QVERIFY(second.has_value());
+        QVERIFY(peer.writeAll(FrameCodec::encode(ProtocolMessage::ready().toJson())
+                                  + FrameCodec::encode(first->toJson())
+                                  + FrameCodec::encode(second->toJson()),
+                              1000));
+        QCOMPARE(host->receive(1000).message->type(), ProtocolType::Ready);
+
+        int handlerCalls = 0;
+        bool callbackThrew = false;
+        try {
+            host->setPageMetadataHandler(
+                [&](const QString &, const QString &) {
+                    ++handlerCalls;
+                    host->setPageMetadataHandler({});
+                });
+        } catch (...) {
+            callbackThrew = true;
+        }
+        QVERIFY(!callbackThrew);
+        QCOMPARE(handlerCalls, 1);
+        const SessionReceiveResult queuedFirst = host->receive(1000);
+        const SessionReceiveResult queuedSecond = host->receive(1000);
+        QCOMPARE(queuedFirst.status, SessionStatus::MessageReady);
+        QCOMPARE(queuedSecond.status, SessionStatus::MessageReady);
+        QCOMPARE(queuedFirst.message->payload().value(QStringLiteral("title")).toString(),
+                 QStringLiteral("First"));
+        QCOMPARE(queuedSecond.message->payload().value(QStringLiteral("title")).toString(),
+                 QStringLiteral("Second"));
+    }
+
+    {
+        auto [host, peer] = authenticatedRaw(QStringLiteral("metadata-close-handler"));
+        QVERIFY(host != nullptr);
+        const auto first = ProtocolMessage::pageMetadata(QStringLiteral("First"));
+        const auto second = ProtocolMessage::pageMetadata(QStringLiteral("Second"));
+        QVERIFY(first.has_value());
+        QVERIFY(second.has_value());
+        QVERIFY(peer.writeAll(FrameCodec::encode(ProtocolMessage::ready().toJson())
+                                  + FrameCodec::encode(first->toJson())
+                                  + FrameCodec::encode(second->toJson()),
+                              1000));
+        QCOMPARE(host->receive(1000).message->type(), ProtocolType::Ready);
+
+        int handlerCalls = 0;
+        bool callbackThrew = false;
+        try {
+            host->setPageMetadataHandler(
+                [&](const QString &, const QString &) {
+                    ++handlerCalls;
+                    host->close();
+                });
+        } catch (...) {
+            callbackThrew = true;
+        }
+        QVERIFY(!callbackThrew);
+        QCOMPARE(handlerCalls, 1);
+        QVERIFY(host->isClosed());
+        QCOMPARE(host->receive(0).status, SessionStatus::Failed);
     }
 #endif
 }

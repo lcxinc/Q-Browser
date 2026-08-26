@@ -1,6 +1,7 @@
 #include "RuntimeFacade.h"
 
 #include "NormalizedPath.h"
+#include "ProtocolMessage.h"
 
 #include <QUrl>
 #include <QUuid>
@@ -9,7 +10,6 @@ namespace {
 
 constexpr qsizetype maximumRawPageTitleCodeUnits = 4096;
 constexpr qsizetype maximumPageTitleCodeUnits = 256;
-constexpr qsizetype maximumPageStatusBytes = 32;
 
 bool isBidiControl(const char16_t value)
 {
@@ -58,22 +58,6 @@ std::optional<QString> canonicalPageTitle(const QString &untrusted)
     }
     return canonical.isEmpty() ? std::nullopt
                                : std::optional<QString>(std::move(canonical));
-}
-
-bool validPageStatus(const QString &status)
-{
-    if (status.isEmpty()) return true;
-    if (status.size() > maximumPageStatusBytes) return false;
-    for (const QChar character : status) {
-        const char16_t codeUnit = character.unicode();
-        if (!((codeUnit >= u'a' && codeUnit <= u'z')
-              || (codeUnit >= u'A' && codeUnit <= u'Z')
-              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
-              || codeUnit == u'_' || codeUnit == u'.')) {
-            return false;
-        }
-    }
-    return true;
 }
 
 } // namespace
@@ -139,7 +123,10 @@ QString RuntimeFacade::navigate(const QString &route)
 bool RuntimeFacade::setPageMetadata(const QString &title, const QString &status)
 {
     const std::optional<QString> canonicalTitle = canonicalPageTitle(title);
-    if (!canonicalTitle.has_value() || !validPageStatus(status)) return false;
+    if (!canonicalTitle.has_value()
+        || !ProtocolMessage::pageMetadata(*canonicalTitle, status).has_value()) {
+        return false;
+    }
     pendingPageMetadata_ = PendingPageMetadata{*canonicalTitle, status};
     emit pageMetadataChanged(*canonicalTitle, status);
     return true;

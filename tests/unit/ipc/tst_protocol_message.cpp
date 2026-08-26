@@ -1,3 +1,4 @@
+#include "FrameCodec.h"
 #include "ProtocolMessage.h"
 
 #include <QJsonArray>
@@ -17,6 +18,7 @@ private slots:
     void factoriesAreValidByConstruction();
     void factoriesRejectInvalidArguments();
     void versionOneUnknownAdditionsStillFailClosed();
+    void frozenLegacyVersionOneDecoderRejectsActualPageMetadataFrame();
 };
 
 void ProtocolMessageTest::parsesValidMessages_data()
@@ -254,6 +256,21 @@ void ProtocolMessageTest::rejectsTypedPayloadViolations_data()
     QTest::newRow("page-metadata-non-token-status")
         << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
                          {QStringLiteral("status"), QStringLiteral("not ready")}});
+    QTest::newRow("page-metadata-admin-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("admin")}});
+    QTest::newRow("page-metadata-trusted-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("trusted")}});
+    QTest::newRow("page-metadata-loading-suffix-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("loading-1")}});
+    QTest::newRow("page-metadata-uppercase-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("READY")}});
+    QTest::newRow("page-metadata-case-variant-status")
+        << pageMetadata({{QStringLiteral("title"), QStringLiteral("Orders")},
+                         {QStringLiteral("status"), QStringLiteral("Loading")}});
 }
 
 void ProtocolMessageTest::rejectsTypedPayloadViolations()
@@ -286,7 +303,7 @@ void ProtocolMessageTest::factoriesAreValidByConstruction()
     const ProtocolMessage shutdown = *ProtocolMessage::shutdown(QStringLiteral("host.request"));
     const ProtocolMessage pageMetadata = *ProtocolMessage::pageMetadata(
         QString(254, u'x') + QString::fromUcs4(U"\U0001f680"),
-        QStringLiteral("loading-1"));
+        QStringLiteral("loading"));
     const ProtocolMessage pageMetadataWithoutStatus = *ProtocolMessage::pageMetadata(
         QStringLiteral("Orders"));
 
@@ -349,6 +366,14 @@ void ProtocolMessageTest::factoriesRejectInvalidArguments()
                                            QString(33, u'a')).has_value());
     QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders"),
                                            QStringLiteral("not ready")).has_value());
+    for (const QString &status : {QStringLiteral("admin"),
+                                  QStringLiteral("trusted"),
+                                  QStringLiteral("loading-1"),
+                                  QStringLiteral("READY"),
+                                  QStringLiteral("Loading")}) {
+        QVERIFY(!ProtocolMessage::pageMetadata(QStringLiteral("Orders"), status)
+                     .has_value());
+    }
 }
 
 void ProtocolMessageTest::versionOneUnknownAdditionsStillFailClosed()
@@ -361,6 +386,61 @@ void ProtocolMessageTest::versionOneUnknownAdditionsStillFailClosed()
     QVERIFY(!result.message.has_value());
     QCOMPARE(result.error, ProtocolError::UnknownType);
     QCOMPARE(result.errorCode, QStringLiteral("ipc.protocol.unknown_type"));
+}
+
+void ProtocolMessageTest::frozenLegacyVersionOneDecoderRejectsActualPageMetadataFrame()
+{
+    enum class LegacyDecodeResult {
+        AcceptedType,
+        UnknownType,
+        InvalidEnvelope,
+    };
+    const QStringList frozenLegacyTypes{
+        QStringLiteral("handshake"),
+        QStringLiteral("handshakeAck"),
+        QStringLiteral("surfaceReady"),
+        QStringLiteral("routeLoad"),
+        QStringLiteral("navigationRequest"),
+        QStringLiteral("ready"),
+        QStringLiteral("request"),
+        QStringLiteral("response"),
+        QStringLiteral("heartbeat"),
+        QStringLiteral("structuredLog"),
+        QStringLiteral("shutdown"),
+    };
+    const auto legacyDecode = [&frozenLegacyTypes](const QJsonObject &object) {
+        const QJsonValue version = object.value(QStringLiteral("protocolVersion"));
+        const QJsonValue type = object.value(QStringLiteral("type"));
+        const QJsonValue payload = object.value(QStringLiteral("payload"));
+        if (!version.isDouble() || version.toInt(-1) != 1 || !type.isString()
+            || !payload.isObject()) {
+            return LegacyDecodeResult::InvalidEnvelope;
+        }
+        return frozenLegacyTypes.contains(type.toString())
+            ? LegacyDecodeResult::AcceptedType
+            : LegacyDecodeResult::UnknownType;
+    };
+
+    for (const QString &legacyType : frozenLegacyTypes) {
+        QCOMPARE(legacyDecode(
+                     QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                                 {QStringLiteral("type"), legacyType},
+                                 {QStringLiteral("payload"), QJsonObject{}}}),
+                 LegacyDecodeResult::AcceptedType);
+    }
+
+    const auto metadata = ProtocolMessage::pageMetadata(
+        QStringLiteral("Orders"), QStringLiteral("ready"));
+    QVERIFY(metadata.has_value());
+    const QByteArray actualFrame = FrameCodec::encode(metadata->toJson());
+    QVERIFY(!actualFrame.isEmpty());
+    FrameCodec legacyFraming;
+    const FrameFeedResult framed = legacyFraming.feed(actualFrame);
+    QCOMPARE(framed.status, FrameStatus::FramesReady);
+    QCOMPARE(framed.frames.size(), 1);
+    QCOMPARE(framed.frames.constFirst(), metadata->toJson());
+    QCOMPARE(legacyDecode(framed.frames.constFirst()),
+             LegacyDecodeResult::UnknownType);
 }
 
 QTEST_MAIN(ProtocolMessageTest)

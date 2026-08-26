@@ -337,6 +337,18 @@ void UnifiedNavigationTest::pageMetadataUsesOnlyCurrentGenerationAndResanitizes(
         Q_ARG(QString, QStringLiteral("<b>Forged</b>")),
         Q_ARG(QString, QStringLiteral("ready"))));
     QCOMPARE(metadataSpy.count(), 2);
+    for (const QString &status : {QStringLiteral("admin"),
+                                  QStringLiteral("trusted"),
+                                  QStringLiteral("loading-1"),
+                                  QStringLiteral("READY"),
+                                  QStringLiteral("Loading")}) {
+        QVERIFY(QMetaObject::invokeMethod(
+            &controller, "handlePageMetadata", Qt::DirectConnection,
+            Q_ARG(quint64, quint64(1)),
+            Q_ARG(QString, QStringLiteral("Forged status")),
+            Q_ARG(QString, status)));
+        QCOMPARE(metadataSpy.count(), 2);
+    }
 
     auto replacement = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
     QVERIFY(replacement.has_value());

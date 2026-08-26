@@ -142,15 +142,10 @@ bool validPageStatus(const QJsonValue &value)
     const QString status = value.toString();
     if (status.isEmpty() || status.size() > maximumPageStatusBytes) return false;
     for (const QChar character : status) {
-        const char16_t codeUnit = character.unicode();
-        if (!((codeUnit >= u'a' && codeUnit <= u'z')
-              || (codeUnit >= u'A' && codeUnit <= u'Z')
-              || (codeUnit >= u'0' && codeUnit <= u'9') || codeUnit == u'-'
-              || codeUnit == u'_' || codeUnit == u'.')) {
-            return false;
-        }
+        if (character.unicode() > 0x7f) return false;
     }
-    return true;
+    return status == QStringLiteral("loading")
+        || status == QStringLiteral("ready");
 }
 
 bool validPayload(const ProtocolType type, const QJsonObject &payload)
