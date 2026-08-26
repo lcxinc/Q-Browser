@@ -2,6 +2,7 @@
 
 #include "PackageInstaller.h"
 #include "PackageStore.h"
+#include "WorkerLaunchRequest.h"
 
 #include <QByteArray>
 #include <QString>
@@ -22,6 +23,8 @@ public:
     [[nodiscard]] InstallResult reverifyInstalledVersion(
         const QString &appId,
         const ActivationBinding &expected) const;
+    [[nodiscard]] InstallResult revalidateWorkerLaunch(
+        const WorkerLaunchRequest &request) const;
 
 #ifdef Q_BROWSER_HOST_TESTING
     [[nodiscard]] static qsizetype liveCountForTesting() noexcept;

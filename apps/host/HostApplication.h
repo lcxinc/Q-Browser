@@ -30,10 +30,9 @@ struct HostWorkerAttachContext final
     std::unique_ptr<IpcSession> session;
     std::unique_ptr<WorkerSurface> surface;
     std::shared_ptr<void> processLifetime;
-    ManifestPermissions permissions;
+    WorkerLaunchRequest launchRequest;
     quint32 processId = 0;
     std::function<void()> stopProcess;
-    std::optional<WorkerAttemptKey> supervisionKey;
 };
 
 class HostApplication final : public QObject
@@ -99,7 +98,6 @@ private:
     QPointer<QObject> updateLifecycleRuntime_;
     QThread *updateLifecycleThread_ = nullptr;
     quint64 nextCapabilityRuntimeIncarnation_ = 1;
-    quint64 nextLeaseAuthorityEpoch_ = 1;
     std::atomic_bool acceptingLifecycle_{true};
 #ifdef Q_BROWSER_HOST_TESTING
     bool lifecycleQueueFullForTesting_ = false;

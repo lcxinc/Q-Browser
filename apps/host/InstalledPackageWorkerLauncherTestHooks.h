@@ -3,6 +3,7 @@
 #ifdef Q_BROWSER_HOST_TESTING
 
 #include "UpdateLifecycleCoordinator.h"
+#include "WorkerLaunchRequest.h"
 
 #include <QString>
 
@@ -12,14 +13,15 @@ namespace qbrowser_host_testing
 {
 struct InstalledPackageWorkerLauncherTestHooks final
 {
-    std::function<void(const UpdateLaunchRequest &)>
+    std::function<void(const WorkerLaunchRequest &)>
         beforeBindingValidation;
-    std::function<void(const UpdateLaunchRequest &)>
+    std::function<void(const WorkerLaunchRequest &)>
         afterBindingValidationBeforeProcessLaunch;
-    std::function<void(const UpdateLaunchRequest &)>
+    std::function<void(const WorkerLaunchRequest &)>
         afterProcessStartBeforeHandshake;
-    std::function<void(quint32)> afterHandshakeBeforeCompletionQueued;
-    std::function<void(const UpdateLaunchRequest &,
+    std::function<void(const WorkerLaunchRequest &, quint32)>
+        afterHandshakeBeforeCompletionQueued;
+    std::function<void(const WorkerLaunchRequest &,
                        UpdateLifecycleCoordinator &)>
         beforeAdmissionDecision;
     std::function<bool(const QString &)> failWorkerTempCleanup;

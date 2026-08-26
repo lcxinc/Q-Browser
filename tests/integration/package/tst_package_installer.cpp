@@ -174,6 +174,47 @@ InstallPolicy policy()
     result.preflight = [](const Manifest &, const QString &) { return true; };
     return result;
 }
+
+VerifiedPackageLease leaseFor(const InstallResult &installed,
+                              const quint64 authorityEpoch)
+{
+    Q_ASSERT(installed.activationBinding.has_value());
+    const ActivationBinding &binding = *installed.activationBinding;
+    return {installed.appId,
+            installed.version,
+            binding.currentDirectory,
+            installed.path,
+            installed.entryPoint,
+            installed.permissions,
+            binding.versionDigestHex,
+            binding.generation,
+            authorityEpoch};
+}
+
+bool makeInstalledFileWritable(const QString &path)
+{
+#ifdef Q_OS_WIN
+    if (SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const auto *const nativePath = reinterpret_cast<LPCWSTR>(path.utf16());
+    const DWORD attributes = GetFileAttributesW(nativePath);
+    if (attributes == INVALID_FILE_ATTRIBUTES
+        || ((attributes & FILE_ATTRIBUTE_READONLY) != 0U
+            && SetFileAttributesW(nativePath,
+                                  attributes & ~FILE_ATTRIBUTE_READONLY)
+                   == FALSE)) {
+        return false;
+    }
+#endif
+    return QFile::setPermissions(path,
+                                 QFileDevice::ReadOwner
+                                     | QFileDevice::WriteOwner);
+}
 }
 
 class PackageInstallerTest final : public QObject
@@ -200,10 +241,113 @@ private slots:
     void publicationRaceRestoresOwnedStagingCleanup();
     void reverifyRejectsMismatchedActivationGeneration();
     void reverifyRejectsActivationChangedDuringSnapshot();
+    void reverifyPinnedSignedVersionAfterCurrentChanges();
+    void rejectTamperedPinnedVersion();
+    void rejectPinnedPathOrDigestMismatch();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
     void rejectsAuthenticatedAppSwappedAfterPrecheckWithoutStoreMutation();
 };
+
+void PackageInstallerTest::reverifyPinnedSignedVersionAfterCurrentChanges()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-first"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    QVERIFY(first.activationBinding.has_value());
+    const VerifiedPackageLease lease = leaseFor(first, 41);
+
+    const InstallResult second = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-current"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.1.0"))));
+    QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+    QCOMPARE(store.resolveCurrent(QStringLiteral("company.pilot")).path,
+             second.path);
+    QVERIFY(!installer.reverifyInstalledVersion(
+                           lease.appId, *first.activationBinding)
+                 .succeeded());
+
+    const InstallResult reverified = installer.reverifyPinnedLease(lease);
+    QVERIFY2(reverified.succeeded(), qPrintable(reverified.stableError));
+    QCOMPARE(reverified.appId, lease.appId);
+    QCOMPARE(reverified.version, lease.version);
+    QCOMPARE(reverified.path, lease.packageDirectory);
+    QCOMPARE(reverified.entryPoint, lease.entryPoint);
+    QVERIFY(reverified.activationBinding.has_value());
+    QCOMPARE(reverified.activationBinding->currentDirectory,
+             lease.versionDirectory);
+    QCOMPARE(reverified.activationBinding->versionDigestHex, lease.digestHex);
+    QCOMPARE(reverified.activationBinding->generation,
+             lease.activationGenerationAtIssue);
+}
+
+void PackageInstallerTest::rejectTamperedPinnedVersion()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-tamper"), keys.value().privateKeyPem,
+        manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    const VerifiedPackageLease lease = leaseFor(installed, 42);
+    const QString entryPath = QDir(installed.path).filePath(installed.entryPoint);
+    QVERIFY(makeInstalledFileWritable(entryPath));
+    QFile entry(entryPath);
+    QVERIFY(entry.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(entry.write("tampered pinned contents"), qint64(24));
+    entry.close();
+
+    const InstallResult rejected = installer.reverifyPinnedLease(lease);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QCOMPARE(rejected.stableError, QStringLiteral("installed_content_invalid"));
+}
+
+void PackageInstallerTest::rejectPinnedPathOrDigestMismatch()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-path-first"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    const InstallResult second = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-path-second"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+    const VerifiedPackageLease original = leaseFor(first, 43);
+
+    VerifiedPackageLease wrongPath = original;
+    wrongPath.packageDirectory = second.path;
+    QVERIFY(!installer.reverifyPinnedLease(wrongPath).succeeded());
+
+    VerifiedPackageLease wrongVersionDirectory = original;
+    wrongVersionDirectory.versionDirectory = QFileInfo(second.path).fileName();
+    QVERIFY(!installer.reverifyPinnedLease(wrongVersionDirectory).succeeded());
+
+    VerifiedPackageLease wrongDigest = original;
+    wrongDigest.digestHex[0] = wrongDigest.digestHex.at(0) == '0' ? '1' : '0';
+    QVERIFY(!installer.reverifyPinnedLease(wrongDigest).succeeded());
+
+    VerifiedPackageLease zeroGeneration = original;
+    zeroGeneration.activationGenerationAtIssue = 0;
+    QVERIFY(!installer.reverifyPinnedLease(zeroGeneration).succeeded());
+}
 
 void PackageInstallerTest::rejectsAuthenticatedAppSwappedAfterPrecheckWithoutStoreMutation()
 {

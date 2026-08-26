@@ -3,8 +3,8 @@
 #include "IpcSession.h"
 #include "SandboxLauncher.h"
 #include "SandboxTrustBoundary.h"
-#include "UpdateLifecycleCoordinator.h"
 #include "WindowsStableIo.h"
+#include "WorkerLaunchRequest.h"
 #include "WorkerSurface.h"
 
 #include <QObject>
@@ -32,22 +32,22 @@ public:
         bool accepted = false;
         QString stableError;
         bool ignoredStale = false;
+        std::optional<WorkerLaunchRequest> authority;
     };
 
     using AttachCallback = std::function<AttachResult(
+        const WorkerLaunchRequest &,
         std::unique_ptr<IpcSession>,
         std::unique_ptr<WorkerSurface>,
-        std::shared_ptr<SandboxProcess>,
-        ManifestPermissions,
-        WorkerAttemptKey)>;
+        std::shared_ptr<SandboxProcess>)>;
     using StopCallback = std::function<void()>;
     using ExitCallback = std::function<void(WorkerAttemptKey, bool)>;
     using FailureCallback = std::function<void(WorkerAttemptKey, const QString &)>;
     using BindingValidator = std::function<InstallResult(
-        const QString &, const ActivationBinding &)>;
+        const WorkerLaunchRequest &)>;
     using AdmissionCompletion = std::function<void(AdmissionResult)>;
     using AdmissionCallback = std::function<bool(
-        const UpdateLaunchRequest &, AdmissionCompletion)>;
+        const WorkerLaunchRequest &, AdmissionCompletion)>;
 
     InstalledPackageWorkerLauncher(SandboxTrustBoundary boundary,
                                    QString workerExecutable,
@@ -66,7 +66,7 @@ public:
     InstalledPackageWorkerLauncher &operator=(
         const InstalledPackageWorkerLauncher &) = delete;
 
-    [[nodiscard]] bool requestLaunch(const UpdateLaunchRequest &request);
+    [[nodiscard]] bool requestLaunch(const WorkerLaunchRequest &request);
     void stopCurrent();
     void cancel() noexcept;
     [[nodiscard]] bool isAccepting() const noexcept;
@@ -115,7 +115,7 @@ private:
     std::shared_ptr<LaunchRetirementContext> currentRetirement_;
     std::optional<WorkerAttemptKey> currentKey_;
     std::optional<WorkerAttemptKey> expectedStop_;
-    std::optional<UpdateLaunchRequest> pendingRequest_;
+    std::optional<WorkerLaunchRequest> pendingRequest_;
     std::unordered_map<quint64, std::shared_ptr<LaunchRetirementContext>> inflight_;
     std::vector<std::shared_ptr<LaunchRetirementContext>> fatalCleanup_;
     quint64 serial_ = 0;

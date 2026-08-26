@@ -319,6 +319,47 @@ bool packageMembersPassPolicy(const QVector<ArchiveFile> &files)
     });
 }
 
+bool permissionsMatch(const ManifestPermissions &left,
+                      const ManifestPermissions &right)
+{
+    return left.network.hosts == right.network.hosts
+        && left.network.methods == right.network.methods
+        && left.storage == right.storage
+        && left.clipboardWrite == right.clipboardWrite
+        && left.clipboardRead == right.clipboardRead
+        && left.fileOpen == right.fileOpen;
+}
+
+bool validDigestHex(const QByteArray &digest)
+{
+    return digest.size() == 64
+        && std::ranges::all_of(digest, [](const char value) {
+               return (value >= '0' && value <= '9')
+                   || (value >= 'a' && value <= 'f');
+           });
+}
+
+bool sameCanonicalDirectory(const QString &expected,
+                            const QString &leased)
+{
+    const QFileInfo expectedInfo(expected);
+    const QFileInfo leasedInfo(leased);
+    const QString expectedCanonical = expectedInfo.canonicalFilePath();
+    const QString leasedCanonical = leasedInfo.canonicalFilePath();
+#ifdef Q_OS_WIN
+    constexpr Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+    constexpr Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+    return expectedInfo.isDir() && !expectedInfo.isSymLink()
+        && leasedInfo.isDir() && !leasedInfo.isSymLink()
+        && !expectedCanonical.isEmpty() && !leasedCanonical.isEmpty()
+        && expectedCanonical.compare(leasedCanonical, pathCase) == 0
+        && QDir::cleanPath(leasedInfo.absoluteFilePath())
+               .compare(QDir::cleanPath(leasedCanonical), pathCase)
+            == 0;
+}
+
 std::optional<QString> authenticatedManifestAppId(
     const QString &packagePath,
     const QByteArray &trustedPublicKeyPem,
@@ -489,6 +530,43 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
                        QStringLiteral("installed_content_invalid"));
     }
     verified.activationBinding = expected;
+    return verified;
+}
+
+InstallResult PackageInstaller::reverifyPinnedLease(
+    const VerifiedPackageLease &lease) const
+{
+    const QString expectedDirectory = m_store.versionPath(
+        lease.appId, lease.versionDirectory);
+    if (lease.appId.isEmpty() || lease.version.isEmpty()
+        || lease.entryPoint.isEmpty() || !validDigestHex(lease.digestHex)
+        || lease.activationGenerationAtIssue <= 0
+        || lease.leaseAuthorityEpoch == 0
+        || lease.versionDirectory
+               != lease.version + QLatin1Char('-')
+                    + QString::fromLatin1(lease.digestHex)
+        || expectedDirectory.isEmpty()
+        || !sameCanonicalDirectory(expectedDirectory,
+                                   lease.packageDirectory)) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+
+    InstallResult verified = verifyInstalled(lease.appId,
+                                             lease.versionDirectory);
+    if (!verified.succeeded() || verified.appId != lease.appId
+        || verified.version != lease.version
+        || verified.entryPoint != lease.entryPoint
+        || !sameCanonicalDirectory(verified.path,
+                                   lease.packageDirectory)
+        || !permissionsMatch(verified.permissions, lease.permissions)) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    verified.activationBinding = ActivationBinding{
+        lease.versionDirectory,
+        lease.digestHex,
+        lease.activationGenerationAtIssue};
     return verified;
 }
 

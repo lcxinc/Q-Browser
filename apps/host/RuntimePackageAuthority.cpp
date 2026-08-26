@@ -46,6 +46,19 @@ InstallResult RuntimePackageAuthority::reverifyInstalledVersion(
     return installer_.reverifyInstalledVersion(appId, expected);
 }
 
+InstallResult RuntimePackageAuthority::revalidateWorkerLaunch(
+    const WorkerLaunchRequest &request) const
+{
+    if (request.revalidationMode == PackageRevalidationMode::PinnedLease) {
+        return installer_.reverifyPinnedLease(request.lease);
+    }
+    const ActivationBinding expected{
+        request.lease.versionDirectory,
+        request.lease.digestHex,
+        request.lease.activationGenerationAtIssue};
+    return installer_.reverifyInstalledVersion(request.lease.appId, expected);
+}
+
 #ifdef Q_BROWSER_HOST_TESTING
 qsizetype RuntimePackageAuthority::liveCountForTesting() noexcept
 {

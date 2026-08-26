@@ -287,15 +287,25 @@ bool HostApplication::initializePackageRuntime()
     auto authority = std::make_shared<RuntimePackageAuthority>(
         runtimeConfig_->packageStoreRoot(),
         runtimeConfig_->trustedPublicKeyPem(), std::move(installPolicy));
+    BrowserTabModel *const tabModel = mainWindow_ != nullptr
+        ? mainWindow_->tabModel() : nullptr;
+    const QString packageTabId = tabModel != nullptr
+        ? tabModel->activeId() : QString{};
+    if (packageTabId.isEmpty() || nextCapabilityRuntimeIncarnation_ == 0) {
+        emit updateLifecycleFailed(
+            QStringLiteral("host.runtime.launch_authority_unavailable"));
+        return false;
+    }
+    const quint64 runtimeIncarnation = nextCapabilityRuntimeIncarnation_++;
 
     QPointer<HostApplication> guard(this);
     installedPackageLauncher_ = std::make_unique<InstalledPackageWorkerLauncher>(
         std::move(*boundary.value), runtimeConfig_->workerExecutable(),
         runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
-        [authority](const QString &appId, const ActivationBinding &binding) {
-            return authority->reverifyInstalledVersion(appId, binding);
+        [authority](const WorkerLaunchRequest &request) {
+            return authority->revalidateWorkerLaunch(request);
         },
-        [guard](const UpdateLaunchRequest &request,
+        [guard](const WorkerLaunchRequest &request,
                 InstalledPackageWorkerLauncher::AdmissionCompletion complete) {
             if (!guard || !complete) return false;
             return guard->enqueueLifecycle(
@@ -309,36 +319,36 @@ bool HostApplication::initializePackageRuntime()
                     }
 #endif
                     const UpdateLifecycleAction action =
-                        coordinator.admitAuthenticatedWorker(
-                            request.key, request.expectedActivation);
+                        coordinator.admitAuthenticatedWorker(request);
                     const bool accepted = action == UpdateLifecycleAction::None;
                     const bool ignoredStale = action
                         == UpdateLifecycleAction::IgnoredStaleAttempt;
-                    complete({accepted,
-                              accepted || ignoredStale
-                                  ? QString{}
-                                  : QStringLiteral(
-                                        "host.launch.admission_rejected"),
-                              ignoredStale});
+                    complete({
+                        accepted,
+                        accepted || ignoredStale
+                            ? QString{}
+                            : QStringLiteral("host.launch.admission_rejected"),
+                        ignoredStale,
+                        accepted
+                            ? std::optional<WorkerLaunchRequest>(request)
+                            : std::nullopt});
                 });
         },
-        [guard](std::unique_ptr<IpcSession> session,
+        [guard](const WorkerLaunchRequest &request,
+                std::unique_ptr<IpcSession> session,
                 std::unique_ptr<WorkerSurface> surface,
-                std::shared_ptr<SandboxProcess> process,
-                ManifestPermissions permissions,
-                const WorkerAttemptKey key) {
+                std::shared_ptr<SandboxProcess> process) {
             if (!guard || process == nullptr)
                 return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
             HostWorkerAttachContext context;
             context.session = std::move(session);
             context.surface = std::move(surface);
             context.processLifetime = std::static_pointer_cast<void>(process);
-            context.permissions = std::move(permissions);
+            context.launchRequest = request;
             context.processId = process->processId();
             context.stopProcess = [process] {
                 process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
             };
-            context.supervisionKey = key;
             return guard->attachWorkerContext(std::move(context));
         },
         [guard] {
@@ -412,9 +422,11 @@ bool HostApplication::initializePackageRuntime()
         [launcher](const UpdateLaunchRequest &request) {
             if (!launcher) return false;
             return QMetaObject::invokeMethod(launcher, [launcher, request] {
-                if (launcher) (void)launcher->requestLaunch(request);
+                if (launcher) (void)launcher->requestLaunch(
+                    request.workerRequest);
             }, Qt::QueuedConnection);
-        }, LifecycleClock::system(), recorder.get());
+        }, LifecycleClock::system(), recorder.get(), packageTabId,
+        runtimeIncarnation);
     coordinator->setBeforeRelaunchCallback([launcher] {
         if (launcher) {
             (void)QMetaObject::invokeMethod(launcher, [launcher] {
@@ -589,21 +601,27 @@ bool HostApplication::attachWorkerSession(std::unique_ptr<IpcSession> session)
 InstalledPackageWorkerLauncher::AttachResult
 HostApplication::attachWorkerContext(HostWorkerAttachContext context)
 {
+    const WorkerLaunchRequest &request = context.launchRequest;
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr
         || gestureRouter_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
         || workerProcessLifetime_ != nullptr || !runtimeConfig_.has_value()
-        || context.session->appIdentity() != runtimeConfig_->appId())
+        || runtimeConfig_->mode() != HostRuntimeMode::Package
+        || request.admission == nullptr || request.tabId.isEmpty()
+        || request.runtimeIncarnation == 0
+        || request.lease.appId != runtimeConfig_->appId()
+        || request.lease.leaseAuthorityEpoch == 0
+        || request.attempt.activation.value == 0
+        || request.attempt.attempt.value == 0
+        || context.session->appIdentity() != request.lease.appId)
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     BrowserTabModel *const tabModel = mainWindow_->tabModel();
     const QString tabId = tabModel != nullptr ? tabModel->activeId() : QString{};
     TabController *const owningTab = mainWindow_->tabController(tabId);
-    if (tabId.isEmpty() || owningTab == nullptr
+    if (tabId.isEmpty() || tabId != request.tabId || owningTab == nullptr
         || workerSessionController_->generation()
-               == std::numeric_limits<quint64>::max()
-        || nextCapabilityRuntimeIncarnation_ == 0
-        || nextLeaseAuthorityEpoch_ == 0) {
+               == std::numeric_limits<quint64>::max()) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     const quintptr workerWindowId = static_cast<quintptr>(
@@ -618,22 +636,21 @@ HostApplication::attachWorkerContext(HostWorkerAttachContext context)
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     const TabCapabilityAuthority authority{
-        tabId,
-        nextCapabilityRuntimeIncarnation_++,
-        runtimeConfig_->appId(),
+        request.tabId,
+        request.runtimeIncarnation,
+        request.lease.appId,
         context.processId,
         workerWindowId,
         workerSessionController_->generation() + 1,
-        nextLeaseAuthorityEpoch_++};
+        request.lease.leaseAuthorityEpoch};
     if (!authority.isValid()) {
         mainWindow_->detachWorkerSurface();
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     QString capabilityError;
-    auto admissionToken = std::make_shared<AuthorityAdmissionToken>();
     auto capabilityRuntime = HostCapabilityRuntime::create(
-        authority, std::move(admissionToken), gestureRouter_.get(),
-        context.permissions, runtimeConfig_->mockOrigin(),
+        authority, request.admission, gestureRouter_.get(),
+        request.lease.permissions, runtimeConfig_->mockOrigin(),
         runtimeConfig_->storageDirectory(),
         static_cast<quintptr>(mainWindow_->winId()), &capabilityError);
     if (capabilityRuntime == nullptr) {
@@ -670,7 +687,7 @@ HostApplication::attachWorkerContext(HostWorkerAttachContext context)
     capabilityRuntime_ = std::move(capabilityRuntime);
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
-    attachedWorkerKey_ = context.supervisionKey;
+    attachedWorkerKey_ = request.attempt;
     synchronizeGestureAuthority();
     Q_ASSERT(mainWindow_->workerSurface() == surface);
     return InstalledPackageWorkerLauncher::AttachResult::Attached;

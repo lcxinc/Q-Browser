@@ -7,6 +7,7 @@
 #include <QDateTime>
 
 #include <chrono>
+#include <limits>
 #include <utility>
 
 namespace
@@ -43,7 +44,9 @@ UpdateLifecycleCoordinator::UpdateLifecycleCoordinator(
     const WorkerSupervisionPolicy supervisionPolicy,
     LaunchCallback launch,
     LifecycleClock clock,
-    EventRecorder *recorder)
+    EventRecorder *recorder,
+    QString tabId,
+    const quint64 runtimeIncarnation)
     : appId_(std::move(appId))
     , store_(store)
     , installer_(installer)
@@ -53,8 +56,13 @@ UpdateLifecycleCoordinator::UpdateLifecycleCoordinator(
     , supervisor_(supervisionPolicy,
                   [this](WorkerActivationId) { restartRequested_ = true; },
                   [this](WorkerActivationId) { rollbackRequested_ = true; })
+    , tabId_(std::move(tabId))
+    , runtimeIncarnation_(runtimeIncarnation)
 {
-    if (appId_.isEmpty() || !launch_ || !clock_.isValid()) failedClosed_ = true;
+    if (appId_.isEmpty() || !launch_ || !clock_.isValid()
+        || runtimeIncarnation_ == 0) {
+        failedClosed_ = true;
+    }
 }
 
 void UpdateLifecycleCoordinator::setBeforeRelaunchCallback(
@@ -86,6 +94,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
     }
     UpdateLifecycleResult result = beginLaunch(
         installed.version, installed.path, installed.entryPoint,
+        installed.permissions,
         *installed.activationBinding, nowMs, false,
         UpdateLifecycleAction::LaunchRequested);
     result.appId = installed.appId;
@@ -133,7 +142,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                     QStringLiteral("update.current_verification_failed"));
             }
             return beginLaunch(rebound.version, rebound.path,
-                               rebound.entryPoint, *confirmed.activationBinding,
+                               rebound.entryPoint, rebound.permissions,
+                               *confirmed.activationBinding,
                                nowMs, false,
                                UpdateLifecycleAction::LaunchRequested);
         }
@@ -165,6 +175,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                                 QStringLiteral("update.lkg_verification_failed"));
     }
     return beginLaunch(rebound.version, rebound.path, rebound.entryPoint,
+                       rebound.permissions,
                        *recovered.activationBinding, nowMs, true,
                        UpdateLifecycleAction::RecoveredAndLaunched);
 }
@@ -173,6 +184,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     QString version,
     QString path,
     QString entryPoint,
+    ManifestPermissions permissions,
     ActivationBinding binding,
     const qint64 nowMs,
     const bool recovery,
@@ -182,6 +194,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     currentVersion_ = std::move(version);
     currentPath_ = std::move(path);
     currentEntryPoint_ = std::move(entryPoint);
+    currentPermissions_ = std::move(permissions);
     currentBinding_ = std::move(binding);
     currentHealthy_ = false;
     handshakeAccepted_ = false;
@@ -199,10 +212,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
     }
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
-    const UpdateLaunchRequest request{appId_, currentVersion_, currentPath_,
-                                      currentEntryPoint_, *currentBinding_,
-                                      *currentKey_, recovery};
-    if (!launch_(request)) {
+    const auto request = issueLaunchRequest(recovery);
+    if (!request.has_value() || !launch_(*request)) {
         const WorkerSupervisionAction action = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
         const UpdateLifecycleAction recoveryAction = applySupervisionAction(
@@ -262,6 +273,23 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::admitAuthenticatedWorker(
         return enterFailedClosed();
     }
     return authenticatedHandshake(key);
+}
+
+UpdateLifecycleAction UpdateLifecycleCoordinator::admitAuthenticatedWorker(
+    const WorkerLaunchRequest &request)
+{
+    if (!currentKey_.has_value() || request.attempt != *currentKey_) {
+        return UpdateLifecycleAction::IgnoredStaleAttempt;
+    }
+    if (!currentWorkerLaunch_.has_value()
+        || request != *currentWorkerLaunch_) {
+        return enterFailedClosed();
+    }
+    const ActivationBinding expected{
+        request.lease.versionDirectory,
+        request.lease.digestHex,
+        request.lease.activationGenerationAtIssue};
+    return admitAuthenticatedWorker(request.attempt, expected);
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::heartbeat(
@@ -374,6 +402,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
     currentVersion_ = rebound.version;
     currentPath_ = rebound.path;
     currentEntryPoint_ = rebound.entryPoint;
+    currentPermissions_ = rebound.permissions;
     const WorkerActivationId activation = supervisor_.activeActivation();
     const std::optional<WorkerAttemptId> attempt = supervisor_.beginAttempt(
         activation, nowMs);
@@ -382,8 +411,8 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
     }
     currentKey_ = WorkerAttemptKey{activation, *attempt};
     currentAttemptStopped_ = true;
-    if (!launch_({appId_, currentVersion_, currentPath_, currentEntryPoint_,
-                  *currentBinding_, *currentKey_, recoveryLaunch_})) {
+    const auto request = issueLaunchRequest(recoveryLaunch_);
+    if (!request.has_value() || !launch_(*request)) {
         const WorkerSupervisionAction failed = supervisor_.workerExited(
             *currentKey_, WorkerExitReason::StartupFailure, nowMs);
         return applySupervisionAction(failed, nowMs);
@@ -416,6 +445,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
     }
     const UpdateLifecycleResult launched = beginLaunch(
         verified.version, verified.path, verified.entryPoint,
+        verified.permissions,
         *rolledBack.activationBinding, nowMs, true,
         UpdateLifecycleAction::RolledBackAndLaunched);
     if (!launched.succeeded()) {
@@ -424,8 +454,56 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
     return UpdateLifecycleAction::RolledBackAndLaunched;
 }
 
+std::optional<UpdateLaunchRequest>
+UpdateLifecycleCoordinator::issueLaunchRequest(const bool recovery)
+{
+    if (!currentBinding_.has_value() || !currentKey_.has_value()
+        || nextLeaseAuthorityEpoch_ == 0) {
+        return std::nullopt;
+    }
+    revokeCurrentLaunchAuthority();
+    const quint64 authorityEpoch = nextLeaseAuthorityEpoch_;
+    nextLeaseAuthorityEpoch_ = authorityEpoch
+            == std::numeric_limits<quint64>::max()
+        ? 0
+        : authorityEpoch + 1;
+    VerifiedPackageLease lease{
+        appId_,
+        currentVersion_,
+        currentBinding_->currentDirectory,
+        currentPath_,
+        currentEntryPoint_,
+        currentPermissions_,
+        currentBinding_->versionDigestHex,
+        currentBinding_->generation,
+        authorityEpoch};
+    WorkerLaunchRequest worker{
+        tabId_,
+        runtimeIncarnation_,
+        QStringLiteral("/"),
+        std::move(lease),
+        std::make_shared<AuthorityAdmissionToken>(),
+        *currentKey_,
+        PackageRevalidationMode::CurrentActivation,
+        recovery};
+    currentWorkerLaunch_ = worker;
+    return UpdateLaunchRequest{
+        appId_, currentVersion_, currentPath_, currentEntryPoint_,
+        *currentBinding_, *currentKey_, recovery, std::move(worker)};
+}
+
+void UpdateLifecycleCoordinator::revokeCurrentLaunchAuthority() noexcept
+{
+    if (currentWorkerLaunch_.has_value()
+        && currentWorkerLaunch_->admission != nullptr) {
+        (void)currentWorkerLaunch_->admission->beginRevoke();
+    }
+    currentWorkerLaunch_.reset();
+}
+
 void UpdateLifecycleCoordinator::stopCurrentAttempt()
 {
+    revokeCurrentLaunchAuthority();
     if (!currentKey_.has_value() || currentAttemptStopped_) return;
     currentAttemptStopped_ = true;
     if (beforeRelaunch_) beforeRelaunch_();
@@ -441,6 +519,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::enterFailedClosed()
 void UpdateLifecycleCoordinator::beginHostShutdown() noexcept
 {
     hostShuttingDown_ = true;
+    revokeCurrentLaunchAuthority();
 }
 
 std::optional<WorkerAttemptKey>

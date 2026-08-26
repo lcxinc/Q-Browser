@@ -2,6 +2,7 @@
 
 #include "PackageInstaller.h"
 #include "SafeEvent.h"
+#include "WorkerLaunchRequest.h"
 #include "WorkerSupervisor.h"
 
 #include <QString>
@@ -30,6 +31,7 @@ struct UpdateLaunchRequest final
     ActivationBinding expectedActivation;
     WorkerAttemptKey key;
     bool recovery = false;
+    WorkerLaunchRequest workerRequest;
 };
 
 enum class UpdateLifecycleError
@@ -85,7 +87,9 @@ public:
                                WorkerSupervisionPolicy supervisionPolicy,
                                LaunchCallback launch,
                                LifecycleClock clock = LifecycleClock::system(),
-                               EventRecorder *recorder = nullptr);
+                               EventRecorder *recorder = nullptr,
+                               QString tabId = {},
+                               quint64 runtimeIncarnation = 1);
 
     // Configure before dispatching lifecycle work. The callback must stop and
     // detach the old attempt; it runs before any restart or recovery launch.
@@ -99,6 +103,8 @@ public:
     [[nodiscard]] UpdateLifecycleAction admitAuthenticatedWorker(
         WorkerAttemptKey key,
         const ActivationBinding &expectedBinding);
+    [[nodiscard]] UpdateLifecycleAction admitAuthenticatedWorker(
+        const WorkerLaunchRequest &request);
     [[nodiscard]] UpdateLifecycleAction heartbeat(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction checkHealth(WorkerAttemptKey key);
     [[nodiscard]] UpdateLifecycleAction workerExited(WorkerAttemptKey key,
@@ -119,6 +125,7 @@ private:
         QString version,
         QString path,
         QString entryPoint,
+        ManifestPermissions permissions,
         ActivationBinding binding,
         qint64 nowMs,
         bool recovery,
@@ -131,6 +138,9 @@ private:
     [[nodiscard]] UpdateLifecycleAction transitionToHealthy(
         WorkerAttemptKey key,
         qint64 steadyNowMs);
+    [[nodiscard]] std::optional<UpdateLaunchRequest> issueLaunchRequest(
+        bool recovery);
+    void revokeCurrentLaunchAuthority() noexcept;
     void stopCurrentAttempt();
     [[nodiscard]] UpdateLifecycleAction enterFailedClosed();
     void record(SafeEventPhase phase,
@@ -150,8 +160,13 @@ private:
     QString currentVersion_;
     QString currentPath_;
     QString currentEntryPoint_;
+    ManifestPermissions currentPermissions_;
     std::optional<ActivationBinding> currentBinding_;
     std::optional<WorkerAttemptKey> currentKey_;
+    std::optional<WorkerLaunchRequest> currentWorkerLaunch_;
+    QString tabId_;
+    quint64 runtimeIncarnation_ = 1;
+    quint64 nextLeaseAuthorityEpoch_ = 1;
     bool currentHealthy_ = false;
     bool handshakeAccepted_ = false;
     bool recoveryLaunch_ = false;

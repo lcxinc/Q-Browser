@@ -1983,6 +1983,25 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     context.session = std::make_unique<IpcSession>(std::move(launch->hostSession));
     context.surface = std::move(surface);
     context.processLifetime = process;
+    context.launchRequest = WorkerLaunchRequest{
+        application.mainWindow()->tabModel()->activeId(),
+        91,
+        QStringLiteral("/"),
+        VerifiedPackageLease{
+            environment.appId(),
+            QStringLiteral("1.0.0"),
+            QStringLiteral("1.0.0-") + QString(64, QLatin1Char('a')),
+            store,
+            QStringLiteral("qml/Main.qml"),
+            {},
+            QByteArray(64, 'a'),
+            1,
+            92},
+        std::make_shared<AuthorityAdmissionToken>(),
+        WorkerAttemptKey{WorkerActivationId{1}, WorkerAttemptId{104}},
+        PackageRevalidationMode::CurrentActivation,
+        false};
+    context.processId = process->processId();
     context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
     QCOMPARE(application.attachWorkerContext(std::move(context)),
              InstalledPackageWorkerLauncher::AttachResult::Attached);

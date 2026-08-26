@@ -58,6 +58,43 @@ struct InstallResult final
     }
 };
 
+struct VerifiedPackageLease final
+{
+    QString appId;
+    QString version;
+    QString versionDirectory;
+    QString packageDirectory;
+    QString entryPoint;
+    ManifestPermissions permissions;
+    QByteArray digestHex;
+    qint64 activationGenerationAtIssue = 0;
+    quint64 leaseAuthorityEpoch = 0;
+
+    friend bool operator==(const VerifiedPackageLease &left,
+                           const VerifiedPackageLease &right)
+    {
+        return left.appId == right.appId
+            && left.version == right.version
+            && left.versionDirectory == right.versionDirectory
+            && left.packageDirectory == right.packageDirectory
+            && left.entryPoint == right.entryPoint
+            && left.permissions.network.hosts
+                   == right.permissions.network.hosts
+            && left.permissions.network.methods
+                   == right.permissions.network.methods
+            && left.permissions.storage == right.permissions.storage
+            && left.permissions.clipboardWrite
+                   == right.permissions.clipboardWrite
+            && left.permissions.clipboardRead
+                   == right.permissions.clipboardRead
+            && left.permissions.fileOpen == right.permissions.fileOpen
+            && left.digestHex == right.digestHex
+            && left.activationGenerationAtIssue
+                   == right.activationGenerationAtIssue
+            && left.leaseAuthorityEpoch == right.leaseAuthorityEpoch;
+    }
+};
+
 struct InstallPolicy final
 {
     QString expectedAppId;
@@ -81,6 +118,8 @@ public:
     [[nodiscard]] InstallResult reverifyInstalledVersion(
         const QString &appId,
         const ActivationBinding &expected) const;
+    [[nodiscard]] InstallResult reverifyPinnedLease(
+        const VerifiedPackageLease &lease) const;
 
 private:
     PackageStore &m_store;
