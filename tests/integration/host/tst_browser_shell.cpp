@@ -230,6 +230,7 @@ private slots:
     void navigationPublishesCommittedStateBeforeOnePersistenceSignal();
     void navigationCommandsAffectOnlyTheActiveStableTab();
     void rendererFailureRetiresOnlyTheFailedSurfaceAndReloadRecreatesIt();
+    void reloadBeforeQueuedRendererCleanupCannotReuseFailedSurface();
     void lateRendererFailureCannotRetireFreshIncarnation();
     void rendererFailureAtPageLimitReleasesSlotBeforeReload();
     void windowShutdownBeforeQueuedRendererCleanupCancelsIt();
@@ -1209,6 +1210,85 @@ void BrowserShellTest::rendererFailureRetiresOnlyTheFailedSurfaceAndReloadRecrea
     QTRY_VERIFY_WITH_TIMEOUT(shutdownPage.isNull(), 5'000);
     QVERIFY(window.shutdown());
     QVERIFY(window.isShutdownComplete());
+}
+
+void BrowserShellTest::reloadBeforeQueuedRendererCleanupCannotReuseFailedSurface()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(browserRoutes(server), server.origin());
+    BrowserTabModel *const model = window.tabModel();
+
+    const QString failedId = model->activeId();
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web/alpha")));
+    WebSurface *const failedSurface = window.webSurface();
+    QVERIFY(waitForWebLoad(failedSurface,
+                           server.url(QStringLiteral("alpha")),
+                           QStringLiteral("Alpha page")));
+    QPointer<WebSurface> failedSurfaceGuard(failedSurface);
+    QPointer<QWebEnginePage> failedPage(failedSurface->page());
+    QPointer<QWebEngineView> failedView(failedSurface->view());
+
+    window.browserChrome()->dispatchCommand(BrowserCommand::NewTab);
+    const QString siblingId = model->activeId();
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web/beta")));
+    WebSurface *const siblingSurface = window.webSurface();
+    QVERIFY(waitForWebLoad(siblingSurface,
+                           server.url(QStringLiteral("beta")),
+                           QStringLiteral("Beta page")));
+    QWebEnginePage *const siblingPage = siblingSurface->page();
+    QWebEngineView *const siblingView = siblingSurface->view();
+
+    activateTab(window, failedId);
+    TabController *const controller = window.tabController(failedId);
+    QVERIFY(controller != nullptr);
+    const quint64 failedIncarnation = controller->incarnation();
+    QVERIFY(QMetaObject::invokeMethod(
+        failedPage.data(), "renderProcessTerminated", Qt::DirectConnection,
+        Q_ARG(QWebEnginePage::RenderProcessTerminationStatus,
+              QWebEnginePage::CrashedTerminationStatus),
+        Q_ARG(int, 97)));
+
+    window.browserChrome()->dispatchCommand(BrowserCommand::Reload);
+    QCOMPARE(controller->webSurface(), failedSurface);
+    QVERIFY(controller->incarnation() > failedIncarnation);
+    QVERIFY(!failedSurfaceGuard.isNull());
+    QVERIFY(!failedPage.isNull());
+    QVERIFY(!failedView.isNull());
+
+    QTRY_COMPARE_WITH_TIMEOUT(controller->surfaceKind(),
+                              HostSurfaceKind::TrustedError, 5'000);
+    QTRY_VERIFY_WITH_TIMEOUT(failedSurfaceGuard.isNull(), 5'000);
+    QTRY_VERIFY_WITH_TIMEOUT(failedPage.isNull(), 5'000);
+    QTRY_VERIFY_WITH_TIMEOUT(failedView.isNull(), 5'000);
+    QCOMPARE(controller->webSurface(), nullptr);
+    QCOMPARE(model->lifecycleAt(model->indexOfId(failedId)),
+             BrowserTabLifecycle::TrustedError);
+    QCOMPARE(window.surfaceStack()->currentWidget(),
+             controller->currentSurface());
+    QCOMPARE(window.tabController(siblingId)->webSurface(), siblingSurface);
+    QCOMPARE(siblingSurface->page(), siblingPage);
+    QCOMPARE(siblingSurface->view(), siblingView);
+
+    const quint64 errorIncarnation = controller->incarnation();
+    window.browserChrome()->dispatchCommand(BrowserCommand::Reload);
+    QPointer<WebSurface> freshSurface(controller->webSurface());
+    QVERIFY(!freshSurface.isNull());
+    QPointer<QWebEnginePage> freshPage(freshSurface->page());
+    QPointer<QWebEngineView> freshView(freshSurface->view());
+    QVERIFY(!freshPage.isNull());
+    QVERIFY(!freshView.isNull());
+    QVERIFY(controller->incarnation() > errorIncarnation);
+    QVERIFY(waitForWebLoad(freshSurface.data(),
+                           server.url(QStringLiteral("alpha")),
+                           QStringLiteral("Alpha page")));
+    QCOMPARE(controller->surfaceKind(), HostSurfaceKind::Web);
+    QCOMPARE(controller->webSurface(), freshSurface.data());
+    QCOMPARE(freshSurface->page(), freshPage.data());
+    QCOMPARE(freshSurface->view(), freshView.data());
+    QCOMPARE(window.tabController(siblingId)->webSurface(), siblingSurface);
+    QCOMPARE(siblingSurface->page(), siblingPage);
+    QCOMPARE(siblingSurface->view(), siblingView);
 }
 
 void BrowserShellTest::lateRendererFailureCannotRetireFreshIncarnation()

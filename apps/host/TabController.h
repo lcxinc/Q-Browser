@@ -3,6 +3,7 @@
 #include "BrowserTabModel.h"
 
 #include <QObject>
+#include <QPointer>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -120,6 +121,7 @@ private:
     QLabel *trustedErrorLabel_ = nullptr;
     QWidget *currentSurface_ = nullptr;
     QUrl webEntry_;
+    QPointer<WebSurface> failedWebSurface_;
     QString workerPackageId_;
     quint64 incarnation_ = 0;
     BrowserTabLifecycle lifecycle_ = BrowserTabLifecycle::Dormant;

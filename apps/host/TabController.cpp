@@ -140,6 +140,10 @@ bool TabController::startWeb(const QUrl &physicalEntry,
         || !physicalEntry.isValid()) {
         return false;
     }
+    if (webSurface_ != nullptr && failedWebSurface_ == webSurface_
+        && webEntry_ == physicalEntry) {
+        return false;
+    }
     transitionTo(BrowserTabLifecycle::Starting);
     (void)model_->setVisualState(tabId_, BrowserVisualState::Normal);
     // Loading is published only after WebEngine reports its own started
@@ -450,34 +454,48 @@ void TabController::connectWebSignals()
                     || !capturedSurface || capturedSurface != webSurface_) {
                     return;
                 }
-                withResourceMutation(
-                    [this, stableId, capturedIncarnation, capturedSurface] {
+                failedWebSurface_ = capturedSurface;
+                const bool queued = QMetaObject::invokeMethod(
+                    this,
+                    [this, stableId, capturedSurface] {
                         if (retired_ || stableId != tabId_
-                            || capturedIncarnation != incarnation_
                             || !capturedSurface
-                            || capturedSurface != webSurface_) {
+                            || capturedSurface != webSurface_
+                            || failedWebSurface_ != capturedSurface) {
                             return;
                         }
-                        WebSurface *const failedSurface =
-                            capturedSurface.data();
-                        disconnect(failedSurface, nullptr, this, nullptr);
-                        if (currentSurface_ == failedSurface) {
-                            currentSurface_ = nullptr;
-                        }
-                        webSurface_ = nullptr;
-                        webEntry_ = {};
-                        advanceIncarnation();
-                        enterTrustedError(
-                            QStringLiteral(
-                                "The web renderer terminated unexpectedly."),
-                            false, false);
-                        failedSurface->setTabActive(false);
-                        const bool pageRetired = failedSurface->shutdown();
-                        Q_ASSERT(pageRetired);
-                        surfaceStack_->removeWidget(failedSurface);
-                        delete failedSurface;
-                    });
-            }, Qt::QueuedConnection);
+                        withResourceMutation(
+                            [this, stableId, capturedSurface] {
+                                if (retired_ || stableId != tabId_
+                                    || !capturedSurface
+                                    || capturedSurface != webSurface_
+                                    || failedWebSurface_ != capturedSurface) {
+                                    return;
+                                }
+                                WebSurface *const failedSurface =
+                                    capturedSurface.data();
+                                disconnect(failedSurface, nullptr, this, nullptr);
+                                if (currentSurface_ == failedSurface) {
+                                    currentSurface_ = nullptr;
+                                }
+                                webSurface_ = nullptr;
+                                webEntry_ = {};
+                                failedWebSurface_.clear();
+                                advanceIncarnation();
+                                enterTrustedError(
+                                    QStringLiteral(
+                                        "The web renderer terminated unexpectedly."),
+                                    false, false);
+                                failedSurface->setTabActive(false);
+                                const bool pageRetired = failedSurface->shutdown();
+                                Q_ASSERT(pageRetired);
+                                surfaceStack_->removeWidget(failedSurface);
+                                delete failedSurface;
+                            });
+                    },
+                    Qt::QueuedConnection);
+                Q_ASSERT(queued);
+            }, Qt::DirectConnection);
 }
 
 void TabController::withResourceMutation(
@@ -562,6 +580,7 @@ void TabController::destroyTrustedErrorSurface()
 void TabController::destroyWebSurface()
 {
     if (webSurface_ == nullptr) return;
+    failedWebSurface_.clear();
     if (currentSurface_ == webSurface_) currentSurface_ = nullptr;
     disconnect(webSurface_, nullptr, this, nullptr);
     webSurface_->setTabActive(false);
