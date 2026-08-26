@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QScopeGuard>
 
 #include <utility>
 
@@ -215,6 +216,27 @@ UserGestureGrantStore::issue(UserGestureSession &session,
         return std::nullopt;
     }
     QMutexLocker lock(&state_->mutex);
+    return issueLocked(session, requestId, lifetimeMs);
+}
+
+std::optional<UserGestureGrant>
+UserGestureGrantStore::tryIssue(UserGestureSession &session,
+                                const QString &requestId,
+                                const int lifetimeMs)
+{
+    if (session.state_ != state_ || session.sessionId_ == 0 || !validToken(requestId)
+        || lifetimeMs <= 0 || lifetimeMs > 60000 || !state_->mutex.tryLock()) {
+        return std::nullopt;
+    }
+    const auto unlock = qScopeGuard([this] { state_->mutex.unlock(); });
+    return issueLocked(session, requestId, lifetimeMs);
+}
+
+std::optional<UserGestureGrant>
+UserGestureGrantStore::issueLocked(UserGestureSession &session,
+                                   const QString &requestId,
+                                   const int lifetimeMs)
+{
     const qint64 now = state_->clock.elapsed();
     purgeExpired(*state_, now);
     auto found = state_->sessions.find(session.sessionId_);
@@ -260,5 +282,21 @@ bool UserGestureGrantStore::consume(UserGestureGrant &grant,
     session->active.remove(grant.grantId_);
     session->used.insert(requestId, now + replayWindowMs);
     grant.active_ = false;
+    return true;
+}
+
+bool UserGestureGrantStore::revokeOutstanding(
+    UserGestureSession &session) noexcept
+{
+    if (session.state_ != state_ || session.sessionId_ == 0) return false;
+    QMutexLocker lock(&state_->mutex);
+    auto found = state_->sessions.find(session.sessionId_);
+    if (found == state_->sessions.end()) return false;
+    const qint64 now = state_->clock.elapsed();
+    purgeExpired(*state_, now);
+    for (auto grant = found->active.cbegin(); grant != found->active.cend(); ++grant) {
+        found->used.insert(grant->requestId, now + replayWindowMs);
+    }
+    found->active.clear();
     return true;
 }

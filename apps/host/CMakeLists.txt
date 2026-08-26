@@ -15,6 +15,8 @@ add_library(q_browser_host STATIC
   HostApplication.h
   HostCapabilityRuntime.cpp
   HostCapabilityRuntime.h
+  HostGestureRouter.cpp
+  HostGestureRouter.h
   HostOwnedFileAuthority.cpp
   HostOwnedFileAuthority.h
   HostOwnedStateDirectory.cpp
@@ -27,6 +29,7 @@ add_library(q_browser_host STATIC
   InstalledPackageWorkerLauncherTestHooks.h
   RuntimePackageAuthority.cpp
   RuntimePackageAuthority.h
+  TabCapabilityAuthority.h
   TabController.cpp
   TabController.h
   WorkerRetirementManager.cpp

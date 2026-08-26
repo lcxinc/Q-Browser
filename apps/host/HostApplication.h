@@ -18,6 +18,7 @@
 class MainWindow;
 class HostWorkerSessionController;
 class HostCapabilityRuntime;
+class HostGestureRouter;
 class WorkerSurface;
 class UpdateLifecycleCoordinator;
 class QTimer;
@@ -79,10 +80,12 @@ private:
     [[nodiscard]] bool enqueueLifecycle(
         std::function<void(UpdateLifecycleCoordinator &)> operation);
     [[nodiscard]] bool initializePackageRuntime();
+    void synchronizeGestureAuthority();
 
     std::optional<HostRuntimeConfig> runtimeConfig_;
     QUrl mockOrigin_;
     std::unique_ptr<MainWindow> mainWindow_;
+    std::unique_ptr<HostGestureRouter> gestureRouter_;
     std::unique_ptr<HostWorkerSessionController> workerSessionController_;
     std::shared_ptr<HostCapabilityRuntime> capabilityRuntime_;
     std::shared_ptr<void> workerProcessLifetime_;
@@ -92,6 +95,8 @@ private:
     std::optional<WorkerAttemptKey> attachedWorkerKey_;
     QPointer<QObject> updateLifecycleRuntime_;
     QThread *updateLifecycleThread_ = nullptr;
+    quint64 nextCapabilityRuntimeIncarnation_ = 1;
+    quint64 nextLeaseAuthorityEpoch_ = 1;
     std::atomic_bool acceptingLifecycle_{true};
 #ifdef Q_BROWSER_HOST_TESTING
     bool lifecycleQueueFullForTesting_ = false;

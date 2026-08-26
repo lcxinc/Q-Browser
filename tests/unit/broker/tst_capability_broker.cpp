@@ -121,6 +121,7 @@ private slots:
     void gestureGrantIsOpaqueBoundExpiringAndSingleUse();
     void gestureStoreBoundsRecordsAndPurgesClosedSessions();
     void gestureSessionRaiiInvalidatesOnDestruction();
+    void revokingOneGestureSessionLeavesSiblingActive();
     void clipboardEnforcesNativeByteLimitAndStableStatuses();
     void enforcesExactIpcRequestAndResponseBudget();
     void fileCancellationAndSizeAreStable();
@@ -292,6 +293,28 @@ void CapabilityBrokerTest::gestureSessionRaiiInvalidatesOnDestruction()
     QVERIFY(!grants.openSession(QStringLiteral("overflow")).has_value());
     sessions.pop_back();
     QVERIFY(grants.openSession(QStringLiteral("replacement")).has_value());
+}
+
+void CapabilityBrokerTest::revokingOneGestureSessionLeavesSiblingActive()
+{
+    UserGestureGrantStore grants;
+    auto first = grants.openSession(QStringLiteral("app.same"));
+    auto sibling = grants.openSession(QStringLiteral("app.same"));
+    QVERIFY(first.has_value());
+    QVERIFY(sibling.has_value());
+    auto firstGrant = grants.issue(*first, QStringLiteral("same-request"), 1000);
+    auto siblingGrant = grants.issue(*sibling, QStringLiteral("same-request"), 1000);
+    QVERIFY(firstGrant.has_value());
+    QVERIFY(siblingGrant.has_value());
+
+    QVERIFY(grants.revokeOutstanding(*first));
+
+    QVERIFY(!grants.consume(*firstGrant,
+                            QStringLiteral("app.same"),
+                            QStringLiteral("same-request")));
+    QVERIFY(grants.consume(*siblingGrant,
+                           QStringLiteral("app.same"),
+                           QStringLiteral("same-request")));
 }
 
 void CapabilityBrokerTest::clipboardEnforcesNativeByteLimitAndStableStatuses()

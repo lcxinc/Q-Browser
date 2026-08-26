@@ -1,6 +1,8 @@
 add_library(q_browser_package STATIC
   ActivationState.cpp
   ActivationState.h
+  AuthorityAdmissionToken.cpp
+  AuthorityAdmissionToken.h
   Archive.cpp
   Archive.h
   ArchiveLimits.h

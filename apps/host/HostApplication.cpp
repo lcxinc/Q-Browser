@@ -1,7 +1,9 @@
 #include "HostApplication.h"
 
 #include "EventRecorder.h"
+#include "BrowserChrome.h"
 #include "HostCapabilityRuntime.h"
+#include "HostGestureRouter.h"
 #include "HostOwnedFileAuthority.h"
 #include "HostWorkerSessionController.h"
 #include "InstalledPackageWorkerLauncher.h"
@@ -12,12 +14,14 @@
 #include "RuntimePackageAuthority.h"
 #include "SandboxTrustBoundary.h"
 #include "UpdateLifecycleCoordinator.h"
+#include "TabCapabilityAuthority.h"
 
 #include "PilotRoutes.h"
 #include "RouteRegistry.h"
 #include "WebSessionProfile.h"
 
 #include <QPointer>
+#include <QGuiApplication>
 #include <QRegularExpression>
 #include <QFile>
 #include <QThread>
@@ -25,6 +29,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <limits>
 #include <utility>
 
 namespace
@@ -455,6 +460,19 @@ bool HostApplication::start()
     window->show();
     recordHostDiagnosticPhase("start-main-window-shown");
     mainWindow_ = std::move(window);
+    gestureRouter_ = std::make_unique<HostGestureRouter>(
+        static_cast<quintptr>(mainWindow_->winId()));
+    connect(gestureRouter_.get(), &HostGestureRouter::browserCommandRequested,
+            mainWindow_->browserChrome(), &BrowserChrome::dispatchCommand);
+    connect(mainWindow_->tabModel(), &BrowserTabModel::activeTabChanged,
+            this, [this] { synchronizeGestureAuthority(); },
+            Qt::DirectConnection);
+    if (QGuiApplication *const application =
+            qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
+        connect(application, &QGuiApplication::applicationStateChanged,
+                this, [this] { synchronizeGestureAuthority(); },
+                Qt::DirectConnection);
+    }
     connect(mainWindow_.get(), &MainWindow::legacyWorkerRetirementRequested,
             this, [this](const QString &) {
                 detachWorkerContext(
@@ -505,6 +523,7 @@ bool HostApplication::start()
     updateHealthTimer_ = std::make_unique<QTimer>();
     updateHealthTimer_->setInterval(50);
     connect(updateHealthTimer_.get(), &QTimer::timeout, this, [this] {
+        synchronizeGestureAuthority();
         if (!attachedWorkerKey_.has_value()) return;
         const WorkerAttemptKey key = *attachedWorkerKey_;
         (void)enqueueLifecycle([key](UpdateLifecycleCoordinator &coordinator) {
@@ -544,36 +563,77 @@ InstalledPackageWorkerLauncher::AttachResult
 HostApplication::attachWorkerContext(HostWorkerAttachContext context)
 {
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr
+        || gestureRouter_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
         || workerProcessLifetime_ != nullptr || !runtimeConfig_.has_value()
         || context.session->appIdentity() != runtimeConfig_->appId())
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    QString capabilityError;
+    BrowserTabModel *const tabModel = mainWindow_->tabModel();
+    const QString tabId = tabModel != nullptr ? tabModel->activeId() : QString{};
+    TabController *const owningTab = mainWindow_->tabController(tabId);
+    if (tabId.isEmpty() || owningTab == nullptr
+        || workerSessionController_->generation()
+               == std::numeric_limits<quint64>::max()
+        || nextCapabilityRuntimeIncarnation_ == 0
+        || nextLeaseAuthorityEpoch_ == 0) {
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
     const quintptr workerWindowId = static_cast<quintptr>(
         context.surface->nativeWindowId());
+    WorkerSurface *const surface = context.surface.get();
+    if (!mainWindow_->attachWorkerSurface(std::move(context.surface))) {
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+    if (mainWindow_->tabModel()->activeId() != tabId
+        || mainWindow_->tabController(tabId) != owningTab) {
+        mainWindow_->detachWorkerSurface();
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+    const TabCapabilityAuthority authority{
+        tabId,
+        nextCapabilityRuntimeIncarnation_++,
+        runtimeConfig_->appId(),
+        context.processId,
+        workerWindowId,
+        workerSessionController_->generation() + 1,
+        nextLeaseAuthorityEpoch_++};
+    if (!authority.isValid()) {
+        mainWindow_->detachWorkerSurface();
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+    QString capabilityError;
+    auto admissionToken = std::make_shared<AuthorityAdmissionToken>();
     auto capabilityRuntime = HostCapabilityRuntime::create(
-        runtimeConfig_->appId(), context.permissions, runtimeConfig_->mockOrigin(),
-        runtimeConfig_->storageDirectory(), static_cast<quintptr>(mainWindow_->winId()),
-        workerWindowId, context.processId, &capabilityError);
+        authority, std::move(admissionToken), gestureRouter_.get(),
+        context.permissions, runtimeConfig_->mockOrigin(),
+        runtimeConfig_->storageDirectory(),
+        static_cast<quintptr>(mainWindow_->winId()), &capabilityError);
     if (capabilityRuntime == nullptr) {
+        mainWindow_->detachWorkerSurface();
         emit updateLifecycleFailed(
             capabilityError.isEmpty()
                 ? QStringLiteral("host.capability.initialization_failed")
                 : capabilityError);
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
-    connect(capabilityRuntime.get(), &HostCapabilityRuntime::completed,
+    QPointer<HostWorkerSessionController> owningController(
+        workerSessionController_.get());
+    connect(capabilityRuntime.get(), &HostCapabilityRuntime::authorityCompleted,
             workerSessionController_.get(),
-            &HostWorkerSessionController::completeCapability,
-            Qt::QueuedConnection);
+            [owningController, authority](
+                const TabCapabilityAuthority &completedAuthority,
+                const quint64 generation, const QString &requestId,
+                const BrokerResult &result) {
+                if (owningController == nullptr
+                    || completedAuthority != authority
+                    || generation != authority.sessionGeneration) {
+                    return;
+                }
+                owningController->completeCapability(
+                    generation, requestId, result);
+            }, Qt::QueuedConnection);
     workerSessionController_->setCapabilityRuntime(capabilityRuntime.get());
-    WorkerSurface *const surface = context.surface.get();
-    if (!mainWindow_->attachWorkerSurface(std::move(context.surface))) {
-        workerSessionController_->setCapabilityRuntime(nullptr);
-        HostCapabilityRuntime::retire(std::move(capabilityRuntime));
-        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    }
     if (!workerSessionController_->attach(std::move(context.session))) {
         workerSessionController_->setCapabilityRuntime(nullptr);
         mainWindow_->detachWorkerSurface();
@@ -584,6 +644,7 @@ HostApplication::attachWorkerContext(HostWorkerAttachContext context)
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
     attachedWorkerKey_ = context.supervisionKey;
+    synchronizeGestureAuthority();
     Q_ASSERT(mainWindow_->workerSurface() == surface);
     return InstalledPackageWorkerLauncher::AttachResult::Attached;
 }
@@ -604,6 +665,29 @@ void HostApplication::detachWorkerContext(const QString &reason)
     stopWorkerProcess_ = {};
     workerProcessLifetime_.reset();
     attachedWorkerKey_.reset();
+}
+
+void HostApplication::synchronizeGestureAuthority()
+{
+    if (gestureRouter_ == nullptr) return;
+    if (capabilityRuntime_ == nullptr || mainWindow_ == nullptr
+        || mainWindow_->tabModel() == nullptr
+        || QGuiApplication::applicationState() != Qt::ApplicationActive
+        || mainWindow_->tabModel()->activeId()
+               != capabilityRuntime_->authority().tabId) {
+        gestureRouter_->hostDeactivated();
+        return;
+    }
+    const TabCapabilityAuthority &authority = capabilityRuntime_->authority();
+    if (workerSessionController_ == nullptr
+        || workerSessionController_->state() != HostWorkerSessionState::Running
+        || workerSessionController_->generation() != authority.sessionGeneration) {
+        gestureRouter_->hostDeactivated();
+        return;
+    }
+    if (!gestureRouter_->activateBinding(authority)) {
+        gestureRouter_->hostDeactivated();
+    }
 }
 
 bool HostApplication::hasWorkerContext() const noexcept

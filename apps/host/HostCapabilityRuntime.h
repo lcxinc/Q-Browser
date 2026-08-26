@@ -2,10 +2,12 @@
 
 #include "CapabilityBroker.h"
 #include "Manifest.h"
+#include "TabCapabilityAuthority.h"
 #include "UserGestureGrantStore.h"
 
 #include <QJsonObject>
 #include <QObject>
+#include <QPointer>
 #include <QUrl>
 
 #include <memory>
@@ -17,9 +19,8 @@ class ClipboardBroker;
 class FileBroker;
 class QtClipboardBackend;
 class QtFileDialogBackend;
-class TrustedWorkerInputObserver;
+class HostGestureRouter;
 class QThread;
-class QTimer;
 
 #ifdef Q_BROWSER_HOST_TESTING
 struct HostWorkerGestureEvidence final
@@ -41,7 +42,9 @@ namespace qbrowser_host_testing
 }
 #endif
 
-class HostCapabilityRuntime final : public QObject
+class HostCapabilityRuntime final
+    : public QObject,
+      public std::enable_shared_from_this<HostCapabilityRuntime>
 {
     Q_OBJECT
 public:
@@ -59,7 +62,18 @@ public:
         quintptr workerWindowId,
         quint32 workerProcessId,
         QString *errorCode = nullptr);
+    [[nodiscard]] static std::shared_ptr<HostCapabilityRuntime> create(
+        const TabCapabilityAuthority &authority,
+        std::shared_ptr<AuthorityAdmissionToken> admissionToken,
+        HostGestureRouter *gestureRouter,
+        const ManifestPermissions &permissions,
+        const QUrl &mockOrigin,
+        const QString &storageDirectory,
+        quintptr hostWindowId,
+        QString *errorCode = nullptr);
     static void retire(std::shared_ptr<HostCapabilityRuntime> runtime) noexcept;
+
+    [[nodiscard]] const TabCapabilityAuthority &authority() const noexcept;
 
     void dispatch(quint64 generation,
                   const QString &requestId,
@@ -72,34 +86,41 @@ signals:
     void completed(quint64 generation,
                    const QString &requestId,
                    const BrokerResult &result);
+    void authorityCompleted(const TabCapabilityAuthority &authority,
+                            quint64 generation,
+                            const QString &requestId,
+                            const BrokerResult &result);
 
 private:
-    HostCapabilityRuntime(QString appIdentity,
+    HostCapabilityRuntime(TabCapabilityAuthority authority,
+                          std::shared_ptr<AuthorityAdmissionToken> admissionToken,
+                          HostGestureRouter *gestureRouter,
+                          bool authorityEnforced,
                           EffectivePolicy policy,
-                          quintptr hostWindowId,
-                          quintptr workerWindowId,
-                          quint32 workerProcessId);
+                          quintptr hostWindowId);
     [[nodiscard]] bool initialize(const QString &storageDirectory,
                                   QString *errorCode);
+    [[nodiscard]] bool queueCompletion(
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
+        quint64 generation,
+        const QString &requestId,
+        const BrokerResult &result);
 
-    QString appIdentity_;
+    const TabCapabilityAuthority authority_;
+    const std::shared_ptr<AuthorityAdmissionToken> admissionToken_;
+    QPointer<HostGestureRouter> gestureRouter_;
+    const bool authorityEnforced_ = false;
     EffectivePolicy policy_;
     quintptr hostWindowId_ = 0;
-    quintptr workerWindowId_ = 0;
-    quint32 workerProcessId_ = 0;
-    quint32 lastGrantedInputTick_ = 0;
     QThread *workerThread_ = nullptr;
-    CapabilityWorkerLane *workerLane_ = nullptr;
-    std::shared_ptr<CapabilityDeliveryState> deliveryState_;
-    QTimer *deliveryTimer_ = nullptr;
+    QPointer<CapabilityWorkerLane> workerLane_;
     std::unique_ptr<QtClipboardBackend> clipboardBackend_;
     std::unique_ptr<QtFileDialogBackend> fileBackend_;
-    std::unique_ptr<UserGestureGrantStore> gestureGrants_;
-    std::unique_ptr<TrustedWorkerInputObserver> inputObserver_;
-    std::optional<UserGestureSession> gestureSession_;
+    std::shared_ptr<UserGestureGrantStore> gestureGrants_;
     std::unique_ptr<ClipboardBroker> clipboard_;
     std::unique_ptr<FileBroker> file_;
     std::unique_ptr<CapabilityBroker> guiBroker_;
+    bool gestureBindingRegistered_ = false;
     bool accepting_ = true;
 };
 

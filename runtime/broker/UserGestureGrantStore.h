@@ -64,10 +64,20 @@ public:
     openSession(const QString &appIdentity);
     [[nodiscard]] std::optional<UserGestureGrant>
     issue(UserGestureSession &session, const QString &requestId, int lifetimeMs);
+    [[nodiscard]] std::optional<UserGestureGrant>
+    tryIssue(UserGestureSession &session,
+             const QString &requestId,
+             int lifetimeMs);
     [[nodiscard]] bool consume(UserGestureGrant &grant,
                                const QString &appIdentity,
                                const QString &requestId);
+    [[nodiscard]] bool revokeOutstanding(UserGestureSession &session) noexcept;
 
 private:
+    [[nodiscard]] std::optional<UserGestureGrant>
+    issueLocked(UserGestureSession &session,
+                const QString &requestId,
+                int lifetimeMs);
+
     std::shared_ptr<UserGestureSharedState> state_;
 };
