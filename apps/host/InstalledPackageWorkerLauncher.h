@@ -35,16 +35,39 @@ public:
         std::optional<WorkerLaunchRequest> authority;
     };
 
+    class CommittedAttachTransaction final
+    {
+    public:
+        ~CommittedAttachTransaction();
+        CommittedAttachTransaction(const CommittedAttachTransaction &) = delete;
+        CommittedAttachTransaction &operator=(
+            const CommittedAttachTransaction &) = delete;
+        CommittedAttachTransaction(CommittedAttachTransaction &&) noexcept;
+        CommittedAttachTransaction &operator=(
+            CommittedAttachTransaction &&) noexcept;
+
+        [[nodiscard]] const WorkerLaunchRequest &request() const noexcept;
+        [[nodiscard]] quint32 processId() const noexcept;
+        [[nodiscard]] std::unique_ptr<IpcSession> takeSession() noexcept;
+        [[nodiscard]] std::unique_ptr<WorkerSurface> takeSurface() noexcept;
+        [[nodiscard]] std::shared_ptr<SandboxProcess> takeProcess() noexcept;
+
+    private:
+        friend class InstalledPackageWorkerLauncher;
+        struct State;
+        explicit CommittedAttachTransaction(std::unique_ptr<State> state);
+
+        std::unique_ptr<State> state_;
+    };
+
     using AttachCallback = std::function<AttachResult(
-        const WorkerLaunchRequest &,
-        std::unique_ptr<IpcSession>,
-        std::unique_ptr<WorkerSurface>,
-        std::shared_ptr<SandboxProcess>)>;
+        CommittedAttachTransaction)>;
     using StopCallback = std::function<void()>;
     using ExitCallback = std::function<void(WorkerAttemptKey, bool)>;
     using FailureCallback = std::function<void(WorkerAttemptKey, const QString &)>;
     using BindingValidator = std::function<InstallResult(
-        const WorkerLaunchRequest &)>;
+        const WorkerLaunchRequest &,
+        std::shared_ptr<const ImmutablePackageGuard>)>;
     using AdmissionCompletion = std::function<void(AdmissionResult)>;
     using AdmissionCallback = std::function<bool(
         const WorkerLaunchRequest &, AdmissionCompletion)>;

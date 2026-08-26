@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -360,6 +362,54 @@ bool sameCanonicalDirectory(const QString &expected,
             == 0;
 }
 
+InstallResult validateInstalledFiles(
+    QVector<ArchiveFile> files,
+    const QString &appId,
+    const QString &versionDirectory,
+    const QString &root,
+    const QByteArray &trustedPublicKeyPem,
+    const InstallPolicy &policy)
+{
+    std::ranges::sort(files, [](const ArchiveFile &left,
+                               const ArchiveFile &right) {
+        return qbrowser_archive_detail::archivePathBytewiseLess(
+            left.path, right.path);
+    });
+    const ArchiveFile *signatureFile = findFile(
+        files, QByteArrayLiteral("metadata/signature.ed25519"));
+    const ContentDigestResult signedDigest = ContentDigest::signedPackage(files);
+    const ContentDigestValidation content = ContentDigest::validatePayload(files);
+    const ArchiveFile *manifestFile = findFile(
+        files, QByteArrayLiteral("manifest.json"));
+    if (signatureFile == nullptr || signatureFile->contents.size() != 64
+        || !signedDigest.hasValue()
+        || !SignatureVerifier::verifyPem(
+                signedDigest.bytes(), trustedPublicKeyPem,
+                signatureFile->contents).isVerified()
+        || !content.isValid() || manifestFile == nullptr) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    const ManifestParseResult parsed = Manifest::parse(manifestFile->contents);
+    const QByteArray entryPoint = parsed.hasValue()
+        ? parsed.value().entryPoint().toUtf8() : QByteArray{};
+    if (!parsed.hasValue() || parsed.value().appId() != appId
+        || !runtimeIsCompatible(policy.runtimeVersion, parsed.value().runtime())
+        || !importsAreAllowed(parsed.value().imports(), policy.allowedImports)
+        || !sourceImportsAreAllowed(files, parsed.value().imports(),
+                                    policy.allowedImports)
+        || !sourcesPassPolicy(files) || !packageMembersPassPolicy(files)
+        || versionDirectory != parsed.value().version() + QLatin1Char('-')
+               + QString::fromLatin1(content.digest().toHex())
+        || findFile(files, entryPoint) == nullptr) {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    }
+    return {InstallPhase::Complete, InstallError::None, {}, appId,
+            parsed.value().version(), root, parsed.value().entryPoint(),
+            parsed.value().permissions(), std::nullopt, {}};
+}
+
 std::optional<QString> authenticatedManifestAppId(
     const QString &packagePath,
     const QByteArray &trustedPublicKeyPem,
@@ -385,7 +435,73 @@ std::optional<QString> authenticatedManifestAppId(
         ? std::optional<QString>(parsed.value().appId())
         : std::nullopt;
 }
+
+QString immutableMemberKey(const QString &root,
+                           const QString &path,
+                           const bool directory)
+{
+    QString relative = QDir::fromNativeSeparators(
+        QDir(root).relativeFilePath(path));
+#ifdef Q_OS_WIN
+    relative = relative.toCaseFolded();
+#endif
+    return (directory ? QStringLiteral("d:") : QStringLiteral("f:"))
+        + relative;
 }
+
+int relativePathDepth(const QString &root, const QString &path)
+{
+    return QDir::fromNativeSeparators(QDir(root).relativeFilePath(path))
+        .count(QLatin1Char('/'));
+}
+
+bool installedFileIsReadOnly(const QString &path)
+{
+#ifdef Q_OS_WIN
+    const auto native = qbrowser_archive_detail::windowsApiPath(path);
+    if (!native.has_value()) return false;
+    const DWORD attributes = GetFileAttributesW(
+        reinterpret_cast<LPCWSTR>(native->utf16()));
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U
+        && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U
+        && (attributes & FILE_ATTRIBUTE_READONLY) != 0U;
+#else
+    const QFileInfo info(path);
+    return info.isFile() && !info.isSymLink()
+        && !info.permission(QFileDevice::WriteOwner
+                            | QFileDevice::WriteUser
+                            | QFileDevice::WriteGroup
+                            | QFileDevice::WriteOther);
+#endif
+}
+}
+
+struct ImmutablePackageGuard::State final
+{
+    QString appId;
+    QString versionDirectory;
+    QString packageDirectory;
+    QVector<ArchiveFile> files;
+    QSet<QString> memberKeys;
+#ifdef Q_OS_WIN
+    struct LockedFile final
+    {
+        QString path;
+        qbrowser_archive_detail::WindowsStableFile file;
+    };
+
+    qbrowser_archive_detail::WindowsStableDirectoryTree tree;
+    mutable std::vector<LockedFile> lockedFiles;
+#endif
+};
+
+ImmutablePackageGuard::ImmutablePackageGuard(std::unique_ptr<State> state)
+    : state_(std::move(state))
+{
+}
+
+ImmutablePackageGuard::~ImmutablePackageGuard() = default;
 
 PackageInstaller::PackageInstaller(PackageStore &store,
                                    QByteArray trustedPublicKeyPem,
@@ -439,10 +555,12 @@ InstallResult PackageInstaller::verifyInstalled(
                            QStringLiteral("installed_content_invalid"));
         }
         const QByteArray relative = QDir(root).relativeFilePath(path).toUtf8();
+        const quint64 fileBytes = static_cast<quint64>(info.size());
         if (!qbrowser_archive_detail::validateArchivePath(
                  relative, m_policy.archiveLimits).has_value()
+            || fileBytes > m_policy.archiveLimits.maximumTotalBytes
             || totalBytes > m_policy.archiveLimits.maximumTotalBytes
-                   - static_cast<quint64>(info.size())) {
+                   - fileBytes) {
             return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                            QStringLiteral("installed_content_invalid"));
         }
@@ -459,40 +577,10 @@ InstallResult PackageInstaller::verifyInstalled(
         totalBytes += static_cast<quint64>(bytes.size());
         files.push_back({relative, bytes});
     }
-    std::ranges::sort(files, [](const ArchiveFile &left, const ArchiveFile &right) {
-        return qbrowser_archive_detail::archivePathBytewiseLess(left.path, right.path);
-    });
-    const ArchiveFile *signatureFile = findFile(
-        files, QByteArrayLiteral("metadata/signature.ed25519"));
-    const ContentDigestResult signedDigest = ContentDigest::signedPackage(files);
-    const ContentDigestValidation content = ContentDigest::validatePayload(files);
-    const ArchiveFile *manifestFile = findFile(files, QByteArrayLiteral("manifest.json"));
-    if (signatureFile == nullptr || signatureFile->contents.size() != 64
-        || !signedDigest.hasValue()
-        || !SignatureVerifier::verifyPem(signedDigest.bytes(),
-                                         m_trustedPublicKeyPem,
-                                         signatureFile->contents).isVerified()
-        || !content.isValid() || manifestFile == nullptr) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
-    }
-    const ManifestParseResult parsed = Manifest::parse(manifestFile->contents);
-    if (!parsed.hasValue() || parsed.value().appId() != appId
-        || !runtimeIsCompatible(m_policy.runtimeVersion, parsed.value().runtime())
-        || !importsAreAllowed(parsed.value().imports(), m_policy.allowedImports)
-        || !sourceImportsAreAllowed(files, parsed.value().imports(),
-                                    m_policy.allowedImports)
-        || !sourcesPassPolicy(files) || !packageMembersPassPolicy(files)
-        || versionDirectory != parsed.value().version() + QLatin1Char('-')
-               + QString::fromLatin1(content.digest().toHex())) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
-    }
-    const QFileInfo entry(root + QLatin1Char('/') + parsed.value().entryPoint());
-    if (!entry.isFile() || entry.isSymLink()) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
-    }
+    InstallResult verified = validateInstalledFiles(
+        std::move(files), appId, versionDirectory, root,
+        m_trustedPublicKeyPem, m_policy);
+    if (!verified.succeeded()) return verified;
 #ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
     if (qbrowser_package_installer_testing::packageInstallerTestHooks()
             .afterVerifyInstalled) {
@@ -500,14 +588,221 @@ InstallResult PackageInstaller::verifyInstalled(
             .afterVerifyInstalled(appId, versionDirectory);
     }
 #endif
-    return {InstallPhase::Complete, InstallError::None, {}, appId,
-            parsed.value().version(), root, parsed.value().entryPoint(),
-            parsed.value().permissions(), std::nullopt};
+    return verified;
+}
+
+InstallResult PackageInstaller::verifyInstalledImmutable(
+    const QString &appId,
+    const QString &versionDirectory,
+    std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
+{
+    const auto invalid = [] {
+        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
+                       QStringLiteral("installed_content_invalid"));
+    };
+    const QString root = m_store.versionPath(appId, versionDirectory);
+    const QFileInfo rootInfo(root);
+    if (root.isEmpty() || !rootInfo.isDir() || rootInfo.isSymLink()) {
+        return invalid();
+    }
+
+    if (retainedGuard == nullptr) {
+        auto state = std::make_unique<ImmutablePackageGuard::State>();
+        state->appId = appId;
+        state->versionDirectory = versionDirectory;
+        state->packageDirectory = root;
+#ifdef Q_OS_WIN
+        const QString versionParent = QFileInfo(root).dir().absolutePath();
+        if (!state->tree.openSharedRoot(versionParent)
+            || !state->tree.addImmutableDirectory(root)) {
+            return invalid();
+        }
+#endif
+        QStringList directories;
+        QStringList filePaths;
+        quint64 scannedMembers = 0;
+        const quint64 maximumScannedMembers =
+            m_policy.archiveLimits.maximumEntries
+                    > std::numeric_limits<quint64>::max() / 64
+            ? std::numeric_limits<quint64>::max()
+            : m_policy.archiveLimits.maximumEntries * 64;
+        QSet<QString> collisionKeys;
+        QDirIterator iterator(
+            root,
+            QDir::AllEntries | QDir::Hidden | QDir::System
+                | QDir::NoDotAndDotDot,
+            QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString path = iterator.next();
+            const QFileInfo info = iterator.fileInfo();
+            if (scannedMembers >= maximumScannedMembers || info.isSymLink()) {
+                return invalid();
+            }
+            ++scannedMembers;
+            const QByteArray relative = QDir::fromNativeSeparators(
+                QDir(root).relativeFilePath(path)).toUtf8();
+            const auto checked = qbrowser_archive_detail::validateArchivePath(
+                relative, m_policy.archiveLimits);
+            if (!checked.has_value()
+                || collisionKeys.contains(checked->collisionKey)) {
+                return invalid();
+            }
+            collisionKeys.insert(checked->collisionKey);
+            if (info.isDir()) {
+                directories.push_back(path);
+                state->memberKeys.insert(
+                    immutableMemberKey(root, path, true));
+                continue;
+            }
+            if (!info.isFile()
+                || static_cast<quint64>(filePaths.size())
+                       >= m_policy.archiveLimits.maximumEntries
+                || info.size() < 0
+                || static_cast<quint64>(info.size())
+                       > m_policy.archiveLimits.maximumEntryBytes) {
+                return invalid();
+            }
+            filePaths.push_back(path);
+            state->memberKeys.insert(immutableMemberKey(root, path, false));
+        }
+        std::ranges::sort(directories, [&root](const QString &left,
+                                               const QString &right) {
+            const int leftDepth = relativePathDepth(root, left);
+            const int rightDepth = relativePathDepth(root, right);
+            return leftDepth != rightDepth
+                ? leftDepth < rightDepth : left < right;
+        });
+#ifdef Q_OS_WIN
+        for (const QString &directory : directories) {
+            if (!state->tree.addImmutableDirectory(directory)) {
+                return invalid();
+            }
+        }
+#endif
+        quint64 totalBytes = 0;
+        for (const QString &path : filePaths) {
+            const QByteArray relative = QDir::fromNativeSeparators(
+                QDir(root).relativeFilePath(path)).toUtf8();
+            QByteArray bytes;
+#ifdef Q_OS_WIN
+            qbrowser_archive_detail::WindowsStableFile locked;
+            if (!locked.openReadLocked(path, state->tree)
+                || !locked.hasSingleLink()
+                || !locked.isStableWithin(state->tree)
+                || !locked.isSameIdentityAt(path)
+                || !installedFileIsReadOnly(path)
+                || locked.readBoundedIncludingEmpty(
+                       m_policy.archiveLimits.maximumEntryBytes, bytes)
+                       != qbrowser_archive_detail::WindowsStableReadStatus::Read) {
+                return invalid();
+            }
+            state->lockedFiles.push_back(
+                {path, std::move(locked)});
+#else
+            QFile file(path);
+            if (!installedFileIsReadOnly(path)
+                || !file.open(QIODevice::ReadOnly)
+                || file.size() < 0
+                || static_cast<quint64>(file.size())
+                       > m_policy.archiveLimits.maximumEntryBytes) {
+                return invalid();
+            }
+            bytes = file.read(static_cast<qint64>(
+                m_policy.archiveLimits.maximumEntryBytes) + 1);
+            if (bytes.size() != file.size()) return invalid();
+#endif
+            const quint64 fileBytes = static_cast<quint64>(bytes.size());
+            if (fileBytes > m_policy.archiveLimits.maximumTotalBytes
+                || totalBytes > m_policy.archiveLimits.maximumTotalBytes
+                       - fileBytes) {
+                return invalid();
+            }
+            totalBytes += static_cast<quint64>(bytes.size());
+            state->files.push_back({relative, std::move(bytes)});
+        }
+        retainedGuard = std::shared_ptr<const ImmutablePackageGuard>(
+            new ImmutablePackageGuard(std::move(state)));
+    }
+
+    if (retainedGuard->state_ == nullptr) return invalid();
+    const ImmutablePackageGuard::State &state = *retainedGuard->state_;
+    if (state.appId != appId || state.versionDirectory != versionDirectory
+        || !sameCanonicalDirectory(state.packageDirectory, root)) {
+        return invalid();
+    }
+#ifdef Q_OS_WIN
+    if (!state.tree.isStable()
+        || state.lockedFiles.size()
+               != static_cast<size_t>(state.files.size())) {
+        return invalid();
+    }
+    QVector<ArchiveFile> authenticatedFiles;
+    authenticatedFiles.reserve(state.files.size());
+    for (size_t index = 0; index < state.lockedFiles.size(); ++index) {
+        auto &locked = state.lockedFiles.at(index);
+        QByteArray bytes;
+        if (!locked.file.hasSingleLink()
+            || !locked.file.isStableWithin(state.tree)
+            || !locked.file.isSameIdentityAt(locked.path)
+            || !installedFileIsReadOnly(locked.path)
+            || locked.file.readBoundedIncludingEmpty(
+                   m_policy.archiveLimits.maximumEntryBytes, bytes)
+                   != qbrowser_archive_detail::WindowsStableReadStatus::Read) {
+            return invalid();
+        }
+        authenticatedFiles.push_back(
+            {state.files.at(static_cast<qsizetype>(index)).path,
+             std::move(bytes)});
+    }
+#else
+    const QVector<ArchiveFile> &authenticatedFiles = state.files;
+#endif
+    QSet<QString> currentMembers;
+    quint64 currentScannedMembers = 0;
+    const quint64 maximumCurrentMembers =
+        m_policy.archiveLimits.maximumEntries
+                > std::numeric_limits<quint64>::max() / 64
+        ? std::numeric_limits<quint64>::max()
+        : m_policy.archiveLimits.maximumEntries * 64;
+    QDirIterator current(
+        root,
+        QDir::AllEntries | QDir::Hidden | QDir::System
+            | QDir::NoDotAndDotDot,
+        QDirIterator::Subdirectories);
+    while (current.hasNext()) {
+        const QString path = current.next();
+        const QFileInfo info = current.fileInfo();
+        if (currentScannedMembers >= maximumCurrentMembers
+            || info.isSymLink() || (!info.isDir() && !info.isFile())) {
+            return invalid();
+        }
+        ++currentScannedMembers;
+#ifdef Q_OS_WIN
+        if (info.isDir() && !state.tree.contains(path)) return invalid();
+#endif
+        currentMembers.insert(immutableMemberKey(root, path, info.isDir()));
+    }
+    if (currentMembers != state.memberKeys) return invalid();
+
+    InstallResult verified = validateInstalledFiles(
+        authenticatedFiles, appId, versionDirectory, root,
+        m_trustedPublicKeyPem, m_policy);
+    if (!verified.succeeded()) return verified;
+    verified.immutableGuard = std::move(retainedGuard);
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+    if (qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterVerifyInstalled) {
+        qbrowser_package_installer_testing::packageInstallerTestHooks()
+            .afterVerifyInstalled(appId, versionDirectory);
+    }
+#endif
+    return verified;
 }
 
 InstallResult PackageInstaller::reverifyInstalledVersion(
     const QString &appId,
-    const ActivationBinding &expected) const
+    const ActivationBinding &expected,
+    std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
     const qsizetype separator = expected.currentDirectory.lastIndexOf(
         QLatin1Char('-'));
@@ -522,7 +817,8 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
         return failure(InstallPhase::Verify, InstallError::ContentInvalid,
                        QStringLiteral("installed_content_invalid"));
     }
-    InstallResult verified = verifyInstalled(appId, expected.currentDirectory);
+    InstallResult verified = verifyInstalledImmutable(
+        appId, expected.currentDirectory, std::move(retainedGuard));
     if (!verified.succeeded()) return verified;
     const PackageStoreResult rebound = m_store.compareCurrent(appId, expected);
     if (!rebound.succeeded()) {
@@ -534,7 +830,8 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
 }
 
 InstallResult PackageInstaller::reverifyPinnedLease(
-    const VerifiedPackageLease &lease) const
+    const VerifiedPackageLease &lease,
+    std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
     const QString expectedDirectory = m_store.versionPath(
         lease.appId, lease.versionDirectory);
@@ -552,8 +849,8 @@ InstallResult PackageInstaller::reverifyPinnedLease(
                        QStringLiteral("installed_content_invalid"));
     }
 
-    InstallResult verified = verifyInstalled(lease.appId,
-                                             lease.versionDirectory);
+    InstallResult verified = verifyInstalledImmutable(
+        lease.appId, lease.versionDirectory, std::move(retainedGuard));
     if (!verified.succeeded() || verified.appId != lease.appId
         || verified.version != lease.version
         || verified.entryPoint != lease.entryPoint
@@ -781,6 +1078,8 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
         return failure(InstallPhase::Activate, InstallError::ActivationFailed,
                        QStringLiteral("activation_failed"));
     }
-    return reverifyInstalledVersion(manifest.appId(),
-                                    *activated.activationBinding);
+    InstallResult installed = reverifyInstalledVersion(
+        manifest.appId(), *activated.activationBinding);
+    installed.immutableGuard.reset();
+    return installed;
 }

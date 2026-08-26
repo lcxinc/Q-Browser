@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QDirIterator>
 #include <QPointer>
+#include <QScopeGuard>
 #include <QTimer>
 #include <bcrypt.h>
 
@@ -169,7 +170,7 @@ bool isStableEntryPoint(const QString &packageDirectory,
     }
 #ifdef Q_OS_WIN
     qbrowser_archive_detail::WindowsStableDirectoryTree tree;
-    if (!tree.openRoot(packageDirectory)) return false;
+    if (!tree.openSharedRoot(packageDirectory)) return false;
     QString parent = packageDirectory;
     const QStringList components = entryPoint.split(QLatin1Char('/'));
     for (qsizetype index = 0; index + 1 < components.size(); ++index) {
@@ -195,9 +196,14 @@ bool matchesPermissions(const ManifestPermissions &left,
 }
 
 bool matchesValidatedLease(const WorkerLaunchRequest &request,
-                           const InstallResult &validated)
+                           const InstallResult &validated,
+                           const std::shared_ptr<const ImmutablePackageGuard>
+                               &expectedGuard = {})
 {
     return validated.succeeded() && validated.activationBinding.has_value()
+        && validated.immutableGuard != nullptr
+        && (expectedGuard == nullptr
+            || validated.immutableGuard == expectedGuard)
         && validated.activationBinding->currentDirectory
                == request.lease.versionDirectory
         && validated.activationBinding->versionDigestHex
@@ -325,6 +331,68 @@ qsizetype installedPackageWorkerActiveLaunchThreads()
 }
 #endif
 
+struct InstalledPackageWorkerLauncher::CommittedAttachTransaction::State final
+{
+    WorkerLaunchRequest request;
+    std::unique_ptr<IpcSession> session;
+    std::unique_ptr<WorkerSurface> surface;
+    std::shared_ptr<SandboxProcess> process;
+    std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
+};
+
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::
+    CommittedAttachTransaction(std::unique_ptr<State> state)
+    : state_(std::move(state))
+{
+    Q_ASSERT(state_ != nullptr);
+}
+
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::
+    ~CommittedAttachTransaction() = default;
+
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::
+    CommittedAttachTransaction(CommittedAttachTransaction &&) noexcept = default;
+
+InstalledPackageWorkerLauncher::CommittedAttachTransaction &
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::operator=(
+    CommittedAttachTransaction &&) noexcept = default;
+
+const WorkerLaunchRequest &
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::request()
+    const noexcept
+{
+    Q_ASSERT(state_ != nullptr);
+    return state_->request;
+}
+
+quint32 InstalledPackageWorkerLauncher::CommittedAttachTransaction::processId()
+    const noexcept
+{
+    return state_ != nullptr && state_->process != nullptr
+        ? state_->process->processId() : 0;
+}
+
+std::unique_ptr<IpcSession>
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::takeSession()
+    noexcept
+{
+    return state_ != nullptr ? std::move(state_->session) : nullptr;
+}
+
+std::unique_ptr<WorkerSurface>
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::takeSurface()
+    noexcept
+{
+    return state_ != nullptr ? std::move(state_->surface) : nullptr;
+}
+
+std::shared_ptr<SandboxProcess>
+InstalledPackageWorkerLauncher::CommittedAttachTransaction::takeProcess()
+    noexcept
+{
+    return state_ != nullptr ? std::move(state_->process) : nullptr;
+}
+
 struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     : std::enable_shared_from_this<LaunchRetirementContext>
 {
@@ -332,6 +400,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     quint64 serial = 0;
     std::unique_ptr<IpcSession> session;
     std::shared_ptr<SandboxProcess> process;
+    std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
     std::optional<SandboxProcessWaitHandle> observerHandle;
     std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree;
     QString tempDirectory;
@@ -434,6 +503,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
         {
             std::lock_guard lock(resourceMutex);
             process.reset();
+            immutableGuard.reset();
             tempTree.reset();
             tempDirectory.clear();
         }
@@ -653,7 +723,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 beforeValidationHooks.beforeBindingValidation(request);
             }
 #endif
-            const InstallResult prelaunch = validateBinding(request);
+            const InstallResult prelaunch = validateBinding(request, {});
             if (!matchesValidatedLease(request, prelaunch)) {
                 recordLauncherValidationFailure("prelaunch", request,
                                                 prelaunch);
@@ -663,6 +733,12 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                             key, QStringLiteral("host.launch.stale_activation"));
                     }, Qt::QueuedConnection);
                 return;
+            }
+            const std::shared_ptr<const ImmutablePackageGuard> immutableGuard =
+                prelaunch.immutableGuard;
+            {
+                std::lock_guard lock(context->resourceMutex);
+                context->immutableGuard = immutableGuard;
             }
 #ifdef Q_BROWSER_HOST_TESTING
             const auto prelaunchHooks =
@@ -739,8 +815,9 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 }, Qt::QueuedConnection);
                 return;
             }
-            const InstallResult admitted = validateBinding(request);
-            if (!matchesValidatedLease(request, admitted)) {
+            const InstallResult admitted = validateBinding(
+                request, immutableGuard);
+            if (!matchesValidatedLease(request, admitted, immutableGuard)) {
                 recordLauncherValidationFailure("posthandshake", request,
                                                 admitted);
                 if (guard) QMetaObject::invokeMethod(
@@ -884,63 +961,101 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     const std::shared_ptr<ObserverStartGate> observerGate = observeProcess(
         context, std::move(*observerHandle));
     if (observerGate == nullptr) return;
+    const auto releaseObserver = qScopeGuard([observerGate] {
+        observerGate->released.release();
+    });
     std::unique_ptr<WorkerSurface> surface(WorkerSurface::create(
         context->windowHandle, context->process->nativeProcessHandle(),
         context->request.attempt.attempt));
     std::unique_ptr<IpcSession> session;
+    std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
     {
         std::lock_guard lock(context->resourceMutex);
         session = std::move(context->session);
+        immutableGuard = context->immutableGuard;
+    }
+    const bool surfaceCreated = surface != nullptr;
+    std::unique_ptr<CommittedAttachTransaction::State> prepared;
+    if (surface != nullptr && session != nullptr
+        && context->process != nullptr && immutableGuard != nullptr) {
+        prepared = std::make_unique<CommittedAttachTransaction::State>();
+        prepared->request = context->request;
+        prepared->session = std::move(session);
+        prepared->surface = std::move(surface);
+        prepared->process = context->process;
+        prepared->immutableGuard = immutableGuard;
     }
     auto use = context->request.admission != nullptr
         ? context->request.admission->tryAcquireUse()
         : std::nullopt;
-    const bool surfaceCreated = surface != nullptr;
-    bool authorityCommitted = false;
-    const bool published = surfaceCreated && use.has_value()
+    std::optional<CommittedAttachTransaction> committed;
+    const bool published = prepared != nullptr && use.has_value()
         && use->publishIfStillAdmitted([&] {
                if (!payload->revalidatedAuthority.has_value()
                    || !admission.authority.has_value()
                    || *payload->revalidatedAuthority != context->request
-                   || *admission.authority != context->request) {
+                   || *admission.authority != context->request
+                   || prepared == nullptr
+                   || prepared->request != context->request
+                   || prepared->immutableGuard != immutableGuard) {
                    return false;
                }
-               authorityCommitted = true;
+               committed.emplace(CommittedAttachTransaction(
+                   std::move(prepared)));
                return true;
            });
+    const bool authorityCommitted = committed.has_value();
     AttachResult attachResult = AttachResult::ConsumedFailure;
+    bool attachThrew = false;
+    QPointer<InstalledPackageWorkerLauncher> self(this);
     if (published && authorityCommitted) {
-        attachResult = attach_(context->request,
-                               std::move(session),
-                               std::move(surface),
-                               context->process);
+        std::optional<AttachCallback> attachCallback;
+        try {
+            attachCallback.emplace(attach_);
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto attachHooks =
+                qbrowser_host_testing::installedPackageWorkerLauncherTestHooks();
+            if (attachHooks.afterAttachPublicationBeforeRealization) {
+                attachHooks.afterAttachPublicationBeforeRealization(
+                    context->request, true);
+            }
+#endif
+            attachResult = (*attachCallback)(std::move(*committed));
+        } catch (...) {
+            attachThrew = true;
+        }
     }
     use.reset();
     if (!published || attachResult != AttachResult::Attached) {
-        observerGate->released.release();
         context->retireAsync();
-        fail(context->request.attempt,
-             surfaceCreated && !authorityCommitted
-                 ? QStringLiteral("host.launch.admission_revoked")
-                 : QStringLiteral("host.launch.attach_failed"));
+        if (self) {
+            self->fail(
+                context->request.attempt,
+                surfaceCreated && !authorityCommitted && !attachThrew
+                    ? QStringLiteral("host.launch.admission_revoked")
+                    : QStringLiteral("host.launch.attach_failed"));
+        }
+        return;
+    }
+    if (!self) {
+        context->retireAsync();
         return;
     }
     payload->consumed.store(true, std::memory_order_release);
     context->attached.store(true, std::memory_order_release);
-    inflight_.erase(serial);
-    currentProcess_ = context->process;
-    currentRetirement_ = context;
-    currentKey_ = context->request.attempt;
-    expectedStop_.reset();
+    self->inflight_.erase(serial);
+    self->currentProcess_ = context->process;
+    self->currentRetirement_ = context;
+    self->currentKey_ = context->request.attempt;
+    self->expectedStop_.reset();
     const QString readyAppId = context->request.lease.appId;
     const QString readyVersion = context->request.lease.version;
     const QString readyDirectory = context->request.lease.packageDirectory;
     const quint64 readyActivation = context->request.attempt.activation.value;
     const quint64 readyAttempt = context->request.attempt.attempt.value;
     const quint32 readyProcessId = context->process->processId();
-    observerGate->released.release();
-    emit ready(readyAppId, readyVersion, readyDirectory,
-               readyActivation, readyAttempt, readyProcessId);
+    emit self->ready(readyAppId, readyVersion, readyDirectory,
+                     readyActivation, readyAttempt, readyProcessId);
 }
 
 std::shared_ptr<InstalledPackageWorkerLauncher::ObserverStartGate>

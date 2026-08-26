@@ -497,6 +497,10 @@ private slots:
     void activationChangedBeforeHandshakeNeverAdmitsStaleWorker();
     void activationChangedAfterHandshakeBeforeAdmissionNeverAttaches();
     void launcherRevalidatesExactLeaseBeforeLaunchAndAfterHandshake();
+    void pinnedLeaseLaunchSurvivesCurrentActivationChange();
+    void throwingAttachFailsClosedAndRetiresWorker();
+    void revocationBeforeAttachCommitNeverReachesHost();
+    void revocationAfterAttachCommitSeesCommittedTransaction();
     void staleAdmissionFailureLetsReplacementBecomeHealthy();
     void destroyedLauncherRetiresHandshakeCompletedInflightLaunch();
     void hostDestroyBeforeFirstValidationKeepsAuthorityAlive();
@@ -1518,16 +1522,35 @@ void ProductionUpdateRuntimeTest::launcherRevalidatesExactLeaseBeforeLaunchAndAf
     std::mutex observedMutex;
     std::optional<WorkerLaunchRequest> beforeLaunch;
     std::optional<WorkerLaunchRequest> afterHandshake;
+    std::atomic_int completedValidations = 0;
+    std::atomic_bool durableCommitObserved = false;
+    std::atomic_bool postValidationWriteAttempted = false;
+    std::atomic_bool postValidationWriteSucceeded = false;
     qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
     hooks.afterBindingValidationBeforeProcessLaunch = [&]
         (const WorkerLaunchRequest &request) {
         std::lock_guard lock(observedMutex);
         beforeLaunch = request;
+        completedValidations.fetch_add(1, std::memory_order_acq_rel);
     };
     hooks.afterHandshakeBeforeCompletionQueued = [&]
         (const WorkerLaunchRequest &request, const quint32) {
         std::lock_guard lock(observedMutex);
         afterHandshake = request;
+        completedValidations.fetch_add(1, std::memory_order_acq_rel);
+        QFile entry(QDir(request.lease.packageDirectory)
+                        .filePath(request.lease.entryPoint));
+        postValidationWriteAttempted.store(true, std::memory_order_release);
+        const bool opened = entry.open(
+            QIODevice::WriteOnly | QIODevice::Append);
+        const bool changed = opened && entry.write("\n// changed after validation") > 0;
+        entry.close();
+        postValidationWriteSucceeded.store(changed,
+                                           std::memory_order_release);
+    };
+    hooks.afterAttachPublicationBeforeRealization = [&]
+        (const WorkerLaunchRequest &, const bool durablyCommitted) {
+        durableCommitObserved.store(durablyCommitted, std::memory_order_release);
     };
     qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
         std::move(hooks));
@@ -1561,6 +1584,10 @@ void ProductionUpdateRuntimeTest::launcherRevalidatesExactLeaseBeforeLaunchAndAf
     QVERIFY2(failed.isEmpty(),
              failed.isEmpty() ? "" : qPrintable(failed.first().at(0).toString()));
     QCOMPARE(ready.count(), 1);
+    QCOMPARE(completedValidations.load(std::memory_order_acquire), 2);
+    QVERIFY(durableCommitObserved.load(std::memory_order_acquire));
+    QVERIFY(postValidationWriteAttempted.load(std::memory_order_acquire));
+    QVERIFY(!postValidationWriteSucceeded.load(std::memory_order_acquire));
 
     std::lock_guard lock(observedMutex);
     QVERIFY(beforeLaunch.has_value());
@@ -1585,6 +1612,394 @@ void ProductionUpdateRuntimeTest::launcherRevalidatesExactLeaseBeforeLaunchAndAf
     QCOMPARE(ready.first().at(1).toString(), beforeLaunch->lease.version);
     QCOMPARE(ready.first().at(2).toString(),
              beforeLaunch->lease.packageDirectory);
+}
+
+void ProductionUpdateRuntimeTest::pinnedLeaseLaunchSurvivesCurrentActivationChange()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+    const QString packageOne = updateSignedPackage(
+        temporary, QStringLiteral("pinned-offline-one"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    const QString packageTwo = updateSignedPackage(
+        temporary, QStringLiteral("pinned-offline-two"),
+        QStringLiteral("1.1.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 321; height: 201 }"),
+        environment.appId());
+    const QString packageThree = updateSignedPackage(
+        temporary, QStringLiteral("pinned-offline-three"),
+        QStringLiteral("1.2.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 322; height: 202 }"),
+        environment.appId());
+    QVERIFY(!packageOne.isEmpty());
+    QVERIFY(!packageTwo.isEmpty());
+    QVERIFY(!packageThree.isEmpty());
+
+    PackageStore competingStore(environment.packageRoot());
+    InstallPolicy competingPolicy;
+    competingPolicy.expectedAppId = environment.appId();
+    competingPolicy.runtimeVersion = QStringLiteral("1.2.0");
+    competingPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                      QStringLiteral("Company.Design")};
+    competingPolicy.preflight = [](const Manifest &, const QString &) {
+        return true;
+    };
+    PackageInstaller competingInstaller(
+        competingStore, keys.value().publicKeyPem, std::move(competingPolicy));
+    ManualLifecycleClock seedClock;
+    QVector<UpdateLaunchRequest> seedLaunches;
+    UpdateLifecycleCoordinator seedCoordinator(
+        environment.appId(), competingStore, competingInstaller, {10, 5'000},
+        [&](const UpdateLaunchRequest &request) {
+            seedLaunches.push_back(request);
+            return true;
+        },
+        seedClock.source());
+    seedClock.set(0);
+    const UpdateLifecycleResult seeded =
+        seedCoordinator.installAndLaunch(packageOne);
+    QVERIFY2(seeded.succeeded(), qPrintable(seeded.stableError));
+    QCOMPARE(seedLaunches.size(), 1);
+    const QString pinnedDirectory = seedLaunches.back().packageDirectory;
+    seedClock.set(1);
+    QCOMPARE(seedCoordinator.authenticatedHandshake(seedLaunches.back().key),
+             UpdateLifecycleAction::None);
+    seedClock.set(20);
+    QCOMPARE(seedCoordinator.heartbeat(seedLaunches.back().key),
+             UpdateLifecycleAction::MarkedHealthy);
+    seedCoordinator.beginHostShutdown();
+    InstallResult two = competingInstaller.install(packageTwo);
+    QVERIFY2(two.succeeded(), qPrintable(two.stableError));
+    const QString brokenEntry = QDir(two.path).filePath(two.entryPoint);
+    two.immutableGuard.reset();
+    QVERIFY(makePathPermissive(brokenEntry));
+    const DWORD attributes = GetFileAttributesW(
+        reinterpret_cast<LPCWSTR>(brokenEntry.utf16()));
+    QVERIFY(attributes != INVALID_FILE_ATTRIBUTES);
+    QVERIFY((attributes & FILE_ATTRIBUTE_READONLY) == 0U
+            || SetFileAttributesW(
+                   reinterpret_cast<LPCWSTR>(brokenEntry.utf16()),
+                   attributes & ~FILE_ATTRIBUTE_READONLY) != FALSE);
+    QFile broken(brokenEntry);
+    QVERIFY(broken.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(broken.write("invalid current"), qint64(15));
+    broken.close();
+
+    std::atomic_bool currentChanged = false;
+    std::atomic_bool currentChangeSucceeded = false;
+    std::atomic_int validations = 0;
+    std::mutex observedMutex;
+    QString currentChangeError;
+    std::optional<WorkerLaunchRequest> pinnedRequest;
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.afterBindingValidationBeforeProcessLaunch = [&]
+        (const WorkerLaunchRequest &request) {
+        validations.fetch_add(1, std::memory_order_acq_rel);
+        if (request.revalidationMode != PackageRevalidationMode::PinnedLease
+            || currentChanged.exchange(true)) {
+            return;
+        }
+        {
+            std::lock_guard lock(observedMutex);
+            pinnedRequest = request;
+        }
+        const InstallResult changed = competingInstaller.install(packageThree);
+        currentChangeSucceeded.store(changed.succeeded(),
+                                     std::memory_order_release);
+        std::lock_guard lock(observedMutex);
+        currentChangeError = changed.stableError;
+    };
+    hooks.afterHandshakeBeforeCompletionQueued = [&]
+        (const WorkerLaunchRequest &, const quint32) {
+        validations.fetch_add(1, std::memory_order_acq_rel);
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    std::unique_ptr<HostApplication> host =
+        std::make_unique<HostApplication>(std::move(*parsed.value));
+    const auto cleanup = qScopeGuard([&] {
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        host.reset();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(!ready.isEmpty() || !failed.isEmpty(), 30'000);
+    QString activationError;
+    std::optional<WorkerLaunchRequest> observedPinnedRequest;
+    {
+        std::lock_guard lock(observedMutex);
+        activationError = currentChangeError;
+        observedPinnedRequest = pinnedRequest;
+    }
+    QVERIFY2(currentChangeSucceeded.load(std::memory_order_acquire),
+             qPrintable(activationError));
+    QVERIFY2(failed.isEmpty(),
+             failed.isEmpty() ? ""
+                              : qPrintable(failed.last().at(0).toString()));
+    QCOMPARE(ready.count(), 1);
+    QCOMPARE(ready.first().at(1).toString(), QStringLiteral("1.0.0"));
+    QCOMPARE(QFileInfo(ready.first().at(2).toString()).canonicalFilePath(),
+             QFileInfo(pinnedDirectory).canonicalFilePath());
+    QCOMPARE(validations.load(std::memory_order_acquire), 2);
+    QVERIFY(currentChanged.load(std::memory_order_acquire));
+    QVERIFY(observedPinnedRequest.has_value());
+    QCOMPARE(observedPinnedRequest->revalidationMode,
+             PackageRevalidationMode::PinnedLease);
+    QVERIFY(competingStore.activationState(environment.appId())
+                .state.current.startsWith(QStringLiteral("1.2.0-")));
+}
+
+void ProductionUpdateRuntimeTest::throwingAttachFailsClosedAndRetiresWorker()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("throwing-attach"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+
+    const qsizetype contextsBefore =
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts();
+    const qsizetype observersBefore =
+        qbrowser_host_testing::installedPackageWorkerActiveObservers();
+    const qsizetype launchesBefore =
+        qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads();
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    hooks.throwAttachRealization = true;
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    std::unique_ptr<HostApplication> host =
+        std::make_unique<HostApplication>(std::move(*parsed.value));
+    const auto cleanup = qScopeGuard([&] {
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        host.reset();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty() || !ready.isEmpty(), 30'000);
+    QCOMPARE(ready.count(), 0);
+    QVERIFY(!failed.isEmpty());
+    QCOMPARE(failed.last().at(0).toString(),
+             QStringLiteral("host.launch.attach_failed"));
+    QVERIFY(!host->hasWorkerContext());
+
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    host.reset();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads(),
+        launchesBefore, 10'000);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerActiveObservers(),
+        observersBefore, 10'000);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore, 10'000);
+}
+
+namespace
+{
+void runAttachRevocationWindow(const bool revokeAfterCommit)
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+    const QString package = updateSignedPackage(
+        temporary,
+        revokeAfterCommit ? QStringLiteral("revoke-after-commit")
+                          : QStringLiteral("revoke-before-commit"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+
+    const qsizetype contextsBefore =
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts();
+    const qsizetype observersBefore =
+        qbrowser_host_testing::installedPackageWorkerActiveObservers();
+    std::mutex ticketMutex;
+    std::optional<AuthorityAdmissionToken::RevocationTicket> ticket;
+    std::atomic_bool revocationReached = false;
+    std::atomic_bool durableCommitObserved = false;
+    std::atomic_bool ticketPendingAtRevocation = false;
+    std::atomic_int hostRealizations = 0;
+    const auto revoke = [&](const WorkerLaunchRequest &request) {
+        auto issued = request.admission->beginRevoke();
+        ticketPendingAtRevocation.store(
+            !issued.isDrained(), std::memory_order_release);
+        {
+            std::lock_guard lock(ticketMutex);
+            ticket.emplace(std::move(issued));
+        }
+        revocationReached.store(true, std::memory_order_release);
+    };
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
+    if (revokeAfterCommit) {
+        hooks.afterAttachPublicationBeforeRealization = [&]
+            (const WorkerLaunchRequest &request, const bool committed) {
+            durableCommitObserved.store(committed, std::memory_order_release);
+            revoke(request);
+        };
+    } else {
+        hooks.beforeAdmissionDecision = [&]
+            (const WorkerLaunchRequest &request,
+             UpdateLifecycleCoordinator &) {
+            revoke(request);
+        };
+    }
+    hooks.beforeCommittedAttachRealization = [&]
+        (const WorkerLaunchRequest &) {
+        hostRealizations.fetch_add(1, std::memory_order_acq_rel);
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hooks));
+    std::unique_ptr<HostApplication> host =
+        std::make_unique<HostApplication>(std::move(*parsed.value));
+    const auto cleanup = qScopeGuard([&] {
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        host.reset();
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        revocationReached.load(std::memory_order_acquire), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty() || !ready.isEmpty(), 30'000);
+
+    if (revokeAfterCommit) {
+        QVERIFY(durableCommitObserved.load(std::memory_order_acquire));
+        QVERIFY(ticketPendingAtRevocation.load(std::memory_order_acquire));
+        QCOMPARE(hostRealizations.load(std::memory_order_acquire), 1);
+    } else {
+        QVERIFY(!durableCommitObserved.load(std::memory_order_acquire));
+        QVERIFY(!ticketPendingAtRevocation.load(std::memory_order_acquire));
+        QCOMPARE(hostRealizations.load(std::memory_order_acquire), 0);
+        QCOMPARE(ready.count(), 0);
+        QVERIFY(!host->hasWorkerContext());
+    }
+    std::optional<AuthorityAdmissionToken::RevocationTicket> retainedTicket;
+    {
+        std::lock_guard lock(ticketMutex);
+        retainedTicket = ticket;
+    }
+    QVERIFY(retainedTicket.has_value());
+    QTRY_VERIFY_WITH_TIMEOUT(retainedTicket->isDrained(), 10'000);
+
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    host.reset();
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerActiveObservers(),
+        observersBefore, 10'000);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore, 10'000);
+}
+}
+
+void ProductionUpdateRuntimeTest::revocationBeforeAttachCommitNeverReachesHost()
+{
+    runAttachRevocationWindow(false);
+}
+
+void ProductionUpdateRuntimeTest::revocationAfterAttachCommitSeesCommittedTransaction()
+{
+    runAttachRevocationWindow(true);
 }
 
 void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHealthy()

@@ -281,9 +281,30 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::admitAuthenticatedWorker(
     if (!currentKey_.has_value() || request.attempt != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
     }
-    if (!currentWorkerLaunch_.has_value()
-        || request != *currentWorkerLaunch_) {
+    if (!currentWorkerLaunch_.has_value() || request != *currentWorkerLaunch_
+        || request.tabId != tabId_
+        || request.runtimeIncarnation != runtimeIncarnation_
+        || request.lease.leaseAuthorityEpoch == 0
+        || request.lease.leaseAuthorityEpoch
+               != currentWorkerLaunch_->lease.leaseAuthorityEpoch) {
         return enterFailedClosed();
+    }
+    if (request.revalidationMode == PackageRevalidationMode::PinnedLease) {
+        const qint64 nowMs = clock_.steadyNowMilliseconds();
+        if (nowMs < 0) return enterFailedClosed();
+        if (handshakeAccepted_) {
+            const WorkerSupervisionAction timeout =
+                supervisor_.checkHealth(request.attempt, nowMs);
+            return timeout == WorkerSupervisionAction::None
+                ? UpdateLifecycleAction::None
+                : applySupervisionAction(timeout, nowMs);
+        }
+        if (!installer_.reverifyPinnedLease(request.lease).succeeded()
+            || !supervisor_.authenticatedHandshake(request.attempt, nowMs)) {
+            return enterFailedClosed();
+        }
+        handshakeAccepted_ = true;
+        return UpdateLifecycleAction::None;
     }
     const ActivationBinding expected{
         request.lease.versionDirectory,
@@ -484,7 +505,8 @@ UpdateLifecycleCoordinator::issueLaunchRequest(const bool recovery)
         std::move(lease),
         std::make_shared<AuthorityAdmissionToken>(),
         *currentKey_,
-        PackageRevalidationMode::CurrentActivation,
+        recovery ? PackageRevalidationMode::PinnedLease
+                 : PackageRevalidationMode::CurrentActivation,
         recovery};
     currentWorkerLaunch_ = worker;
     return UpdateLaunchRequest{

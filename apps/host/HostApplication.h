@@ -25,6 +25,7 @@ class QEvent;
 class QTimer;
 class QThread;
 
+#ifdef Q_BROWSER_HOST_TESTING
 struct HostWorkerAttachContext final
 {
     std::unique_ptr<IpcSession> session;
@@ -34,6 +35,7 @@ struct HostWorkerAttachContext final
     quint32 processId = 0;
     std::function<void()> stopProcess;
 };
+#endif
 
 class HostApplication final : public QObject
 {
@@ -49,8 +51,10 @@ public:
     [[nodiscard]] bool requestPackageInstall(const QString &packagePath);
     [[nodiscard]] bool requestOfflineStart();
     [[nodiscard]] bool attachWorkerSession(std::unique_ptr<IpcSession> session);
-    [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult attachWorkerContext(
-        HostWorkerAttachContext context);
+#ifdef Q_BROWSER_HOST_TESTING
+    [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult
+        attachWorkerContextForTesting(HostWorkerAttachContext context);
+#endif
     void detachWorkerContext(const QString &reason);
     [[nodiscard]] bool hasWorkerContext() const noexcept;
     [[nodiscard]] MainWindow *mainWindow() const noexcept;
@@ -75,6 +79,8 @@ signals:
                                          const QVariantMap &payload);
 
 private:
+    struct WorkerAttachContext;
+
     bool eventFilter(QObject *watched, QEvent *event) override;
     [[nodiscard]] bool requestPackageInstall(
         const QString &packagePath,
@@ -82,6 +88,11 @@ private:
     [[nodiscard]] bool enqueueLifecycle(
         std::function<void(UpdateLifecycleCoordinator &)> operation);
     [[nodiscard]] bool initializePackageRuntime();
+    [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult
+        attachWorkerContext(
+            InstalledPackageWorkerLauncher::CommittedAttachTransaction transaction);
+    [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult
+        realizeWorkerContext(WorkerAttachContext context);
     void synchronizeGestureAuthority();
 
     std::optional<HostRuntimeConfig> runtimeConfig_;

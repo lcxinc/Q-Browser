@@ -24,7 +24,8 @@ public:
         const QString &appId,
         const ActivationBinding &expected) const;
     [[nodiscard]] InstallResult revalidateWorkerLaunch(
-        const WorkerLaunchRequest &request) const;
+        const WorkerLaunchRequest &request,
+        std::shared_ptr<const ImmutablePackageGuard> retainedGuard = {}) const;
 
 #ifdef Q_BROWSER_HOST_TESTING
     [[nodiscard]] static qsizetype liveCountForTesting() noexcept;

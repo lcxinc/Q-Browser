@@ -31,7 +31,18 @@
 #include <atomic>
 #include <cstdio>
 #include <limits>
+#include <stdexcept>
 #include <utility>
+
+struct HostApplication::WorkerAttachContext final
+{
+    std::unique_ptr<IpcSession> session;
+    std::unique_ptr<WorkerSurface> surface;
+    std::shared_ptr<void> processLifetime;
+    WorkerLaunchRequest launchRequest;
+    quint32 processId = 0;
+    std::function<void()> stopProcess;
+};
 
 namespace
 {
@@ -302,8 +313,11 @@ bool HostApplication::initializePackageRuntime()
     installedPackageLauncher_ = std::make_unique<InstalledPackageWorkerLauncher>(
         std::move(*boundary.value), runtimeConfig_->workerExecutable(),
         runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
-        [authority](const WorkerLaunchRequest &request) {
-            return authority->revalidateWorkerLaunch(request);
+        [authority](
+            const WorkerLaunchRequest &request,
+            std::shared_ptr<const ImmutablePackageGuard> retainedGuard) {
+            return authority->revalidateWorkerLaunch(
+                request, std::move(retainedGuard));
         },
         [guard](const WorkerLaunchRequest &request,
                 InstalledPackageWorkerLauncher::AdmissionCompletion complete) {
@@ -334,22 +348,21 @@ bool HostApplication::initializePackageRuntime()
                             : std::nullopt});
                 });
         },
-        [guard](const WorkerLaunchRequest &request,
-                std::unique_ptr<IpcSession> session,
-                std::unique_ptr<WorkerSurface> surface,
-                std::shared_ptr<SandboxProcess> process) {
-            if (!guard || process == nullptr)
+        [guard](InstalledPackageWorkerLauncher::CommittedAttachTransaction
+                    transaction) {
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto hooks = qbrowser_host_testing::
+                installedPackageWorkerLauncherTestHooks();
+            if (hooks.beforeCommittedAttachRealization) {
+                hooks.beforeCommittedAttachRealization(transaction.request());
+            }
+            if (hooks.throwAttachRealization) {
+                throw std::runtime_error("injected attach realization failure");
+            }
+#endif
+            if (!guard)
                 return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-            HostWorkerAttachContext context;
-            context.session = std::move(session);
-            context.surface = std::move(surface);
-            context.processLifetime = std::static_pointer_cast<void>(process);
-            context.launchRequest = request;
-            context.processId = process->processId();
-            context.stopProcess = [process] {
-                process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
-            };
-            return guard->attachWorkerContext(std::move(context));
+            return guard->attachWorkerContext(std::move(transaction));
         },
         [guard] {
             if (guard) guard->detachWorkerContext(
@@ -599,7 +612,40 @@ bool HostApplication::attachWorkerSession(std::unique_ptr<IpcSession> session)
 }
 
 InstalledPackageWorkerLauncher::AttachResult
-HostApplication::attachWorkerContext(HostWorkerAttachContext context)
+HostApplication::attachWorkerContext(
+    InstalledPackageWorkerLauncher::CommittedAttachTransaction transaction)
+{
+    WorkerAttachContext context;
+    context.launchRequest = transaction.request();
+    context.processId = transaction.processId();
+    const std::shared_ptr<SandboxProcess> process = transaction.takeProcess();
+    context.session = transaction.takeSession();
+    context.surface = transaction.takeSurface();
+    context.processLifetime = std::static_pointer_cast<void>(process);
+    context.stopProcess = [process] {
+        if (process != nullptr)
+            process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    };
+    return realizeWorkerContext(std::move(context));
+}
+
+#ifdef Q_BROWSER_HOST_TESTING
+InstalledPackageWorkerLauncher::AttachResult
+HostApplication::attachWorkerContextForTesting(HostWorkerAttachContext supplied)
+{
+    WorkerAttachContext context;
+    context.session = std::move(supplied.session);
+    context.surface = std::move(supplied.surface);
+    context.processLifetime = std::move(supplied.processLifetime);
+    context.launchRequest = std::move(supplied.launchRequest);
+    context.processId = supplied.processId;
+    context.stopProcess = std::move(supplied.stopProcess);
+    return realizeWorkerContext(std::move(context));
+}
+#endif
+
+InstalledPackageWorkerLauncher::AttachResult
+HostApplication::realizeWorkerContext(WorkerAttachContext context)
 {
     const WorkerLaunchRequest &request = context.launchRequest;
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr

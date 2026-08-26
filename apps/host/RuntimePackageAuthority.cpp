@@ -47,16 +47,19 @@ InstallResult RuntimePackageAuthority::reverifyInstalledVersion(
 }
 
 InstallResult RuntimePackageAuthority::revalidateWorkerLaunch(
-    const WorkerLaunchRequest &request) const
+    const WorkerLaunchRequest &request,
+    std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
     if (request.revalidationMode == PackageRevalidationMode::PinnedLease) {
-        return installer_.reverifyPinnedLease(request.lease);
+        return installer_.reverifyPinnedLease(
+            request.lease, std::move(retainedGuard));
     }
     const ActivationBinding expected{
         request.lease.versionDirectory,
         request.lease.digestHex,
         request.lease.activationGenerationAtIssue};
-    return installer_.reverifyInstalledVersion(request.lease.appId, expected);
+    return installer_.reverifyInstalledVersion(
+        request.lease.appId, expected, std::move(retainedGuard));
 }
 
 #ifdef Q_BROWSER_HOST_TESTING

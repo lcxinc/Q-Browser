@@ -9,9 +9,11 @@
 #include <QString>
 
 #include <functional>
+#include <memory>
 #include <optional>
 
 class PackageStore;
+class ImmutablePackageGuard;
 
 enum class InstallPhase
 {
@@ -51,11 +53,31 @@ struct InstallResult final
     QString entryPoint;
     ManifestPermissions permissions;
     std::optional<ActivationBinding> activationBinding;
+    std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
 
     [[nodiscard]] bool succeeded() const noexcept
     {
         return error == InstallError::None && phase == InstallPhase::Complete;
     }
+};
+
+class ImmutablePackageGuard final
+{
+public:
+    ~ImmutablePackageGuard();
+
+    ImmutablePackageGuard(const ImmutablePackageGuard &) = delete;
+    ImmutablePackageGuard &operator=(const ImmutablePackageGuard &) = delete;
+    ImmutablePackageGuard(ImmutablePackageGuard &&) = delete;
+    ImmutablePackageGuard &operator=(ImmutablePackageGuard &&) = delete;
+
+private:
+    friend class PackageInstaller;
+
+    struct State;
+    explicit ImmutablePackageGuard(std::unique_ptr<State> state);
+
+    std::unique_ptr<State> state_;
 };
 
 struct VerifiedPackageLease final
@@ -117,11 +139,17 @@ public:
         const QString &versionDirectory) const;
     [[nodiscard]] InstallResult reverifyInstalledVersion(
         const QString &appId,
-        const ActivationBinding &expected) const;
+        const ActivationBinding &expected,
+        std::shared_ptr<const ImmutablePackageGuard> retainedGuard = {}) const;
     [[nodiscard]] InstallResult reverifyPinnedLease(
-        const VerifiedPackageLease &lease) const;
+        const VerifiedPackageLease &lease,
+        std::shared_ptr<const ImmutablePackageGuard> retainedGuard = {}) const;
 
 private:
+    [[nodiscard]] InstallResult verifyInstalledImmutable(
+        const QString &appId,
+        const QString &versionDirectory,
+        std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const;
     PackageStore &m_store;
     QByteArray m_trustedPublicKeyPem;
     InstallPolicy m_policy;

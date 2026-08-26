@@ -14,6 +14,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -243,6 +244,8 @@ private slots:
     void reverifyRejectsActivationChangedDuringSnapshot();
     void reverifyPinnedSignedVersionAfterCurrentChanges();
     void rejectTamperedPinnedVersion();
+    void rejectWritableButUnchangedPinnedVersion();
+    void pinnedGuardLocksIdentityAndRejectsMemberJunction();
     void rejectPinnedPathOrDigestMismatch();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
@@ -296,12 +299,13 @@ void PackageInstallerTest::rejectTamperedPinnedVersion()
     QVERIFY(keys.hasValue());
     PackageStore store(temporary.filePath(QStringLiteral("store")));
     PackageInstaller installer(store, keys.value().publicKeyPem, policy());
-    const InstallResult installed = installer.install(signedPackage(
+    InstallResult installed = installer.install(signedPackage(
         temporary, QStringLiteral("pinned-tamper"), keys.value().privateKeyPem,
         manifest(QStringLiteral("1.0.0"))));
     QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
     const VerifiedPackageLease lease = leaseFor(installed, 42);
     const QString entryPath = QDir(installed.path).filePath(installed.entryPoint);
+    installed.immutableGuard.reset();
     QVERIFY(makeInstalledFileWritable(entryPath));
     QFile entry(entryPath);
     QVERIFY(entry.open(QIODevice::WriteOnly | QIODevice::Truncate));
@@ -312,6 +316,126 @@ void PackageInstallerTest::rejectTamperedPinnedVersion()
     QVERIFY(!rejected.succeeded());
     QCOMPARE(rejected.error, InstallError::ContentInvalid);
     QCOMPARE(rejected.stableError, QStringLiteral("installed_content_invalid"));
+}
+
+void PackageInstallerTest::rejectWritableButUnchangedPinnedVersion()
+{
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-writable"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    const VerifiedPackageLease lease = leaseFor(installed, 44);
+    const QString entryPath = QDir(installed.path).filePath(installed.entryPoint);
+    QFile entry(entryPath);
+    QVERIFY(entry.open(QIODevice::ReadOnly));
+    const QByteArray originalBytes = entry.readAll();
+    entry.close();
+    QVERIFY(makeInstalledFileWritable(entryPath));
+    QVERIFY(entry.open(QIODevice::ReadOnly));
+    QCOMPARE(entry.readAll(), originalBytes);
+    entry.close();
+
+    const InstallResult rejected = installer.reverifyPinnedLease(lease);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QCOMPARE(rejected.stableError, QStringLiteral("installed_content_invalid"));
+}
+
+void PackageInstallerTest::pinnedGuardLocksIdentityAndRejectsMemberJunction()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows stable handle and junction behavior is Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+
+    {
+        InstallResult installed = installer.install(signedPackage(
+            temporary, QStringLiteral("pinned-identity"),
+            keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+        QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+        const VerifiedPackageLease lease = leaseFor(installed, 45);
+        const InstallResult first = installer.reverifyPinnedLease(
+            lease, installed.immutableGuard);
+        QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+        QVERIFY(first.immutableGuard != nullptr);
+        QVERIFY(installed.immutableGuard == nullptr);
+        const QString replacement = temporary.filePath(
+            QStringLiteral("identity-replacement.qml"));
+        QFile replacementFile(replacement);
+        QVERIFY(replacementFile.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(replacementFile.write("replacement identity"), qint64(20));
+        replacementFile.close();
+        const QString entry = QDir(lease.packageDirectory).filePath(
+            lease.entryPoint);
+        SetLastError(ERROR_SUCCESS);
+        QVERIFY(!MoveFileExW(
+            reinterpret_cast<LPCWSTR>(replacement.utf16()),
+            reinterpret_cast<LPCWSTR>(entry.utf16()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH));
+        const DWORD replacementError = GetLastError();
+        QVERIFY(replacementError == ERROR_SHARING_VIOLATION
+                || replacementError == ERROR_ACCESS_DENIED);
+        const InstallResult second = installer.reverifyPinnedLease(
+            lease, first.immutableGuard);
+        QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+        QCOMPARE(second.immutableGuard, first.immutableGuard);
+    }
+
+    InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-junction"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    const VerifiedPackageLease lease = leaseFor(installed, 46);
+    installed.immutableGuard.reset();
+    QStringList members{lease.packageDirectory};
+    QDirIterator iterator(
+        lease.packageDirectory,
+        QDir::AllEntries | QDir::Hidden | QDir::System
+            | QDir::NoDotAndDotDot,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext()) members.push_back(iterator.next());
+    for (const QString &member : members) {
+        QVERIFY2(makeInstalledFileWritable(member), qPrintable(member));
+    }
+    const QString metadata = QDir(lease.packageDirectory).filePath(
+        QStringLiteral("metadata"));
+    const QString junctionTarget = temporary.filePath(
+        QStringLiteral("junction-target"));
+    QVERIFY(QDir().mkpath(junctionTarget));
+    const QStringList metadataFiles = QDir(metadata).entryList(
+        QDir::Files | QDir::Hidden | QDir::System);
+    QVERIFY(!metadataFiles.isEmpty());
+    for (const QString &name : metadataFiles) {
+        QVERIFY(QFile::copy(QDir(metadata).filePath(name),
+                            QDir(junctionTarget).filePath(name)));
+    }
+    QVERIFY(QDir(metadata).removeRecursively());
+    const int junctionExit = QProcess::execute(
+        QStringLiteral("C:/Windows/System32/cmd.exe"),
+        {QStringLiteral("/d"), QStringLiteral("/c"),
+         QStringLiteral("mklink"), QStringLiteral("/J"),
+         QDir::toNativeSeparators(metadata),
+         QDir::toNativeSeparators(junctionTarget)});
+    if (junctionExit != 0) {
+        QSKIP("Windows junction creation is unavailable");
+    }
+    const InstallResult rejected = installer.reverifyPinnedLease(lease);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QCOMPARE(rejected.stableError,
+             QStringLiteral("installed_content_invalid"));
+#endif
 }
 
 void PackageInstallerTest::rejectPinnedPathOrDigestMismatch()

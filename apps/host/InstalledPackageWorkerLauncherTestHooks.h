@@ -21,6 +21,10 @@ struct InstalledPackageWorkerLauncherTestHooks final
         afterProcessStartBeforeHandshake;
     std::function<void(const WorkerLaunchRequest &, quint32)>
         afterHandshakeBeforeCompletionQueued;
+    std::function<void(const WorkerLaunchRequest &, bool)>
+        afterAttachPublicationBeforeRealization;
+    std::function<void(const WorkerLaunchRequest &)>
+        beforeCommittedAttachRealization;
     std::function<void(const WorkerLaunchRequest &,
                        UpdateLifecycleCoordinator &)>
         beforeAdmissionDecision;
@@ -29,6 +33,7 @@ struct InstalledPackageWorkerLauncherTestHooks final
     std::function<void()> afterFailureSignalBeforeLifecycleEnqueue;
     bool failLaunchThreadStart = false;
     bool failObserverThreadStart = false;
+    bool throwAttachRealization = false;
 };
 
 void setInstalledPackageWorkerLauncherTestHooks(

@@ -2003,7 +2003,7 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
         false};
     context.processId = process->processId();
     context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
-    QCOMPARE(application.attachWorkerContext(std::move(context)),
+    QCOMPARE(application.attachWorkerContextForTesting(std::move(context)),
              InstalledPackageWorkerLauncher::AttachResult::Attached);
     QVERIFY(application.hasWorkerContext());
     QCOMPARE(application.mainWindow()->workerSurface(), surfacePointer);
@@ -2065,7 +2065,7 @@ void UnifiedNavigationTest::failedWorkerContextAttachmentConsumesSurfaceExactlyO
         context.stopProcess = [process] {
             process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
         };
-        QCOMPARE(application.attachWorkerContext(std::move(context)),
+        QCOMPARE(application.attachWorkerContextForTesting(std::move(context)),
                  InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure);
         QCOMPARE(destroyed, 1);
         QCOMPARE(application.mainWindow()->workerSurface(), nullptr);
