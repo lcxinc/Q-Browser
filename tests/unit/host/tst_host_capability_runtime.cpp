@@ -23,6 +23,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -100,8 +101,10 @@ private slots:
     void mainWindowDeactivationRevokesGestureEvidence();
     void backgroundFocusAndDispatchStateCannotAuthorize();
     void browserCommandIsSuppressedAndNeverBecomesGesture();
+    void browserCommandLifecycleReentryDoesNotDeadlock();
     void staleQueuedBrowserCommandIsDropped_data();
     void staleQueuedBrowserCommandIsDropped();
+    void queuedBrowserCommandCannotReviveAfterBindingRoundTrip();
     void heldBrowserChordRemainsSuppressedAcrossBindingSwitch();
     void revocationClosesUseAndPublicationUntilGuardDrains();
     void retiringRuntimeLeavesSiblingGestureStorageAndCompletionActive();
@@ -519,6 +522,59 @@ void HostCapabilityRuntimeTest::browserCommandIsSuppressedAndNeverBecomesGesture
     QVERIFY(!router->activateBinding(binding));
 }
 
+void HostCapabilityRuntimeTest::browserCommandLifecycleReentryDoesNotDeadlock()
+{
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority binding = authority(
+        QStringLiteral("tab-a"), 1, 41, 401, 7, 11);
+    auto token = std::make_shared<AuthorityAdmissionToken>();
+    auto store = std::make_shared<UserGestureGrantStore>();
+    auto session = store->openSession(binding.appIdentity);
+    QVERIFY(session.has_value());
+    QVERIFY(router->registerBinding(
+        binding, token, store, std::move(*session)));
+    QVERIFY(router->activateBinding(binding));
+    router->setSystemEvidenceForTesting(validEvidence(binding, 1'000));
+
+    std::promise<void> revokeReturned;
+    std::future<void> revokeFinished = revokeReturned.get_future();
+    std::thread revokeThread;
+    bool revokeReturnedInsideSignal = false;
+    bool lifecycleCompleted = false;
+    const QMetaObject::Connection connection = connect(
+        router.get(), &HostGestureRouter::browserCommandRequested,
+        router.get(),
+        [router = router.get(), binding, token, &revokeReturned,
+         &revokeFinished, &revokeThread, &revokeReturnedInsideSignal,
+         &lifecycleCompleted](const BrowserCommand command) {
+            if (command != BrowserCommand::CloseTab) return;
+            revokeThread = std::thread([token, &revokeReturned] {
+                (void)token->beginRevoke();
+                revokeReturned.set_value();
+            });
+            revokeReturnedInsideSignal =
+                revokeFinished.wait_for(std::chrono::seconds(1))
+                == std::future_status::ready;
+            if (revokeReturnedInsideSignal) {
+                router->unregisterBinding(binding);
+                lifecycleCompleted = true;
+            }
+        },
+        Qt::DirectConnection);
+    QVERIFY(connection);
+
+    QVERIFY(router->routeKeyboardForTesting(
+        QKeyCombination(Qt::ControlModifier, Qt::Key_W), true, 900));
+    QCoreApplication::sendPostedEvents(router.get(), QEvent::MetaCall);
+    if (revokeThread.joinable()) revokeThread.join();
+
+    QVERIFY2(revokeReturnedInsideSignal,
+             "beginRevoke was blocked by the browser-command publication gate");
+    QVERIFY(lifecycleCompleted);
+    QVERIFY(!router->activateBinding(binding));
+}
+
 void HostCapabilityRuntimeTest::staleQueuedBrowserCommandIsDropped_data()
 {
     QTest::addColumn<bool>("retireOriginal");
@@ -563,6 +619,45 @@ void HostCapabilityRuntimeTest::staleQueuedBrowserCommandIsDropped()
 
     QCOMPARE(commands.count(), 0);
     QVERIFY(router->routeKeyboardForTesting(ctrlTab, false, 1'101));
+}
+
+void HostCapabilityRuntimeTest::queuedBrowserCommandCannotReviveAfterBindingRoundTrip()
+{
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority first = authority(
+        QStringLiteral("tab-a"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority second = authority(
+        QStringLiteral("tab-b"), 2, 42, 402, 9, 12);
+    auto firstToken = std::make_shared<AuthorityAdmissionToken>();
+    auto secondToken = std::make_shared<AuthorityAdmissionToken>();
+    auto firstStore = std::make_shared<UserGestureGrantStore>();
+    auto secondStore = std::make_shared<UserGestureGrantStore>();
+    auto firstSession = firstStore->openSession(first.appIdentity);
+    auto secondSession = secondStore->openSession(second.appIdentity);
+    QVERIFY(firstSession.has_value());
+    QVERIFY(secondSession.has_value());
+    QVERIFY(router->registerBinding(
+        first, firstToken, firstStore, std::move(*firstSession)));
+    QVERIFY(router->registerBinding(
+        second, secondToken, secondStore, std::move(*secondSession)));
+    QVERIFY(router->activateBinding(first));
+    router->setSystemEvidenceForTesting(validEvidence(first, 1'000));
+    QSignalSpy commands(router.get(),
+                        &HostGestureRouter::browserCommandRequested);
+    QVERIFY(commands.isValid());
+    const QKeyCombination ctrlTab(Qt::ControlModifier, Qt::Key_Tab);
+
+    QVERIFY(router->routeKeyboardForTesting(ctrlTab, true, 900));
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(router->activateBinding(second));
+    router->setSystemEvidenceForTesting(validEvidence(second, 1'100));
+    QVERIFY(router->activateBinding(first));
+    router->setSystemEvidenceForTesting(validEvidence(first, 1'200));
+    QCoreApplication::sendPostedEvents(router.get(), QEvent::MetaCall);
+
+    QCOMPARE(commands.count(), 0);
+    QVERIFY(router->routeKeyboardForTesting(ctrlTab, false, 1'201));
 }
 
 void HostCapabilityRuntimeTest::heldBrowserChordRemainsSuppressedAcrossBindingSwitch()

@@ -126,6 +126,7 @@ struct HostGestureRouterState final
     bool nativeHooksDisabledForTesting = false;
     QHash<QString, std::shared_ptr<GestureBinding>> bindings;
     std::shared_ptr<GestureBinding> activeBinding;
+    quint64 activationEpoch = 0;
     std::unique_ptr<HostGestureNativeObserver> nativeObserver;
     QSet<int> suppressedKeys;
 #ifdef Q_BROWSER_HOST_TESTING
@@ -325,8 +326,7 @@ void HostGestureRouter::unregisterBinding(
     }
     const std::shared_ptr<GestureBinding> binding = found.value();
     if (state_->activeBinding == binding) {
-        (void)clearEvidence(binding);
-        state_->activeBinding.reset();
+        clearActiveEvidence();
     } else {
         (void)clearEvidence(binding);
     }
@@ -367,6 +367,7 @@ bool HostGestureRouter::activateBinding(
     auto guard = binding->token->tryAcquireUse();
     if (!guard.has_value()) return false;
     return guard->publishIfStillAdmitted([this, binding] {
+        ++state_->activationEpoch;
         state_->activeBinding = binding;
         return true;
     });
@@ -551,11 +552,14 @@ bool HostGestureRouter::routeKeyboard(
         }
         const BrowserCommand queuedCommand = *command;
         const TabCapabilityAuthority queuedAuthority = binding->authority;
+        const quint64 queuedActivationEpoch = state_->activationEpoch;
         if (!guard->publishIfStillAdmitted(
-                [this, binding, queuedAuthority, queuedCommand] {
+                [this, binding, queuedAuthority, queuedCommand,
+                 queuedActivationEpoch] {
                     return QMetaObject::invokeMethod(
                         this,
-                        [this, binding, queuedAuthority, queuedCommand] {
+                        [this, binding, queuedAuthority, queuedCommand,
+                         queuedActivationEpoch] {
                             if (binding->token == nullptr) {
                                 (void)clearEvidence(binding);
                                 return;
@@ -565,23 +569,28 @@ bool HostGestureRouter::routeKeyboard(
                                 (void)clearEvidence(binding);
                                 return;
                             }
-                            const bool emitted =
+                            const HostGestureSystemEvidence queuedEvidence =
+                                systemEvidence(queuedAuthority);
+                            if (!validSystemEvidence(queuedEvidence,
+                                                     queuedAuthority)) {
+                                (void)clearEvidence(binding);
+                                return;
+                            }
+                            const bool dispatchAdmitted =
                                 queuedGuard->publishIfStillAdmitted(
                                     [this, binding, queuedAuthority,
-                                     queuedCommand] {
-                                        if (state_->activeBinding != binding
-                                            || binding->authority
-                                                != queuedAuthority
-                                            || !validSystemEvidence(
-                                                systemEvidence(queuedAuthority),
-                                                queuedAuthority)) {
-                                            return false;
-                                        }
-                                        emit browserCommandRequested(
-                                            queuedCommand);
-                                        return true;
+                                     queuedActivationEpoch] {
+                                        return state_->activeBinding == binding
+                                            && binding->authority
+                                                == queuedAuthority
+                                            && state_->activationEpoch
+                                                == queuedActivationEpoch;
                                     });
-                            if (!emitted) (void)clearEvidence(binding);
+                            if (!dispatchAdmitted) {
+                                (void)clearEvidence(binding);
+                                return;
+                            }
+                            emit browserCommandRequested(queuedCommand);
                         },
                         Qt::QueuedConnection);
                 })) {
@@ -650,6 +659,7 @@ bool HostGestureRouter::observeMouse(
 void HostGestureRouter::clearActiveEvidence() noexcept
 {
     const std::shared_ptr<GestureBinding> old = state_->activeBinding;
+    if (old != nullptr) ++state_->activationEpoch;
     state_->activeBinding.reset();
     (void)clearEvidence(old);
 }
