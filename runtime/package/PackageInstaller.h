@@ -73,6 +73,7 @@ struct InstallResult final
     ManifestPermissions permissions;
     std::optional<ActivationBinding> activationBinding;
     std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
+    quint32 nativeError = 0;
 
     [[nodiscard]] bool succeeded() const noexcept
     {
@@ -101,6 +102,9 @@ private:
     mutable std::unique_ptr<State> state_;
     mutable std::mutex closeMutex_;
 };
+
+[[nodiscard]] InstallResult closeImmutablePackageGuard(
+    InstallResult result) noexcept;
 
 struct VerifiedPackageLease final
 {

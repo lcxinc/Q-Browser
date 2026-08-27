@@ -74,12 +74,17 @@ void UpdateLifecycleCoordinator::setBeforeRelaunchCallback(
 UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
     const QString &packagePath)
 {
+    if (!retryPendingImmutableCleanup()) {
+        return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
+                                pendingImmutableCleanupError_);
+    }
     const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
         return lifecycleFailure(UpdateLifecycleError::InvalidConfiguration,
                                 QStringLiteral("update.invalid_configuration"));
     }
-    const InstallResult installed = installer_.install(packagePath);
+    InstallResult installed = installer_.install(packagePath);
+    (void)settleTemporaryVerification(installed);
     if (!installed.succeeded() || installed.appId != appId_) {
         record(SafeEventPhase::Install, SafeEventCode::Rejected, 0);
         return lifecycleFailure(UpdateLifecycleError::InstallRejected,
@@ -105,6 +110,10 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
 
 UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
 {
+    if (!retryPendingImmutableCleanup()) {
+        return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
+                                pendingImmutableCleanupError_);
+    }
     const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
         return lifecycleFailure(UpdateLifecycleError::InvalidConfiguration,
@@ -133,13 +142,17 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                 return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
                                         QStringLiteral("update.current_changed"));
             }
-            const InstallResult rebound = installer_.reverifyInstalledVersion(
+            InstallResult rebound = installer_.reverifyInstalledVersion(
                 appId_, *confirmed.activationBinding);
-            if (!rebound.succeeded()) {
+            const bool cleanupSettled = settleTemporaryVerification(rebound);
+            if (!rebound.succeeded() || !cleanupSettled) {
                 (void)enterFailedClosed();
                 return lifecycleFailure(
                     UpdateLifecycleError::PackageVerificationFailed,
-                    QStringLiteral("update.current_verification_failed"));
+                    rebound.stableError.startsWith(
+                        QStringLiteral("package.immutable_"))
+                        ? rebound.stableError
+                        : QStringLiteral("update.current_verification_failed"));
             }
             return beginLaunch(rebound.version, rebound.path,
                                rebound.entryPoint, rebound.permissions,
@@ -167,12 +180,17 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
         return lifecycleFailure(UpdateLifecycleError::StateCommitFailed,
                                 QStringLiteral("update.recovery_commit_failed"));
     }
-    const InstallResult rebound = installer_.reverifyInstalledVersion(
+    InstallResult rebound = installer_.reverifyInstalledVersion(
         appId_, *recovered.activationBinding);
-    if (!rebound.succeeded()) {
+    const bool cleanupSettled = settleTemporaryVerification(rebound);
+    if (!rebound.succeeded() || !cleanupSettled) {
         (void)enterFailedClosed();
         return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
-                                QStringLiteral("update.lkg_verification_failed"));
+                                rebound.stableError.startsWith(
+                                    QStringLiteral("package.immutable_"))
+                                    ? rebound.stableError
+                                    : QStringLiteral(
+                                          "update.lkg_verification_failed"));
     }
     return beginLaunch(rebound.version, rebound.path, rebound.entryPoint,
                        rebound.permissions,
@@ -239,6 +257,7 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::beginLaunch(
 UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
     const WorkerAttemptKey key)
 {
+    if (!retryPendingImmutableCleanup()) return enterFailedClosed();
     const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (!currentKey_.has_value() || key != *currentKey_) {
         return UpdateLifecycleAction::IgnoredStaleAttempt;
@@ -249,9 +268,13 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::authenticatedHandshake(
             ? UpdateLifecycleAction::None
             : applySupervisionAction(timeout, nowMs);
     }
-    if (!currentBinding_.has_value()
-        || !installer_.reverifyInstalledVersion(appId_, *currentBinding_)
-                .succeeded()) {
+    if (!currentBinding_.has_value()) {
+        return enterFailedClosed();
+    }
+    InstallResult verified = installer_.reverifyInstalledVersion(
+        appId_, *currentBinding_);
+    const bool cleanupSettled = settleTemporaryVerification(verified);
+    if (!verified.succeeded() || !cleanupSettled) {
         return enterFailedClosed();
     }
     if (!supervisor_.authenticatedHandshake(key, nowMs)) {
@@ -419,13 +442,17 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::applySupervisionAction(
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
 {
+    if (!retryPendingImmutableCleanup()) return enterFailedClosed();
     restartRequested_ = false;
     handshakeAccepted_ = false;
     stopCurrentAttempt();
     if (!currentBinding_.has_value()) return enterFailedClosed();
-    const InstallResult rebound = installer_.reverifyInstalledVersion(
+    InstallResult rebound = installer_.reverifyInstalledVersion(
         appId_, *currentBinding_);
-    if (!rebound.succeeded()) return enterFailedClosed();
+    const bool cleanupSettled = settleTemporaryVerification(rebound);
+    if (!rebound.succeeded() || !cleanupSettled) {
+        return enterFailedClosed();
+    }
     currentVersion_ = rebound.version;
     currentPath_ = rebound.path;
     currentEntryPoint_ = rebound.entryPoint;
@@ -454,6 +481,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::restart(const qint64 nowMs)
 UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
     const qint64 nowMs)
 {
+    if (!retryPendingImmutableCleanup()) return enterFailedClosed();
     rollbackRequested_ = false;
     stopCurrentAttempt();
     if (!currentBinding_.has_value()) return enterFailedClosed();
@@ -465,9 +493,10 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::rollbackAndRecover(
     if (!state.hasValue()) {
         return enterFailedClosed();
     }
-    const InstallResult verified = installer_.reverifyInstalledVersion(
+    InstallResult verified = installer_.reverifyInstalledVersion(
         appId_, *rolledBack.activationBinding);
-    if (!verified.succeeded()) {
+    const bool cleanupSettled = settleTemporaryVerification(verified);
+    if (!verified.succeeded() || !cleanupSettled) {
         return enterFailedClosed();
     }
     const UpdateLifecycleResult launched = beginLaunch(
@@ -537,6 +566,37 @@ void UpdateLifecycleCoordinator::stopCurrentAttempt()
     if (beforeRelaunch_) beforeRelaunch_();
 }
 
+bool UpdateLifecycleCoordinator::settleTemporaryVerification(
+    InstallResult &result) noexcept
+{
+    if (result.immutableGuard == nullptr) return true;
+    if (result.succeeded()) {
+        result = closeImmutablePackageGuard(std::move(result));
+    }
+    if (result.immutableGuard == nullptr) return true;
+    pendingImmutableCleanup_ = std::move(result.immutableGuard);
+    pendingImmutableCleanupError_ = result.stableError.isEmpty()
+        ? QStringLiteral("package.immutable_restore_failed")
+        : result.stableError;
+    return false;
+}
+
+bool UpdateLifecycleCoordinator::retryPendingImmutableCleanup() noexcept
+{
+    if (pendingImmutableCleanup_ == nullptr) return true;
+    const ImmutablePackageGuardCloseResult closed =
+        pendingImmutableCleanup_->close();
+    if (!closed.value.has_value()) {
+        pendingImmutableCleanupError_ = closed.errorCode.isEmpty()
+            ? QStringLiteral("package.immutable_restore_failed")
+            : closed.errorCode;
+        return false;
+    }
+    pendingImmutableCleanup_.reset();
+    pendingImmutableCleanupError_.clear();
+    return true;
+}
+
 UpdateLifecycleAction UpdateLifecycleCoordinator::enterFailedClosed()
 {
     failedClosed_ = true;
@@ -546,6 +606,7 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::enterFailedClosed()
 
 void UpdateLifecycleCoordinator::beginHostShutdown() noexcept
 {
+    (void)retryPendingImmutableCleanup();
     hostShuttingDown_ = true;
     revokeCurrentLaunchAuthority();
 }

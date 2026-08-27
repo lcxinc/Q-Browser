@@ -402,7 +402,9 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     std::unique_ptr<IpcSession> session;
     std::shared_ptr<SandboxProcess> process;
     std::optional<SandboxProcess> fallbackProcess;
+    std::optional<SandboxPreparedLaunch> preparedCleanup;
     std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
+    std::optional<SandboxProcess> failedLaunchCleanup;
     std::optional<SandboxProcessWaitHandle> observerHandle;
     std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree;
     QString tempDirectory;
@@ -480,6 +482,8 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
 #endif
         std::shared_ptr<SandboxProcess> ownedProcess;
         SandboxProcess *retiringProcess = nullptr;
+        SandboxProcess *failedLaunchCleanupOwner = nullptr;
+        SandboxPreparedLaunch *preparedCleanupOwner = nullptr;
         std::shared_ptr<const ImmutablePackageGuard> ownedImmutableGuard;
         std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
             ownedTempTree;
@@ -492,6 +496,10 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             retiringProcess = ownedProcess != nullptr
                 ? ownedProcess.get()
                 : fallbackProcess.has_value() ? &*fallbackProcess : nullptr;
+            failedLaunchCleanupOwner = failedLaunchCleanup.has_value()
+                ? &*failedLaunchCleanup : nullptr;
+            preparedCleanupOwner = preparedCleanup.has_value()
+                ? &*preparedCleanup : nullptr;
             ownedImmutableGuard = immutableGuard;
             ownedTempTree = tempTree;
             ownedTempDirectory = tempDirectory;
@@ -507,6 +515,19 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             }
         }
         if (!error.isEmpty()) return {false, error};
+        if (failedLaunchCleanupOwner != nullptr) {
+            const auto failedLaunchClosed = failedLaunchCleanupOwner->close();
+            if (!failedLaunchClosed.value.has_value()) {
+                error = failedLaunchClosed.errorCode.isEmpty()
+                    ? QStringLiteral("host.launch.sandbox_cleanup_failed")
+                    : failedLaunchClosed.errorCode;
+            }
+        }
+        if (!error.isEmpty()) return {false, error};
+        {
+            std::lock_guard lock(resourceMutex);
+            failedLaunchCleanup.reset();
+        }
         if (ownedImmutableGuard != nullptr) {
             const ImmutablePackageGuardCloseResult immutableClosed =
                 ownedImmutableGuard->close();
@@ -522,6 +543,19 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             immutableGuard.reset();
         }
         ownedImmutableGuard.reset();
+        if (preparedCleanupOwner != nullptr) {
+            const auto preparedClosed = preparedCleanupOwner->close();
+            if (!preparedClosed.value.has_value()) {
+                error = preparedClosed.errorCode.isEmpty()
+                    ? QStringLiteral("host.launch.sandbox_cleanup_failed")
+                    : preparedClosed.errorCode;
+            }
+        }
+        if (!error.isEmpty()) return {false, error};
+        {
+            std::lock_guard lock(resourceMutex);
+            preparedCleanup.reset();
+        }
         if (retiringProcess != nullptr) {
             const auto grantsClosed = retiringProcess->close();
             if (!grantsClosed.value.has_value()) {
@@ -817,13 +851,15 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             if (!matchesValidatedLease(request, prelaunch)) {
                 recordLauncherValidationFailure("prelaunch", request,
                                                 prelaunch);
-                prelaunch.immutableGuard.reset();
-                const auto closed = prepared->close();
-                const QString error = closed.value.has_value()
-                    ? QStringLiteral("host.launch.stale_activation")
-                    : (closed.errorCode.isEmpty()
-                           ? QStringLiteral("host.launch.sandbox_cleanup_failed")
-                           : closed.errorCode);
+                {
+                    std::lock_guard lock(context->resourceMutex);
+                    context->immutableGuard =
+                        std::move(prelaunch.immutableGuard);
+                    context->preparedCleanup.emplace(
+                        std::move(*prepared.value));
+                }
+                const QString error =
+                    QStringLiteral("host.launch.stale_activation");
                 if (guard) QMetaObject::invokeMethod(
                     guard, [guard, key = request.attempt, error] {
                         if (guard) guard->fail(key, error);
@@ -842,14 +878,15 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             SandboxLaunchResult launched = SandboxLauncher::launch(
                 *prepared.value, pair.takeWorkerEnds());
             if (!launched.process.has_value()) {
-                prelaunch.immutableGuard.reset();
-                immutableGuard.reset();
-                const auto closed = prepared->close();
-                const QString error = !closed.value.has_value()
-                    ? (closed.errorCode.isEmpty()
-                           ? QStringLiteral("host.launch.sandbox_cleanup_failed")
-                           : closed.errorCode)
-                    : launched.errorCode.isEmpty()
+                {
+                    std::lock_guard lock(context->resourceMutex);
+                    context->immutableGuard = std::move(immutableGuard);
+                    context->failedLaunchCleanup =
+                        std::move(launched.failedLaunchCleanup);
+                    context->preparedCleanup.emplace(
+                        std::move(*prepared.value));
+                }
+                const QString error = launched.errorCode.isEmpty()
                     ? QStringLiteral("host.launch.process_failed")
                     : launched.errorCode;
                 if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.attempt, error] {
@@ -877,7 +914,6 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                         context->immutableGuard = immutableGuard;
                     }
                     context->requestTerminateNoWait();
-                    prelaunch.immutableGuard.reset();
                     if (guard) QMetaObject::invokeMethod(
                         guard, [guard, key = request.attempt] {
                             if (guard) guard->fail(

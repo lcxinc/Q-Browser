@@ -22,6 +22,7 @@ namespace qbrowser_sandbox_testing
 struct SandboxProcessTestHooks final
 {
     bool forceCloseWaitTimeout = false;
+    bool forceCreateProcessFailure = false;
     std::function<bool(const QString &)> failAclRestore;
     std::function<void(const QString &)> beforeAclGrant;
 };
@@ -113,13 +114,6 @@ private:
     std::mutex closeMutex_;
 };
 
-struct SandboxLaunchResult final
-{
-    std::optional<SandboxProcess> process;
-    QString errorCode;
-    SandboxNativeError nativeError;
-};
-
 struct SandboxPreparedLaunchState;
 
 class SandboxPreparedLaunch final
@@ -145,6 +139,15 @@ private:
     std::unique_ptr<SandboxPreparedLaunchState> state_;
 };
 
+struct SandboxLaunchResult final
+{
+    std::optional<SandboxProcess> process;
+    QString errorCode;
+    SandboxNativeError nativeError;
+    std::optional<SandboxPreparedLaunch> preparedCleanup;
+    std::optional<SandboxProcess> failedLaunchCleanup;
+};
+
 class SandboxLauncher final
 {
 public:
@@ -156,6 +159,10 @@ public:
                                       WorkerPipeEnds &&workerPipeEnds);
 
 private:
+    [[nodiscard]] static SandboxLaunchResult failureAfterCheckedRollback(
+        std::vector<AclGrant> &grants,
+        const QString &originalCode,
+        SandboxNativeError originalError);
     [[nodiscard]] static SandboxValueResult<SandboxPreparedLaunch> prepare(
         const SandboxLaunchConfig &config,
         bool requireMembershipSeal);

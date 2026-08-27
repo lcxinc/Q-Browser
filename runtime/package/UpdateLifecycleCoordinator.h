@@ -142,6 +142,9 @@ private:
         bool recovery);
     void revokeCurrentLaunchAuthority() noexcept;
     void stopCurrentAttempt();
+    [[nodiscard]] bool settleTemporaryVerification(
+        InstallResult &result) noexcept;
+    [[nodiscard]] bool retryPendingImmutableCleanup() noexcept;
     [[nodiscard]] UpdateLifecycleAction enterFailedClosed();
     void record(SafeEventPhase phase,
                 SafeEventCode code,
@@ -164,6 +167,8 @@ private:
     std::optional<ActivationBinding> currentBinding_;
     std::optional<WorkerAttemptKey> currentKey_;
     std::optional<WorkerLaunchRequest> currentWorkerLaunch_;
+    std::shared_ptr<const ImmutablePackageGuard> pendingImmutableCleanup_;
+    QString pendingImmutableCleanupError_;
     QString tabId_;
     quint64 runtimeIncarnation_ = 1;
     quint64 nextLeaseAuthorityEpoch_ = 1;

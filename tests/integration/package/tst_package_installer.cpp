@@ -348,6 +348,8 @@ private slots:
     void pinnedGuardLocksIdentityAndRejectsMemberJunction();
     void pinnedGuardFreezesMembershipUntilReleased();
     void pinnedGuardRestoreFailureIsObservableAndRetryableInReverseOrder();
+    void installReportsGuardCleanupFailureAndRetainsRetry();
+    void reverifySecondComparisonReportsGuardCleanupFailureAndRetainsRetry();
     void rejectPinnedPathOrDigestMismatch();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
@@ -685,6 +687,121 @@ void PackageInstallerTest::
                  std::optional<DirectoryDaclSnapshot>(
                      original.value(QDir::cleanPath(path))));
     }
+#endif
+}
+
+void PackageInstallerTest::installReportsGuardCleanupFailureAndRetainsRetry()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership restoration is Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+
+    int restoreAttempts = 0;
+    qbrowser_package_installer_testing::
+        setImmutableMembershipRestoreFailureHook([&](const QString &) {
+            ++restoreAttempts;
+            return restoreAttempts == 1;
+        });
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("install-cleanup-failure"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+
+    QVERIFY(!installed.succeeded());
+    QCOMPARE(installed.error, InstallError::ContentInvalid);
+    QCOMPARE(installed.stableError,
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(installed.nativeError, quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(installed.immutableGuard != nullptr);
+    QVERIFY(restoreAttempts > 0);
+
+    qbrowser_package_installer_testing::
+        resetImmutableMembershipRestoreFailureHook();
+    const ImmutablePackageGuardCloseResult retried =
+        installed.immutableGuard->close();
+    QVERIFY2(retried.value.has_value(), qPrintable(retried.errorCode));
+    installed.immutableGuard.reset();
+#endif
+}
+
+void PackageInstallerTest::
+    reverifySecondComparisonReportsGuardCleanupFailureAndRetainsRetry()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership restoration is Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult first = installer.install(signedPackage(
+        temporary, QStringLiteral("cleanup-snapshot-a"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    const InstallResult second = installer.install(signedPackage(
+        temporary, QStringLiteral("cleanup-snapshot-b"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.1.0"))));
+    QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+    QVERIFY(second.activationBinding.has_value());
+    const PackageStoreResult rolledBack = store.rollbackForTesting(
+        QStringLiteral("company.pilot"), *second.activationBinding);
+    QVERIFY(rolledBack.succeeded());
+    QVERIFY(rolledBack.activationBinding.has_value());
+
+    bool changed = false;
+    qbrowser_package_installer_testing::PackageInstallerTestHooks hooks;
+    hooks.afterVerifyInstalled = [&](const QString &, const QString &) {
+        if (changed) return;
+        changed = true;
+        const PackageStoreResult activated = store.activateForTesting(
+            QStringLiteral("company.pilot"), QFileInfo(second.path).fileName());
+        QVERIFY(activated.succeeded());
+    };
+    qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+        std::move(hooks));
+    int restoreAttempts = 0;
+    qbrowser_package_installer_testing::
+        setImmutableMembershipRestoreFailureHook([&](const QString &) {
+            ++restoreAttempts;
+            return restoreAttempts == 1;
+        });
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    InstallResult rejected = installer.reverifyInstalledVersion(
+        QStringLiteral("company.pilot"), *rolledBack.activationBinding);
+
+    QVERIFY(changed);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(rejected.error, InstallError::ContentInvalid);
+    QCOMPARE(rejected.stableError,
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(rejected.nativeError, quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(rejected.immutableGuard != nullptr);
+    QVERIFY(restoreAttempts > 0);
+
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+    qbrowser_package_installer_testing::
+        resetImmutableMembershipRestoreFailureHook();
+    const ImmutablePackageGuardCloseResult retried =
+        rejected.immutableGuard->close();
+    QVERIFY2(retried.value.has_value(), qPrintable(retried.errorCode));
+    rejected.immutableGuard.reset();
 #endif
 }
 

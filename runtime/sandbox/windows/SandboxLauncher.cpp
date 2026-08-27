@@ -314,28 +314,17 @@ SandboxLaunchResult win32Failure(
     return failure(code, SandboxNativeError::win32(nativeError));
 }
 
-SandboxLaunchResult failureAfterCheckedRollback(
-    std::vector<AclGrant> &grants,
-    const QString &originalCode,
-    const SandboxNativeError originalError)
+SandboxValueResult<bool> closeAclGrant(AclGrant &grant) noexcept
 {
-    QString rollbackCode;
-    SandboxNativeError rollbackError;
-    for (auto grant = grants.rbegin(); grant != grants.rend(); ++grant) {
-        if (!grant->isValid()) {
-            continue;
-        }
-        const auto restored = grant->close();
-        if (!restored.value.has_value() && rollbackCode.isEmpty()) {
-            rollbackCode = restored.errorCode;
-            rollbackError = restored.nativeError;
-        }
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    const auto &hooks = qbrowser_sandbox_testing::sandboxProcessTestHooks();
+    if (hooks.failAclRestore && hooks.failAclRestore(grant.finalPath())) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.acl.restore_failed"),
+                SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
     }
-    if (rollbackCode.isEmpty()) {
-        grants.clear();
-        return failure(originalCode, originalError);
-    }
-    return failure(rollbackCode, rollbackError);
+#endif
+    return grant.close();
 }
 
 bool inheritablePipeHandle(const HANDLE handle)
@@ -347,6 +336,31 @@ bool inheritablePipeHandle(const HANDLE handle)
 }
 
 } // namespace
+
+SandboxLaunchResult SandboxLauncher::failureAfterCheckedRollback(
+    std::vector<AclGrant> &grants,
+    const QString &originalCode,
+    const SandboxNativeError originalError)
+{
+    QString rollbackCode;
+    SandboxNativeError rollbackError;
+    for (auto grant = grants.rbegin(); grant != grants.rend(); ++grant) {
+        if (!grant->isValid()) continue;
+        const auto restored = closeAclGrant(*grant);
+        if (!restored.value.has_value() && rollbackCode.isEmpty()) {
+            rollbackCode = restored.errorCode;
+            rollbackError = restored.nativeError;
+        }
+    }
+    if (rollbackCode.isEmpty()) {
+        grants.clear();
+        return failure(originalCode, originalError);
+    }
+    SandboxLaunchResult failed = failure(rollbackCode, rollbackError);
+    failed.failedLaunchCleanup = SandboxProcess(
+        nullptr, 0, JobLimits{}, std::move(grants), {});
+    return failed;
+}
 
 #ifdef Q_BROWSER_SANDBOX_TESTING
 namespace qbrowser_sandbox_testing
@@ -421,7 +435,7 @@ bool SandboxPreparedLaunch::isValid() const noexcept
 SandboxValueResult<bool> SandboxPreparedLaunch::close() noexcept
 {
     if (state_ == nullptr) return {true, {}, {}};
-    const auto closed = state_->packageGrant.close();
+    const auto closed = closeAclGrant(state_->packageGrant);
     if (!closed.value.has_value()) return closed;
     state_.reset();
     return {true, {}, {}};
@@ -673,18 +687,7 @@ SandboxValueResult<bool> SandboxProcess::closeGrantsLocked() noexcept
     for (qsizetype index = static_cast<qsizetype>(grants_.size());
          index > 0; --index) {
         AclGrant &grant = grants_[static_cast<std::size_t>(index - 1)];
-        SandboxValueResult<bool> restored;
-#ifdef Q_BROWSER_SANDBOX_TESTING
-        const auto &hooks = qbrowser_sandbox_testing::sandboxProcessTestHooks();
-        if (hooks.failAclRestore && hooks.failAclRestore(grant.finalPath())) {
-            restored = {std::nullopt,
-                        QStringLiteral("sandbox.acl.restore_failed"),
-                        SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
-        } else
-#endif
-        {
-            restored = grant.close();
-        }
+        const SandboxValueResult<bool> restored = closeAclGrant(grant);
         if (restored.value.has_value()) {
             grants_.erase(grants_.begin() + (index - 1));
         } else if (firstErrorCode.isEmpty()) {
@@ -768,20 +771,6 @@ SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
                 SandboxNativeError::win32(ERROR_INVALID_DATA)};
     }
 
-    auto profile = AppContainerProfile::createOrOpen(config.appId());
-    if (!profile.has_value()) {
-        return {std::nullopt, profile.errorCode, profile.nativeError};
-    }
-    auto sidText = profile->sidString();
-    if (!sidText.value.has_value()) {
-        return {std::nullopt, sidText.errorCode, sidText.nativeError};
-    }
-    const DWORD sidBytes = GetLengthSid(profile->sid());
-    if (sidBytes == 0) {
-        return {std::nullopt,
-                QStringLiteral("sandbox.profile.sid_failed"),
-                SandboxNativeError::win32(ERROR_INVALID_SID)};
-    }
     // Keep the validated image open without write/delete sharing before any
     // ACL mutation so it cannot be replaced between validation and launch.
     UniqueHandle executableLock(CreateFileW(
@@ -818,6 +807,20 @@ SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
     auto job = JobLimits::create(config.resourceLimits());
     if (!job.value.has_value()) {
         return {std::nullopt, job.errorCode, job.nativeError};
+    }
+    auto profile = AppContainerProfile::createOrOpen(config.appId());
+    if (!profile.has_value()) {
+        return {std::nullopt, profile.errorCode, profile.nativeError};
+    }
+    auto sidText = profile->sidString();
+    if (!sidText.value.has_value()) {
+        return {std::nullopt, sidText.errorCode, sidText.nativeError};
+    }
+    const DWORD sidBytes = GetLengthSid(profile->sid());
+    if (sidBytes == 0) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.sid_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
 #ifdef Q_BROWSER_SANDBOX_TESTING
     if (qbrowser_sandbox_testing::sandboxProcessTestHooks().beforeAclGrant) {
@@ -1018,16 +1021,23 @@ SandboxLaunchResult SandboxLauncher::launch(
     PROCESS_INFORMATION process{};
     const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
         | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
-    if (!CreateProcessW(reinterpret_cast<LPCWSTR>(executable.utf16()),
-                        commandLine.data(),
-                        nullptr,
-                        nullptr,
-                        TRUE,
-                        flags,
-                         environmentBlock.value->data(),
-                        reinterpret_cast<LPCWSTR>(tempDirectory.utf16()),
-                        &startup.StartupInfo,
-                        &process)) {
+    bool created = false;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    if (!qbrowser_sandbox_testing::sandboxProcessTestHooks()
+             .forceCreateProcessFailure) {
+#endif
+        created = CreateProcessW(
+            reinterpret_cast<LPCWSTR>(executable.utf16()),
+            commandLine.data(), nullptr, nullptr, TRUE, flags,
+            environmentBlock.value->data(),
+            reinterpret_cast<LPCWSTR>(tempDirectory.utf16()),
+            &startup.StartupInfo, &process) != FALSE;
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    } else {
+        SetLastError(ERROR_ACCESS_DENIED);
+    }
+#endif
+    if (!created) {
         const DWORD error = GetLastError();
         return failureAfterCheckedRollback(
             grants,
@@ -1089,9 +1099,17 @@ SandboxLaunchResult SandboxLauncher::launch(
     SandboxLaunchResult launched = launch(
         *prepared.value, std::move(workerPipeEnds));
     if (!launched.process.has_value()) {
+        if (launched.failedLaunchCleanup.has_value()) {
+            launched.preparedCleanup.emplace(
+                std::move(*prepared.value));
+            return launched;
+        }
         const auto closed = prepared->close();
         if (!closed.value.has_value()) {
-            return failure(closed.errorCode, closed.nativeError);
+            launched.errorCode = closed.errorCode;
+            launched.nativeError = closed.nativeError;
+            launched.preparedCleanup.emplace(
+                std::move(*prepared.value));
         }
     }
     return launched;

@@ -828,6 +828,24 @@ ImmutablePackageGuardCloseResult ImmutablePackageGuard::close() const noexcept
     return {true, {}, 0U};
 }
 
+InstallResult closeImmutablePackageGuard(InstallResult result) noexcept
+{
+    if (result.immutableGuard == nullptr) return result;
+    const ImmutablePackageGuardCloseResult closed =
+        result.immutableGuard->close();
+    if (!closed.value.has_value()) {
+        result.phase = InstallPhase::Verify;
+        result.error = InstallError::ContentInvalid;
+        result.stableError = closed.errorCode.isEmpty()
+            ? QStringLiteral("package.immutable_restore_failed")
+            : closed.errorCode;
+        result.nativeError = closed.nativeError;
+        return result;
+    }
+    result.immutableGuard.reset();
+    return result;
+}
+
 PackageInstaller::PackageInstaller(PackageStore &store,
                                    QByteArray trustedPublicKeyPem,
                                    InstallPolicy policy)
@@ -921,9 +939,15 @@ InstallResult PackageInstaller::verifyInstalledImmutable(
     const QString &versionDirectory,
     std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
-    const auto invalid = [] {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+    const bool ownsAcquiredGuard = retainedGuard == nullptr;
+    const auto invalid = [&retainedGuard, ownsAcquiredGuard] {
+        InstallResult result = failure(
+            InstallPhase::Verify, InstallError::ContentInvalid,
+            QStringLiteral("installed_content_invalid"));
+        result.immutableGuard = retainedGuard;
+        return ownsAcquiredGuard
+            ? closeImmutablePackageGuard(std::move(result))
+            : result;
     };
     const QString root = m_store.versionPath(appId, versionDirectory);
     const QFileInfo rootInfo(root);
@@ -1050,17 +1074,22 @@ InstallResult PackageInstaller::verifyInstalledImmutable(
         directoriesToSeal.append(directories);
         state->directorySeals.reserve(
             static_cast<size_t>(directoriesToSeal.size()));
-        for (const QString &directory : directoriesToSeal) {
-            ImmutableDirectoryMembershipSeal seal;
-            if (!sealImmutableDirectoryMembership(
-                    directory, state->tree, seal)) {
-                return invalid();
-            }
-            state->directorySeals.push_back(std::move(seal));
-        }
-#endif
         retainedGuard = std::shared_ptr<const ImmutablePackageGuard>(
             new ImmutablePackageGuard(std::move(state)));
+        auto &guardState = *retainedGuard->state_;
+        for (const QString &directory : directoriesToSeal) {
+            ImmutableDirectoryMembershipSeal seal;
+            const bool sealed = sealImmutableDirectoryMembership(
+                directory, guardState.tree, seal);
+            if (seal.active) {
+                guardState.directorySeals.push_back(std::move(seal));
+            }
+            if (!sealed) return invalid();
+        }
+#else
+        retainedGuard = std::shared_ptr<const ImmutablePackageGuard>(
+            new ImmutablePackageGuard(std::move(state)));
+#endif
     }
 
     if (retainedGuard->state_ == nullptr) return invalid();
@@ -1135,7 +1164,12 @@ InstallResult PackageInstaller::verifyInstalledImmutable(
     InstallResult verified = validateInstalledFiles(
         authenticatedFiles, appId, versionDirectory, root,
         m_trustedPublicKeyPem, m_policy);
-    if (!verified.succeeded()) return verified;
+    if (!verified.succeeded()) {
+        verified.immutableGuard = retainedGuard;
+        return ownsAcquiredGuard
+            ? closeImmutablePackageGuard(std::move(verified))
+            : verified;
+    }
     verified.immutableGuard = std::move(retainedGuard);
 #ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
     if (qbrowser_package_installer_testing::packageInstallerTestHooks()
@@ -1152,26 +1186,37 @@ InstallResult PackageInstaller::reverifyInstalledVersion(
     const ActivationBinding &expected,
     std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
+    const bool ownsAcquiredGuard = retainedGuard == nullptr;
+    const auto invalidWithRetainedGuard = [&retainedGuard] {
+        InstallResult result = failure(
+            InstallPhase::Verify, InstallError::ContentInvalid,
+            QStringLiteral("installed_content_invalid"));
+        result.immutableGuard = retainedGuard;
+        return result;
+    };
     const qsizetype separator = expected.currentDirectory.lastIndexOf(
         QLatin1Char('-'));
     if (separator <= 0
         || expected.currentDirectory.sliced(separator + 1).toLatin1()
             != expected.versionDigestHex) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+        return invalidWithRetainedGuard();
     }
     const PackageStoreResult active = m_store.compareCurrent(appId, expected);
     if (!active.succeeded()) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+        return invalidWithRetainedGuard();
     }
     InstallResult verified = verifyInstalledImmutable(
         appId, expected.currentDirectory, std::move(retainedGuard));
     if (!verified.succeeded()) return verified;
     const PackageStoreResult rebound = m_store.compareCurrent(appId, expected);
     if (!rebound.succeeded()) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+        InstallResult rejected = failure(
+            InstallPhase::Verify, InstallError::ContentInvalid,
+            QStringLiteral("installed_content_invalid"));
+        rejected.immutableGuard = std::move(verified.immutableGuard);
+        return ownsAcquiredGuard
+            ? closeImmutablePackageGuard(std::move(rejected))
+            : rejected;
     }
     verified.activationBinding = expected;
     return verified;
@@ -1181,6 +1226,7 @@ InstallResult PackageInstaller::reverifyPinnedLease(
     const VerifiedPackageLease &lease,
     std::shared_ptr<const ImmutablePackageGuard> retainedGuard) const
 {
+    const bool ownsAcquiredGuard = retainedGuard == nullptr;
     const QString expectedDirectory = m_store.versionPath(
         lease.appId, lease.versionDirectory);
     if (lease.appId.isEmpty() || lease.version.isEmpty()
@@ -1193,20 +1239,28 @@ InstallResult PackageInstaller::reverifyPinnedLease(
         || expectedDirectory.isEmpty()
         || !sameCanonicalDirectory(expectedDirectory,
                                    lease.packageDirectory)) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+        InstallResult rejected = failure(
+            InstallPhase::Verify, InstallError::ContentInvalid,
+            QStringLiteral("installed_content_invalid"));
+        rejected.immutableGuard = std::move(retainedGuard);
+        return rejected;
     }
 
     InstallResult verified = verifyInstalledImmutable(
         lease.appId, lease.versionDirectory, std::move(retainedGuard));
-    if (!verified.succeeded() || verified.appId != lease.appId
-        || verified.version != lease.version
+    if (!verified.succeeded()) return verified;
+    if (verified.appId != lease.appId || verified.version != lease.version
         || verified.entryPoint != lease.entryPoint
         || !sameCanonicalDirectory(verified.path,
                                    lease.packageDirectory)
         || !permissionsMatch(verified.permissions, lease.permissions)) {
-        return failure(InstallPhase::Verify, InstallError::ContentInvalid,
-                       QStringLiteral("installed_content_invalid"));
+        InstallResult rejected = failure(
+            InstallPhase::Verify, InstallError::ContentInvalid,
+            QStringLiteral("installed_content_invalid"));
+        rejected.immutableGuard = std::move(verified.immutableGuard);
+        return ownsAcquiredGuard
+            ? closeImmutablePackageGuard(std::move(rejected))
+            : rejected;
     }
     verified.activationBinding = ActivationBinding{
         lease.versionDirectory,
@@ -1428,6 +1482,5 @@ InstallResult PackageInstaller::install(const QString &packagePath) const
     }
     InstallResult installed = reverifyInstalledVersion(
         manifest.appId(), *activated.activationBinding);
-    installed.immutableGuard.reset();
-    return installed;
+    return closeImmutablePackageGuard(std::move(installed));
 }
