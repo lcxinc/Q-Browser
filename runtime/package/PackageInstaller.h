@@ -10,10 +10,29 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 class PackageStore;
 class ImmutablePackageGuard;
+
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+namespace qbrowser_package_installer_testing
+{
+void setImmutableMembershipRestoreFailureHook(
+    std::function<bool(const QString &)> hook);
+void resetImmutableMembershipRestoreFailureHook();
+[[nodiscard]] const std::function<bool(const QString &)> &
+immutableMembershipRestoreFailureHook();
+}
+#endif
+
+struct ImmutablePackageGuardCloseResult final
+{
+    std::optional<bool> value;
+    QString errorCode;
+    quint32 nativeError = 0;
+};
 
 enum class InstallPhase
 {
@@ -66,6 +85,8 @@ class ImmutablePackageGuard final
 public:
     ~ImmutablePackageGuard();
 
+    [[nodiscard]] ImmutablePackageGuardCloseResult close() const noexcept;
+
     ImmutablePackageGuard(const ImmutablePackageGuard &) = delete;
     ImmutablePackageGuard &operator=(const ImmutablePackageGuard &) = delete;
     ImmutablePackageGuard(ImmutablePackageGuard &&) = delete;
@@ -77,7 +98,8 @@ private:
     struct State;
     explicit ImmutablePackageGuard(std::unique_ptr<State> state);
 
-    std::unique_ptr<State> state_;
+    mutable std::unique_ptr<State> state_;
+    mutable std::mutex closeMutex_;
 };
 
 struct VerifiedPackageLease final

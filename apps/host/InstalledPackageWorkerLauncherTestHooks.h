@@ -37,6 +37,7 @@ struct InstalledPackageWorkerLauncherTestHooks final
     std::function<void(bool)> afterLaunchFinishedBeforeThreadReturn;
     bool failLaunchThreadStart = false;
     bool failObserverThreadStart = false;
+    bool throwProcessSharedAllocation = false;
     bool throwAttachRealization = false;
 };
 

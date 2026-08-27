@@ -404,7 +404,8 @@ bool HostApplication::initializePackageRuntime()
                 || error == QStringLiteral("host.launch.process_cleanup_failed")
                 || error.startsWith(QStringLiteral("sandbox.process."))
                 || error.startsWith(QStringLiteral("sandbox.job."))
-                || error.startsWith(QStringLiteral("sandbox.acl."));
+                || error.startsWith(QStringLiteral("sandbox.acl."))
+                || error.startsWith(QStringLiteral("package.immutable_"));
             const bool admissionFailure = error.startsWith(
                 QStringLiteral("host.launch.admission_"));
             (void)localGuard->enqueueLifecycle(

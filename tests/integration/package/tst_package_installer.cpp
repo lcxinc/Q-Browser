@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -230,6 +231,55 @@ struct PackageMembershipMutationAttempt final
     bool nestedDirectoryCreated = false;
 };
 
+struct DirectoryDaclSnapshot final
+{
+    bool present = false;
+    bool protectedFromInheritance = false;
+    QByteArray bytes;
+
+    friend bool operator==(const DirectoryDaclSnapshot &,
+                           const DirectoryDaclSnapshot &) = default;
+};
+
+std::optional<DirectoryDaclSnapshot> directoryDaclSnapshot(
+    const QString &path)
+{
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD result = GetNamedSecurityInfoW(
+        const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(path.utf16())),
+        SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, nullptr, nullptr, &descriptor);
+    if (result != ERROR_SUCCESS || descriptor == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return std::nullopt;
+    }
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    PACL dacl = nullptr;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    const bool valid = GetSecurityDescriptorDacl(
+                           descriptor, &present, &dacl, &defaulted)
+            != FALSE
+        && GetSecurityDescriptorControl(descriptor, &control, &revision)
+            != FALSE
+        && (dacl == nullptr || dacl->AclSize >= sizeof(ACL));
+    if (!valid) {
+        LocalFree(descriptor);
+        return std::nullopt;
+    }
+    DirectoryDaclSnapshot snapshot;
+    snapshot.present = present != FALSE;
+    snapshot.protectedFromInheritance = (control & SE_DACL_PROTECTED) != 0U;
+    if (dacl != nullptr) {
+        snapshot.bytes = QByteArray(
+            reinterpret_cast<const char *>(dacl),
+            static_cast<qsizetype>(dacl->AclSize));
+    }
+    LocalFree(descriptor);
+    return snapshot;
+}
+
 bool clearInstalledDirectoryDacl(const QString &path)
 {
     return SetNamedSecurityInfoW(
@@ -297,6 +347,7 @@ private slots:
     void rejectWritableButUnchangedPinnedVersion();
     void pinnedGuardLocksIdentityAndRejectsMemberJunction();
     void pinnedGuardFreezesMembershipUntilReleased();
+    void pinnedGuardRestoreFailureIsObservableAndRetryableInReverseOrder();
     void rejectPinnedPathOrDigestMismatch();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
@@ -555,6 +606,85 @@ void PackageInstallerTest::pinnedGuardFreezesMembershipUntilReleased()
     QVERIFY(released.nestedFileCreated);
     QVERIFY(released.rootDirectoryCreated);
     QVERIFY(released.nestedDirectoryCreated);
+#endif
+}
+
+void PackageInstallerTest::
+    pinnedGuardRestoreFailureIsObservableAndRetryableInReverseOrder()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership restoration is Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("membership-restore"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    const VerifiedPackageLease lease = leaseFor(installed, 48);
+    const QString root = lease.packageDirectory;
+    const QString metadata = QDir(root).filePath(QStringLiteral("metadata"));
+    const QString qml = QDir(root).filePath(QStringLiteral("qml"));
+    const QStringList forwardOrder{root, metadata, qml};
+    QHash<QString, DirectoryDaclSnapshot> original;
+    for (const QString &path : forwardOrder) {
+        const auto snapshot = directoryDaclSnapshot(path);
+        QVERIFY2(snapshot.has_value(), qPrintable(path));
+        original.insert(QDir::cleanPath(path), *snapshot);
+    }
+
+    const InstallResult verified = installer.reverifyPinnedLease(lease);
+    QVERIFY2(verified.succeeded(), qPrintable(verified.stableError));
+    QVERIFY(verified.immutableGuard != nullptr);
+
+    QStringList restoreAttempts;
+    bool failMetadataRestore = true;
+    qbrowser_package_installer_testing::
+        setImmutableMembershipRestoreFailureHook([&](const QString &path) {
+            const QString clean = QDir::cleanPath(path);
+            restoreAttempts.push_back(clean);
+            return failMetadataRestore && clean == QDir::cleanPath(metadata);
+        });
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    const ImmutablePackageGuardCloseResult failed =
+        verified.immutableGuard->close();
+    QVERIFY(!failed.value.has_value());
+    QCOMPARE(failed.errorCode,
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(failed.nativeError, quint32(ERROR_ACCESS_DENIED));
+    QCOMPARE(restoreAttempts,
+             QStringList({QDir::cleanPath(qml),
+                          QDir::cleanPath(metadata),
+                          QDir::cleanPath(root)}));
+    QCOMPARE(directoryDaclSnapshot(qml),
+             std::optional<DirectoryDaclSnapshot>(
+                 original.value(QDir::cleanPath(qml))));
+    QCOMPARE(directoryDaclSnapshot(root),
+             std::optional<DirectoryDaclSnapshot>(
+                 original.value(QDir::cleanPath(root))));
+    QVERIFY(directoryDaclSnapshot(metadata)
+            != std::optional<DirectoryDaclSnapshot>(
+                original.value(QDir::cleanPath(metadata))));
+
+    failMetadataRestore = false;
+    restoreAttempts.clear();
+    const ImmutablePackageGuardCloseResult retried =
+        verified.immutableGuard->close();
+    QVERIFY2(retried.value.has_value(), qPrintable(retried.errorCode));
+    QCOMPARE(restoreAttempts, QStringList({QDir::cleanPath(metadata)}));
+    for (const QString &path : forwardOrder) {
+        QCOMPARE(directoryDaclSnapshot(path),
+                 std::optional<DirectoryDaclSnapshot>(
+                     original.value(QDir::cleanPath(path))));
+    }
 #endif
 }
 

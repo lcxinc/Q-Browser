@@ -8,6 +8,7 @@
 #include "PackageStore.h"
 #include "RuntimePackageAuthority.h"
 #include "UpdateTestSupport.h"
+#include "WinPipeTransport.h"
 #include "WorkerTestEnvironment.h"
 #include "WorkerRetirementManager.h"
 #include "WorkerLaunchRequest.h"
@@ -595,6 +596,9 @@ private slots:
     void lifecycleQueueFullBeforeAdmissionNeverAttaches();
     void processWaitCleanupFailureIsFatalAndRetryable();
     void aclRestoreCleanupFailureIsFatalAndRetryable();
+    void immutableMembershipRestoreCleanupFailureIsFatalAndRetryable();
+    void processOwnershipAllocationFailureRetainsSealForRetryableCleanup();
+    void invalidJobLimitsAreRejectedBeforeAclGrant();
     void readyHandlerCanDestroyHostWithoutUseAfterFree();
     void unexpectedExitSignalHandlerCanDestroyHost();
     void exitCallbackCanDestroyHost();
@@ -821,7 +825,14 @@ void runActivationAdmissionRace(const ActivationRacePoint racePoint)
         10'000);
 }
 
-void runSandboxCloseFailure(const bool forceWaitTimeout)
+enum class SandboxCloseFailureKind
+{
+    ProcessWait,
+    AclRestore,
+    ImmutableMembershipRestore,
+};
+
+void runSandboxCloseFailure(const SandboxCloseFailureKind failureKind)
 {
     WorkerTestEnvironment environment;
     QVERIFY2(environment.isValid(), qPrintable(environment.error()));
@@ -866,21 +877,38 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
     QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
     QVERIFY(host->start());
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 30'000);
-    qbrowser_sandbox_testing::SandboxProcessTestHooks hooks;
-    hooks.forceCloseWaitTimeout = forceWaitTimeout;
-    if (!forceWaitTimeout) {
-        hooks.failAclRestore = [](const QString &) { return true; };
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+        qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+    });
+    qbrowser_sandbox_testing::SandboxProcessTestHooks sandboxHooks;
+    sandboxHooks.forceCloseWaitTimeout = failureKind
+        == SandboxCloseFailureKind::ProcessWait;
+    if (failureKind == SandboxCloseFailureKind::AclRestore) {
+        sandboxHooks.failAclRestore = [](const QString &) { return true; };
+    } else if (failureKind
+               == SandboxCloseFailureKind::ImmutableMembershipRestore) {
+        qbrowser_package_installer_testing::
+            setImmutableMembershipRestoreFailureHook(
+                [](const QString &) { return true; });
     }
-    qbrowser_sandbox_testing::setSandboxProcessTestHooks(std::move(hooks));
+    qbrowser_sandbox_testing::setSandboxProcessTestHooks(
+        std::move(sandboxHooks));
     QVERIFY(terminateProcessId(ready.first().at(5).toUInt()));
-    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 10'000);
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty() || !exited.isEmpty(), 10'000);
+    QVERIFY(!failed.isEmpty());
     QCOMPARE(exited.count(), 0);
     const QString cleanupError = failed.last().at(0).toString();
-    QCOMPARE(cleanupError,
-             forceWaitTimeout
-                 ? QStringLiteral("sandbox.process.wait_timeout")
-                 : QStringLiteral("sandbox.acl.restore_failed"));
+    const QString expectedError = failureKind == SandboxCloseFailureKind::ProcessWait
+        ? QStringLiteral("sandbox.process.wait_timeout")
+        : failureKind == SandboxCloseFailureKind::AclRestore
+        ? QStringLiteral("sandbox.acl.restore_failed")
+        : QStringLiteral("package.immutable_restore_failed");
+    QCOMPARE(cleanupError, expectedError);
 
+    qbrowser_package_installer_testing::
+        resetImmutableMembershipRestoreFailureHook();
     qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
     QVERIFY(host->retryWorkerCleanupForTesting());
     QTRY_VERIFY_WITH_TIMEOUT(
@@ -888,6 +916,106 @@ void runSandboxCloseFailure(const bool forceWaitTimeout)
             .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
         10'000);
     QCOMPARE(exited.count(), 0);
+    host.reset();
+}
+
+void runProcessOwnershipAllocationFailure()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("allocation-failure"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--install-package=") + package,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY(parsed.value.has_value());
+
+    const qsizetype contextsBefore = qbrowser_host_testing::
+        installedPackageWorkerLiveRetirementContexts();
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hostHooks;
+    hostHooks.throwProcessSharedAllocation = true;
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hostHooks));
+    qbrowser_sandbox_testing::SandboxProcessTestHooks sandboxHooks;
+    sandboxHooks.forceCloseWaitTimeout = true;
+    qbrowser_sandbox_testing::setSandboxProcessTestHooks(
+        std::move(sandboxHooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+    });
+
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    const auto hasFailure = [&failed](const QString &expected) {
+        for (const QList<QVariant> &arguments : failed) {
+            if (!arguments.isEmpty() && arguments.first().toString() == expected) {
+                return true;
+            }
+        }
+        return false;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(
+        hasFailure(QStringLiteral("host.launch.process_failed")), 30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        hasFailure(QStringLiteral("sandbox.process.wait_timeout")), 50'000);
+    QCOMPARE(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore + 1);
+
+    PackageStore store(environment.packageRoot());
+    const PackageStoreResult current = store.resolveCurrent(environment.appId());
+    QVERIFY(current.succeeded());
+    const RuntimeMembershipMutationAttempt mutation =
+        attemptRuntimeMembershipMutation(
+            current.path, QDir(current.path).filePath(QStringLiteral("qml")));
+    QVERIFY(!mutation.rootAclCleared);
+    QVERIFY(!mutation.nestedAclCleared);
+    QVERIFY(!mutation.rootFileCreated);
+    QVERIFY(!mutation.nestedFileCreated);
+    QVERIFY(!mutation.rootDirectoryCreated);
+    QVERIFY(!mutation.nestedDirectoryCreated);
+
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+    QVERIFY(host->retryWorkerCleanupForTesting());
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore, 10'000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(QDir(environment.sandboxTempRoot()).filePath(QStringLiteral("workers")))
+            .entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty(),
+        10'000);
     host.reset();
 }
 
@@ -1039,6 +1167,8 @@ void runLauncherThreadStartFailure(
     }
 
     std::atomic<quint32> processId = 0;
+    std::atomic_int launchFinishedObservations = 0;
+    std::atomic_bool configAliveWhenLaunchFinished = true;
     const auto barrier = std::make_shared<LauncherRetirementBarrier>();
     qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hooks;
     hooks.failLaunchThreadStart = !observerFailure;
@@ -1047,6 +1177,14 @@ void runLauncherThreadStartFailure(
         (const WorkerLaunchRequest &, const quint32 pid) {
         processId.store(pid, std::memory_order_release);
     };
+    if (!observerFailure) {
+        hooks.afterLaunchFinishedBeforeThreadReturn = [&](const bool alive) {
+            configAliveWhenLaunchFinished.store(alive,
+                                                std::memory_order_release);
+            launchFinishedObservations.fetch_add(1,
+                                                 std::memory_order_acq_rel);
+        };
+    }
     if (pauseRetirement) {
         hooks.beforeRetirementCleanup = [barrier] {
             barrier->entered.release();
@@ -1131,7 +1269,11 @@ void runLauncherThreadStartFailure(
     QCOMPARE(stableError,
              observerFailure
                  ? QStringLiteral("host.launch.observer_thread_unavailable")
-                 : QStringLiteral("host.launch.launch_thread_unavailable"));
+                  : QStringLiteral("host.launch.launch_thread_unavailable"));
+    if (!observerFailure) {
+        QCOMPARE(launchFinishedObservations.load(std::memory_order_acquire), 1);
+        QVERIFY(!configAliveWhenLaunchFinished.load(std::memory_order_acquire));
+    }
     if (!pauseRetirement) {
         QVERIFY2(destructionMs < 100,
                  qPrintable(QStringLiteral("Host destruction blocked for %1 ms")
@@ -2282,12 +2424,71 @@ void ProductionUpdateRuntimeTest::staleAdmissionFailureLetsReplacementBecomeHeal
 
 void ProductionUpdateRuntimeTest::processWaitCleanupFailureIsFatalAndRetryable()
 {
-    runSandboxCloseFailure(true);
+    runSandboxCloseFailure(SandboxCloseFailureKind::ProcessWait);
 }
 
 void ProductionUpdateRuntimeTest::aclRestoreCleanupFailureIsFatalAndRetryable()
 {
-    runSandboxCloseFailure(false);
+    runSandboxCloseFailure(SandboxCloseFailureKind::AclRestore);
+}
+
+void ProductionUpdateRuntimeTest::
+    immutableMembershipRestoreCleanupFailureIsFatalAndRetryable()
+{
+    runSandboxCloseFailure(
+        SandboxCloseFailureKind::ImmutableMembershipRestore);
+}
+
+void ProductionUpdateRuntimeTest::
+    processOwnershipAllocationFailureRetainsSealForRetryableCleanup()
+{
+    runProcessOwnershipAllocationFailure();
+}
+
+void ProductionUpdateRuntimeTest::invalidJobLimitsAreRejectedBeforeAclGrant()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto boundary = SandboxTrustBoundary::create(
+        SandboxApprovedRoots{environment.packageRoot(),
+                             environment.sandboxTempRoot(),
+                             {environment.runtimeRoot()}});
+    QVERIFY2(boundary.value.has_value(), qPrintable(boundary.errorCode));
+
+    SandboxLaunchRequest request;
+    request.appId = environment.appId();
+    request.executablePath = environment.workerExecutable();
+    request.packageDirectory = QDir(environment.packageRoot()).filePath(
+        QStringLiteral("apps/test/1.0.0"));
+    request.tempDirectory = QDir(environment.sandboxTempRoot()).filePath(
+        QStringLiteral("sessions/worker"));
+    request.resourceLimits = {2, 128ULL * 1024ULL * 1024ULL};
+    auto config = boundary.value->makeLaunchConfig(request);
+    QVERIFY2(config.value.has_value(), qPrintable(config.errorCode));
+
+    QStringList attemptedAclGrants;
+    qbrowser_sandbox_testing::SandboxProcessTestHooks hooks;
+    hooks.beforeAclGrant = [&](const QString &path) {
+        attemptedAclGrants.push_back(path);
+    };
+    qbrowser_sandbox_testing::setSandboxProcessTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_sandbox_testing::resetSandboxProcessTestHooks();
+    });
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    const SandboxLaunchResult launched = SandboxLauncher::launch(
+        *config.value, pair.takeWorkerEnds());
+
+    QVERIFY(!launched.process.has_value());
+    QCOMPARE(launched.errorCode,
+             QStringLiteral("sandbox.job.invalid_limits"));
+    QCOMPARE(launched.nativeError.value,
+             quint32(ERROR_INVALID_PARAMETER));
+    QVERIFY2(attemptedAclGrants.isEmpty(),
+             qPrintable(QStringLiteral("ACL grant attempted before invalid "
+                                       "job limits were rejected: %1")
+                            .arg(attemptedAclGrants.join(u','))));
 }
 
 void ProductionUpdateRuntimeTest::destroyedLauncherRetiresHandshakeCompletedInflightLaunch()

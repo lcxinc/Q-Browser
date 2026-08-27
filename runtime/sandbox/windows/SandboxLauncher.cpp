@@ -219,8 +219,21 @@ public:
     }
     UniqueHandle(const UniqueHandle &) = delete;
     UniqueHandle &operator=(const UniqueHandle &) = delete;
+    UniqueHandle(UniqueHandle &&other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr))
+    {
+    }
+    UniqueHandle &operator=(UniqueHandle &&other) noexcept
+    {
+        if (this != &other) {
+            if (validHandle(handle_)) CloseHandle(handle_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
 
     [[nodiscard]] HANDLE get() const noexcept { return handle_; }
+    [[nodiscard]] bool isValid() const noexcept { return validHandle(handle_); }
     [[nodiscard]] HANDLE release() noexcept
     {
         return std::exchange(handle_, nullptr);
@@ -366,6 +379,8 @@ struct SandboxPreparedLaunchState final
     AppContainerProfile profile;
     QString appContainerSid;
     QByteArray appContainerSidBytes;
+    UniqueHandle executableLock;
+    JobLimits job;
     AclGrant packageGrant;
     bool requireMembershipSeal = false;
 };
@@ -397,7 +412,8 @@ SandboxPreparedLaunch &SandboxPreparedLaunch::operator=(
 bool SandboxPreparedLaunch::isValid() const noexcept
 {
     return state_ != nullptr && state_->config.isValid()
-        && state_->profile.isValid() && state_->packageGrant.isValid()
+        && state_->profile.isValid() && state_->executableLock.isValid()
+        && state_->job.isValid() && state_->packageGrant.isValid()
         && !state_->appContainerSid.isEmpty()
         && !state_->appContainerSidBytes.isEmpty();
 }
@@ -742,6 +758,7 @@ SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
                 QStringLiteral("sandbox.path.invalid"),
                 SandboxNativeError::win32(ERROR_PATH_NOT_FOUND)};
     }
+    const QString executable = absolutePath(config.executablePath());
     const QString packageDirectory = absolutePath(config.packageDirectory());
     const QString tempDirectory = absolutePath(config.tempDirectory());
     if (pathWithin(packageDirectory, tempDirectory)
@@ -765,10 +782,53 @@ SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
                 QStringLiteral("sandbox.profile.sid_failed"),
                 SandboxNativeError::win32(ERROR_INVALID_SID)};
     }
+    // Keep the validated image open without write/delete sharing before any
+    // ACL mutation so it cannot be replaced between validation and launch.
+    UniqueHandle executableLock(CreateFileW(
+        reinterpret_cast<LPCWSTR>(executable.utf16()),
+        GENERIC_READ | FILE_EXECUTE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr));
+    FILE_ATTRIBUTE_TAG_INFO executableAttributes{};
+    if (!executableLock.isValid()
+        || !GetFileInformationByHandleEx(executableLock.get(),
+                                         FileAttributeTagInfo,
+                                         &executableAttributes,
+                                         sizeof(executableAttributes))
+        || (executableAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            != 0U
+        || (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            != 0U) {
+        const DWORD error = !executableLock.isValid()
+            ? GetLastError()
+            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                != 0U
+            ? ERROR_REPARSE_TAG_INVALID
+            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                != 0U
+            ? ERROR_DIRECTORY
+            : GetLastError();
+        return {std::nullopt,
+                QStringLiteral("sandbox.path.executable_unstable"),
+                SandboxNativeError::win32(error)};
+    }
+    auto job = JobLimits::create(config.resourceLimits());
+    if (!job.value.has_value()) {
+        return {std::nullopt, job.errorCode, job.nativeError};
+    }
+#ifdef Q_BROWSER_SANDBOX_TESTING
+    if (qbrowser_sandbox_testing::sandboxProcessTestHooks().beforeAclGrant) {
+        qbrowser_sandbox_testing::sandboxProcessTestHooks().beforeAclGrant(
+            packageDirectory);
+    }
+#endif
     auto packageGrant = AclGrant::apply(packageDirectory,
-                                        profile->sid(),
-                                        SandboxPathAccess::ReadOnly,
-                                        true);
+                                         profile->sid(),
+                                         SandboxPathAccess::ReadOnly,
+                                         true);
     if (!packageGrant.has_value()) {
         return {std::nullopt,
                 packageGrant.errorCode,
@@ -780,6 +840,8 @@ SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
         static_cast<const char *>(profile->sid()),
         static_cast<qsizetype>(sidBytes));
     state->appContainerSid = std::move(*sidText.value);
+    state->executableLock = std::move(executableLock);
+    state->job = std::move(*job.value);
     state->packageGrant = std::move(*packageGrant);
     state->profile = std::move(*profile.value);
     state->requireMembershipSeal = requireMembershipSeal;
@@ -835,47 +897,6 @@ SandboxLaunchResult SandboxLauncher::launch(
     if (pathWithin(packageDirectory, tempDirectory)
         || pathWithin(tempDirectory, packageDirectory)) {
         return win32Failure(QStringLiteral("sandbox.path.overlap"));
-    }
-
-    // Keep the validated image open without write/delete sharing through
-    // CreateProcess so it cannot be replaced between validation and launch.
-    UniqueHandle executableLock(CreateFileW(
-        reinterpret_cast<LPCWSTR>(executable.utf16()),
-        GENERIC_READ | FILE_EXECUTE | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-        nullptr));
-    FILE_ATTRIBUTE_TAG_INFO executableAttributes{};
-    if (!validHandle(executableLock.get())
-        || !GetFileInformationByHandleEx(executableLock.get(),
-                                         FileAttributeTagInfo,
-                                         &executableAttributes,
-                                         sizeof(executableAttributes))
-        || (executableAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            != 0U
-        || (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            != 0U) {
-        const DWORD error = !validHandle(executableLock.get())
-            ? GetLastError()
-            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-                != 0U
-            ? ERROR_REPARSE_TAG_INVALID
-            : (executableAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                != 0U
-            ? ERROR_DIRECTORY
-            : GetLastError();
-        return win32Failure(
-            QStringLiteral("sandbox.path.executable_unstable"), error);
-    }
-
-    // Resource limits are caller-selected launch data. The package ACL grant
-    // is already owned by the prepared launch; all remaining mutations are
-    // rolled back locally without disturbing the immutable package seal.
-    auto job = JobLimits::create(config.resourceLimits());
-    if (!job.value.has_value()) {
-        return failure(job.errorCode, job.nativeError);
     }
 
     std::vector<AclGrant> grants;
@@ -1017,7 +1038,7 @@ SandboxLaunchResult SandboxLauncher::launch(
     UniqueHandle threadHandle(process.hThread);
     workerPipeEnds.close();
 
-    auto assignment = job->assignProcess(processHandle.get());
+    auto assignment = prepared.state_->job.assignProcess(processHandle.get());
     if (!assignment.value.has_value()) {
         TerminateProcess(processHandle.get(), ERROR_PROCESS_ABORTED);
         WaitForSingleObject(processHandle.get(), 5000);
@@ -1039,7 +1060,7 @@ SandboxLaunchResult SandboxLauncher::launch(
     QString appContainerSid = prepared.state_->appContainerSid;
     SandboxProcess launched(processHandle.release(),
                             process.dwProcessId,
-                            std::move(*job),
+                             std::move(prepared.state_->job),
                             std::move(grants),
                             std::move(appContainerSid));
     prepared.state_.reset();

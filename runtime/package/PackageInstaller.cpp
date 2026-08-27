@@ -30,6 +30,33 @@
 #include <Aclapi.h>
 #endif
 
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+namespace qbrowser_package_installer_testing
+{
+namespace
+{
+std::function<bool(const QString &)> currentMembershipRestoreFailureHook;
+}
+
+void setImmutableMembershipRestoreFailureHook(
+    std::function<bool(const QString &)> hook)
+{
+    currentMembershipRestoreFailureHook = std::move(hook);
+}
+
+void resetImmutableMembershipRestoreFailureHook()
+{
+    currentMembershipRestoreFailureHook = {};
+}
+
+const std::function<bool(const QString &)> &
+immutableMembershipRestoreFailureHook()
+{
+    return currentMembershipRestoreFailureHook;
+}
+}
+#endif
+
 namespace
 {
 #ifdef Q_OS_WIN
@@ -484,7 +511,9 @@ bool installedFileIsReadOnly(const QString &path)
 struct ImmutableDirectoryMembershipSeal final
 {
     qbrowser_archive_detail::UniqueWindowsHandle handle;
-    QByteArray originalSecurity;
+    QString path;
+    QByteArray originalDacl;
+    bool originalDaclPresent = false;
     bool originalDaclProtected = false;
     bool active = false;
 
@@ -497,15 +526,17 @@ struct ImmutableDirectoryMembershipSeal final
     ImmutableDirectoryMembershipSeal(
         ImmutableDirectoryMembershipSeal &&other) noexcept
         : handle(std::move(other.handle))
-        , originalSecurity(std::move(other.originalSecurity))
+        , path(std::move(other.path))
+        , originalDacl(std::move(other.originalDacl))
+        , originalDaclPresent(other.originalDaclPresent)
         , originalDaclProtected(other.originalDaclProtected)
         , active(std::exchange(other.active, false))
     {
     }
     ImmutableDirectoryMembershipSeal &operator=(
-        ImmutableDirectoryMembershipSeal &&other) noexcept;
+        ImmutableDirectoryMembershipSeal &&other) noexcept = delete;
 
-    void restore() noexcept;
+    [[nodiscard]] DWORD restore() noexcept;
 };
 
 bool directoryMembershipDenyPresent(
@@ -578,45 +609,39 @@ bool immutableDirectoryMembershipSealIsIntact(
     return intact;
 }
 
-void ImmutableDirectoryMembershipSeal::restore() noexcept
+DWORD ImmutableDirectoryMembershipSeal::restore() noexcept
 {
-    if (!active || !handle.isValid() || originalSecurity.isEmpty()) return;
-    auto *descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
-        originalSecurity.data());
-    BOOL daclPresent = FALSE;
-    BOOL daclDefaulted = FALSE;
-    PACL dacl = nullptr;
-    if (GetSecurityDescriptorDacl(
-            descriptor, &daclPresent, &dacl, &daclDefaulted) != FALSE) {
-        const SECURITY_INFORMATION protection = originalDaclProtected
-            ? PROTECTED_DACL_SECURITY_INFORMATION
-            : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        (void)SetSecurityInfo(
-            handle.get(), SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | protection,
-            nullptr, nullptr, daclPresent != FALSE ? dacl : nullptr, nullptr);
+    if (!active) return ERROR_SUCCESS;
+    if (!handle.isValid()) return ERROR_INVALID_HANDLE;
+    PACL dacl = originalDacl.isEmpty()
+        ? nullptr : reinterpret_cast<PACL>(originalDacl.data());
+    if (dacl != nullptr && IsValidAcl(dacl) == FALSE) {
+        return ERROR_INVALID_ACL;
     }
+#ifdef Q_BROWSER_PACKAGE_INSTALLER_TESTING
+    const auto &failRestore = qbrowser_package_installer_testing::
+        immutableMembershipRestoreFailureHook();
+    if (failRestore && failRestore(path)) {
+        return ERROR_ACCESS_DENIED;
+    }
+#endif
+    const SECURITY_INFORMATION protection = originalDaclProtected
+        ? PROTECTED_DACL_SECURITY_INFORMATION
+        : UNPROTECTED_DACL_SECURITY_INFORMATION;
+    const DWORD restored = SetSecurityInfo(
+        handle.get(), SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | protection,
+        nullptr, nullptr, originalDaclPresent ? dacl : nullptr, nullptr);
+    if (restored != ERROR_SUCCESS) return restored;
     active = false;
-    originalSecurity.clear();
+    originalDacl.clear();
+    originalDaclPresent = false;
+    return ERROR_SUCCESS;
 }
 
 ImmutableDirectoryMembershipSeal::~ImmutableDirectoryMembershipSeal()
 {
-    restore();
-}
-
-ImmutableDirectoryMembershipSeal &
-ImmutableDirectoryMembershipSeal::operator=(
-    ImmutableDirectoryMembershipSeal &&other) noexcept
-{
-    if (this != &other) {
-        restore();
-        handle = std::move(other.handle);
-        originalSecurity = std::move(other.originalSecurity);
-        originalDaclProtected = other.originalDaclProtected;
-        active = std::exchange(other.active, false);
-    }
-    return *this;
+    (void)restore();
 }
 
 bool sealImmutableDirectoryMembership(
@@ -628,6 +653,7 @@ bool sealImmutableDirectoryMembership(
     if (!native.has_value() || !tree.contains(path) || !tree.isStable()) {
         return false;
     }
+    seal.path = path;
     seal.handle = qbrowser_archive_detail::UniqueWindowsHandle(CreateFileW(
         reinterpret_cast<LPCWSTR>(native->utf16()),
         READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
@@ -664,9 +690,24 @@ bool sealImmutableDirectoryMembership(
         LocalFree(descriptor);
         return false;
     }
-    seal.originalSecurity = QByteArray(
-        static_cast<const char *>(descriptor),
-        static_cast<qsizetype>(descriptorBytes));
+    BOOL daclPresent = FALSE;
+    BOOL daclDefaulted = FALSE;
+    PACL descriptorDacl = nullptr;
+    if (GetSecurityDescriptorDacl(
+            descriptor, &daclPresent, &descriptorDacl, &daclDefaulted)
+            == FALSE
+        || (descriptorDacl != nullptr
+            && (descriptorDacl->AclSize < sizeof(ACL)
+                || IsValidAcl(descriptorDacl) == FALSE))) {
+        LocalFree(descriptor);
+        return false;
+    }
+    seal.originalDaclPresent = daclPresent != FALSE;
+    if (descriptorDacl != nullptr) {
+        seal.originalDacl = QByteArray(
+            reinterpret_cast<const char *>(descriptorDacl),
+            static_cast<qsizetype>(descriptorDacl->AclSize));
+    }
     seal.originalDaclProtected = (control & SE_DACL_PROTECTED) != 0;
 
     BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
@@ -679,7 +720,8 @@ bool sealImmutableDirectoryMembership(
                WinCreatorOwnerRightsSid, nullptr, ownerRightsBuffer,
                &ownerRightsBytes) == FALSE) {
         LocalFree(descriptor);
-        seal.originalSecurity.clear();
+        seal.originalDacl.clear();
+        seal.originalDaclPresent = false;
         return false;
     }
 
@@ -710,7 +752,8 @@ bool sealImmutableDirectoryMembership(
     if (sealedDacl != nullptr) LocalFree(sealedDacl);
     LocalFree(descriptor);
     if (applied != ERROR_SUCCESS) {
-        seal.originalSecurity.clear();
+        seal.originalDacl.clear();
+        seal.originalDaclPresent = false;
         return false;
     }
     seal.active = true;
@@ -742,12 +785,24 @@ struct ImmutablePackageGuard::State final
     ~State()
     {
 #ifdef Q_OS_WIN
-        for (auto seal = directorySeals.rbegin();
-             seal != directorySeals.rend(); ++seal) {
-            seal->restore();
-        }
+        (void)restoreDirectorySeals();
 #endif
     }
+
+#ifdef Q_OS_WIN
+    [[nodiscard]] DWORD restoreDirectorySeals() noexcept
+    {
+        DWORD firstError = ERROR_SUCCESS;
+        for (auto seal = directorySeals.rbegin();
+             seal != directorySeals.rend(); ++seal) {
+            const DWORD restored = seal->restore();
+            if (restored != ERROR_SUCCESS && firstError == ERROR_SUCCESS) {
+                firstError = restored;
+            }
+        }
+        return firstError;
+    }
+#endif
 };
 
 ImmutablePackageGuard::ImmutablePackageGuard(std::unique_ptr<State> state)
@@ -756,6 +811,22 @@ ImmutablePackageGuard::ImmutablePackageGuard(std::unique_ptr<State> state)
 }
 
 ImmutablePackageGuard::~ImmutablePackageGuard() = default;
+
+ImmutablePackageGuardCloseResult ImmutablePackageGuard::close() const noexcept
+{
+    std::lock_guard lock(closeMutex_);
+    if (state_ == nullptr) return {true, {}, 0U};
+#ifdef Q_OS_WIN
+    const DWORD restored = state_->restoreDirectorySeals();
+    if (restored != ERROR_SUCCESS) {
+        return {std::nullopt,
+                QStringLiteral("package.immutable_restore_failed"),
+                static_cast<quint32>(restored)};
+    }
+#endif
+    state_.reset();
+    return {true, {}, 0U};
+}
 
 PackageInstaller::PackageInstaller(PackageStore &store,
                                    QByteArray trustedPublicKeyPem,

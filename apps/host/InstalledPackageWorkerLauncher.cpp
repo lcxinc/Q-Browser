@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <new>
 #include <semaphore>
 #include <system_error>
 #include <thread>
@@ -400,6 +401,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     quint64 serial = 0;
     std::unique_ptr<IpcSession> session;
     std::shared_ptr<SandboxProcess> process;
+    std::optional<SandboxProcess> fallbackProcess;
     std::shared_ptr<const ImmutablePackageGuard> immutableGuard;
     std::optional<SandboxProcessWaitHandle> observerHandle;
     std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree> tempTree;
@@ -437,8 +439,11 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
         terminationRequested.store(true, std::memory_order_release);
         std::unique_lock lock(resourceMutex, std::try_to_lock);
         if (!lock.owns_lock()) return;
-        if (process != nullptr)
+        if (process != nullptr) {
             process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        } else if (fallbackProcess.has_value()) {
+            fallbackProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        }
     }
 
     void honorTerminationRequest() noexcept
@@ -474,6 +479,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
         if (hooks.beforeRetirementCleanup) hooks.beforeRetirementCleanup();
 #endif
         std::shared_ptr<SandboxProcess> ownedProcess;
+        SandboxProcess *retiringProcess = nullptr;
         std::shared_ptr<const ImmutablePackageGuard> ownedImmutableGuard;
         std::shared_ptr<qbrowser_archive_detail::WindowsStableDirectoryTree>
             ownedTempTree;
@@ -483,18 +489,31 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             session.reset();
             observerHandle.reset();
             ownedProcess = process;
+            retiringProcess = ownedProcess != nullptr
+                ? ownedProcess.get()
+                : fallbackProcess.has_value() ? &*fallbackProcess : nullptr;
             ownedImmutableGuard = immutableGuard;
             ownedTempTree = tempTree;
             ownedTempDirectory = tempDirectory;
         }
         QString error;
-        if (ownedProcess != nullptr) {
-            ownedProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
-            const auto executionClosed = ownedProcess->closeExecution();
+        if (retiringProcess != nullptr) {
+            retiringProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+            const auto executionClosed = retiringProcess->closeExecution();
             if (!executionClosed.value.has_value()) {
                 error = executionClosed.errorCode.isEmpty()
                     ? QStringLiteral("host.launch.process_cleanup_failed")
                     : executionClosed.errorCode;
+            }
+        }
+        if (!error.isEmpty()) return {false, error};
+        if (ownedImmutableGuard != nullptr) {
+            const ImmutablePackageGuardCloseResult immutableClosed =
+                ownedImmutableGuard->close();
+            if (!immutableClosed.value.has_value()) {
+                error = immutableClosed.errorCode.isEmpty()
+                    ? QStringLiteral("host.launch.package_cleanup_failed")
+                    : immutableClosed.errorCode;
             }
         }
         if (!error.isEmpty()) return {false, error};
@@ -503,8 +522,8 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             immutableGuard.reset();
         }
         ownedImmutableGuard.reset();
-        if (ownedProcess != nullptr) {
-            const auto grantsClosed = ownedProcess->close();
+        if (retiringProcess != nullptr) {
+            const auto grantsClosed = retiringProcess->close();
             if (!grantsClosed.value.has_value()) {
                 error = grantsClosed.errorCode.isEmpty()
                     ? QStringLiteral("host.launch.process_cleanup_failed")
@@ -519,6 +538,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
         {
             std::lock_guard lock(resourceMutex);
             process.reset();
+            fallbackProcess.reset();
             tempTree.reset();
             tempDirectory.clear();
         }
@@ -701,9 +721,39 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                               : configured.errorCode);
         return false;
     }
-    auto launchTask =
+#ifdef Q_BROWSER_HOST_TESTING
+    class LaunchTaskLifetime final
+    {
+    public:
+        explicit LaunchTaskLifetime(
+            std::shared_ptr<std::atomic_bool> alive) noexcept
+            : alive_(std::move(alive))
+        {
+        }
+        ~LaunchTaskLifetime()
+        {
+            if (alive_ != nullptr) {
+                alive_->store(false, std::memory_order_release);
+            }
+        }
+        LaunchTaskLifetime(const LaunchTaskLifetime &) = delete;
+        LaunchTaskLifetime &operator=(const LaunchTaskLifetime &) = delete;
+        LaunchTaskLifetime(LaunchTaskLifetime &&other) noexcept
+            : alive_(std::move(other.alive_))
+        {
+        }
+
+    private:
+        std::shared_ptr<std::atomic_bool> alive_;
+    };
+    const auto launchTaskAlive = std::make_shared<std::atomic_bool>(true);
+#endif
+    auto launchTask = std::optional{
         [guard, context, request, nonce, launchSerial,
          validateBinding = validateBinding_,
+#ifdef Q_BROWSER_HOST_TESTING
+         taskLifetime = LaunchTaskLifetime(launchTaskAlive),
+#endif
          config = std::move(*configured.value)]() mutable {
 #ifdef Q_BROWSER_HOST_TESTING
             struct LaunchThreadCount final
@@ -810,15 +860,24 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             {
                 std::shared_ptr<SandboxProcess> process;
                 try {
+#ifdef Q_BROWSER_HOST_TESTING
+                    const auto allocationHooks = qbrowser_host_testing::
+                        installedPackageWorkerLauncherTestHooks();
+                    if (allocationHooks.throwProcessSharedAllocation) {
+                        throw std::bad_alloc();
+                    }
+#endif
                     process = std::make_shared<SandboxProcess>(
                         std::move(*launched.process));
                 } catch (...) {
-                    launched.process->requestTerminateNoWait(
-                        ERROR_PROCESS_ABORTED);
-                    (void)launched.process->closeExecution();
+                    {
+                        std::lock_guard lock(context->resourceMutex);
+                        context->fallbackProcess.emplace(
+                            std::move(*launched.process));
+                        context->immutableGuard = immutableGuard;
+                    }
+                    context->requestTerminateNoWait();
                     prelaunch.immutableGuard.reset();
-                    immutableGuard.reset();
-                    (void)launched.process->close();
                     if (guard) QMetaObject::invokeMethod(
                         guard, [guard, key = request.attempt] {
                             if (guard) guard->fail(
@@ -911,16 +970,26 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     if (guard) guard->requestAdmission(launchSerial, payload);
                 },
                 Qt::QueuedConnection);
-        };
+        }};
 #ifdef Q_BROWSER_HOST_TESTING
     activeLaunchThreads.fetch_add(1, std::memory_order_acq_rel);
 #endif
-    if (!startDetachedLauncherThread(LauncherThreadRole::Launch,
-                                     std::move(launchTask))) {
+    const bool launchStarted = startDetachedLauncherThread(
+        LauncherThreadRole::Launch, std::move(*launchTask));
+    launchTask.reset();
+    if (!launchStarted) {
 #ifdef Q_BROWSER_HOST_TESTING
         activeLaunchThreads.fetch_sub(1, std::memory_order_acq_rel);
 #endif
         context->launchFinished();
+#ifdef Q_BROWSER_HOST_TESTING
+        const auto failedStartHooks = qbrowser_host_testing::
+            installedPackageWorkerLauncherTestHooks();
+        if (failedStartHooks.afterLaunchFinishedBeforeThreadReturn) {
+            failedStartHooks.afterLaunchFinishedBeforeThreadReturn(
+                launchTaskAlive->load(std::memory_order_acquire));
+        }
+#endif
         context->retireAsync();
         fail(request.attempt,
              QStringLiteral("host.launch.launch_thread_unavailable"));
