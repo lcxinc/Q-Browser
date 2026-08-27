@@ -13,10 +13,31 @@
 namespace
 {
 UpdateLifecycleResult lifecycleFailure(const UpdateLifecycleError error,
-                                       const QString &stableError)
+                                       const QString &stableError,
+                                       const quint32 nativeError = 0)
 {
-    return {error, UpdateLifecycleAction::FailedClosed, stableError, {}, {}, {}};
+    return {error, UpdateLifecycleAction::FailedClosed, stableError,
+            {}, {}, {}, nativeError};
 }
+}
+
+UpdateLifecycleShutdownCleanup::UpdateLifecycleShutdownCleanup(
+    std::shared_ptr<const ImmutablePackageGuard> guard) noexcept
+    : guard_(std::move(guard))
+{
+}
+
+ImmutablePackageGuardCloseResult UpdateLifecycleShutdownCleanup::close() noexcept
+{
+    if (guard_ == nullptr) return {true, {}, 0U};
+    ImmutablePackageGuardCloseResult result = guard_->close();
+    if (result.value.has_value()) guard_.reset();
+    return result;
+}
+
+bool UpdateLifecycleShutdownCleanup::isPending() const noexcept
+{
+    return guard_ != nullptr;
 }
 
 LifecycleClock LifecycleClock::system()
@@ -76,7 +97,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
 {
     if (!retryPendingImmutableCleanup()) {
         return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
-                                pendingImmutableCleanupError_);
+                                pendingImmutableCleanupError_,
+                                pendingImmutableCleanupNativeError_);
     }
     const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
@@ -90,7 +112,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::installAndLaunch(
         return lifecycleFailure(UpdateLifecycleError::InstallRejected,
                                 installed.stableError.isEmpty()
                                     ? QStringLiteral("update.install_rejected")
-                                    : installed.stableError);
+                                    : installed.stableError,
+                                installed.nativeError);
     }
     if (!installed.activationBinding.has_value()) {
         (void)enterFailedClosed();
@@ -112,7 +135,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
 {
     if (!retryPendingImmutableCleanup()) {
         return lifecycleFailure(UpdateLifecycleError::PackageVerificationFailed,
-                                pendingImmutableCleanupError_);
+                                pendingImmutableCleanupError_,
+                                pendingImmutableCleanupNativeError_);
     }
     const qint64 nowMs = clock_.steadyNowMilliseconds();
     if (failedClosed_ || nowMs < 0) {
@@ -152,7 +176,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                     rebound.stableError.startsWith(
                         QStringLiteral("package.immutable_"))
                         ? rebound.stableError
-                        : QStringLiteral("update.current_verification_failed"));
+                        : QStringLiteral("update.current_verification_failed"),
+                    rebound.nativeError);
             }
             return beginLaunch(rebound.version, rebound.path,
                                rebound.entryPoint, rebound.permissions,
@@ -190,7 +215,8 @@ UpdateLifecycleResult UpdateLifecycleCoordinator::startOffline()
                                     QStringLiteral("package.immutable_"))
                                     ? rebound.stableError
                                     : QStringLiteral(
-                                          "update.lkg_verification_failed"));
+                                          "update.lkg_verification_failed"),
+                                rebound.nativeError);
     }
     return beginLaunch(rebound.version, rebound.path, rebound.entryPoint,
                        rebound.permissions,
@@ -578,6 +604,7 @@ bool UpdateLifecycleCoordinator::settleTemporaryVerification(
     pendingImmutableCleanupError_ = result.stableError.isEmpty()
         ? QStringLiteral("package.immutable_restore_failed")
         : result.stableError;
+    pendingImmutableCleanupNativeError_ = result.nativeError;
     return false;
 }
 
@@ -590,10 +617,12 @@ bool UpdateLifecycleCoordinator::retryPendingImmutableCleanup() noexcept
         pendingImmutableCleanupError_ = closed.errorCode.isEmpty()
             ? QStringLiteral("package.immutable_restore_failed")
             : closed.errorCode;
+        pendingImmutableCleanupNativeError_ = closed.nativeError;
         return false;
     }
     pendingImmutableCleanup_.reset();
     pendingImmutableCleanupError_.clear();
+    pendingImmutableCleanupNativeError_ = 0;
     return true;
 }
 
@@ -604,11 +633,24 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::enterFailedClosed()
     return UpdateLifecycleAction::FailedClosed;
 }
 
-void UpdateLifecycleCoordinator::beginHostShutdown() noexcept
+UpdateLifecycleShutdownResult
+UpdateLifecycleCoordinator::beginHostShutdown() noexcept
 {
-    (void)retryPendingImmutableCleanup();
     hostShuttingDown_ = true;
     revokeCurrentLaunchAuthority();
+    if (retryPendingImmutableCleanup()) return {};
+
+    UpdateLifecycleShutdownResult result;
+    result.stableError = pendingImmutableCleanupError_.isEmpty()
+        ? QStringLiteral("package.immutable_restore_failed")
+        : pendingImmutableCleanupError_;
+    result.nativeError = pendingImmutableCleanupNativeError_;
+    UpdateLifecycleShutdownCleanup cleanup(
+        std::move(pendingImmutableCleanup_));
+    result.cleanupOwner.emplace(std::move(cleanup));
+    pendingImmutableCleanupError_.clear();
+    pendingImmutableCleanupNativeError_ = 0;
+    return result;
 }
 
 std::optional<WorkerAttemptKey>

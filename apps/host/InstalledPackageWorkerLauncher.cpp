@@ -858,11 +858,17 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     context->preparedCleanup.emplace(
                         std::move(*prepared.value));
                 }
-                const QString error =
-                    QStringLiteral("host.launch.stale_activation");
+                const bool immutableCleanupFailed =
+                    prelaunch.stableError
+                    == QStringLiteral("package.immutable_restore_failed");
+                const QString error = immutableCleanupFailed
+                    ? prelaunch.stableError
+                    : QStringLiteral("host.launch.stale_activation");
+                const quint32 nativeError = immutableCleanupFailed
+                    ? prelaunch.nativeError : 0U;
                 if (guard) QMetaObject::invokeMethod(
-                    guard, [guard, key = request.attempt, error] {
-                        if (guard) guard->fail(key, error);
+                    guard, [guard, key = request.attempt, error, nativeError] {
+                        if (guard) guard->fail(key, error, nativeError);
                     }, Qt::QueuedConnection);
                 return;
             }
@@ -1435,9 +1441,11 @@ bool InstalledPackageWorkerLauncher::retryFatalCleanupForTesting()
 
 void InstalledPackageWorkerLauncher::fail(
     const WorkerAttemptKey key,
-    const QString &stableError)
+    const QString &stableError,
+    const quint32 nativeError)
 {
     if (failed_) failed_(key, stableError.isEmpty()
-                                  ? QStringLiteral("host.launch.failed")
-                                  : stableError);
+                                   ? QStringLiteral("host.launch.failed")
+                                   : stableError,
+                         nativeError);
 }

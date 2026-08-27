@@ -68,10 +68,45 @@ struct UpdateLifecycleResult final
     QString appId;
     QString version;
     QString path;
+    quint32 nativeError = 0;
 
     [[nodiscard]] bool succeeded() const noexcept
     {
         return error == UpdateLifecycleError::None;
+    }
+};
+
+class UpdateLifecycleShutdownCleanup final
+{
+public:
+    UpdateLifecycleShutdownCleanup() = default;
+    UpdateLifecycleShutdownCleanup(const UpdateLifecycleShutdownCleanup &) = delete;
+    UpdateLifecycleShutdownCleanup &operator=(
+        const UpdateLifecycleShutdownCleanup &) = delete;
+    UpdateLifecycleShutdownCleanup(UpdateLifecycleShutdownCleanup &&) noexcept = default;
+    UpdateLifecycleShutdownCleanup &operator=(
+        UpdateLifecycleShutdownCleanup &&) noexcept = default;
+
+    [[nodiscard]] ImmutablePackageGuardCloseResult close() noexcept;
+    [[nodiscard]] bool isPending() const noexcept;
+
+private:
+    friend class UpdateLifecycleCoordinator;
+    explicit UpdateLifecycleShutdownCleanup(
+        std::shared_ptr<const ImmutablePackageGuard> guard) noexcept;
+
+    std::shared_ptr<const ImmutablePackageGuard> guard_;
+};
+
+struct UpdateLifecycleShutdownResult final
+{
+    QString stableError;
+    quint32 nativeError = 0;
+    std::optional<UpdateLifecycleShutdownCleanup> cleanupOwner;
+
+    [[nodiscard]] bool succeeded() const noexcept
+    {
+        return stableError.isEmpty() && !cleanupOwner.has_value();
     }
 };
 
@@ -115,7 +150,7 @@ public:
         WorkerAttemptKey key);
     void recordRouteLoadAcknowledged(const QString &routeTemplate,
                                      qsizetype pendingRouteLoads) const;
-    void beginHostShutdown() noexcept;
+    [[nodiscard]] UpdateLifecycleShutdownResult beginHostShutdown() noexcept;
 
     [[nodiscard]] std::optional<WorkerAttemptKey> currentAttemptKey() const noexcept;
     [[nodiscard]] bool failedClosed() const noexcept;
@@ -169,6 +204,7 @@ private:
     std::optional<WorkerLaunchRequest> currentWorkerLaunch_;
     std::shared_ptr<const ImmutablePackageGuard> pendingImmutableCleanup_;
     QString pendingImmutableCleanupError_;
+    quint32 pendingImmutableCleanupNativeError_ = 0;
     QString tabId_;
     quint64 runtimeIncarnation_ = 1;
     quint64 nextLeaseAuthorityEpoch_ = 1;

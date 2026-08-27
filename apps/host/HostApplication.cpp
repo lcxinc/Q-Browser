@@ -15,6 +15,7 @@
 #include "SandboxTrustBoundary.h"
 #include "UpdateLifecycleCoordinator.h"
 #include "TabCapabilityAuthority.h"
+#include "WorkerRetirementManager.h"
 
 #include "PilotRoutes.h"
 #include "RouteRegistry.h"
@@ -88,12 +89,16 @@ QString pilotRouteTemplate(const QString &route)
 class HostLifecycleRuntime final : public QObject
 {
 public:
+    using FailurePublisher = std::function<void(const QString &, quint32)>;
+
     HostLifecycleRuntime(std::shared_ptr<RuntimePackageAuthority> authority,
                          std::unique_ptr<EventRecorder> recorder,
-                         std::unique_ptr<UpdateLifecycleCoordinator> coordinator)
+                         std::unique_ptr<UpdateLifecycleCoordinator> coordinator,
+                         FailurePublisher publishFailure)
         : authority_(std::move(authority))
         , recorder_(std::move(recorder))
         , coordinator_(std::move(coordinator))
+        , publishFailure_(std::move(publishFailure))
     {
     }
 
@@ -130,18 +135,95 @@ public:
         accepting_.store(false, std::memory_order_release);
     }
 
-    void shutdown()
+    [[nodiscard]] bool shutdown()
     {
         closeAdmission();
-        if (coordinator_ != nullptr) coordinator_->beginHostShutdown();
+        if (!shutdownStarted_) {
+            shutdownStarted_ = true;
+            if (coordinator_ == nullptr) return true;
+            UpdateLifecycleShutdownResult result =
+                coordinator_->beginHostShutdown();
+            if (result.succeeded()) return true;
+            if (publishFailure_) {
+                publishFailure_(result.stableError, result.nativeError);
+            }
+            if (!result.cleanupOwner.has_value()) return true;
+            pendingShutdownCleanup_.emplace(
+                std::move(*result.cleanupOwner));
+        }
+        if (submitShutdownCleanup()) return true;
+        if (publishFailure_) {
+            publishFailure_(
+                QStringLiteral("host.launch.retirement_unavailable"), 0U);
+        }
+        scheduleShutdownCleanupRetry();
+        return false;
     }
 
 private:
+    [[nodiscard]] bool submitShutdownCleanup() noexcept
+    {
+        try {
+            if (sharedShutdownCleanup_ == nullptr
+                && pendingShutdownCleanup_.has_value()) {
+                sharedShutdownCleanup_ =
+                    std::make_shared<UpdateLifecycleShutdownCleanup>(
+                        std::move(*pendingShutdownCleanup_));
+                pendingShutdownCleanup_.reset();
+            }
+            if (sharedShutdownCleanup_ == nullptr) return true;
+            const std::shared_ptr<UpdateLifecycleShutdownCleanup> cleanupOwner =
+                sharedShutdownCleanup_;
+            const WorkerRetirementManager::Ticket ticket =
+                WorkerRetirementManager::instance().retire(
+                    [cleanupOwner] {
+                        const ImmutablePackageGuardCloseResult closed =
+                            cleanupOwner->close();
+                        return WorkerRetirementAttemptResult{
+                            closed.value.has_value(),
+                            closed.errorCode.isEmpty()
+                                ? QStringLiteral(
+                                      "package.immutable_restore_failed")
+                                : closed.errorCode};
+                    },
+                    [publishFailure = publishFailure_](
+                        const bool succeeded, const QString &stableError) {
+                        if (!succeeded && publishFailure) {
+                            publishFailure(stableError, 0U);
+                        }
+                    });
+            if (ticket == 0) return false;
+            sharedShutdownCleanup_.reset();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void scheduleShutdownCleanupRetry()
+    {
+        if (shutdownCleanupRetryScheduled_) return;
+        shutdownCleanupRetryScheduled_ = true;
+        QTimer::singleShot(25, this, [this] {
+            shutdownCleanupRetryScheduled_ = false;
+            if (submitShutdownCleanup()) {
+                if (QThread *const owningThread = thread()) owningThread->quit();
+                return;
+            }
+            scheduleShutdownCleanupRetry();
+        });
+    }
+
     std::shared_ptr<RuntimePackageAuthority> authority_;
     std::unique_ptr<EventRecorder> recorder_;
     std::unique_ptr<UpdateLifecycleCoordinator> coordinator_;
+    FailurePublisher publishFailure_;
+    std::optional<UpdateLifecycleShutdownCleanup> pendingShutdownCleanup_;
+    std::shared_ptr<UpdateLifecycleShutdownCleanup> sharedShutdownCleanup_;
     std::atomic<qsizetype> pending_{0};
     std::atomic_bool accepting_{true};
+    bool shutdownStarted_ = false;
+    bool shutdownCleanupRetryScheduled_ = false;
 };
 }
 
@@ -173,8 +255,7 @@ HostApplication::~HostApplication()
         (void)QMetaObject::invokeMethod(
             runtime,
             [runtime, lifecycleThread] {
-                if (runtime) runtime->shutdown();
-                lifecycleThread->quit();
+                if (!runtime || runtime->shutdown()) lifecycleThread->quit();
             }, Qt::QueuedConnection);
     } else if (lifecycleThread != nullptr) {
         lifecycleThread->quit();
@@ -254,8 +335,11 @@ bool HostApplication::requestPackageInstall(
                 packagePath);
             if (!result.succeeded() && guard) {
                 const QString error = result.stableError;
-                QMetaObject::invokeMethod(guard, [guard, error] {
-                    if (guard) emit guard->updateLifecycleFailed(error);
+                const quint32 nativeError = result.nativeError;
+                QMetaObject::invokeMethod(guard, [guard, error, nativeError] {
+                    if (guard) {
+                        emit guard->updateLifecycleFailed(error, nativeError);
+                    }
                 }, Qt::QueuedConnection);
             }
         });
@@ -268,8 +352,11 @@ bool HostApplication::requestOfflineStart()
         const UpdateLifecycleResult result = coordinator.startOffline();
         if (!result.succeeded() && guard) {
             const QString error = result.stableError;
-            QMetaObject::invokeMethod(guard, [guard, error] {
-                if (guard) emit guard->updateLifecycleFailed(error);
+            const quint32 nativeError = result.nativeError;
+            QMetaObject::invokeMethod(guard, [guard, error, nativeError] {
+                if (guard) {
+                    emit guard->updateLifecycleFailed(error, nativeError);
+                }
             }, Qt::QueuedConnection);
         }
     });
@@ -383,12 +470,14 @@ bool HostApplication::initializePackageRuntime()
                     (void)coordinator.workerExited(key, WorkerExitReason::Crashed);
                 });
         },
-        [guard](const WorkerAttemptKey key, const QString &stableError) {
+        [guard](const WorkerAttemptKey key,
+                const QString &stableError,
+                const quint32 nativeError) {
             QPointer<HostApplication> localGuard = guard;
             if (!localGuard) return;
             const QString error = stableError.isEmpty()
                 ? QStringLiteral("host.launch.failed") : stableError;
-            emit localGuard->updateLifecycleFailed(error);
+            emit localGuard->updateLifecycleFailed(error, nativeError);
             if (!localGuard) return;
 #ifdef Q_BROWSER_HOST_TESTING
             const auto hooks = qbrowser_host_testing::
@@ -460,7 +549,18 @@ bool HostApplication::initializePackageRuntime()
 
     auto *const runtime = new HostLifecycleRuntime(
         std::move(authority), std::move(recorder),
-        std::move(coordinator));
+        std::move(coordinator),
+        [guard](const QString &stableError, const quint32 nativeError) {
+            if (!guard) return;
+            (void)QMetaObject::invokeMethod(
+                guard,
+                [guard, stableError, nativeError] {
+                    if (guard) {
+                        emit guard->updateLifecycleFailed(
+                            stableError, nativeError);
+                    }
+                }, Qt::QueuedConnection);
+        });
     auto *const lifecycleThread = new QThread;
     lifecycleThread->setObjectName(QStringLiteral("host-update-lifecycle"));
     runtime->moveToThread(lifecycleThread);

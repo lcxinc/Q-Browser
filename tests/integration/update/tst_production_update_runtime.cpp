@@ -37,6 +37,7 @@
 
 #include <future>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -597,9 +598,11 @@ private slots:
     void processWaitCleanupFailureIsFatalAndRetryable();
     void aclRestoreCleanupFailureIsFatalAndRetryable();
     void immutableMembershipRestoreCleanupFailureIsFatalAndRetryable();
+    void prelaunchImmutableCleanupFailureSurfacesStableAndNativeError();
     void sandboxLaunchFailureRetainsImmutableCleanupForRetirement();
     void sandboxLaunchRollbackCleanupFailureRetainsAllOwners();
     void temporaryReverifyCleanupFailureIsFatalAndRetried();
+    void hostShutdownReturnsRetryableImmutableCleanupFailure();
     void processOwnershipAllocationFailureRetainsSealForRetryableCleanup();
     void invalidJobLimitsAreRejectedBeforeAclGrant();
     void readyHandlerCanDestroyHostWithoutUseAfterFree();
@@ -1979,7 +1982,7 @@ void ProductionUpdateRuntimeTest::pinnedLeaseLaunchSurvivesCurrentActivationChan
     seedClock.set(20);
     QCOMPARE(seedCoordinator.heartbeat(seedLaunches.back().key),
              UpdateLifecycleAction::MarkedHealthy);
-    seedCoordinator.beginHostShutdown();
+    (void)seedCoordinator.beginHostShutdown();
     InstallResult two = competingInstaller.install(packageTwo);
     QVERIFY2(two.succeeded(), qPrintable(two.stableError));
     const QString brokenEntry = QDir(two.path).filePath(two.entryPoint);
@@ -2443,6 +2446,168 @@ void ProductionUpdateRuntimeTest::
 }
 
 void ProductionUpdateRuntimeTest::
+    prelaunchImmutableCleanupFailureSurfacesStableAndNativeError()
+{
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+
+    const QByteArray qml = QByteArrayLiteral(
+        "import QtQuick\nItem { width: 320; height: 200 }");
+    const QString packageB = updateSignedPackage(
+        temporary, QStringLiteral("prelaunch-cleanup-b"),
+        QStringLiteral("1.1.0"), keys.value().privateKeyPem, false, qml,
+        environment.appId());
+    const QString packageA = updateSignedPackage(
+        temporary, QStringLiteral("prelaunch-cleanup-a"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false, qml,
+        environment.appId());
+    QVERIFY(!packageA.isEmpty());
+    QVERIFY(!packageB.isEmpty());
+
+    PackageStore competingStore(environment.packageRoot());
+    InstallPolicy competingPolicy;
+    competingPolicy.expectedAppId = environment.appId();
+    competingPolicy.runtimeVersion = QStringLiteral("1.2.0");
+    competingPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                      QStringLiteral("Company.Design")};
+    competingPolicy.preflight = [](const Manifest &, const QString &) {
+        return true;
+    };
+    PackageInstaller competingInstaller(
+        competingStore, keys.value().publicKeyPem, std::move(competingPolicy));
+    const InstallResult installedA = competingInstaller.install(packageA);
+    QVERIFY2(installedA.succeeded(), qPrintable(installedA.stableError));
+
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy ready(host.get(), &HostApplication::packageWorkerReady);
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+
+    const qsizetype contextsBefore = qbrowser_host_testing::
+        installedPackageWorkerLiveRetirementContexts();
+    QSemaphore retirementEntered;
+    QSemaphore retirementRelease;
+    std::atomic_bool pauseFirstRetirement{true};
+    std::atomic_bool activationChanged{false};
+    std::atomic_bool activationSucceeded{false};
+    std::atomic_int restoreAttempts{0};
+    const std::function<bool(const QString &)> failMembershipRestore =
+        [&](const QString &) {
+            restoreAttempts.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        };
+    qbrowser_host_testing::InstalledPackageWorkerLauncherTestHooks hostHooks;
+    hostHooks.beforeBindingValidation = [&](const WorkerLaunchRequest &) {
+        qbrowser_package_installer_testing::PackageInstallerTestHooks
+            installerHooks;
+        installerHooks.afterVerifyInstalled =
+            [&](const QString &, const QString &) {
+                if (activationChanged.exchange(true,
+                                               std::memory_order_acq_rel)) {
+                    return;
+                }
+                qbrowser_package_installer_testing::
+                    resetImmutableMembershipRestoreFailureHook();
+                const InstallResult activated =
+                    competingInstaller.install(packageB);
+                qbrowser_package_installer_testing::
+                    setImmutableMembershipRestoreFailureHook(
+                        failMembershipRestore);
+                activationSucceeded.store(activated.succeeded(),
+                                          std::memory_order_release);
+            };
+        qbrowser_package_installer_testing::setPackageInstallerTestHooks(
+            std::move(installerHooks));
+        qbrowser_package_installer_testing::
+            setImmutableMembershipRestoreFailureHook(failMembershipRestore);
+    };
+    hostHooks.beforeRetirementCleanup = [&] {
+        if (!pauseFirstRetirement.exchange(false,
+                                           std::memory_order_acq_rel)) {
+            return;
+        }
+        retirementEntered.release();
+        retirementRelease.acquire();
+    };
+    qbrowser_host_testing::setInstalledPackageWorkerLauncherTestHooks(
+        std::move(hostHooks));
+    const auto resetHooks = qScopeGuard([&] {
+        retirementRelease.release();
+        qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+        qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(activationChanged.load(std::memory_order_acquire),
+                             30'000);
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 30'000);
+    QVERIFY(retirementEntered.tryAcquire(1, 30'000));
+    QVERIFY(activationSucceeded.load(std::memory_order_acquire));
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(failed.first().at(0).toString(),
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(failed.first().size(), 2);
+    QCOMPARE(failed.first().at(1).toUInt(), quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(restoreAttempts.load(std::memory_order_acquire) > 0);
+
+    qbrowser_package_installer_testing::resetPackageInstallerTestHooks();
+    retirementRelease.release();
+    const auto cleanupFailureCount = [&failed] {
+        int count = 0;
+        for (const QList<QVariant> &failure : failed) {
+            if (!failure.isEmpty()
+                && failure.first().toString()
+                    == QStringLiteral("package.immutable_restore_failed")) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(cleanupFailureCount() >= 2, 30'000);
+    QCOMPARE(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore + 1);
+
+    qbrowser_host_testing::resetInstalledPackageWorkerLauncherTestHooks();
+    qbrowser_package_installer_testing::
+        resetImmutableMembershipRestoreFailureHook();
+    QVERIFY(host->retryWorkerCleanupForTesting());
+    QTRY_COMPARE_WITH_TIMEOUT(
+        qbrowser_host_testing::installedPackageWorkerLiveRetirementContexts(),
+        contextsBefore, 10'000);
+    host.reset();
+}
+
+void ProductionUpdateRuntimeTest::
     sandboxLaunchFailureRetainsImmutableCleanupForRetirement()
 {
     WorkerTestEnvironment environment;
@@ -2788,6 +2953,112 @@ void ProductionUpdateRuntimeTest::
     const UpdateLifecycleResult alreadyClosed = coordinator.startOffline();
     QVERIFY(!alreadyClosed.succeeded());
     QCOMPARE(restoreAttempts, attemptsAfterRetry);
+#endif
+}
+
+void ProductionUpdateRuntimeTest::
+    hostShutdownReturnsRetryableImmutableCleanupFailure()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership restoration is Windows-specific");
+#else
+    UpdateTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString appId = QStringLiteral("company.pilot");
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    InstallPolicy installPolicy;
+    installPolicy.expectedAppId = appId;
+    installPolicy.runtimeVersion = QStringLiteral("1.2.0");
+    installPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                    QStringLiteral("Company.Design")};
+    installPolicy.preflight = [](const Manifest &, const QString &) {
+        return true;
+    };
+    PackageInstaller installer(
+        store, keys.value().publicKeyPem, std::move(installPolicy));
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("shutdown-cleanup-owner"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        appId);
+    QVERIFY(!package.isEmpty());
+    const InstallResult seeded = installer.install(package);
+    QVERIFY2(seeded.succeeded(), qPrintable(seeded.stableError));
+
+    ManualLifecycleClock clock;
+    clock.set(0);
+    auto coordinator = std::make_unique<UpdateLifecycleCoordinator>(
+        appId, store, installer, WorkerSupervisionPolicy{10, 5'000},
+        [](const UpdateLaunchRequest &) { return true; }, clock.source());
+    std::atomic_bool failRestore{true};
+    std::atomic_int restoreAttempts{0};
+    qbrowser_package_installer_testing::
+        setImmutableMembershipRestoreFailureHook([&](const QString &) {
+            restoreAttempts.fetch_add(1, std::memory_order_acq_rel);
+            return failRestore.load(std::memory_order_acquire);
+        });
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    const UpdateLifecycleResult failed = coordinator->startOffline();
+    QVERIFY(!failed.succeeded());
+    QCOMPARE(failed.stableError,
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(failed.nativeError, quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(restoreAttempts.load(std::memory_order_acquire) > 0);
+
+    bool shutdownSucceeded = true;
+    QString shutdownStableError;
+    quint32 shutdownNativeError = 0;
+    bool cleanupPendingBeforeRetry = false;
+    bool cleanupPendingAfterRetry = true;
+    bool retrySucceeded = false;
+    int attemptsBeforeOwnerRetry = 0;
+    const auto exerciseShutdown =
+        [&]<typename Coordinator>(
+            std::unique_ptr<Coordinator> &ownedCoordinator) {
+            using ShutdownResult = decltype(
+                ownedCoordinator->beginHostShutdown());
+            if constexpr (std::is_void_v<ShutdownResult>) {
+                ownedCoordinator->beginHostShutdown();
+                return false;
+            } else {
+                ShutdownResult shutdown =
+                    ownedCoordinator->beginHostShutdown();
+                shutdownSucceeded = shutdown.succeeded();
+                shutdownStableError = shutdown.stableError;
+                shutdownNativeError = shutdown.nativeError;
+                if (!shutdown.cleanupOwner.has_value()) return true;
+                auto cleanupOwner =
+                    std::move(*shutdown.cleanupOwner);
+                cleanupPendingBeforeRetry = cleanupOwner.isPending();
+                ownedCoordinator.reset();
+                failRestore.store(false, std::memory_order_release);
+                attemptsBeforeOwnerRetry = restoreAttempts.load(
+                    std::memory_order_acquire);
+                const ImmutablePackageGuardCloseResult retried =
+                    cleanupOwner.close();
+                retrySucceeded = retried.value.has_value();
+                cleanupPendingAfterRetry = cleanupOwner.isPending();
+                return true;
+            }
+        };
+
+    QVERIFY2(exerciseShutdown(coordinator),
+             "beginHostShutdown still discards the cleanup result");
+    QVERIFY(!shutdownSucceeded);
+    QCOMPARE(shutdownStableError,
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(shutdownNativeError, quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(cleanupPendingBeforeRetry);
+    QVERIFY(retrySucceeded);
+    QVERIFY(!cleanupPendingAfterRetry);
+    QVERIFY(restoreAttempts.load(std::memory_order_acquire)
+            > attemptsBeforeOwnerRetry);
 #endif
 }
 

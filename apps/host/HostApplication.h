@@ -66,7 +66,8 @@ public:
 #endif
 
 signals:
-    void updateLifecycleFailed(const QString &stableError);
+    void updateLifecycleFailed(const QString &stableError,
+                               quint32 nativeError = 0);
     void packageWorkerReady(const QString &appId,
                             const QString &version,
                             const QString &packageDirectory,

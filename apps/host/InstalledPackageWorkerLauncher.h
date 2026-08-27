@@ -64,7 +64,9 @@ public:
         CommittedAttachTransaction)>;
     using StopCallback = std::function<void()>;
     using ExitCallback = std::function<void(WorkerAttemptKey, bool)>;
-    using FailureCallback = std::function<void(WorkerAttemptKey, const QString &)>;
+    using FailureCallback = std::function<void(WorkerAttemptKey,
+                                               const QString &,
+                                               quint32)>;
     using BindingValidator = std::function<InstallResult(
         const WorkerLaunchRequest &,
         std::shared_ptr<const ImmutablePackageGuard>)>;
@@ -122,7 +124,9 @@ private:
         std::shared_ptr<LaunchRetirementContext> context,
         bool succeeded,
         const QString &stableError);
-    void fail(WorkerAttemptKey key, const QString &stableError);
+    void fail(WorkerAttemptKey key,
+              const QString &stableError,
+              quint32 nativeError = 0);
 
     SandboxTrustBoundary boundary_;
     QString workerExecutable_;
