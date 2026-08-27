@@ -18,6 +18,8 @@
 #include <QTemporaryDir>
 #include <QTest>
 
+#include <chrono>
+#include <future>
 #include <utility>
 
 #ifdef Q_OS_WIN
@@ -216,6 +218,54 @@ bool makeInstalledFileWritable(const QString &path)
                                  QFileDevice::ReadOwner
                                      | QFileDevice::WriteOwner);
 }
+
+#ifdef Q_OS_WIN
+struct PackageMembershipMutationAttempt final
+{
+    bool rootAclCleared = false;
+    bool nestedAclCleared = false;
+    bool rootFileCreated = false;
+    bool nestedFileCreated = false;
+    bool rootDirectoryCreated = false;
+    bool nestedDirectoryCreated = false;
+};
+
+bool clearInstalledDirectoryDacl(const QString &path)
+{
+    return SetNamedSecurityInfoW(
+               const_cast<LPWSTR>(
+                   reinterpret_cast<LPCWSTR>(path.utf16())),
+               SE_FILE_OBJECT,
+               DACL_SECURITY_INFORMATION
+                   | UNPROTECTED_DACL_SECURITY_INFORMATION,
+               nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
+bool createNewInstalledFile(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+        && file.write("late member") == qint64(11);
+}
+
+PackageMembershipMutationAttempt attemptPackageMembershipMutation(
+    const QString &root,
+    const QString &nested)
+{
+    PackageMembershipMutationAttempt result;
+    result.rootAclCleared = clearInstalledDirectoryDacl(root);
+    result.nestedAclCleared = clearInstalledDirectoryDacl(nested);
+    result.rootFileCreated = createNewInstalledFile(
+        QDir(root).filePath(QStringLiteral("late-root.qml")));
+    result.nestedFileCreated = createNewInstalledFile(
+        QDir(nested).filePath(QStringLiteral("late-nested.qml")));
+    result.rootDirectoryCreated = QDir(root).mkdir(
+        QStringLiteral("late-root-directory"));
+    result.nestedDirectoryCreated = QDir(nested).mkdir(
+        QStringLiteral("late-nested-directory"));
+    return result;
+}
+#endif
 }
 
 class PackageInstallerTest final : public QObject
@@ -246,6 +296,7 @@ private slots:
     void rejectTamperedPinnedVersion();
     void rejectWritableButUnchangedPinnedVersion();
     void pinnedGuardLocksIdentityAndRejectsMemberJunction();
+    void pinnedGuardFreezesMembershipUntilReleased();
     void rejectPinnedPathOrDigestMismatch();
     void installsReverifiesAndActivatesEntryBeyondWindowsMaxPath();
     void rejectsAuthenticatedOtherAppBeforeStoreMutation();
@@ -435,6 +486,75 @@ void PackageInstallerTest::pinnedGuardLocksIdentityAndRejectsMemberJunction()
     QCOMPARE(rejected.error, InstallError::ContentInvalid);
     QCOMPARE(rejected.stableError,
              QStringLiteral("installed_content_invalid"));
+#endif
+}
+
+void PackageInstallerTest::pinnedGuardFreezesMembershipUntilReleased()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership sealing is Windows-specific");
+#else
+    PackageTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    PackageStore store(temporary.filePath(QStringLiteral("store")));
+    PackageInstaller installer(store, keys.value().publicKeyPem, policy());
+    const InstallResult installed = installer.install(signedPackage(
+        temporary, QStringLiteral("pinned-membership"),
+        keys.value().privateKeyPem, manifest(QStringLiteral("1.0.0"))));
+    QVERIFY2(installed.succeeded(), qPrintable(installed.stableError));
+    const VerifiedPackageLease lease = leaseFor(installed, 47);
+    InstallResult first = installer.reverifyPinnedLease(lease);
+    QVERIFY2(first.succeeded(), qPrintable(first.stableError));
+    QVERIFY(first.immutableGuard != nullptr);
+    InstallResult second = installer.reverifyPinnedLease(
+        lease, first.immutableGuard);
+    QVERIFY2(second.succeeded(), qPrintable(second.stableError));
+    QCOMPARE(second.immutableGuard, first.immutableGuard);
+
+    const QString root = lease.packageDirectory;
+    const QString nested = QDir(root).filePath(QStringLiteral("qml"));
+    QVERIFY(QFileInfo(nested).isDir());
+    auto heldMutation = std::async(
+        std::launch::async,
+        [root, nested] {
+            return attemptPackageMembershipMutation(root, nested);
+        });
+    QCOMPARE(heldMutation.wait_for(std::chrono::seconds(5)),
+             std::future_status::ready);
+    const PackageMembershipMutationAttempt held = heldMutation.get();
+    QVERIFY(!held.rootAclCleared);
+    QVERIFY(!held.nestedAclCleared);
+    QVERIFY(!held.rootFileCreated);
+    QVERIFY(!held.nestedFileCreated);
+    QVERIFY(!held.rootDirectoryCreated);
+    QVERIFY(!held.nestedDirectoryCreated);
+    QVERIFY(!QFileInfo::exists(
+        QDir(root).filePath(QStringLiteral("late-root.qml"))));
+    QVERIFY(!QFileInfo::exists(
+        QDir(nested).filePath(QStringLiteral("late-nested.qml"))));
+    QVERIFY(!QFileInfo::exists(
+        QDir(root).filePath(QStringLiteral("late-root-directory"))));
+    QVERIFY(!QFileInfo::exists(
+        QDir(nested).filePath(QStringLiteral("late-nested-directory"))));
+
+    second.immutableGuard.reset();
+    first.immutableGuard.reset();
+    auto releasedMutation = std::async(
+        std::launch::async,
+        [root, nested] {
+            return attemptPackageMembershipMutation(root, nested);
+        });
+    QCOMPARE(releasedMutation.wait_for(std::chrono::seconds(5)),
+             std::future_status::ready);
+    const PackageMembershipMutationAttempt released = releasedMutation.get();
+    QVERIFY(released.rootAclCleared);
+    QVERIFY(released.nestedAclCleared);
+    QVERIFY(released.rootFileCreated);
+    QVERIFY(released.nestedFileCreated);
+    QVERIFY(released.rootDirectoryCreated);
+    QVERIFY(released.nestedDirectoryCreated);
 #endif
 }
 

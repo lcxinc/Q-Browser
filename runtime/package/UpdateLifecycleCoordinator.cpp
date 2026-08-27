@@ -289,28 +289,34 @@ UpdateLifecycleAction UpdateLifecycleCoordinator::admitAuthenticatedWorker(
                != currentWorkerLaunch_->lease.leaseAuthorityEpoch) {
         return enterFailedClosed();
     }
-    if (request.revalidationMode == PackageRevalidationMode::PinnedLease) {
-        const qint64 nowMs = clock_.steadyNowMilliseconds();
-        if (nowMs < 0) return enterFailedClosed();
-        if (handshakeAccepted_) {
-            const WorkerSupervisionAction timeout =
-                supervisor_.checkHealth(request.attempt, nowMs);
-            return timeout == WorkerSupervisionAction::None
-                ? UpdateLifecycleAction::None
-                : applySupervisionAction(timeout, nowMs);
-        }
-        if (!installer_.reverifyPinnedLease(request.lease).succeeded()
-            || !supervisor_.authenticatedHandshake(request.attempt, nowMs)) {
+    if (request.revalidationMode == PackageRevalidationMode::CurrentActivation) {
+        const ActivationBinding expected{
+            request.lease.versionDirectory,
+            request.lease.digestHex,
+            request.lease.activationGenerationAtIssue};
+        if (!currentBinding_.has_value() || *currentBinding_ != expected
+            || !store_.compareCurrent(appId_, expected).succeeded()) {
             return enterFailedClosed();
         }
-        handshakeAccepted_ = true;
-        return UpdateLifecycleAction::None;
     }
-    const ActivationBinding expected{
-        request.lease.versionDirectory,
-        request.lease.digestHex,
-        request.lease.activationGenerationAtIssue};
-    return admitAuthenticatedWorker(request.attempt, expected);
+    const qint64 nowMs = clock_.steadyNowMilliseconds();
+    if (nowMs < 0) return enterFailedClosed();
+    if (handshakeAccepted_) {
+        const WorkerSupervisionAction timeout =
+            supervisor_.checkHealth(request.attempt, nowMs);
+        return timeout == WorkerSupervisionAction::None
+            ? UpdateLifecycleAction::None
+            : applySupervisionAction(timeout, nowMs);
+    }
+    // The launcher has already performed both exact package validations with
+    // one retained immutable guard. Admission independently linearizes only
+    // the tab/runtime/epoch authority above; reacquiring the package through
+    // a new path-based guard would conflict with the active membership seal.
+    if (!supervisor_.authenticatedHandshake(request.attempt, nowMs)) {
+        return enterFailedClosed();
+    }
+    handshakeAccepted_ = true;
+    return UpdateLifecycleAction::None;
 }
 
 UpdateLifecycleAction UpdateLifecycleCoordinator::heartbeat(

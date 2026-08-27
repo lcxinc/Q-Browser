@@ -360,6 +360,62 @@ const SandboxProcessTestHooks &sandboxProcessTestHooks()
 }
 #endif
 
+struct SandboxPreparedLaunchState final
+{
+    SandboxLaunchConfig config;
+    AppContainerProfile profile;
+    QString appContainerSid;
+    QByteArray appContainerSidBytes;
+    AclGrant packageGrant;
+    bool requireMembershipSeal = false;
+};
+
+SandboxPreparedLaunch::SandboxPreparedLaunch(
+    std::unique_ptr<SandboxPreparedLaunchState> state) noexcept
+    : state_(std::move(state))
+{
+}
+
+SandboxPreparedLaunch::~SandboxPreparedLaunch()
+{
+    closeBestEffort();
+}
+
+SandboxPreparedLaunch::SandboxPreparedLaunch(
+    SandboxPreparedLaunch &&other) noexcept = default;
+
+SandboxPreparedLaunch &SandboxPreparedLaunch::operator=(
+    SandboxPreparedLaunch &&other) noexcept
+{
+    if (this != &other) {
+        closeBestEffort();
+        state_ = std::move(other.state_);
+    }
+    return *this;
+}
+
+bool SandboxPreparedLaunch::isValid() const noexcept
+{
+    return state_ != nullptr && state_->config.isValid()
+        && state_->profile.isValid() && state_->packageGrant.isValid()
+        && !state_->appContainerSid.isEmpty()
+        && !state_->appContainerSidBytes.isEmpty();
+}
+
+SandboxValueResult<bool> SandboxPreparedLaunch::close() noexcept
+{
+    if (state_ == nullptr) return {true, {}, {}};
+    const auto closed = state_->packageGrant.close();
+    if (!closed.value.has_value()) return closed;
+    state_.reset();
+    return {true, {}, {}};
+}
+
+void SandboxPreparedLaunch::closeBestEffort() noexcept
+{
+    (void)close();
+}
+
 SandboxProcessWaitHandle::SandboxProcessWaitHandle(HANDLE handle) noexcept
     : handle_(handle)
 {
@@ -542,9 +598,8 @@ void SandboxProcess::terminate(const DWORD exitCode) noexcept
     (void)waitForFinished(5000);
 }
 
-SandboxValueResult<bool> SandboxProcess::close() noexcept
+SandboxValueResult<bool> SandboxProcess::closeExecutionLocked() noexcept
 {
-    std::lock_guard closeLock(closeMutex_);
     HANDLE waitHandle = nullptr;
     {
         std::lock_guard lock(mutex_);
@@ -590,7 +645,12 @@ SandboxValueResult<bool> SandboxProcess::close() noexcept
         processId_ = 0;
     }
     const auto jobClosed = job_.close();
-    if (!jobClosed.value.has_value()) return jobClosed;
+    return jobClosed;
+}
+
+SandboxValueResult<bool> SandboxProcess::closeGrantsLocked() noexcept
+{
+    std::lock_guard lock(mutex_);
 
     QString firstErrorCode;
     SandboxNativeError firstNativeError;
@@ -623,6 +683,20 @@ SandboxValueResult<bool> SandboxProcess::close() noexcept
     return {true, {}, {}};
 }
 
+SandboxValueResult<bool> SandboxProcess::closeExecution() noexcept
+{
+    std::lock_guard closeLock(closeMutex_);
+    return closeExecutionLocked();
+}
+
+SandboxValueResult<bool> SandboxProcess::close() noexcept
+{
+    std::lock_guard closeLock(closeMutex_);
+    const auto execution = closeExecutionLocked();
+    if (!execution.value.has_value()) return execution;
+    return closeGrantsLocked();
+}
+
 void SandboxProcess::closeBestEffort() noexcept
 {
     requestTerminateNoWait(ERROR_PROCESS_ABORTED);
@@ -642,11 +716,85 @@ SandboxProcess::SandboxProcess(HANDLE process,
 {
 }
 
-SandboxLaunchResult SandboxLauncher::launch(
+SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
+    const SandboxLaunchConfig &config)
+{
+    return prepare(config, true);
+}
+
+SandboxValueResult<SandboxPreparedLaunch> SandboxLauncher::prepare(
     const SandboxLaunchConfig &config,
+    const bool requireMembershipSeal)
+{
+    auto trusted = config.revalidateTrust();
+    if (!trusted.value.has_value()) {
+        return {std::nullopt, trusted.errorCode, trusted.nativeError};
+    }
+    const QFileInfo executableInfo(config.executablePath());
+    const QFileInfo packageInfo(config.packageDirectory());
+    const QFileInfo tempInfo(config.tempDirectory());
+    if (!executableInfo.isAbsolute() || !executableInfo.isFile()
+        || executableInfo.isSymLink() || !packageInfo.isAbsolute()
+        || !packageInfo.isDir() || packageInfo.isSymLink()
+        || !tempInfo.isAbsolute() || !tempInfo.isDir()
+        || tempInfo.isSymLink()) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.path.invalid"),
+                SandboxNativeError::win32(ERROR_PATH_NOT_FOUND)};
+    }
+    const QString packageDirectory = absolutePath(config.packageDirectory());
+    const QString tempDirectory = absolutePath(config.tempDirectory());
+    if (pathWithin(packageDirectory, tempDirectory)
+        || pathWithin(tempDirectory, packageDirectory)) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.path.overlap"),
+                SandboxNativeError::win32(ERROR_INVALID_DATA)};
+    }
+
+    auto profile = AppContainerProfile::createOrOpen(config.appId());
+    if (!profile.has_value()) {
+        return {std::nullopt, profile.errorCode, profile.nativeError};
+    }
+    auto sidText = profile->sidString();
+    if (!sidText.value.has_value()) {
+        return {std::nullopt, sidText.errorCode, sidText.nativeError};
+    }
+    const DWORD sidBytes = GetLengthSid(profile->sid());
+    if (sidBytes == 0) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.profile.sid_failed"),
+                SandboxNativeError::win32(ERROR_INVALID_SID)};
+    }
+    auto packageGrant = AclGrant::apply(packageDirectory,
+                                        profile->sid(),
+                                        SandboxPathAccess::ReadOnly,
+                                        true);
+    if (!packageGrant.has_value()) {
+        return {std::nullopt,
+                packageGrant.errorCode,
+                packageGrant.nativeError};
+    }
+    auto state = std::make_unique<SandboxPreparedLaunchState>();
+    state->config = config;
+    state->appContainerSidBytes = QByteArray(
+        static_cast<const char *>(profile->sid()),
+        static_cast<qsizetype>(sidBytes));
+    state->appContainerSid = std::move(*sidText.value);
+    state->packageGrant = std::move(*packageGrant);
+    state->profile = std::move(*profile.value);
+    state->requireMembershipSeal = requireMembershipSeal;
+    return {SandboxPreparedLaunch(std::move(state)), {}, {}};
+}
+
+SandboxLaunchResult SandboxLauncher::launch(
+    SandboxPreparedLaunch &prepared,
     WorkerPipeEnds &&workerPipeEnds)
 {
     static_assert(!std::is_copy_constructible_v<WorkerPipeEnds>);
+    if (!prepared.isValid()) {
+        return win32Failure(QStringLiteral("sandbox.launch.not_prepared"),
+                            ERROR_INVALID_STATE);
+    }
     if (!workerPipeEnds.isValid()) {
         return win32Failure(QStringLiteral("sandbox.ipc.invalid_handles"),
                             ERROR_INVALID_HANDLE);
@@ -659,6 +807,13 @@ SandboxLaunchResult SandboxLauncher::launch(
                             ERROR_INVALID_HANDLE);
     }
 
+    auto rebound = prepared.state_->config.rebindPreparedPackageSecurity(
+        prepared.state_->appContainerSidBytes,
+        prepared.state_->requireMembershipSeal);
+    if (!rebound.value.has_value()) {
+        return failure(rebound.errorCode, rebound.nativeError);
+    }
+    const SandboxLaunchConfig &config = *rebound.value;
     auto trusted = config.revalidateTrust();
     if (!trusted.value.has_value()) {
         return failure(trusted.errorCode, trusted.nativeError);
@@ -715,35 +870,19 @@ SandboxLaunchResult SandboxLauncher::launch(
             QStringLiteral("sandbox.path.executable_unstable"), error);
     }
 
-    // Resource limits are caller-selected launch data. Validate and construct
-    // the Job before the first filesystem ACL mutation.
+    // Resource limits are caller-selected launch data. The package ACL grant
+    // is already owned by the prepared launch; all remaining mutations are
+    // rolled back locally without disturbing the immutable package seal.
     auto job = JobLimits::create(config.resourceLimits());
     if (!job.value.has_value()) {
         return failure(job.errorCode, job.nativeError);
     }
 
-    auto profile = AppContainerProfile::createOrOpen(config.appId());
-    if (!profile.has_value()) {
-        return failure(profile.errorCode, profile.nativeError);
-    }
-    auto sidText = profile->sidString();
-    if (!sidText.value.has_value()) {
-        return failure(sidText.errorCode, sidText.nativeError);
-    }
-
     std::vector<AclGrant> grants;
     grants.reserve(static_cast<size_t>(config.runtimeResources().size())
                    + 2U);
-    auto packageGrant = AclGrant::apply(packageDirectory,
-                                        profile->sid(),
-                                        SandboxPathAccess::ReadOnly,
-                                        true);
-    if (!packageGrant.has_value()) {
-        return failure(packageGrant.errorCode, packageGrant.nativeError);
-    }
-    grants.push_back(std::move(*packageGrant));
     auto tempGrant = AclGrant::apply(tempDirectory,
-                                     profile->sid(),
+                                     prepared.state_->profile.sid(),
                                      SandboxPathAccess::ReadWrite,
                                      true);
     if (!tempGrant.has_value()) {
@@ -751,8 +890,10 @@ SandboxLaunchResult SandboxLauncher::launch(
                                            tempGrant.errorCode,
                                            tempGrant.nativeError);
     }
-    if (pathWithin(grants.front().finalPath(), tempGrant->finalPath())
-        || pathWithin(tempGrant->finalPath(), grants.front().finalPath())) {
+    if (pathWithin(prepared.state_->packageGrant.finalPath(),
+                   tempGrant->finalPath())
+        || pathWithin(tempGrant->finalPath(),
+                      prepared.state_->packageGrant.finalPath())) {
         return failureAfterCheckedRollback(
             grants,
             QStringLiteral("sandbox.path.overlap"),
@@ -761,7 +902,7 @@ SandboxLaunchResult SandboxLauncher::launch(
     grants.push_back(std::move(*tempGrant));
     for (const QString &runtimeResource : config.runtimeResources()) {
         auto runtimeGrant = AclGrant::apply(runtimeResource,
-                                            profile->sid(),
+                                            prepared.state_->profile.sid(),
                                             SandboxPathAccess::ReadExecute,
                                             false);
         if (!runtimeGrant.has_value()) {
@@ -807,7 +948,7 @@ SandboxLaunchResult SandboxLauncher::launch(
             QStringLiteral("sandbox.launch.capability_failed"),
             SandboxNativeError::win32(capabilityError));
     }
-    capabilities.AppContainerSid = profile->sid();
+    capabilities.AppContainerSid = prepared.state_->profile.sid();
     capabilities.Capabilities = compatibilityCapabilities.data();
     capabilities.CapabilityCount = compatibilityCapabilities.size();
     capabilities.Reserved = 0;
@@ -893,11 +1034,44 @@ SandboxLaunchResult SandboxLauncher::launch(
             QStringLiteral("sandbox.launch.resume_failed"),
             SandboxNativeError::win32(error));
     }
-    return {SandboxProcess(processHandle.release(),
-                           process.dwProcessId,
-                           std::move(*job),
-                           std::move(grants),
-                            *sidText.value),
-            {},
-            {}};
+    grants.insert(grants.begin(),
+                  std::move(prepared.state_->packageGrant));
+    QString appContainerSid = prepared.state_->appContainerSid;
+    SandboxProcess launched(processHandle.release(),
+                            process.dwProcessId,
+                            std::move(*job),
+                            std::move(grants),
+                            std::move(appContainerSid));
+    prepared.state_.reset();
+    return {std::move(launched), {}, {}};
+}
+
+SandboxLaunchResult SandboxLauncher::launch(
+    const SandboxLaunchConfig &config,
+    WorkerPipeEnds &&workerPipeEnds)
+{
+    if (!workerPipeEnds.isValid()) {
+        return win32Failure(QStringLiteral("sandbox.ipc.invalid_handles"),
+                            ERROR_INVALID_HANDLE);
+    }
+    const HANDLE workerRead = workerPipeEnds.nativeReadHandle();
+    const HANDLE workerWrite = workerPipeEnds.nativeWriteHandle();
+    if (workerRead == workerWrite || !inheritablePipeHandle(workerRead)
+        || !inheritablePipeHandle(workerWrite)) {
+        return win32Failure(QStringLiteral("sandbox.ipc.invalid_handles"),
+                            ERROR_INVALID_HANDLE);
+    }
+    auto prepared = prepare(config, false);
+    if (!prepared.value.has_value()) {
+        return failure(prepared.errorCode, prepared.nativeError);
+    }
+    SandboxLaunchResult launched = launch(
+        *prepared.value, std::move(workerPipeEnds));
+    if (!launched.process.has_value()) {
+        const auto closed = prepared->close();
+        if (!closed.value.has_value()) {
+            return failure(closed.errorCode, closed.nativeError);
+        }
+    }
+    return launched;
 }

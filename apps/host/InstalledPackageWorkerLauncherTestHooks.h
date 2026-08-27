@@ -31,6 +31,10 @@ struct InstalledPackageWorkerLauncherTestHooks final
     std::function<bool(const QString &)> failWorkerTempCleanup;
     std::function<void()> beforeRetirementCleanup;
     std::function<void()> afterFailureSignalBeforeLifecycleEnqueue;
+    std::function<void()> afterUnexpectedExitSignalBeforeExitCallback;
+    std::function<void()> duringExitCallbackBeforeLifecycleEnqueue;
+    std::function<void()> afterExitCallbackBeforePendingLaunch;
+    std::function<void(bool)> afterLaunchFinishedBeforeThreadReturn;
     bool failLaunchThreadStart = false;
     bool failObserverThreadStart = false;
     bool throwAttachRealization = false;

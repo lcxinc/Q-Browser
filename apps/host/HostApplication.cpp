@@ -370,6 +370,14 @@ bool HostApplication::initializePackageRuntime()
         },
         [guard](const WorkerAttemptKey key, const bool expected) {
             if (!guard || expected) return;
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto hooks = qbrowser_host_testing::
+                installedPackageWorkerLauncherTestHooks();
+            if (hooks.duringExitCallbackBeforeLifecycleEnqueue) {
+                hooks.duringExitCallbackBeforeLifecycleEnqueue();
+            }
+#endif
+            if (!guard) return;
             (void)guard->enqueueLifecycle(
                 [key](UpdateLifecycleCoordinator &coordinator) {
                     (void)coordinator.workerExited(key, WorkerExitReason::Crashed);
@@ -389,6 +397,7 @@ bool HostApplication::initializePackageRuntime()
                 hooks.afterFailureSignalBeforeLifecycleEnqueue();
             }
 #endif
+            if (!localGuard) return;
             const bool cleanupFailure = error == QStringLiteral(
                     "host.launch.temp_cleanup_failed")
                 || error == QStringLiteral("host.launch.process_wait_failed")

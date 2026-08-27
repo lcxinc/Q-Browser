@@ -207,7 +207,8 @@ SandboxValueResult<bool> noReparseAncestors(const QString &path)
 }
 
 SandboxValueResult<StablePath> openStablePath(const QString &path,
-                                              const bool directory)
+                                              const bool directory,
+                                              const bool requireWriteDac = true)
 {
     const QFileInfo information(path);
     if (!information.isAbsolute() || path.contains(u'\0')) {
@@ -222,7 +223,8 @@ SandboxValueResult<StablePath> openStablePath(const QString &path,
     const QString normalized = absolutePath(path);
     // A launch config is valid by construction only if the Host can later
     // apply and roll back the exact AppContainer ACE on every retained path.
-    const DWORD access = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES
+    const DWORD access = READ_CONTROL | FILE_READ_ATTRIBUTES
+        | (requireWriteDac ? WRITE_DAC : 0U)
         | (directory ? 0U : GENERIC_READ | FILE_EXECUTE);
     const QString apiPath = windowsApiPath(normalized);
     UniqueHandle handle(CreateFileW(
@@ -422,7 +424,228 @@ SandboxValueResult<QByteArray> trustedSecurityState(const StablePath &path)
     return {evidence, {}, {}};
 }
 
-SandboxValueResult<bool> revalidateStable(const StablePath &stable)
+struct AceEvidence final
+{
+    BYTE type = 0;
+    BYTE flags = 0;
+    ACCESS_MASK mask = 0;
+    QByteArray sid;
+    QByteArray raw;
+};
+
+struct SecurityDescriptorEvidence final
+{
+    QByteArray owner;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    std::vector<AceEvidence> aces;
+};
+
+std::optional<SecurityDescriptorEvidence> parseSecurityEvidence(
+    const QByteArray &bytes)
+{
+    if (bytes.isEmpty()) return std::nullopt;
+    auto *descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
+        const_cast<char *>(bytes.constData()));
+    if (IsValidSecurityDescriptor(descriptor) == FALSE) {
+        return std::nullopt;
+    }
+    PSID owner = nullptr;
+    BOOL ownerDefaulted = FALSE;
+    PACL dacl = nullptr;
+    BOOL daclPresent = FALSE;
+    BOOL daclDefaulted = FALSE;
+    SecurityDescriptorEvidence evidence;
+    DWORD revision = 0;
+    if (GetSecurityDescriptorOwner(
+            descriptor, &owner, &ownerDefaulted) == FALSE
+        || owner == nullptr || IsValidSid(owner) == FALSE
+        || GetSecurityDescriptorDacl(
+               descriptor, &daclPresent, &dacl, &daclDefaulted) == FALSE
+        || daclPresent == FALSE || dacl == nullptr
+        || IsValidAcl(dacl) == FALSE
+        || GetSecurityDescriptorControl(
+               descriptor, &evidence.control, &revision) == FALSE) {
+        return std::nullopt;
+    }
+    evidence.owner = QByteArray(
+        static_cast<const char *>(owner),
+        static_cast<qsizetype>(GetLengthSid(owner)));
+    evidence.aces.reserve(dacl->AceCount);
+    for (DWORD index = 0; index < dacl->AceCount; ++index) {
+        void *rawAce = nullptr;
+        if (GetAce(dacl, index, &rawAce) == FALSE || rawAce == nullptr) {
+            return std::nullopt;
+        }
+        const auto *header = static_cast<const ACE_HEADER *>(rawAce);
+        if ((header->AceType != ACCESS_ALLOWED_ACE_TYPE
+             && header->AceType != ACCESS_DENIED_ACE_TYPE)
+            || header->AceSize < sizeof(ACCESS_ALLOWED_ACE)) {
+            return std::nullopt;
+        }
+        const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(rawAce);
+        PSID sid = const_cast<DWORD *>(&ace->SidStart);
+        if (IsValidSid(sid) == FALSE) return std::nullopt;
+        AceEvidence parsed;
+        parsed.type = header->AceType;
+        parsed.flags = header->AceFlags;
+        parsed.mask = ace->Mask;
+        parsed.sid = QByteArray(
+            static_cast<const char *>(sid),
+            static_cast<qsizetype>(GetLengthSid(sid)));
+        parsed.raw = QByteArray(
+            static_cast<const char *>(rawAce),
+            static_cast<qsizetype>(header->AceSize));
+        evidence.aces.push_back(std::move(parsed));
+    }
+    return evidence;
+}
+
+bool sameSid(const QByteArray &left, const QByteArray &right)
+{
+    return !left.isEmpty() && !right.isEmpty()
+        && IsValidSid(const_cast<char *>(left.constData())) != FALSE
+        && IsValidSid(const_cast<char *>(right.constData())) != FALSE
+        && EqualSid(const_cast<char *>(left.constData()),
+                    const_cast<char *>(right.constData())) != FALSE;
+}
+
+bool preparedPackageSecurityTransitionAllowed(
+    const QByteArray &beforeBytes,
+    const QByteArray &afterBytes,
+    const QByteArray &appContainerSid,
+    const bool requireMembershipSeal)
+{
+    const auto before = parseSecurityEvidence(beforeBytes);
+    const auto after = parseSecurityEvidence(afterBytes);
+    if (!before.has_value() || !after.has_value()
+        || !sameSid(before->owner, after->owner)
+        || appContainerSid.isEmpty()
+        || IsValidSid(const_cast<char *>(appContainerSid.constData()))
+               == FALSE
+        || (requireMembershipSeal
+            && (after->control & SE_DACL_PROTECTED) == 0U)) {
+        return false;
+    }
+    constexpr SECURITY_DESCRIPTOR_CONTROL allowedControlChanges =
+        SE_DACL_PROTECTED | SE_DACL_AUTO_INHERIT_REQ
+        | SE_DACL_AUTO_INHERITED;
+    if ((before->control & ~allowedControlChanges)
+        != (after->control & ~allowedControlChanges)) {
+        return false;
+    }
+
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldBytes = sizeof(worldBuffer);
+    BYTE ownerRightsBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD ownerRightsBytes = sizeof(ownerRightsBuffer);
+    if (CreateWellKnownSid(
+            WinWorldSid, nullptr, worldBuffer, &worldBytes) == FALSE
+        || CreateWellKnownSid(
+               WinCreatorOwnerRightsSid, nullptr, ownerRightsBuffer,
+               &ownerRightsBytes) == FALSE) {
+        return false;
+    }
+    const QByteArray worldSid(
+        reinterpret_cast<const char *>(worldBuffer),
+        static_cast<qsizetype>(worldBytes));
+    const QByteArray ownerRightsSid(
+        reinterpret_cast<const char *>(ownerRightsBuffer),
+        static_cast<qsizetype>(ownerRightsBytes));
+    constexpr ACCESS_MASK directoryMutationRights = FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+    constexpr BYTE inheritedReadFlags =
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+
+    bool appReadPresent = false;
+    bool worldDenyPresent = false;
+    bool ownerRightsDenyPresent = false;
+    for (const AceEvidence &ace : after->aces) {
+        if (ace.type == ACCESS_ALLOWED_ACE_TYPE
+            && sameSid(ace.sid, appContainerSid)
+            && ace.mask == FILE_GENERIC_READ
+            && ace.flags == inheritedReadFlags) {
+            appReadPresent = true;
+        }
+        if (ace.type == ACCESS_DENIED_ACE_TYPE
+            && sameSid(ace.sid, worldSid)
+            && (ace.mask & directoryMutationRights)
+                   == directoryMutationRights
+            && ace.flags == 0U) {
+            worldDenyPresent = true;
+        }
+        if (ace.type == ACCESS_DENIED_ACE_TYPE
+            && sameSid(ace.sid, ownerRightsSid)
+            && (ace.mask & (WRITE_DAC | WRITE_OWNER))
+                   == (WRITE_DAC | WRITE_OWNER)
+            && ace.flags == 0U) {
+            ownerRightsDenyPresent = true;
+        }
+    }
+    if (!appReadPresent
+        || (requireMembershipSeal
+            && (!worldDenyPresent || !ownerRightsDenyPresent))) {
+        return false;
+    }
+
+    std::vector<bool> matchedBefore(before->aces.size(), false);
+    for (const AceEvidence &candidate : after->aces) {
+        bool matched = false;
+        for (size_t index = 0; index < before->aces.size(); ++index) {
+            if (!matchedBefore[index]
+                && (before->aces[index].raw == candidate.raw
+                    || (before->aces[index].type == candidate.type
+                        && before->aces[index].mask == candidate.mask
+                        && sameSid(before->aces[index].sid, candidate.sid)
+                        && static_cast<BYTE>(before->aces[index].flags
+                                             & ~INHERITED_ACE)
+                               == candidate.flags))) {
+                matchedBefore[index] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        const bool expectedAppRead =
+            candidate.type == ACCESS_ALLOWED_ACE_TYPE
+            && sameSid(candidate.sid, appContainerSid)
+            && candidate.mask == FILE_GENERIC_READ
+            && candidate.flags == inheritedReadFlags;
+        const bool expectedWorldDeny =
+            candidate.type == ACCESS_DENIED_ACE_TYPE
+            && sameSid(candidate.sid, worldSid)
+            && (candidate.mask & directoryMutationRights)
+                   == directoryMutationRights
+            && candidate.flags == 0U;
+        const bool expectedOwnerRightsDeny =
+            candidate.type == ACCESS_DENIED_ACE_TYPE
+            && sameSid(candidate.sid, ownerRightsSid)
+            && (candidate.mask & (WRITE_DAC | WRITE_OWNER))
+                   == (WRITE_DAC | WRITE_OWNER)
+            && candidate.flags == 0U;
+        if (!expectedAppRead
+            && !(requireMembershipSeal
+                 && (expectedWorldDeny || expectedOwnerRightsDeny))) {
+            return false;
+        }
+    }
+    for (size_t index = 0; index < before->aces.size(); ++index) {
+        if (matchedBefore[index]) continue;
+        const QByteArray &sid = before->aces[index].sid;
+        if (!sameSid(sid, appContainerSid)
+            && !(requireMembershipSeal
+                 && (sameSid(sid, worldSid)
+                     || sameSid(sid, ownerRightsSid)))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+SandboxValueResult<bool> revalidateStableAgainstSecurity(
+    const StablePath &stable,
+    const QByteArray &expectedSecurity,
+    const bool requireWriteDac)
 {
     if (!stable.handle.isValid()) {
         return {std::nullopt,
@@ -449,7 +672,8 @@ SandboxValueResult<bool> revalidateStable(const StablePath &stable)
                 QStringLiteral("sandbox.trust.identity_changed"),
                 SandboxNativeError::win32(ERROR_FILE_INVALID)};
     }
-    auto reopened = openStablePath(stable.requestedPath, stable.directory);
+    auto reopened = openStablePath(
+        stable.requestedPath, stable.directory, requireWriteDac);
     if (!reopened.value.has_value()
         || reopened.value->identity != stable.identity
         || pathKey(reopened.value->finalPath) != pathKey(stable.finalPath)) {
@@ -463,12 +687,18 @@ SandboxValueResult<bool> revalidateStable(const StablePath &stable)
     if (!security.value.has_value()) {
         return {std::nullopt, security.errorCode, security.nativeError};
     }
-    if (*security.value != stable.securityState) {
+    if (*security.value != expectedSecurity) {
         return {std::nullopt,
                 QStringLiteral("sandbox.trust.security_changed"),
                 SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
     }
     return {true, {}, {}};
+}
+
+SandboxValueResult<bool> revalidateStable(const StablePath &stable)
+{
+    return revalidateStableAgainstSecurity(
+        stable, stable.securityState, true);
 }
 
 SandboxValueResult<StablePath> openTrustedPath(const QString &path,
@@ -600,8 +830,12 @@ SandboxValueResult<bool> SandboxLaunchConfig::revalidateTrust() const
     if (!roots.value.has_value()) {
         return roots;
     }
-    const StablePath *selected[] = {
-        &state_->package, &state_->temp, &state_->executable};
+    auto package = reboundPackageSecurity_.isEmpty()
+        ? revalidateStable(state_->package)
+        : revalidateStableAgainstSecurity(
+              state_->package, reboundPackageSecurity_, false);
+    if (!package.value.has_value()) return package;
+    const StablePath *selected[] = {&state_->temp, &state_->executable};
     for (const StablePath *path : selected) {
         auto checked = revalidateStable(*path);
         if (!checked.value.has_value()) {
@@ -609,6 +843,55 @@ SandboxValueResult<bool> SandboxLaunchConfig::revalidateTrust() const
         }
     }
     return {true, {}, {}};
+}
+
+SandboxValueResult<SandboxLaunchConfig>
+SandboxLaunchConfig::rebindPreparedPackageSecurity(
+    const QByteArray &appContainerSid,
+    const bool requireMembershipSeal) const
+{
+    if (!isValid() || !reboundPackageSecurity_.isEmpty()
+        || appContainerSid.isEmpty()
+        || IsValidSid(const_cast<char *>(appContainerSid.constData()))
+               == FALSE) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.trust.config_invalid"),
+                SandboxNativeError::win32(ERROR_INVALID_PARAMETER)};
+    }
+    auto roots = revalidateTrustState(*state_->trust);
+    if (!roots.value.has_value()) {
+        return {std::nullopt, roots.errorCode, roots.nativeError};
+    }
+    const StablePath *unchanged[] = {&state_->temp, &state_->executable};
+    for (const StablePath *path : unchanged) {
+        auto checked = revalidateStable(*path);
+        if (!checked.value.has_value()) {
+            return {std::nullopt, checked.errorCode, checked.nativeError};
+        }
+    }
+    auto currentSecurity = trustedSecurityState(state_->package);
+    if (!currentSecurity.value.has_value()) {
+        return {std::nullopt,
+                currentSecurity.errorCode,
+                currentSecurity.nativeError};
+    }
+    if (!preparedPackageSecurityTransitionAllowed(
+            state_->package.securityState,
+            *currentSecurity.value,
+            appContainerSid,
+            requireMembershipSeal)) {
+        return {std::nullopt,
+                QStringLiteral("sandbox.trust.package_security_transition"),
+                SandboxNativeError::win32(ERROR_ACCESS_DENIED)};
+    }
+    auto stable = revalidateStableAgainstSecurity(
+        state_->package, *currentSecurity.value, false);
+    if (!stable.value.has_value()) {
+        return {std::nullopt, stable.errorCode, stable.nativeError};
+    }
+    SandboxLaunchConfig rebound(state_, request_);
+    rebound.reboundPackageSecurity_ = std::move(*currentSecurity.value);
+    return {std::move(rebound), {}, {}};
 }
 
 SandboxValueResult<SandboxTrustBoundary> SandboxTrustBoundary::create(

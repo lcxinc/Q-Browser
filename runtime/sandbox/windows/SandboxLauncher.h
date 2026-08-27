@@ -12,6 +12,7 @@
 
 #include <optional>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -79,6 +80,7 @@ public:
     [[nodiscard]] DWORD exitCode() const noexcept;
     void requestTerminateNoWait(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
     void terminate(DWORD exitCode = ERROR_PROCESS_ABORTED) noexcept;
+    [[nodiscard]] SandboxValueResult<bool> closeExecution() noexcept;
     [[nodiscard]] SandboxValueResult<bool> close() noexcept;
 #ifdef Q_BROWSER_SANDBOX_TESTING
     [[nodiscard]] static SandboxProcess adoptForTesting(
@@ -97,6 +99,8 @@ private:
                    JobLimits job,
                    std::vector<AclGrant> grants,
                    QString appContainerSid) noexcept;
+    [[nodiscard]] SandboxValueResult<bool> closeExecutionLocked() noexcept;
+    [[nodiscard]] SandboxValueResult<bool> closeGrantsLocked() noexcept;
     void closeBestEffort() noexcept;
 
     HANDLE process_ = nullptr;
@@ -115,9 +119,43 @@ struct SandboxLaunchResult final
     SandboxNativeError nativeError;
 };
 
+struct SandboxPreparedLaunchState;
+
+class SandboxPreparedLaunch final
+{
+public:
+    SandboxPreparedLaunch() noexcept = default;
+    ~SandboxPreparedLaunch();
+
+    SandboxPreparedLaunch(const SandboxPreparedLaunch &) = delete;
+    SandboxPreparedLaunch &operator=(const SandboxPreparedLaunch &) = delete;
+    SandboxPreparedLaunch(SandboxPreparedLaunch &&other) noexcept;
+    SandboxPreparedLaunch &operator=(SandboxPreparedLaunch &&other) noexcept;
+
+    [[nodiscard]] bool isValid() const noexcept;
+    [[nodiscard]] SandboxValueResult<bool> close() noexcept;
+
+private:
+    friend class SandboxLauncher;
+    explicit SandboxPreparedLaunch(
+        std::unique_ptr<SandboxPreparedLaunchState> state) noexcept;
+    void closeBestEffort() noexcept;
+
+    std::unique_ptr<SandboxPreparedLaunchState> state_;
+};
+
 class SandboxLauncher final
 {
 public:
+    [[nodiscard]] static SandboxValueResult<SandboxPreparedLaunch> prepare(
+        const SandboxLaunchConfig &config);
+    static SandboxLaunchResult launch(SandboxPreparedLaunch &prepared,
+                                      WorkerPipeEnds &&workerPipeEnds);
     static SandboxLaunchResult launch(const SandboxLaunchConfig &config,
                                       WorkerPipeEnds &&workerPipeEnds);
+
+private:
+    [[nodiscard]] static SandboxValueResult<SandboxPreparedLaunch> prepare(
+        const SandboxLaunchConfig &config,
+        bool requireMembershipSeal);
 };

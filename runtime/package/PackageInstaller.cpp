@@ -26,6 +26,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef Q_OS_WIN
+#include <Aclapi.h>
+#endif
+
 namespace
 {
 #ifdef Q_OS_WIN
@@ -475,6 +479,245 @@ bool installedFileIsReadOnly(const QString &path)
                             | QFileDevice::WriteOther);
 #endif
 }
+
+#ifdef Q_OS_WIN
+struct ImmutableDirectoryMembershipSeal final
+{
+    qbrowser_archive_detail::UniqueWindowsHandle handle;
+    QByteArray originalSecurity;
+    bool originalDaclProtected = false;
+    bool active = false;
+
+    ImmutableDirectoryMembershipSeal() = default;
+    ~ImmutableDirectoryMembershipSeal();
+    ImmutableDirectoryMembershipSeal(
+        const ImmutableDirectoryMembershipSeal &) = delete;
+    ImmutableDirectoryMembershipSeal &operator=(
+        const ImmutableDirectoryMembershipSeal &) = delete;
+    ImmutableDirectoryMembershipSeal(
+        ImmutableDirectoryMembershipSeal &&other) noexcept
+        : handle(std::move(other.handle))
+        , originalSecurity(std::move(other.originalSecurity))
+        , originalDaclProtected(other.originalDaclProtected)
+        , active(std::exchange(other.active, false))
+    {
+    }
+    ImmutableDirectoryMembershipSeal &operator=(
+        ImmutableDirectoryMembershipSeal &&other) noexcept;
+
+    void restore() noexcept;
+};
+
+bool directoryMembershipDenyPresent(
+    PACL dacl,
+    PSID sid,
+    const ACCESS_MASK required)
+{
+    if (dacl == nullptr || sid == nullptr) return false;
+    for (DWORD index = 0; index < dacl->AceCount; ++index) {
+        void *rawAce = nullptr;
+        if (GetAce(dacl, index, &rawAce) == FALSE || rawAce == nullptr) {
+            return false;
+        }
+        const auto *header = static_cast<const ACE_HEADER *>(rawAce);
+        if (header->AceType != ACCESS_DENIED_ACE_TYPE) continue;
+        const auto *ace = static_cast<const ACCESS_DENIED_ACE *>(rawAce);
+        PSID aceSid = const_cast<DWORD *>(&ace->SidStart);
+        if (EqualSid(aceSid, sid) != FALSE
+            && (ace->Mask & required) == required) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool immutableDirectoryMembershipSealIsIntact(
+    const ImmutableDirectoryMembershipSeal &seal)
+{
+    if (!seal.active || !seal.handle.isValid()) return false;
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (GetFileInformationByHandleEx(
+            seal.handle.get(), FileAttributeTagInfo, &attributes,
+            static_cast<DWORD>(sizeof(attributes))) == FALSE
+        || (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U
+        || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        return false;
+    }
+
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD security = GetSecurityInfo(
+        seal.handle.get(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, &dacl, nullptr, &descriptor);
+    if (security != ERROR_SUCCESS || descriptor == nullptr || dacl == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldBytes = sizeof(worldBuffer);
+    BYTE ownerRightsBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD ownerRightsBytes = sizeof(ownerRightsBuffer);
+    constexpr ACCESS_MASK directoryMutationRights = FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+    const bool intact = GetSecurityDescriptorControl(
+                            descriptor, &control, &revision) != FALSE
+        && (control & SE_DACL_PROTECTED) != 0
+        && CreateWellKnownSid(
+               WinWorldSid, nullptr, worldBuffer, &worldBytes) != FALSE
+        && CreateWellKnownSid(
+               WinCreatorOwnerRightsSid, nullptr, ownerRightsBuffer,
+               &ownerRightsBytes) != FALSE
+        && directoryMembershipDenyPresent(
+               dacl, worldBuffer, directoryMutationRights)
+        && directoryMembershipDenyPresent(
+               dacl, ownerRightsBuffer, WRITE_DAC | WRITE_OWNER);
+    LocalFree(descriptor);
+    return intact;
+}
+
+void ImmutableDirectoryMembershipSeal::restore() noexcept
+{
+    if (!active || !handle.isValid() || originalSecurity.isEmpty()) return;
+    auto *descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
+        originalSecurity.data());
+    BOOL daclPresent = FALSE;
+    BOOL daclDefaulted = FALSE;
+    PACL dacl = nullptr;
+    if (GetSecurityDescriptorDacl(
+            descriptor, &daclPresent, &dacl, &daclDefaulted) != FALSE) {
+        const SECURITY_INFORMATION protection = originalDaclProtected
+            ? PROTECTED_DACL_SECURITY_INFORMATION
+            : UNPROTECTED_DACL_SECURITY_INFORMATION;
+        (void)SetSecurityInfo(
+            handle.get(), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            nullptr, nullptr, daclPresent != FALSE ? dacl : nullptr, nullptr);
+    }
+    active = false;
+    originalSecurity.clear();
+}
+
+ImmutableDirectoryMembershipSeal::~ImmutableDirectoryMembershipSeal()
+{
+    restore();
+}
+
+ImmutableDirectoryMembershipSeal &
+ImmutableDirectoryMembershipSeal::operator=(
+    ImmutableDirectoryMembershipSeal &&other) noexcept
+{
+    if (this != &other) {
+        restore();
+        handle = std::move(other.handle);
+        originalSecurity = std::move(other.originalSecurity);
+        originalDaclProtected = other.originalDaclProtected;
+        active = std::exchange(other.active, false);
+    }
+    return *this;
+}
+
+bool sealImmutableDirectoryMembership(
+    const QString &path,
+    const qbrowser_archive_detail::WindowsStableDirectoryTree &tree,
+    ImmutableDirectoryMembershipSeal &seal)
+{
+    const auto native = qbrowser_archive_detail::windowsApiPath(path);
+    if (!native.has_value() || !tree.contains(path) || !tree.isStable()) {
+        return false;
+    }
+    seal.handle = qbrowser_archive_detail::UniqueWindowsHandle(CreateFileW(
+        reinterpret_cast<LPCWSTR>(native->utf16()),
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr));
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (!seal.handle.isValid()
+        || GetFileInformationByHandleEx(
+               seal.handle.get(), FileAttributeTagInfo, &attributes,
+               static_cast<DWORD>(sizeof(attributes))) == FALSE
+        || (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U
+        || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U
+        || !tree.isStable()) {
+        return false;
+    }
+
+    PACL existingDacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD security = GetSecurityInfo(
+        seal.handle.get(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, &existingDacl, nullptr, &descriptor);
+    if (security != ERROR_SUCCESS || descriptor == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    const DWORD descriptorBytes = GetSecurityDescriptorLength(descriptor);
+    if (descriptorBytes == 0
+        || GetSecurityDescriptorControl(
+               descriptor, &control, &revision) == FALSE) {
+        LocalFree(descriptor);
+        return false;
+    }
+    seal.originalSecurity = QByteArray(
+        static_cast<const char *>(descriptor),
+        static_cast<qsizetype>(descriptorBytes));
+    seal.originalDaclProtected = (control & SE_DACL_PROTECTED) != 0;
+
+    BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD worldBytes = sizeof(worldBuffer);
+    BYTE ownerRightsBuffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD ownerRightsBytes = sizeof(ownerRightsBuffer);
+    if (CreateWellKnownSid(
+            WinWorldSid, nullptr, worldBuffer, &worldBytes) == FALSE
+        || CreateWellKnownSid(
+               WinCreatorOwnerRightsSid, nullptr, ownerRightsBuffer,
+               &ownerRightsBytes) == FALSE) {
+        LocalFree(descriptor);
+        seal.originalSecurity.clear();
+        return false;
+    }
+
+    constexpr ACCESS_MASK directoryMutationRights = FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+    EXPLICIT_ACCESSW deny[2]{};
+    deny[0].grfAccessPermissions = directoryMutationRights;
+    deny[1].grfAccessPermissions = WRITE_DAC | WRITE_OWNER;
+    for (EXPLICIT_ACCESSW &entry : deny) {
+        entry.grfAccessMode = DENY_ACCESS;
+        entry.grfInheritance = NO_INHERITANCE;
+        entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    }
+    deny[0].Trustee.ptstrName = reinterpret_cast<LPWSTR>(worldBuffer);
+    deny[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(ownerRightsBuffer);
+    PACL sealedDacl = nullptr;
+    const DWORD acl = SetEntriesInAclW(
+        static_cast<ULONG>(std::size(deny)), deny, existingDacl, &sealedDacl);
+    const DWORD applied = acl == ERROR_SUCCESS && sealedDacl != nullptr
+        ? SetSecurityInfo(
+              seal.handle.get(), SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION
+                  | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr, nullptr, sealedDacl, nullptr)
+        : acl;
+    if (sealedDacl != nullptr) LocalFree(sealedDacl);
+    LocalFree(descriptor);
+    if (applied != ERROR_SUCCESS) {
+        seal.originalSecurity.clear();
+        return false;
+    }
+    seal.active = true;
+    return immutableDirectoryMembershipSealIsIntact(seal)
+        && tree.isStable();
+}
+#endif
 }
 
 struct ImmutablePackageGuard::State final
@@ -493,7 +736,18 @@ struct ImmutablePackageGuard::State final
 
     qbrowser_archive_detail::WindowsStableDirectoryTree tree;
     mutable std::vector<LockedFile> lockedFiles;
+    std::vector<ImmutableDirectoryMembershipSeal> directorySeals;
 #endif
+
+    ~State()
+    {
+#ifdef Q_OS_WIN
+        for (auto seal = directorySeals.rbegin();
+             seal != directorySeals.rend(); ++seal) {
+            seal->restore();
+        }
+#endif
+    }
 };
 
 ImmutablePackageGuard::ImmutablePackageGuard(std::unique_ptr<State> state)
@@ -720,6 +974,20 @@ InstallResult PackageInstaller::verifyInstalledImmutable(
             totalBytes += static_cast<quint64>(bytes.size());
             state->files.push_back({relative, std::move(bytes)});
         }
+#ifdef Q_OS_WIN
+        QStringList directoriesToSeal{root};
+        directoriesToSeal.append(directories);
+        state->directorySeals.reserve(
+            static_cast<size_t>(directoriesToSeal.size()));
+        for (const QString &directory : directoriesToSeal) {
+            ImmutableDirectoryMembershipSeal seal;
+            if (!sealImmutableDirectoryMembership(
+                    directory, state->tree, seal)) {
+                return invalid();
+            }
+            state->directorySeals.push_back(std::move(seal));
+        }
+#endif
         retainedGuard = std::shared_ptr<const ImmutablePackageGuard>(
             new ImmutablePackageGuard(std::move(state)));
     }
@@ -731,9 +999,18 @@ InstallResult PackageInstaller::verifyInstalledImmutable(
         return invalid();
     }
 #ifdef Q_OS_WIN
+    const size_t expectedDirectorySeals = 1U
+        + static_cast<size_t>(std::ranges::count_if(
+            state.memberKeys, [](const QString &key) {
+                return key.startsWith(QStringLiteral("d:"));
+            }));
     if (!state.tree.isStable()
         || state.lockedFiles.size()
-               != static_cast<size_t>(state.files.size())) {
+               != static_cast<size_t>(state.files.size())
+        || state.directorySeals.size() != expectedDirectorySeals
+        || !std::ranges::all_of(
+            state.directorySeals,
+            immutableDirectoryMembershipSealIsIntact)) {
         return invalid();
     }
     QVector<ArchiveFile> authenticatedFiles;

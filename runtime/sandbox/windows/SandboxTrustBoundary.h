@@ -3,6 +3,7 @@
 #include "JobLimits.h"
 #include "SandboxError.h"
 
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
 
@@ -64,9 +65,14 @@ private:
     explicit SandboxLaunchConfig(std::shared_ptr<const SandboxLaunchState> state,
                                  SandboxLaunchRequest request) noexcept;
     [[nodiscard]] SandboxValueResult<bool> revalidateTrust() const;
+    [[nodiscard]] SandboxValueResult<SandboxLaunchConfig>
+        rebindPreparedPackageSecurity(
+            const QByteArray &appContainerSid,
+            bool requireMembershipSeal) const;
 
     std::shared_ptr<const SandboxLaunchState> state_;
     SandboxLaunchRequest request_;
+    QByteArray reboundPackageSecurity_;
 };
 
 struct SandboxTrustState;
