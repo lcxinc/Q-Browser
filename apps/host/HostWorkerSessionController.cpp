@@ -9,6 +9,7 @@
 #include <QJsonObject>
 #include <QThread>
 
+#include <limits>
 #include <utility>
 
 namespace {
@@ -93,7 +94,9 @@ HostWorkerSessionController::~HostWorkerSessionController()
     stopIoThreadForDestruction();
 }
 
-bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
+bool HostWorkerSessionController::attach(
+    std::unique_ptr<IpcSession> session,
+    HostCapabilityRuntime *const capabilityRuntime)
 {
     if (QThread::currentThread() != thread()) {
         lastErrorCode_ = QStringLiteral("host.worker_session.wrong_thread");
@@ -105,18 +108,34 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
         lastErrorCode_ = QStringLiteral("host.worker_session.invalid_attachment");
         return false;
     }
+    std::optional<CapabilityBinding> capabilityBinding;
+    if (capabilityRuntime != nullptr) {
+        const TabCapabilityAuthority &authority =
+            capabilityRuntime->authority();
+        if (!authority.isValid()
+            || authority.appIdentity != session->appIdentity()
+            || generation_ == std::numeric_limits<quint64>::max()
+            || authority.sessionGeneration != generation_ + 1) {
+            lastErrorCode_ =
+                QStringLiteral("host.worker_session.invalid_capability_binding");
+            return false;
+        }
+        capabilityBinding = CapabilityBinding{capabilityRuntime, authority};
+    }
     if (io_ != nullptr || ioThread_ != nullptr) {
         pendingSession_ = std::move(session);
+        pendingCapabilityBinding_ = std::move(capabilityBinding);
         cleanupFinalState_ = HostWorkerSessionState::Detached;
         state_ = HostWorkerSessionState::ShuttingDown;
         pendingRouteLoads_.clear();
         outbound_.clear();
         activeCommand_.reset();
         activeCapabilityRequestId_.clear();
+        invalidateCapabilityBinding();
         requestIoStop();
         return true;
     }
-    return startSession(std::move(session));
+    return startSession(std::move(session), std::move(capabilityBinding));
 }
 
 bool HostWorkerSessionController::canAttachImmediately() const noexcept
@@ -125,9 +144,25 @@ bool HostWorkerSessionController::canAttachImmediately() const noexcept
     return io_ == nullptr && ioThread_ == nullptr && pendingSession_ == nullptr;
 }
 
-bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> session)
+bool HostWorkerSessionController::startSession(
+    std::unique_ptr<IpcSession> session,
+    std::optional<CapabilityBinding> capabilityBinding)
 {
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
+    if (capabilityBinding.has_value()
+        && (capabilityBinding->runtime.isNull()
+            || !capabilityBinding->authority.isValid()
+            || capabilityBinding->runtime->authority()
+                != capabilityBinding->authority
+            || capabilityBinding->authority.appIdentity
+                != session->appIdentity()
+            || generation_ == std::numeric_limits<quint64>::max()
+            || capabilityBinding->authority.sessionGeneration
+                != generation_ + 1)) {
+        lastErrorCode_ =
+            QStringLiteral("host.worker_session.invalid_capability_binding");
+        return false;
+    }
     QCoreApplication *const navigationDispatchContext =
         QCoreApplication::instance();
     if (navigationDispatchContext == nullptr
@@ -139,6 +174,11 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
     ++generation_;
     const quint64 attachedGeneration = generation_;
     appIdentity_ = session->appIdentity();
+    capabilityRuntime_ = capabilityBinding.has_value()
+        ? capabilityBinding->runtime : QPointer<HostCapabilityRuntime>{};
+    capabilityAuthority_ = capabilityBinding.has_value()
+        ? std::optional<TabCapabilityAuthority>(capabilityBinding->authority)
+        : std::nullopt;
     pendingRouteLoads_.clear();
     outbound_.clear();
     activeCommand_.reset();
@@ -146,7 +186,8 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
     lastErrorCode_.clear();
     ioThread_ = new QThread;
     ioThread_->setObjectName(QStringLiteral("host-worker-session-io"));
-    io_ = new HostWorkerSessionIo(std::move(session), generation_, thread());
+    io_ = new HostWorkerSessionIo(
+        std::move(session), generation_, thread(), capabilityAuthority_);
     const QPointer<HostWorkerSessionIo> attachedIo = io_;
     QThread *const attachedThread = ioThread_;
     if (!io_->moveToThread(ioThread_)) {
@@ -155,6 +196,8 @@ bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> sessi
         delete ioThread_;
         ioThread_ = nullptr;
         appIdentity_.clear();
+        capabilityRuntime_ = nullptr;
+        capabilityAuthority_.reset();
         state_ = HostWorkerSessionState::Failed;
         lastErrorCode_ = QStringLiteral("host.worker_session.io_transfer_failed");
         return false;
@@ -241,6 +284,7 @@ bool HostWorkerSessionController::shutdown(const QString &reason)
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
     pendingRouteLoads_.clear();
+    invalidateCapabilityBinding();
     const quint64 generation = generation_;
     HostWorkerSessionIo *const io = io_;
     QMetaObject::invokeMethod(io, [io, generation, reason] {
@@ -370,6 +414,7 @@ void HostWorkerSessionController::handleRouteLoadResponse(
 }
 
 void HostWorkerSessionController::handleCapabilityRequest(
+    const TabCapabilityAuthority &requestAuthority,
     const quint64 generation, const QString &requestId,
     const QString &capability, const QString &operation,
     const QJsonObject &payload)
@@ -387,11 +432,24 @@ void HostWorkerSessionController::handleCapabilityRequest(
         return;
     }
     activeCapabilityRequestId_ = requestId;
-    if (capabilityRuntime_ == nullptr) {
-        completeCapability(
-            generation, requestId,
+    if (capabilityRuntime_ == nullptr || !capabilityAuthority_.has_value()) {
+        if (requestAuthority.isValid()) {
+            activeCapabilityRequestId_.clear();
+            failClosed(QStringLiteral(
+                "host.worker_session.capability_authority_mismatch"));
+            return;
+        }
+        queueCapabilityResponse(
+            std::nullopt, generation, requestId,
             BrokerResult::failure(QStringLiteral("capability.denied"),
                                   QStringLiteral("Capability is not permitted.")));
+        return;
+    }
+    if (requestAuthority != *capabilityAuthority_
+        || capabilityRuntime_->authority() != *capabilityAuthority_) {
+        activeCapabilityRequestId_.clear();
+        failClosed(
+            QStringLiteral("host.worker_session.capability_authority_mismatch"));
         return;
     }
     capabilityRuntime_->dispatch(generation, requestId, capability, operation,
@@ -399,11 +457,32 @@ void HostWorkerSessionController::handleCapabilityRequest(
 }
 
 void HostWorkerSessionController::completeCapability(
+    const TabCapabilityAuthority &authority,
+    const quint64 generation, const QString &requestId,
+    const BrokerResult &result)
+{
+    queueCapabilityResponse(authority, generation, requestId, result);
+}
+
+void HostWorkerSessionController::queueCapabilityResponse(
+    std::optional<TabCapabilityAuthority> authority,
     const quint64 generation, const QString &requestId,
     const BrokerResult &result)
 {
     if (generation != generation_ || state_ != HostWorkerSessionState::Running
         || requestId.isEmpty() || requestId != activeCapabilityRequestId_) return;
+    if (authority.has_value()) {
+        if (!capabilityAuthority_.has_value()
+            || *authority != *capabilityAuthority_
+            || capabilityRuntime_ == nullptr
+            || capabilityRuntime_->authority() != *capabilityAuthority_) {
+            return;
+        }
+    } else if (capabilityAuthority_.has_value()
+               || capabilityRuntime_ != nullptr || result.ok
+               || result.errorCode != QStringLiteral("capability.denied")) {
+        return;
+    }
     const auto response = result.ok
         ? ProtocolMessage::successResponse(requestId, result.value)
         : ProtocolMessage::errorResponse(requestId, result.errorCode,
@@ -419,6 +498,11 @@ void HostWorkerSessionController::completeCapability(
     if (!outbound_.isEmpty()) outbound_.back().capabilityRequestId = requestId;
     else if (activeCommand_.has_value())
         activeCommand_->capabilityRequestId = requestId;
+    if (!outbound_.isEmpty()) {
+        outbound_.back().capabilityAuthority = std::move(authority);
+    } else if (activeCommand_.has_value()) {
+        activeCommand_->capabilityAuthority = std::move(authority);
+    }
     emit capabilityResponseQueued(requestId, result.ok, result.errorCode,
                                   generation);
 }
@@ -516,15 +600,29 @@ void HostWorkerSessionController::failClosed(const QString &errorCode)
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
     appIdentity_.clear();
+    pendingCapabilityBinding_.reset();
+    invalidateCapabilityBinding();
     cleanupFinalState_ = HostWorkerSessionState::Failed;
     requestIoStop();
     emit failed(lastErrorCode_, generation_);
 }
 
-void HostWorkerSessionController::setCapabilityRuntime(
-    HostCapabilityRuntime *const runtime) noexcept
+void HostWorkerSessionController::unbindCapabilityRuntime(
+    const TabCapabilityAuthority &authority) noexcept
 {
-    capabilityRuntime_ = runtime;
+    if (!capabilityAuthority_.has_value()
+        || *capabilityAuthority_ != authority) {
+        return;
+    }
+    invalidateCapabilityBinding();
+}
+
+void HostWorkerSessionController::invalidateCapabilityBinding() noexcept
+{
+    HostCapabilityRuntime *const runtime = capabilityRuntime_.data();
+    capabilityRuntime_ = nullptr;
+    capabilityAuthority_.reset();
+    if (runtime != nullptr) runtime->invalidate();
 }
 
 void HostWorkerSessionController::requestIoStop()
@@ -570,11 +668,16 @@ void HostWorkerSessionController::handleIoThreadFinished(
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
     appIdentity_.clear();
+    invalidateCapabilityBinding();
 
     if (pendingSession_ != nullptr) {
         std::unique_ptr<IpcSession> replacement = std::move(pendingSession_);
+        std::optional<CapabilityBinding> replacementBinding =
+            std::move(pendingCapabilityBinding_);
+        pendingCapabilityBinding_.reset();
         state_ = HostWorkerSessionState::Detached;
-        if (!startSession(std::move(replacement))) {
+        if (!startSession(std::move(replacement),
+                          std::move(replacementBinding))) {
             state_ = HostWorkerSessionState::Failed;
             lastErrorCode_ = QStringLiteral("host.worker_session.reattach_failed");
             emit failed(lastErrorCode_, generation_);
@@ -590,6 +693,8 @@ void HostWorkerSessionController::stopIoThreadForDestruction()
 {
     Q_ASSERT(QThread::currentThread() == thread());
     pendingSession_.reset();
+    pendingCapabilityBinding_.reset();
+    invalidateCapabilityBinding();
     HostWorkerSessionIo *const oldIo = io_.data();
     QThread *const oldThread = ioThread_;
     const quint64 oldGeneration = generation_;

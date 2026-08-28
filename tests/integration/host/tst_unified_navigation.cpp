@@ -2,6 +2,7 @@
 #include "BrowserChrome.h"
 #include "BrowserCommand.h"
 #include "HostCapabilityRuntime.h"
+#include "HostGestureRouter.h"
 #include "HostOwnedFileAuthority.h"
 #include "MainWindow.h"
 #include "NavigationBar.h"
@@ -1707,23 +1708,35 @@ void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondReques
     permissions.network.methods = {QStringLiteral("GET")};
     QTemporaryDir storage;
     QVERIFY(storage.isValid());
+    auto router = HostGestureRouter::createForTesting(1);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority capabilityAuthority{
+        QStringLiteral("tab-capability-pending"), 1,
+        QStringLiteral("com.qbrowser.pilot"), 41, 401,
+        controller.generation() + 1, 11};
+    auto admissionToken = std::make_shared<AuthorityAdmissionToken>();
     QString error;
     auto runtime = HostCapabilityRuntime::create(
-        QStringLiteral("com.qbrowser.pilot"), permissions, origin, storage.path(),
-        0, 0, 0, &error);
+        capabilityAuthority, admissionToken, router.get(), permissions, origin,
+        storage.path(), 1, &error, nullptr);
     QVERIFY2(runtime != nullptr, qPrintable(error));
     auto cleanup = qScopeGuard([&] {
-        controller.setCapabilityRuntime(nullptr);
         HostCapabilityRuntime::retire(std::exchange(runtime, {}));
         if (sessions.has_value() && sessions->worker != nullptr)
             sessions->worker->close();
         (void)WorkerRetirementManager::instance().flush(10'000);
     });
-    connect(runtime.get(), &HostCapabilityRuntime::completed, &controller,
-            &HostWorkerSessionController::completeCapability,
+    connect(runtime.get(), &HostCapabilityRuntime::authorityCompleted,
+            &controller,
+            [&controller](const TabCapabilityAuthority &authority,
+                          const quint64 generation,
+                          const QString &requestId,
+                          const BrokerResult &result) {
+                controller.completeCapability(
+                    authority, generation, requestId, result);
+            },
             Qt::QueuedConnection);
-    controller.setCapabilityRuntime(runtime.get());
-    QVERIFY(controller.attach(std::move(sessions->host)));
+    QVERIFY(controller.attach(std::move(sessions->host), runtime.get()));
     QSignalSpy heartbeats(&controller,
                           &HostWorkerSessionController::heartbeatObserved);
     QVERIFY(heartbeats.isValid());
@@ -1772,7 +1785,7 @@ void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondReques
              QStringLiteral("capability.busy"));
     QCOMPARE(controller.pendingCapabilityCount(), qsizetype(1));
 
-    controller.setCapabilityRuntime(nullptr);
+    controller.unbindCapabilityRuntime(capabilityAuthority);
     HostCapabilityRuntime::retire(std::exchange(runtime, {}));
     sessions->worker->close();
     QTRY_COMPARE_WITH_TIMEOUT(controller.state(), HostWorkerSessionState::Failed,

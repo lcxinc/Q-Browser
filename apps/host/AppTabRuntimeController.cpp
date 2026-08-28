@@ -27,6 +27,7 @@ AppTabRuntimeController::AppTabRuntimeController(
     TabController *const tabController,
     MainWindow *const mainWindow,
     HostGestureRouter *const gestureRouter,
+    FileDialogCoordinator *const fileDialogCoordinator,
     std::shared_ptr<RuntimePackageAuthority> authority,
     SandboxApprovedRoots roots,
     QString workerExecutable,
@@ -43,6 +44,7 @@ AppTabRuntimeController::AppTabRuntimeController(
     , tabController_(tabController)
     , mainWindow_(mainWindow)
     , gestureRouter_(gestureRouter)
+    , fileDialogCoordinator_(fileDialogCoordinator)
     , authority_(std::move(authority))
     , mockOrigin_(std::move(apiOrigin))
     , storageDirectory_(std::move(storageDirectory))
@@ -336,6 +338,8 @@ void AppTabRuntimeController::failClosed(const QString &reason)
     } else if (transportGate_ != nullptr) {
         transportGate_->store(false, std::memory_order_release);
     }
+    clearPendingAttach();
+    if (capabilityRuntime_ != nullptr) capabilityRuntime_->invalidate();
     QPointer<InstalledPackageWorkerLauncher> launcher(launcher_.get());
     if (launcher != nullptr) {
         (void)QMetaObject::invokeMethod(
@@ -345,12 +349,18 @@ void AppTabRuntimeController::failClosed(const QString &reason)
             },
             Qt::QueuedConnection);
     }
-    Q_UNUSED(reason);
+    if (sessionController_ != nullptr
+        && sessionController_->state() == HostWorkerSessionState::Running) {
+        (void)sessionController_->shutdown(
+            reason.isEmpty() ? QStringLiteral("host.worker.fail_closed")
+                             : reason);
+    }
 }
 
 void AppTabRuntimeController::stop(const QString &reason)
 {
     if (launcher_ == nullptr) return;
+    if (capabilityRuntime_ != nullptr) capabilityRuntime_->invalidate();
     if (sessionController_ != nullptr
         && sessionController_->state() == HostWorkerSessionState::Running) {
         (void)sessionController_->shutdown(
@@ -365,6 +375,7 @@ void AppTabRuntimeController::close(const QString &reason)
     closing_ = true;
     accepting_ = false;
     clearPendingAttach();
+    if (capabilityRuntime_ != nullptr) capabilityRuntime_->invalidate();
     if (launcher_ != nullptr) {
         if (sessionController_ != nullptr
             && sessionController_->state() == HostWorkerSessionState::Running) {
@@ -441,7 +452,7 @@ AppTabRuntimeController::realizeAttach(
     auto capability = HostCapabilityRuntime::create(
         authority, request.admission, gestureRouter_.data(),
         request.lease.permissions, mockOrigin_, storageDirectory_, hostWindowId_,
-        &capabilityError);
+        &capabilityError, fileDialogCoordinator_);
     // The production factory needs the configured storage directory. A
     // controller constructed by HostApplication supplies it through the
     // capability factory below; this guard keeps malformed test fixtures
@@ -478,7 +489,8 @@ AppTabRuntimeController::realizeAttach(
     }
 
     std::unique_ptr<IpcSession> session = std::move(pending.session);
-    if (!sessionController_->attach(std::move(session))
+    if (!sessionController_->attach(std::move(session),
+                                    pending.capability.get())
         || sessionController_->state() != HostWorkerSessionState::Running
         || sessionController_->generation() != expectedGeneration) {
         if (pending.process != nullptr) {
@@ -513,7 +525,8 @@ void AppTabRuntimeController::completePendingAttach(
         ? pending.process->processId() : 0;
     const quint64 expectedGeneration = pending.expectedGeneration;
     if (sessionController_->generation() == std::numeric_limits<quint64>::max()
-        || !sessionController_->attach(std::move(pending.session))
+        || !sessionController_->attach(std::move(pending.session),
+                                       pending.capability.get())
         || sessionController_->state() != HostWorkerSessionState::Running
         || sessionController_->generation() != expectedGeneration) {
         if (pending.process != nullptr) {
@@ -543,7 +556,15 @@ void AppTabRuntimeController::completePendingAttach(
 bool AppTabRuntimeController::completeAttach(PendingAttach pending,
                                               const quint64 expectedGeneration)
 {
-    const auto discard = [&pending] {
+    const auto rollback = [this, &pending] {
+        if (sessionController_ != nullptr
+            && sessionController_->state()
+                == HostWorkerSessionState::Running
+            && sessionController_->generation()
+                == pending.expectedGeneration) {
+            (void)sessionController_->shutdown(
+                QStringLiteral("host.worker.attach_rollback"));
+        }
         if (pending.process != nullptr) {
             pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
         }
@@ -556,7 +577,7 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         || mainWindow_.isNull()
         || sessionController_->state() != HostWorkerSessionState::Running
         || sessionController_->generation() != expectedGeneration) {
-        return discard();
+        return rollback();
     }
     const TabCapabilityAuthority authority{
         pending.request.tabId,
@@ -566,7 +587,10 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         static_cast<quintptr>(pending.surface->nativeWindowId()),
         expectedGeneration,
         pending.request.lease.leaseAuthorityEpoch};
-    if (!authority.isValid()) return discard();
+    if (!authority.isValid()
+        || pending.capability->authority() != authority) {
+        return rollback();
+    }
     QPointer<HostWorkerSessionController> owningController(
         sessionController_.get());
     connect(pending.capability.get(), &HostCapabilityRuntime::authorityCompleted,
@@ -581,7 +605,7 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
                     return;
                 }
                 owningController->completeCapability(
-                    generation, requestId, result);
+                    completedAuthority, generation, requestId, result);
             },
             Qt::QueuedConnection);
 
@@ -592,13 +616,12 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         }
         if (transportGate_ != nullptr
             && !transportGate_->load(std::memory_order_acquire)) {
-            return discard();
+            return rollback();
         }
         if (!mainWindow_->attachWorkerSurface(tabId_,
                                               std::move(pending.surface))) {
-            return discard();
+            return rollback();
         }
-        sessionController_->setCapabilityRuntime(pending.capability.get());
     }
 
     processLifetime_ = std::move(pending.process);
@@ -650,7 +673,10 @@ void AppTabRuntimeController::stopCurrent(const QString &reason)
         (void)sessionController_->shutdown(
             reason.isEmpty() ? QStringLiteral("host.worker.stop") : reason);
     }
-    if (sessionController_ != nullptr) sessionController_->setCapabilityRuntime(nullptr);
+    if (sessionController_ != nullptr && capabilityRuntime_ != nullptr) {
+        sessionController_->unbindCapabilityRuntime(
+            capabilityRuntime_->authority());
+    }
     HostCapabilityRuntime::retire(std::exchange(capabilityRuntime_, {}));
     if (mainWindow_ != nullptr) mainWindow_->detachWorkerSurface(tabId_);
     if (stopProcess_) stopProcess_();

@@ -23,6 +23,7 @@ class AppRuntimeCoordinator;
 struct AppRuntimeResult;
 class HostWorkerSessionController;
 class HostCapabilityRuntime;
+class FileDialogCoordinator;
 class HostGestureRouter;
 class RuntimePackageAuthority;
 class WorkerSurface;
@@ -150,6 +151,7 @@ private:
     QUrl mockOrigin_;
     std::unique_ptr<MainWindow> mainWindow_;
     std::unique_ptr<HostGestureRouter> gestureRouter_;
+    std::unique_ptr<FileDialogCoordinator> fileDialogCoordinator_;
     std::unique_ptr<HostWorkerSessionController> workerSessionController_;
     std::shared_ptr<HostCapabilityRuntime> capabilityRuntime_;
     std::shared_ptr<void> workerProcessLifetime_;

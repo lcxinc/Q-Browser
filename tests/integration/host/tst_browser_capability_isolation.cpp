@@ -121,7 +121,7 @@ private slots:
     void shutdownCannotLoseImmediateCompletion();
     void callbackCanRequestShutdown();
     void shutdownCancelsAllAndWaitsForCallbackQuiescence();
-    void fullRequestAndSessionIdentityRoutingIsDeferred();
+    void boundedFinalSendGateIsDeferred();
 };
 
 void BrowserCapabilityIsolationTest::
@@ -881,12 +881,11 @@ void BrowserCapabilityIsolationTest::
 }
 
 void BrowserCapabilityIsolationTest::
-    fullRequestAndSessionIdentityRoutingIsDeferred()
+    boundedFinalSendGateIsDeferred()
 {
-    QFAIL("TODO(Task16 Tasks 4-5): final delivery still belongs to the Host "
-          "full-authority/request/session admission and bounded IO seam; Task 3 "
-          "only guarantees an immutable operation callback and retired-token "
-          "discard inside the process-owned coordinator");
+    QFAIL("TODO(Task16 Task5): Host Task4 gates immutable completion before the "
+          "existing response queue; retaining UseGuard through owned bounded "
+          "transport completion remains the Task5 send seam");
 }
 
 QTEST_GUILESS_MAIN(BrowserCapabilityIsolationTest)

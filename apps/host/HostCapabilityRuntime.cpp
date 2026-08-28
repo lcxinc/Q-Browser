@@ -2,6 +2,7 @@
 
 #include "ClipboardBroker.h"
 #include "FileBroker.h"
+#include "FileDialogCoordinator.h"
 #include "HostGestureRouter.h"
 #include "NetworkBroker.h"
 #include "PolicyEngine.h"
@@ -13,7 +14,9 @@
 #include <QCoreApplication>
 #include <QThread>
 
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #ifndef Q_BROWSER_HOST_TESTING
@@ -102,6 +105,27 @@ HostPolicy hostPolicyFor(const QUrl &mockOrigin)
 }
 }
 
+struct PendingHostFileRequest final
+{
+    PendingHostFileRequest(TabCapabilityAuthority immutableAuthority,
+                           const quint64 immutableGeneration,
+                           QString immutableRequestId,
+                           PreparedFileRequest immutablePrepared)
+        : authority(std::move(immutableAuthority)),
+          generation(immutableGeneration),
+          requestId(std::move(immutableRequestId)),
+          prepared(std::move(immutablePrepared))
+    {
+    }
+
+    const TabCapabilityAuthority authority;
+    const quint64 generation = 0;
+    const QString requestId;
+    PreparedFileRequest prepared;
+    std::optional<FileDialogOperation> operation;
+    std::atomic_bool callbackQuiesced{false};
+};
+
 class CapabilityWorkerLane final : public QObject
 {
 public:
@@ -148,14 +172,16 @@ HostCapabilityRuntime::HostCapabilityRuntime(
     const bool authorityEnforced,
 #endif
     EffectivePolicy policy,
-    const quintptr hostWindowId)
+    const quintptr hostWindowId,
+    FileDialogCoordinator *const fileDialogCoordinator)
     : authority_(std::move(authority)),
       admissionToken_(std::move(admissionToken)),
       gestureRouter_(gestureRouter),
 #ifdef Q_BROWSER_HOST_TESTING
       authorityEnforced_(authorityEnforced),
 #endif
-      policy_(std::move(policy)), hostWindowId_(hostWindowId)
+      policy_(std::move(policy)), hostWindowId_(hostWindowId),
+      fileDialogCoordinator_(fileDialogCoordinator)
 {
 }
 
@@ -174,7 +200,8 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
     const quintptr hostWindowId,
     const quintptr workerWindowId,
     const quint32 workerProcessId,
-    QString *errorCode)
+    QString *errorCode,
+    FileDialogCoordinator *const fileDialogCoordinator)
 {
     if (appIdentity.isEmpty() || storageDirectory.isEmpty()
         || !validMockOrigin(mockOrigin)) {
@@ -193,7 +220,7 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
         new HostCapabilityRuntime(
             std::move(legacyAuthority),
             std::make_shared<AuthorityAdmissionToken>(), nullptr, false,
-            std::move(effective), hostWindowId));
+            std::move(effective), hostWindowId, fileDialogCoordinator));
     if (!runtime->initialize(storageDirectory, errorCode)) return nullptr;
     if (errorCode != nullptr) errorCode->clear();
     return runtime;
@@ -208,7 +235,8 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
     const QUrl &mockOrigin,
     const QString &storageDirectory,
     const quintptr hostWindowId,
-    QString *errorCode)
+    QString *errorCode,
+    FileDialogCoordinator *const fileDialogCoordinator)
 {
     if (!authority.isValid() || admissionToken == nullptr
         || gestureRouter == nullptr || hostWindowId == 0
@@ -226,7 +254,7 @@ std::shared_ptr<HostCapabilityRuntime> HostCapabilityRuntime::create(
 #ifdef Q_BROWSER_HOST_TESTING
             true,
 #endif
-            std::move(effective), hostWindowId));
+            std::move(effective), hostWindowId, fileDialogCoordinator));
     if (!runtime->initialize(storageDirectory, errorCode)) return nullptr;
     if (errorCode != nullptr) errorCode->clear();
     return runtime;
@@ -243,6 +271,8 @@ void HostCapabilityRuntime::retire(
     if (runtime == nullptr) return;
     Q_ASSERT(QThread::currentThread() == runtime->thread());
     runtime->invalidate();
+    const std::shared_ptr<PendingHostFileRequest> pendingFile =
+        runtime->pendingFile_;
     (void)QObject::disconnect(runtime.get(), nullptr, nullptr, nullptr);
     QThread *const thread = std::exchange(runtime->workerThread_, nullptr);
     if (thread == nullptr) return;
@@ -251,16 +281,25 @@ void HostCapabilityRuntime::retire(
     struct RetirementState final
     {
         std::shared_ptr<HostCapabilityRuntime> runtime;
+        std::shared_ptr<PendingHostFileRequest> pendingFile;
         QThread *thread = nullptr;
     };
     auto state = std::make_shared<RetirementState>(
-        RetirementState{std::move(runtime), thread});
+        RetirementState{std::move(runtime), pendingFile, thread});
     (void)WorkerRetirementManager::instance().retire(
         [state] {
             if (!state->thread->wait(1'000)) {
                 return WorkerRetirementAttemptResult{
                     false,
                     QStringLiteral("host.capability.retirement_pending")};
+            }
+            if (state->pendingFile != nullptr
+                && !state->pendingFile->callbackQuiesced.load(
+                    std::memory_order_acquire)) {
+                return WorkerRetirementAttemptResult{
+                    false,
+                    QStringLiteral(
+                        "host.capability.file_callback_retirement_pending")};
             }
             return WorkerRetirementAttemptResult{true, {}};
         },
@@ -272,6 +311,8 @@ void HostCapabilityRuntime::retire(
                 guiContext,
                 [state] {
                     state->runtime->workerLane_ = nullptr;
+                    state->runtime->pendingFile_.reset();
+                    state->pendingFile.reset();
                     delete std::exchange(state->thread, nullptr);
                     state->runtime.reset();
                 }, Qt::QueuedConnection);
@@ -281,6 +322,13 @@ void HostCapabilityRuntime::retire(
 bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
                                        QString *errorCode)
 {
+    if (policy_.file.has_value() && fileDialogCoordinator_ == nullptr) {
+        if (errorCode != nullptr) {
+            *errorCode = QStringLiteral(
+                "host.capability.file_coordinator_unavailable");
+        }
+        return false;
+    }
     auto *const lane = new CapabilityWorkerLane(policy_, storageDirectory, errorCode);
     auto *const thread = new QThread;
     thread->setObjectName(QStringLiteral("host-capability-worker"));
@@ -327,7 +375,7 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
         file_ = std::make_unique<FileBroker>(*policy_.file, *fileBackend_);
     }
     guiBroker_ = std::make_unique<CapabilityBroker>(
-        policy_, CapabilityServices{nullptr, nullptr, clipboard_.get(), file_.get()});
+        policy_, CapabilityServices{nullptr, nullptr, clipboard_.get(), nullptr});
     if (!lane->moveToThread(thread)) {
         if (gestureBindingRegistered_ && gestureRouter_ != nullptr) {
             gestureRouter_->unregisterBinding(authority_);
@@ -357,19 +405,17 @@ void HostCapabilityRuntime::dispatch(const quint64 generation,
         weak_from_this().lock();
     if (lifetime == nullptr) return;
     if (!accepting_ || admissionToken_ == nullptr
-#ifdef Q_BROWSER_HOST_TESTING
-        || (authorityEnforced_
-            && generation != authority_.sessionGeneration)
-#else
-        || generation != authority_.sessionGeneration
-#endif
-        ) {
+        || !generationMatches(generation)) {
         return;
     }
     auto acquired = admissionToken_->tryAcquireUse();
     if (!acquired.has_value()) return;
     auto use = std::make_shared<AuthorityAdmissionToken::UseGuard>(
         std::move(*acquired));
+    if (capability == QStringLiteral("file")) {
+        dispatchFile(std::move(use), generation, requestId, operation, payload);
+        return;
+    }
     const HostRequestContext context{authority_.appIdentity, requestId, nullptr};
     if (capability == QStringLiteral("network")
         || capability == QStringLiteral("storage")) {
@@ -410,6 +456,169 @@ void HostCapabilityRuntime::dispatch(const quint64 generation,
     (void)queueCompletion(use, generation, requestId, result);
 }
 
+void HostCapabilityRuntime::dispatchFile(
+    std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
+    const quint64 generation,
+    const QString &requestId,
+    const QString &operation,
+    const QJsonObject &payload)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (use == nullptr || !accepting_ || !generationMatches(generation)) {
+        return;
+    }
+    const auto denied = [] {
+        return BrokerResult::failure(
+            QStringLiteral("capability.denied"),
+            QStringLiteral("Capability is not permitted."));
+    };
+    if (gestureRouter_ == nullptr
+        || !gestureRouter_->isActiveBinding(authority_)) {
+        (void)queueCompletion(std::move(use), generation, requestId, denied());
+        return;
+    }
+    if (pendingFile_ != nullptr) {
+        (void)queueCompletion(
+            std::move(use), generation, requestId,
+            BrokerResult::failure(QStringLiteral("file.busy"),
+                                  QStringLiteral("File dialog is busy.")));
+        return;
+    }
+    if (file_ == nullptr || fileDialogCoordinator_ == nullptr) {
+        (void)queueCompletion(std::move(use), generation, requestId, denied());
+        return;
+    }
+
+    PreparedFileRequestResult preparation = file_->prepareFileRequest(
+        operation, payload, {authority_.appIdentity, requestId, nullptr});
+    if (!preparation.request.has_value()) {
+        (void)queueCompletion(std::move(use), generation, requestId,
+                              preparation.rejection);
+        return;
+    }
+    auto pending = std::make_shared<PendingHostFileRequest>(
+        authority_, generation, requestId, std::move(*preparation.request));
+    pendingFile_ = pending;
+    const std::weak_ptr<HostCapabilityRuntime> weakRuntime = weak_from_this();
+    std::optional<FileDialogOperation> operationHandle;
+    bool admitted = false;
+    try {
+        admitted = use->publishIfStillAdmitted(
+            [this, weakRuntime, pending, &operationHandle] {
+                operationHandle = fileDialogCoordinator_->openAsync(
+                    FileDialogOpenRequest(
+                        pending->prepared,
+                        [weakRuntime, pending] {
+                            const auto runtime = weakRuntime.lock();
+                            return runtime != nullptr
+                                && runtime->isActiveFileOwner(pending);
+                        }),
+                    [weakRuntime, pending](
+                        const FileDialogOperationToken &token,
+                        FileDialogSelection selection) mutable {
+                        try {
+                            if (const auto runtime = weakRuntime.lock();
+                                runtime != nullptr) {
+                                (void)QMetaObject::invokeMethod(
+                                    runtime.get(),
+                                    [weakRuntime, pending, token,
+                                     selection = std::move(selection)]() mutable {
+                                        if (const auto owner = weakRuntime.lock();
+                                            owner != nullptr) {
+                                            owner->completeFile(
+                                                pending, token,
+                                                std::move(selection));
+                                        }
+                                    },
+                                    Qt::QueuedConnection);
+                            }
+                        } catch (...) {
+                        }
+                        pending->callbackQuiesced.store(
+                            true, std::memory_order_release);
+                    });
+                return operationHandle.has_value();
+            });
+    } catch (...) {
+        admitted = false;
+    }
+    if (!admitted || !operationHandle.has_value()) {
+        pending->callbackQuiesced.store(true, std::memory_order_release);
+        if (pendingFile_ == pending) pendingFile_.reset();
+        (void)queueCompletion(
+            std::move(use), generation, requestId,
+            BrokerResult::failure(
+                QStringLiteral("file.failed"),
+                QStringLiteral("Selected file is unavailable.")));
+        return;
+    }
+    pending->operation = std::move(*operationHandle);
+}
+
+void HostCapabilityRuntime::completeFile(
+    const std::shared_ptr<PendingHostFileRequest> &pending,
+    const FileDialogOperationToken &token,
+    FileDialogSelection selection)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (pending == nullptr || pendingFile_ != pending
+        || !pending->operation.has_value()
+        || !(pending->operation->token == token)) {
+        return;
+    }
+    if (!accepting_ || admissionToken_ == nullptr
+        || pending->authority != authority_
+        || pending->generation != authority_.sessionGeneration
+        || pending->generation != pending->authority.sessionGeneration
+        || pending->requestId.isEmpty()
+        || pending->requestId != pending->prepared.requestId()
+        || pending->prepared.appIdentity() != authority_.appIdentity) {
+        pendingFile_.reset();
+        return;
+    }
+    auto acquired = admissionToken_->tryAcquireUse();
+    if (!acquired.has_value()) {
+        pendingFile_.reset();
+        return;
+    }
+    auto use = std::make_shared<AuthorityAdmissionToken::UseGuard>(
+        std::move(*acquired));
+    if (!isActiveFileOwner(pending)) {
+        selection = {};
+        selection.status = FileDialogStatus::Denied;
+        selection.approvedMaximumBytes = pending->prepared.maximumBytes();
+    }
+    const BrokerResult result = file_->completeFileRequest(
+        pending->prepared, selection);
+    pendingFile_.reset();
+    (void)queueCompletion(std::move(use), pending->generation,
+                          pending->requestId, result);
+}
+
+bool HostCapabilityRuntime::isActiveFileOwner(
+    const std::shared_ptr<PendingHostFileRequest> &pending) const noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return pending != nullptr && pendingFile_ == pending && accepting_
+        && pending->authority == authority_
+        && pending->generation == authority_.sessionGeneration
+        && pending->requestId == pending->prepared.requestId()
+        && pending->prepared.appIdentity() == authority_.appIdentity
+        && gestureRouter_ != nullptr
+        && gestureRouter_->isActiveBinding(authority_);
+}
+
+bool HostCapabilityRuntime::generationMatches(
+    const quint64 generation) const noexcept
+{
+#ifdef Q_BROWSER_HOST_TESTING
+    return !authorityEnforced_
+        || generation == authority_.sessionGeneration;
+#else
+    return generation == authority_.sessionGeneration;
+#endif
+}
+
 bool HostCapabilityRuntime::queueCompletion(
     std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
     const quint64 generation,
@@ -418,19 +627,56 @@ bool HostCapabilityRuntime::queueCompletion(
 {
     if (use == nullptr) return false;
     const TabCapabilityAuthority immutableAuthority = authority_;
+    const std::weak_ptr<HostCapabilityRuntime> weakRuntime = weak_from_this();
     return use->publishIfStillAdmitted(
-        [this, immutableAuthority, generation, requestId, result] {
+        [this, weakRuntime, immutableAuthority, generation, requestId,
+         result] {
             return QMetaObject::invokeMethod(
                 this,
-                [this, immutableAuthority, generation, requestId, result] {
-                    if (!accepting_ || immutableAuthority != authority_) return;
-                    emit authorityCompleted(immutableAuthority, generation,
-                                            requestId, result);
-#ifdef Q_BROWSER_HOST_TESTING
-                    emit completed(generation, requestId, result);
-#endif
+                [weakRuntime, immutableAuthority, generation, requestId,
+                 result] {
+                    const auto runtime = weakRuntime.lock();
+                    if (runtime == nullptr || !runtime->accepting_
+                        || immutableAuthority != runtime->authority_
+                        || !runtime->generationMatches(generation)
+                        || runtime->admissionToken_ == nullptr) {
+                        return;
+                    }
+                    auto acquired = runtime->admissionToken_->tryAcquireUse();
+                    if (!acquired.has_value()) return;
+                    (void)runtime->publishCompletion(
+                        std::make_shared<AuthorityAdmissionToken::UseGuard>(
+                            std::move(*acquired)),
+                        immutableAuthority, generation, requestId, result);
                 },
                 Qt::QueuedConnection);
+        });
+}
+
+bool HostCapabilityRuntime::publishCompletion(
+    std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
+    const TabCapabilityAuthority &immutableAuthority,
+    const quint64 generation,
+    const QString &requestId,
+    const BrokerResult &result)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (use == nullptr || !accepting_ || immutableAuthority != authority_
+        || !generationMatches(generation)) {
+        return false;
+    }
+    return use->publishIfStillAdmitted(
+        [this, immutableAuthority, generation, requestId, result] {
+            if (!accepting_ || immutableAuthority != authority_
+                || !generationMatches(generation)) {
+                return false;
+            }
+            emit authorityCompleted(immutableAuthority, generation,
+                                    requestId, result);
+#ifdef Q_BROWSER_HOST_TESTING
+            emit completed(generation, requestId, result);
+#endif
+            return true;
         });
 }
 
@@ -438,6 +684,9 @@ void HostCapabilityRuntime::invalidate() noexcept
 {
     if (!accepting_) return;
     accepting_ = false;
+    if (pendingFile_ != nullptr && pendingFile_->operation.has_value()) {
+        (void)pendingFile_->operation->cancellation.cancel();
+    }
     if (gestureBindingRegistered_ && gestureRouter_ != nullptr) {
         gestureRouter_->unregisterBinding(authority_);
         gestureBindingRegistered_ = false;

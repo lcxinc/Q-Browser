@@ -4,6 +4,7 @@
 #include "AppTabRuntimeController.h"
 #include "BrowserChrome.h"
 #include "HostCapabilityRuntime.h"
+#include "FileDialogCoordinator.h"
 #include "HostGestureRouter.h"
 #include "HostOwnedFileAuthority.h"
 #include "HostWorkerSessionController.h"
@@ -423,7 +424,8 @@ private:
 }
 
 HostApplication::HostApplication(QUrl mockOrigin, QObject *parent)
-    : QObject(parent), mockOrigin_(std::move(mockOrigin))
+    : QObject(parent), mockOrigin_(std::move(mockOrigin)),
+      fileDialogCoordinator_(std::make_unique<FileDialogCoordinator>())
 {
 }
 
@@ -432,6 +434,7 @@ HostApplication::HostApplication(HostRuntimeConfig runtimeConfig,
     : QObject(parent)
     , runtimeConfig_(std::move(runtimeConfig))
     , mockOrigin_(runtimeConfig_->mockOrigin())
+    , fileDialogCoordinator_(std::make_unique<FileDialogCoordinator>())
 {
 }
 
@@ -449,6 +452,9 @@ HostApplication::~HostApplication()
         }
     }
     detachWorkerContext(QStringLiteral("host.application.stopping"));
+    if (fileDialogCoordinator_ != nullptr) {
+        fileDialogCoordinator_->shutdown();
+    }
 
     QPointer<HostLifecycleRuntime> runtime(
         static_cast<HostLifecycleRuntime *>(updateLifecycleRuntime_.data()));
@@ -582,7 +588,8 @@ AppTabRuntimeController *HostApplication::ensureAppTabRuntimeController(
     if (!runtimeConfig_.has_value()
         || runtimeConfig_->mode() != HostRuntimeMode::Package
         || packageAuthority_ == nullptr || mainWindow_ == nullptr
-        || gestureRouter_ == nullptr || tabId.isEmpty()) {
+        || gestureRouter_ == nullptr || fileDialogCoordinator_ == nullptr
+        || tabId.isEmpty()) {
         return nullptr;
     }
     TabController *const tab = mainWindow_->tabController(tabId);
@@ -639,7 +646,8 @@ AppTabRuntimeController *HostApplication::ensureAppTabRuntimeController(
             return queued;
         };
     auto controller = std::make_unique<AppTabRuntimeController>(
-        tabId, tab, mainWindow_.get(), gestureRouter_.get(), packageAuthority_,
+        tabId, tab, mainWindow_.get(), gestureRouter_.get(),
+        fileDialogCoordinator_.get(), packageAuthority_,
         roots, runtimeConfig_->workerExecutable(),
         runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
         runtimeConfig_->storageDirectory(),
@@ -1912,6 +1920,7 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
     const WorkerLaunchRequest &request = context.launchRequest;
     if (mainWindow_ == nullptr || workerSessionController_ == nullptr
         || gestureRouter_ == nullptr
+        || fileDialogCoordinator_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
         || workerProcessLifetime_ != nullptr || !runtimeConfig_.has_value()
@@ -1960,7 +1969,8 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
         authority, request.admission, gestureRouter_.get(),
         request.lease.permissions, runtimeConfig_->mockOrigin(),
         runtimeConfig_->storageDirectory(),
-        static_cast<quintptr>(mainWindow_->winId()), &capabilityError);
+        static_cast<quintptr>(mainWindow_->winId()), &capabilityError,
+        fileDialogCoordinator_.get());
     if (capabilityRuntime == nullptr) {
         mainWindow_->detachWorkerSurface();
         emit updateLifecycleFailed(
@@ -1983,11 +1993,10 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
                     return;
                 }
                 owningController->completeCapability(
-                    generation, requestId, result);
+                    completedAuthority, generation, requestId, result);
             }, Qt::QueuedConnection);
-    workerSessionController_->setCapabilityRuntime(capabilityRuntime.get());
-    if (!workerSessionController_->attach(std::move(context.session))) {
-        workerSessionController_->setCapabilityRuntime(nullptr);
+    if (!workerSessionController_->attach(std::move(context.session),
+                                          capabilityRuntime.get())) {
         mainWindow_->detachWorkerSurface();
         HostCapabilityRuntime::retire(std::move(capabilityRuntime));
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
@@ -2010,8 +2019,10 @@ void HostApplication::detachWorkerContext(const QString &reason)
             reason.isEmpty() ? QStringLiteral("host.worker_context.detached") : reason);
     }
     if (stopWorkerProcess_) stopWorkerProcess_();
-    if (workerSessionController_ != nullptr)
-        workerSessionController_->setCapabilityRuntime(nullptr);
+    if (workerSessionController_ != nullptr && capabilityRuntime_ != nullptr) {
+        workerSessionController_->unbindCapabilityRuntime(
+            capabilityRuntime_->authority());
+    }
     HostCapabilityRuntime::retire(std::exchange(capabilityRuntime_, {}));
     if (mainWindow_ != nullptr) mainWindow_->detachWorkerSurface();
     stopWorkerProcess_ = {};

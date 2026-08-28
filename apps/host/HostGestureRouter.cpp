@@ -373,6 +373,14 @@ bool HostGestureRouter::activateBinding(
     });
 }
 
+bool HostGestureRouter::isActiveBinding(
+    const TabCapabilityAuthority &authority) const noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return state_->activeBinding != nullptr
+        && state_->activeBinding->authority == authority;
+}
+
 void HostGestureRouter::hostDeactivated() noexcept
 {
     Q_ASSERT(QThread::currentThread() == thread());

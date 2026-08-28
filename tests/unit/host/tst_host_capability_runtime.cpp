@@ -1,5 +1,6 @@
 #include "AuthorityAdmissionToken.h"
 #include "BrowserCommand.h"
+#include "FileDialogCoordinator.h"
 #include "FileDialogTestHooks.h"
 #include "HostApplication.h"
 #include "HostCapabilityRuntime.h"
@@ -9,12 +10,15 @@
 #include "WorkerRetirementManager.h"
 
 #include <QClipboard>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QFile>
 #include <QGuiApplication>
 #include <QHostAddress>
 #include <QJsonObject>
 #include <QScopeGuard>
+#include <QSemaphore>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTemporaryDir>
@@ -22,8 +26,10 @@
 #include <QUrl>
 
 #include <chrono>
+#include <atomic>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -92,6 +98,14 @@ QJsonObject requestPayload(const QUrl &url)
             {QStringLiteral("url"), url.toString(QUrl::FullyEncoded)},
             {QStringLiteral("bodyBase64"), QString{}}};
 }
+
+void writeFile(const QString &path, const QByteArray &content)
+{
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(content), content.size());
+    file.close();
+}
 }
 
 class HostCapabilityRuntimeTest final : public QObject
@@ -106,6 +120,10 @@ private slots:
     void clipboardRuntimesCanCoexist();
     void backgroundFileRequestIsDeniedBeforeValidation();
     void backgroundFileRequestNeverCreatesDialog();
+    void activeFileRequestCompletesThroughProcessCoordinator();
+    void switchingOwnerDoesNotRebindFileCompletion();
+    void revokedFileCallbackIsDroppedAndRetireCancelsExactlyOnce();
+    void delayedFileCallbackIsDroppedAfterAdmissionRevocation();
     void onlyActiveAuthorityCanIssueAndConsumeGesture();
     void authorityTransitionsRevokeUnconsumedEvidence();
     void mainWindowDeactivationRevokesGestureEvidence();
@@ -207,10 +225,10 @@ void HostCapabilityRuntimeTest::clipboardRuntimesCanCoexist()
     QString secondError;
     auto first = HostCapabilityRuntime::create(
         firstAuthority, firstToken, router.get(), clipboardPermission(), origin,
-        firstStorage.path(), 1, &firstError);
+        firstStorage.path(), 1, &firstError, nullptr);
     auto second = HostCapabilityRuntime::create(
         secondAuthority, secondToken, router.get(), clipboardPermission(), origin,
-        secondStorage.path(), 1, &secondError);
+        secondStorage.path(), 1, &secondError, nullptr);
     const bool firstCreated = first != nullptr;
     const bool secondCreated = second != nullptr;
     HostCapabilityRuntime::retire(std::exchange(first, {}));
@@ -230,6 +248,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestIsDeniedBeforeValidation()
     const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
     auto router = HostGestureRouter::createForTesting(100);
     QVERIFY(router != nullptr);
+    FileDialogCoordinator coordinator;
     const TabCapabilityAuthority activeAuthority = authority(
         QStringLiteral("tab-active"), 1, 41, 401, 7, 11);
     const TabCapabilityAuthority backgroundAuthority = authority(
@@ -240,7 +259,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestIsDeniedBeforeValidation()
     QString backgroundError;
     auto active = HostCapabilityRuntime::create(
         activeAuthority, activeToken, router.get(), filePermission(), origin,
-        activeStorage.path(), 100, &activeError);
+        activeStorage.path(), 100, &activeError, &coordinator);
     QVERIFY2(active != nullptr, qPrintable(activeError));
     auto activeCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(active, {}));
@@ -248,7 +267,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestIsDeniedBeforeValidation()
     });
     auto background = HostCapabilityRuntime::create(
         backgroundAuthority, backgroundToken, router.get(), filePermission(),
-        origin, backgroundStorage.path(), 100, &backgroundError);
+        origin, backgroundStorage.path(), 100, &backgroundError, &coordinator);
     QVERIFY2(background != nullptr, qPrintable(backgroundError));
     auto backgroundCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(background, {}));
@@ -300,6 +319,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestNeverCreatesDialog()
     const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
     auto router = HostGestureRouter::createForTesting(100);
     QVERIFY(router != nullptr);
+    FileDialogCoordinator coordinator;
     const TabCapabilityAuthority activeAuthority = authority(
         QStringLiteral("tab-active"), 1, 41, 401, 7, 11);
     const TabCapabilityAuthority backgroundAuthority = authority(
@@ -310,7 +330,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestNeverCreatesDialog()
     QString backgroundError;
     auto active = HostCapabilityRuntime::create(
         activeAuthority, activeToken, router.get(), filePermission(), origin,
-        activeStorage.path(), 100, &activeError);
+        activeStorage.path(), 100, &activeError, &coordinator);
     QVERIFY2(active != nullptr, qPrintable(activeError));
     auto activeCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(active, {}));
@@ -318,7 +338,7 @@ void HostCapabilityRuntimeTest::backgroundFileRequestNeverCreatesDialog()
     });
     auto background = HostCapabilityRuntime::create(
         backgroundAuthority, backgroundToken, router.get(), filePermission(),
-        origin, backgroundStorage.path(), 100, &backgroundError);
+        origin, backgroundStorage.path(), 100, &backgroundError, &coordinator);
     QVERIFY2(background != nullptr, qPrintable(backgroundError));
     auto backgroundCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(background, {}));
@@ -340,6 +360,354 @@ void HostCapabilityRuntimeTest::backgroundFileRequestNeverCreatesDialog()
     QVERIFY(!result.ok);
     QCOMPARE(result.errorCode, QStringLiteral("capability.denied"));
 #endif
+}
+
+void HostCapabilityRuntimeTest::
+    activeFileRequestCompletesThroughProcessCoordinator()
+{
+    QTemporaryDir directory;
+    QTemporaryDir storage;
+    QVERIFY(directory.isValid());
+    QVERIFY(storage.isValid());
+    const QString selectedPath =
+        QDir(directory.path()).filePath(QStringLiteral("selected.txt"));
+    writeFile(selectedPath, QByteArray("owner"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeShow;
+    QSemaphore showEntered;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow =
+        [&](const qint64,
+            qbrowser_broker_testing::FileDialogTestShowCompletion completion) {
+            {
+                const std::scoped_lock lock(showMutex);
+                completeShow = std::move(completion);
+            }
+            showEntered.release();
+        };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    FileDialogCoordinator coordinator;
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority binding = authority(
+        QStringLiteral("tab-owner"), 1, 41, 401, 7, 11);
+    auto token = std::make_shared<AuthorityAdmissionToken>();
+    QString error;
+    auto runtime = HostCapabilityRuntime::create(
+        binding, token, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")), storage.path(), 100,
+        &error, &coordinator);
+    QVERIFY2(runtime != nullptr, qPrintable(error));
+    auto cleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+        QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+        coordinator.shutdown();
+    });
+    QVERIFY(router->activateBinding(binding));
+    QSignalSpy completed(runtime.get(),
+                         &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(completed.isValid());
+
+    runtime->dispatch(binding.sessionGeneration, QStringLiteral("open-owner"),
+                      QStringLiteral("file"), QStringLiteral("open"), {});
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    {
+        const std::scoped_lock lock(showMutex);
+        QVERIFY(completeShow);
+        completeShow({FileDialogStatus::Opened, selectedPath});
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 2'000);
+    const QList<QVariant> completion = completed.takeFirst();
+    QCOMPARE(completion.at(0).value<TabCapabilityAuthority>(), binding);
+    QCOMPARE(completion.at(1).toULongLong(), binding.sessionGeneration);
+    QCOMPARE(completion.at(2).toString(), QStringLiteral("open-owner"));
+    const BrokerResult result = completion.at(3).value<BrokerResult>();
+    QVERIFY(result.ok);
+    QCOMPARE(result.value.value(QStringLiteral("name")).toString(),
+             QStringLiteral("selected.txt"));
+    QCOMPARE(QByteArray::fromBase64(
+                 result.value.value(QStringLiteral("contentBase64"))
+                     .toString().toLatin1()),
+             QByteArray("owner"));
+}
+
+void HostCapabilityRuntimeTest::switchingOwnerDoesNotRebindFileCompletion()
+{
+    QTemporaryDir directory;
+    QTemporaryDir ownerStorage;
+    QTemporaryDir siblingStorage;
+    QVERIFY(directory.isValid());
+    QVERIFY(ownerStorage.isValid());
+    QVERIFY(siblingStorage.isValid());
+    const QString selectedPath =
+        QDir(directory.path()).filePath(QStringLiteral("original.txt"));
+    writeFile(selectedPath, QByteArray("original"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeShow;
+    QSemaphore showEntered;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow =
+        [&](const qint64,
+            qbrowser_broker_testing::FileDialogTestShowCompletion completion) {
+            {
+                const std::scoped_lock lock(showMutex);
+                completeShow = std::move(completion);
+            }
+            showEntered.release();
+        };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    FileDialogCoordinator coordinator;
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority ownerAuthority = authority(
+        QStringLiteral("tab-owner"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority siblingAuthority = authority(
+        QStringLiteral("tab-sibling"), 2, 42, 402, 9, 12);
+    auto ownerToken = std::make_shared<AuthorityAdmissionToken>();
+    auto siblingToken = std::make_shared<AuthorityAdmissionToken>();
+    QString ownerError;
+    QString siblingError;
+    auto owner = HostCapabilityRuntime::create(
+        ownerAuthority, ownerToken, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")), ownerStorage.path(),
+        100, &ownerError, &coordinator);
+    auto sibling = HostCapabilityRuntime::create(
+        siblingAuthority, siblingToken, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")), siblingStorage.path(),
+        100, &siblingError, &coordinator);
+    QVERIFY2(owner != nullptr, qPrintable(ownerError));
+    QVERIFY2(sibling != nullptr, qPrintable(siblingError));
+    auto cleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(owner, {}));
+        HostCapabilityRuntime::retire(std::exchange(sibling, {}));
+        QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+        coordinator.shutdown();
+    });
+    QSignalSpy ownerCompleted(owner.get(),
+                              &HostCapabilityRuntime::authorityCompleted);
+    QSignalSpy siblingCompleted(sibling.get(),
+                                &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(ownerCompleted.isValid());
+    QVERIFY(siblingCompleted.isValid());
+    QVERIFY(router->activateBinding(ownerAuthority));
+
+    owner->dispatch(ownerAuthority.sessionGeneration,
+                    QStringLiteral("original-owner"), QStringLiteral("file"),
+                    QStringLiteral("open"), {});
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    QVERIFY(router->activateBinding(siblingAuthority));
+    {
+        const std::scoped_lock lock(showMutex);
+        QVERIFY(completeShow);
+        completeShow({FileDialogStatus::Opened, selectedPath});
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(ownerCompleted.count(), 1, 2'000);
+    QCOMPARE(siblingCompleted.count(), 0);
+    const QList<QVariant> completion = ownerCompleted.takeFirst();
+    QCOMPARE(completion.at(0).value<TabCapabilityAuthority>(), ownerAuthority);
+    QCOMPARE(completion.at(2).toString(), QStringLiteral("original-owner"));
+    const BrokerResult result = completion.at(3).value<BrokerResult>();
+    QVERIFY(!result.ok);
+    QCOMPARE(result.errorCode, QStringLiteral("capability.denied"));
+}
+
+void HostCapabilityRuntimeTest::
+    revokedFileCallbackIsDroppedAndRetireCancelsExactlyOnce()
+{
+    QTemporaryDir directory;
+    QTemporaryDir storage;
+    QTemporaryDir reopenedStorage;
+    QVERIFY(directory.isValid());
+    QVERIFY(storage.isValid());
+    QVERIFY(reopenedStorage.isValid());
+    const QString selectedPath =
+        QDir(directory.path()).filePath(QStringLiteral("late.txt"));
+    const QString reopenedPath =
+        QDir(directory.path()).filePath(QStringLiteral("reopened.txt"));
+    writeFile(selectedPath, QByteArray("late"));
+    writeFile(reopenedPath, QByteArray("new-owner"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeShow;
+    QSemaphore showEntered;
+    QSemaphore operationQuiesced;
+    std::atomic<int> cancelCalls{0};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow =
+        [&](const qint64,
+            qbrowser_broker_testing::FileDialogTestShowCompletion completion) {
+            {
+                const std::scoped_lock lock(showMutex);
+                completeShow = std::move(completion);
+            }
+            showEntered.release();
+        };
+    hooks.coordinatorCancel = [&] { ++cancelCalls; };
+    hooks.coordinatorOperationQuiesced = [&] { operationQuiesced.release(); };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    FileDialogCoordinator coordinator;
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority binding = authority(
+        QStringLiteral("tab-retired"), 1, 41, 401, 7, 11);
+    auto token = std::make_shared<AuthorityAdmissionToken>();
+    QString error;
+    auto runtime = HostCapabilityRuntime::create(
+        binding, token, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")), storage.path(), 100,
+        &error, &coordinator);
+    QVERIFY2(runtime != nullptr, qPrintable(error));
+    QVERIFY(router->activateBinding(binding));
+    QSignalSpy completed(runtime.get(),
+                         &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(completed.isValid());
+
+    runtime->dispatch(binding.sessionGeneration, QStringLiteral("retire-open"),
+                      QStringLiteral("file"), QStringLiteral("open"), {});
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    qbrowser_broker_testing::FileDialogTestShowCompletion lateOld;
+    {
+        const std::scoped_lock lock(showMutex);
+        lateOld = completeShow;
+    }
+    HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+    QVERIFY(operationQuiesced.tryAcquire(1, 1'000));
+    QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    QCoreApplication::processEvents();
+    QCOMPARE(cancelCalls.load(), 1);
+    QCOMPARE(completed.count(), 0);
+
+    const TabCapabilityAuthority reopenedBinding = authority(
+        QStringLiteral("tab-retired"), 2, 51, 501, 8, 12);
+    auto reopenedToken = std::make_shared<AuthorityAdmissionToken>();
+    QString reopenedError;
+    auto reopened = HostCapabilityRuntime::create(
+        reopenedBinding, reopenedToken, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")),
+        reopenedStorage.path(), 100, &reopenedError, &coordinator);
+    QVERIFY2(reopened != nullptr, qPrintable(reopenedError));
+    auto reopenedCleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(reopened, {}));
+        QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+    });
+    QVERIFY(router->activateBinding(reopenedBinding));
+    QSignalSpy reopenedCompleted(reopened.get(),
+                                 &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(reopenedCompleted.isValid());
+    reopened->dispatch(reopenedBinding.sessionGeneration,
+                       QStringLiteral("reopened-open"), QStringLiteral("file"),
+                       QStringLiteral("open"), {});
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeReopened;
+    {
+        const std::scoped_lock lock(showMutex);
+        QVERIFY(lateOld);
+        QVERIFY(completeShow);
+        completeReopened = completeShow;
+    }
+    lateOld({FileDialogStatus::Opened, selectedPath});
+    completeReopened({FileDialogStatus::Opened, reopenedPath});
+    QTRY_COMPARE_WITH_TIMEOUT(reopenedCompleted.count(), 1, 2'000);
+    QCoreApplication::processEvents();
+    QCOMPARE(cancelCalls.load(), 1);
+    QCOMPARE(completed.count(), 0);
+    const QList<QVariant> reopenedCompletion = reopenedCompleted.takeFirst();
+    QCOMPARE(reopenedCompletion.at(0).value<TabCapabilityAuthority>(),
+             reopenedBinding);
+    QCOMPARE(reopenedCompletion.at(2).toString(),
+             QStringLiteral("reopened-open"));
+    const BrokerResult reopenedResult =
+        reopenedCompletion.at(3).value<BrokerResult>();
+    QVERIFY(reopenedResult.ok);
+    QCOMPARE(QByteArray::fromBase64(
+                 reopenedResult.value.value(QStringLiteral("contentBase64"))
+                     .toString().toLatin1()),
+             QByteArray("new-owner"));
+    coordinator.shutdown();
+}
+
+void HostCapabilityRuntimeTest::
+    delayedFileCallbackIsDroppedAfterAdmissionRevocation()
+{
+    QTemporaryDir directory;
+    QTemporaryDir storage;
+    QVERIFY(directory.isValid());
+    QVERIFY(storage.isValid());
+    const QString selectedPath =
+        QDir(directory.path()).filePath(QStringLiteral("revoked.txt"));
+    writeFile(selectedPath, QByteArray("revoked"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeShow;
+    QSemaphore showEntered;
+    QSemaphore operationQuiesced;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&] (
+                                const qint64,
+                                qbrowser_broker_testing::
+                                    FileDialogTestShowCompletion completion) {
+        {
+            const std::scoped_lock lock(showMutex);
+            completeShow = std::move(completion);
+        }
+        showEntered.release();
+    };
+    hooks.coordinatorOperationQuiesced = [&] { operationQuiesced.release(); };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    FileDialogCoordinator coordinator;
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority binding = authority(
+        QStringLiteral("tab-revoked"), 1, 61, 601, 13, 17);
+    auto token = std::make_shared<AuthorityAdmissionToken>();
+    QString error;
+    auto runtime = HostCapabilityRuntime::create(
+        binding, token, router.get(), filePermission(),
+        QUrl(QStringLiteral("http://127.0.0.1:8080/")), storage.path(), 100,
+        &error, &coordinator);
+    QVERIFY2(runtime != nullptr, qPrintable(error));
+    auto cleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+        QVERIFY(WorkerRetirementManager::instance().flush(10'000));
+        coordinator.shutdown();
+    });
+    QVERIFY(router->activateBinding(binding));
+    QSignalSpy completed(runtime.get(),
+                         &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(completed.isValid());
+
+    runtime->dispatch(binding.sessionGeneration,
+                      QStringLiteral("revoked-open"), QStringLiteral("file"),
+                      QStringLiteral("open"), {});
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    {
+        const std::scoped_lock lock(showMutex);
+        QVERIFY(completeShow);
+        completeShow({FileDialogStatus::Opened, selectedPath});
+    }
+    QVERIFY(operationQuiesced.tryAcquire(1, 1'000));
+    (void)token->beginRevoke();
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+    QCOMPARE(completed.count(), 0);
 }
 
 void HostCapabilityRuntimeTest::onlyActiveAuthorityCanIssueAndConsumeGesture()
@@ -914,7 +1282,7 @@ void HostCapabilityRuntimeTest::retiringRuntimeLeavesSiblingGestureStorageAndCom
     auto first = HostCapabilityRuntime::create(
         firstAuthority, firstToken, router.get(),
         clipboardAndStoragePermissions(), origin, firstStorage.path(), 100,
-        &firstError);
+        &firstError, nullptr);
     QVERIFY2(first != nullptr, qPrintable(firstError));
     auto firstCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(first, {}));
@@ -923,7 +1291,7 @@ void HostCapabilityRuntimeTest::retiringRuntimeLeavesSiblingGestureStorageAndCom
     auto sibling = HostCapabilityRuntime::create(
         siblingAuthority, siblingToken, router.get(),
         clipboardAndStoragePermissions(), origin, siblingStorage.path(), 100,
-        &siblingError);
+        &siblingError, nullptr);
     QVERIFY2(sibling != nullptr, qPrintable(siblingError));
     auto siblingCleanup = qScopeGuard([&] {
         HostCapabilityRuntime::retire(std::exchange(sibling, {}));

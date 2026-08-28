@@ -17,10 +17,14 @@ class CapabilityWorkerLane;
 struct CapabilityDeliveryState;
 class ClipboardBroker;
 class FileBroker;
+class FileDialogCoordinator;
+class FileDialogOperationToken;
+struct FileDialogSelection;
 class QtClipboardBackend;
 class QtFileDialogBackend;
 class HostGestureRouter;
 class QThread;
+struct PendingHostFileRequest;
 
 #ifdef Q_BROWSER_HOST_TESTING
 struct HostWorkerGestureEvidence final
@@ -62,7 +66,8 @@ public:
         quintptr hostWindowId,
         quintptr workerWindowId,
         quint32 workerProcessId,
-        QString *errorCode = nullptr);
+        QString *errorCode = nullptr,
+        FileDialogCoordinator *fileDialogCoordinator = nullptr);
 #endif
     [[nodiscard]] static std::shared_ptr<HostCapabilityRuntime> create(
         const TabCapabilityAuthority &authority,
@@ -72,7 +77,8 @@ public:
         const QUrl &mockOrigin,
         const QString &storageDirectory,
         quintptr hostWindowId,
-        QString *errorCode = nullptr);
+        QString *errorCode,
+        FileDialogCoordinator *fileDialogCoordinator);
     static void retire(std::shared_ptr<HostCapabilityRuntime> runtime) noexcept;
 
     [[nodiscard]] const TabCapabilityAuthority &authority() const noexcept;
@@ -103,7 +109,8 @@ private:
                           bool authorityEnforced,
 #endif
                           EffectivePolicy policy,
-                          quintptr hostWindowId);
+                          quintptr hostWindowId,
+                          FileDialogCoordinator *fileDialogCoordinator);
     [[nodiscard]] bool initialize(const QString &storageDirectory,
                                   QString *errorCode);
     [[nodiscard]] bool queueCompletion(
@@ -111,6 +118,25 @@ private:
         quint64 generation,
         const QString &requestId,
         const BrokerResult &result);
+    [[nodiscard]] bool publishCompletion(
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
+        const TabCapabilityAuthority &authority,
+        quint64 generation,
+        const QString &requestId,
+        const BrokerResult &result);
+    void dispatchFile(
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
+        quint64 generation,
+        const QString &requestId,
+        const QString &operation,
+        const QJsonObject &payload);
+    void completeFile(
+        const std::shared_ptr<PendingHostFileRequest> &pending,
+        const FileDialogOperationToken &token,
+        FileDialogSelection selection);
+    [[nodiscard]] bool isActiveFileOwner(
+        const std::shared_ptr<PendingHostFileRequest> &pending) const noexcept;
+    [[nodiscard]] bool generationMatches(quint64 generation) const noexcept;
 
     const TabCapabilityAuthority authority_;
     const std::shared_ptr<AuthorityAdmissionToken> admissionToken_;
@@ -120,6 +146,7 @@ private:
 #endif
     EffectivePolicy policy_;
     quintptr hostWindowId_ = 0;
+    FileDialogCoordinator *fileDialogCoordinator_ = nullptr;
     QThread *workerThread_ = nullptr;
     QPointer<CapabilityWorkerLane> workerLane_;
     std::unique_ptr<QtClipboardBackend> clipboardBackend_;
@@ -128,6 +155,7 @@ private:
     std::unique_ptr<ClipboardBroker> clipboard_;
     std::unique_ptr<FileBroker> file_;
     std::unique_ptr<CapabilityBroker> guiBroker_;
+    std::shared_ptr<PendingHostFileRequest> pendingFile_;
     bool gestureBindingRegistered_ = false;
     bool accepting_ = true;
 };

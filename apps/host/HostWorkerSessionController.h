@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ProtocolMessage.h"
+#include "TabCapabilityAuthority.h"
 
 #include <QHash>
 #include <QObject>
@@ -34,7 +35,9 @@ public:
     explicit HostWorkerSessionController(MainWindow *window, QObject *parent = nullptr);
     ~HostWorkerSessionController() override;
 
-    [[nodiscard]] bool attach(std::unique_ptr<IpcSession> session);
+    [[nodiscard]] bool attach(
+        std::unique_ptr<IpcSession> session,
+        HostCapabilityRuntime *capabilityRuntime = nullptr);
     [[nodiscard]] bool canAttachImmediately() const noexcept;
     [[nodiscard]] bool requestRouteLoad(const QString &route);
     [[nodiscard]] bool sendVisibilityChanged(bool active);
@@ -46,8 +49,10 @@ public:
     [[nodiscard]] qsizetype pendingCapabilityCount() const noexcept;
     [[nodiscard]] bool hasIoThread() const noexcept;
     [[nodiscard]] bool ioThreadRunning() const noexcept;
-    void setCapabilityRuntime(HostCapabilityRuntime *runtime) noexcept;
-    void completeCapability(quint64 generation,
+    void unbindCapabilityRuntime(
+        const TabCapabilityAuthority &authority) noexcept;
+    void completeCapability(const TabCapabilityAuthority &authority,
+                            quint64 generation,
                             const QString &requestId,
                             const BrokerResult &result);
 
@@ -85,12 +90,19 @@ private:
         bool trackedRouteLoad = false;
         bool resumePollingAfter = false;
         QString capabilityRequestId;
+        std::optional<TabCapabilityAuthority> capabilityAuthority;
+    };
+
+    struct CapabilityBinding final {
+        QPointer<HostCapabilityRuntime> runtime;
+        TabCapabilityAuthority authority;
     };
 
     void handleRouteLoadResponse(quint64 generation,
                                  const QString &requestId,
                                  const QJsonObject &payload);
-    void handleCapabilityRequest(quint64 generation,
+    void handleCapabilityRequest(const TabCapabilityAuthority &authority,
+                                 quint64 generation,
                                  const QString &requestId,
                                  const QString &capability,
                                  const QString &operation,
@@ -105,7 +117,14 @@ private:
     void pumpOutbound();
     void resumeIoPolling();
     void failClosed(const QString &errorCode);
-    bool startSession(std::unique_ptr<IpcSession> session);
+    bool startSession(std::unique_ptr<IpcSession> session,
+                      std::optional<CapabilityBinding> capabilityBinding);
+    void queueCapabilityResponse(
+        std::optional<TabCapabilityAuthority> authority,
+        quint64 generation,
+        const QString &requestId,
+        const BrokerResult &result);
+    void invalidateCapabilityBinding() noexcept;
     void requestIoStop();
     void handleIoThreadFinished(QPointer<HostWorkerSessionIo> oldIo,
                                 QThread *oldThread,
@@ -117,8 +136,10 @@ private:
     NavigationCallback navigate_;
     QPointer<HostWorkerSessionIo> io_;
     QPointer<HostCapabilityRuntime> capabilityRuntime_;
+    std::optional<TabCapabilityAuthority> capabilityAuthority_;
     QThread *ioThread_ = nullptr;
     std::unique_ptr<IpcSession> pendingSession_;
+    std::optional<CapabilityBinding> pendingCapabilityBinding_;
     QQueue<OutboundCommand> outbound_;
     std::optional<OutboundCommand> activeCommand_;
     QString activeCapabilityRequestId_;

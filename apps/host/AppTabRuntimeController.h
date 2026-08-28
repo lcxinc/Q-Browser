@@ -16,6 +16,7 @@
 #include <atomic>
 
 class HostCapabilityRuntime;
+class FileDialogCoordinator;
 class HostGestureRouter;
 class HostWorkerSessionController;
 class MainWindow;
@@ -37,6 +38,7 @@ public:
                             TabController *tabController,
                             MainWindow *mainWindow,
                             HostGestureRouter *gestureRouter,
+                            FileDialogCoordinator *fileDialogCoordinator,
                             std::shared_ptr<RuntimePackageAuthority> authority,
                             SandboxApprovedRoots roots,
                             QString workerExecutable,
@@ -123,6 +125,7 @@ private:
     QPointer<TabController> tabController_;
     QPointer<MainWindow> mainWindow_;
     QPointer<HostGestureRouter> gestureRouter_;
+    FileDialogCoordinator *fileDialogCoordinator_ = nullptr;
     std::shared_ptr<RuntimePackageAuthority> authority_;
     QUrl mockOrigin_;
     QString storageDirectory_;

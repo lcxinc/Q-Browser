@@ -1,10 +1,12 @@
 #pragma once
 
 #include "IpcSession.h"
+#include "TabCapabilityAuthority.h"
 
 #include <QObject>
 #include <QVariantMap>
 #include <memory>
+#include <optional>
 
 class QTimer;
 class QThread;
@@ -16,7 +18,9 @@ class HostWorkerSessionIo final : public QObject
 public:
     HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
                         quint64 generation,
-                        QThread *ownerThread);
+                        QThread *ownerThread,
+                        std::optional<TabCapabilityAuthority>
+                            capabilityAuthority = std::nullopt);
 
     void start();
     void sendMessage(quint64 generation,
@@ -46,7 +50,8 @@ signals:
     void sessionFailed(quint64 generation, const QString &errorCode);
     void shutdownFinished(quint64 generation);
     void heartbeatObserved(quint64 generation);
-    void capabilityRequested(quint64 generation,
+    void capabilityRequested(const TabCapabilityAuthority &authority,
+                             quint64 generation,
                              const QString &requestId,
                              const QString &capability,
                              const QString &operation,
@@ -64,6 +69,7 @@ private:
     QTimer *pollTimer_ = nullptr;
     quint64 generation_ = 0;
     QThread *ownerThread_ = nullptr;
+    const std::optional<TabCapabilityAuthority> capabilityAuthority_;
     bool awaitingGui_ = false;
     bool stopping_ = false;
     bool terminal_ = false;

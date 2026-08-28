@@ -9,11 +9,14 @@
 
 HostWorkerSessionIo::HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
                                          const quint64 generation,
-                                         QThread *const ownerThread)
+                                         QThread *const ownerThread,
+                                         std::optional<TabCapabilityAuthority>
+                                             capabilityAuthority)
     : session_(std::move(session))
     , pollTimer_(new QTimer(this))
     , generation_(generation)
     , ownerThread_(ownerThread)
+    , capabilityAuthority_(std::move(capabilityAuthority))
 {
     pollTimer_->setInterval(2);
     connect(pollTimer_, &QTimer::timeout, this,
@@ -140,6 +143,7 @@ void HostWorkerSessionIo::pollSession()
         case ProtocolType::Request: {
             const QJsonObject requestPayload = message.payload();
             emit capabilityRequested(
+                capabilityAuthority_.value_or(TabCapabilityAuthority{}),
                 generation_, message.requestId(),
                 requestPayload.value(QStringLiteral("capability")).toString(),
                 requestPayload.value(QStringLiteral("operation")).toString(),

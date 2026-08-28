@@ -44,6 +44,8 @@ public:
     void unregisterBinding(const TabCapabilityAuthority &authority) noexcept;
     [[nodiscard]] bool activateBinding(
         const TabCapabilityAuthority &authority);
+    [[nodiscard]] bool isActiveBinding(
+        const TabCapabilityAuthority &authority) const noexcept;
     void hostDeactivated() noexcept;
 
     [[nodiscard]] std::optional<UserGestureGrant> issueGrant(
