@@ -18,9 +18,36 @@
 #include <fcntl.h>
 #include <io.h>
 #include <vector>
+#elif defined(Q_OS_UNIX)
+#include <sys/stat.h>
 #endif
 
 namespace {
+constexpr qsizetype maximumIdentityTokenBytes = 256;
+
+BrokerResult fileFailure(const QString &code, const QString &message)
+{
+    return BrokerResult::failure(code, message);
+}
+
+bool isSafeFileLeafName(const QString &name)
+{
+    if (name.isEmpty() || name.size() > 255
+        || name == QStringLiteral(".") || name == QStringLiteral("..")
+        || QDir::isAbsolutePath(name) || name.endsWith(u'.')
+        || name.endsWith(u' ') || name.contains(u'/')
+        || name.contains(u'\\') || name.contains(u':')) {
+        return false;
+    }
+    for (const QChar character : name) {
+        if (character.isNull()
+            || character.category() == QChar::Other_Control) {
+            return false;
+        }
+    }
+    return QFileInfo(name).fileName() == name;
+}
+
 #ifdef Q_OS_WIN
 template<typename Interface>
 class ComPointer final
@@ -88,19 +115,25 @@ private:
 
 struct WindowsFileIdentity final
 {
-    DWORD volume = 0;
-    DWORD indexHigh = 0;
-    DWORD indexLow = 0;
+    quint64 volume = 0;
+    QByteArray fileId;
 
     [[nodiscard]] bool operator==(const WindowsFileIdentity &) const noexcept = default;
 };
+
+QByteArray identityToken(const WindowsFileIdentity &identity)
+{
+    return QByteArray("win-id128:")
+        + QByteArray::number(static_cast<qulonglong>(identity.volume), 16)
+        + ':' + identity.fileId.toHex();
+}
 
 bool queryPlainFileHandle(HANDLE handle,
                           WindowsFileIdentity &identity,
                           qint64 &size)
 {
     FILE_ATTRIBUTE_TAG_INFO tag{};
-    BY_HANDLE_FILE_INFORMATION information{};
+    FILE_ID_INFO identityInformation{};
     LARGE_INTEGER fileSize{};
     const bool valid = GetFileType(handle) == FILE_TYPE_DISK
         && GetFileInformationByHandleEx(handle,
@@ -111,15 +144,21 @@ bool queryPlainFileHandle(HANDLE handle,
         && (tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT
                                   | FILE_ATTRIBUTE_DIRECTORY))
             == 0U
-        && GetFileInformationByHandle(handle, &information) != FALSE
+        && GetFileInformationByHandleEx(handle,
+                                        FileIdInfo,
+                                        &identityInformation,
+                                        static_cast<DWORD>(sizeof(identityInformation)))
+            != FALSE
         && GetFileSizeEx(handle, &fileSize) != FALSE
         && fileSize.QuadPart >= 0;
     if (!valid) {
         return false;
     }
-    identity = {information.dwVolumeSerialNumber,
-                information.nFileIndexHigh,
-                information.nFileIndexLow};
+    identity = {
+        static_cast<quint64>(identityInformation.VolumeSerialNumber),
+        QByteArray(
+            reinterpret_cast<const char *>(identityInformation.FileId.Identifier),
+            static_cast<qsizetype>(sizeof(FILE_ID_128)))};
     size = fileSize.QuadPart;
     return true;
 }
@@ -232,6 +271,7 @@ public:
         }
         path_ = path;
         size_ = size;
+        identity_ = identity;
         file_ = std::move(file);
         status_ = FileDialogStatus::Opened;
         return S_OK;
@@ -259,7 +299,10 @@ public:
             _close(descriptor);
             return FileDialogResult::error(FileDialogStatus::Failed);
         }
-        return FileDialogResult::opened(QFileInfo(path_).fileName(), size_, std::move(file));
+        return FileDialogResult::opened(QFileInfo(path_).fileName(),
+                                        size_,
+                                        std::move(file),
+                                        identityToken(identity_));
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID interfaceId, void **object) override
@@ -324,21 +367,99 @@ private:
     FileDialogStatus status_ = FileDialogStatus::Failed;
     QString path_;
     qint64 size_ = 0;
+    WindowsFileIdentity identity_;
     UniqueHandle file_;
 };
 #endif
+
+QByteArray stableStreamIdentityToken(QIODevice &stream)
+{
+    auto *const file = dynamic_cast<QFile *>(&stream);
+    if (file == nullptr || file->handle() < 0) {
+        return {};
+    }
+#ifdef Q_OS_WIN
+    const intptr_t native = _get_osfhandle(static_cast<int>(file->handle()));
+    if (native == -1) {
+        return {};
+    }
+    WindowsFileIdentity identity;
+    qint64 size = 0;
+    if (!queryPlainFileHandle(reinterpret_cast<HANDLE>(native), identity, size)) {
+        return {};
+    }
+    return identityToken(identity);
+#elif defined(Q_OS_UNIX)
+    struct stat information {};
+    if (::fstat(static_cast<int>(file->handle()), &information) != 0
+        || !S_ISREG(information.st_mode)) {
+        return {};
+    }
+    return QByteArray("unix:")
+        + QByteArray::number(static_cast<qulonglong>(information.st_dev), 16)
+        + ':'
+        + QByteArray::number(static_cast<qulonglong>(information.st_ino), 16);
+#else
+    return {};
+#endif
+}
+}
+
+PreparedFileRequest::PreparedFileRequest(QString operation,
+                                         QJsonObject payload,
+                                         QString appIdentity,
+                                         QString requestId,
+                                         const qint64 maximumBytes)
+    : operation_(std::move(operation)),
+      payload_(std::move(payload)),
+      appIdentity_(std::move(appIdentity)),
+      requestId_(std::move(requestId)),
+      maximumBytes_(maximumBytes)
+{
+}
+
+const QString &PreparedFileRequest::operation() const noexcept
+{
+    return operation_;
+}
+
+const QJsonObject &PreparedFileRequest::payload() const noexcept
+{
+    return payload_;
+}
+
+const QString &PreparedFileRequest::appIdentity() const noexcept
+{
+    return appIdentity_;
+}
+
+const QString &PreparedFileRequest::requestId() const noexcept
+{
+    return requestId_;
+}
+
+qint64 PreparedFileRequest::maximumBytes() const noexcept
+{
+    return maximumBytes_;
 }
 
 FileDialogResult FileDialogResult::opened(QString name,
                                           const qint64 size,
-                                          std::unique_ptr<QIODevice> stream)
+                                          std::unique_ptr<QIODevice> stream,
+                                          QByteArray identityBeforeRead,
+                                          QByteArray identityAfterRead)
 {
-    return {FileDialogStatus::Opened, std::move(name), size, std::move(stream)};
+    return {FileDialogStatus::Opened,
+            std::move(name),
+            size,
+            std::move(stream),
+            std::move(identityBeforeRead),
+            std::move(identityAfterRead)};
 }
 
 FileDialogResult FileDialogResult::error(const FileDialogStatus status)
 {
-    return {status, {}, 0, {}};
+    return {status, {}, 0, {}, {}, {}};
 }
 
 FileDialogResult QtFileDialogBackend::openFile(const qint64 maximumBytes)
@@ -420,7 +541,14 @@ FileDialogResult QtFileDialogBackend::openFile(const qint64 maximumBytes)
     if (!file->open(QIODevice::ReadOnly)) {
         return FileDialogResult::error(FileDialogStatus::Failed);
     }
-    return FileDialogResult::opened(information.fileName(), information.size(), std::move(file));
+    const QByteArray identity = stableStreamIdentityToken(*file);
+    if (identity.isEmpty()) {
+        return FileDialogResult::error(FileDialogStatus::Failed);
+    }
+    return FileDialogResult::opened(information.fileName(),
+                                    information.size(),
+                                    std::move(file),
+                                    identity);
 #endif
 }
 
@@ -429,60 +557,223 @@ FileBroker::FileBroker(EffectiveFilePolicy policy, FileDialogBackend &backend)
 {
 }
 
+PreparedFileRequestResult FileBroker::prepareFileRequest(
+    const QString &operation,
+    const QJsonObject &payload,
+    const HostRequestContext &context) const
+{
+    PreparedFileRequestResult result;
+    if (!CapabilityBroker::validRequestContext(context)) {
+        result.rejection = fileFailure(
+            QStringLiteral("capability.denied"),
+            QStringLiteral("Capability is not permitted."));
+        return result;
+    }
+    if (operation != QStringLiteral("open")) {
+        result.rejection = fileFailure(
+            QStringLiteral("file.invalid_request"),
+            QStringLiteral("File request is invalid."));
+        return result;
+    }
+    if (!policy_.open || policy_.maximumBytes <= 0) {
+        result.rejection = fileFailure(
+            QStringLiteral("capability.denied"),
+            QStringLiteral("Capability is not permitted."));
+        return result;
+    }
+    if (!CapabilityBroker::requestFitsIpc(
+            context.requestId, QStringLiteral("file"), operation, payload)) {
+        result.rejection = fileFailure(
+            QStringLiteral("capability.payload_too_large"),
+            QStringLiteral("Capability request is too large."));
+        return result;
+    }
+    if (!payload.isEmpty()) {
+        result.rejection = fileFailure(
+            QStringLiteral("file.invalid_request"),
+            QStringLiteral("File request is invalid."));
+        return result;
+    }
+
+    PreparedFileRequest prepared(
+        operation,
+        payload,
+        context.appIdentity,
+        context.requestId,
+        std::min(policy_.maximumBytes, maximumIpcBinaryResultBytes()));
+    result.request = std::move(prepared);
+    return result;
+}
+
+BrokerResult FileBroker::completeFileRequest(
+    const PreparedFileRequest &request,
+    const FileDialogSelection &selection) const
+{
+    const auto finalize = [&request](BrokerResult result) {
+        return CapabilityBroker::boundResponseToIpc(
+            request.requestId_, std::move(result));
+    };
+    const HostRequestContext context{request.appIdentity_, request.requestId_};
+    if (!CapabilityBroker::validRequestContext(context)
+        || request.operation_ != QStringLiteral("open")
+        || !request.payload_.isEmpty()
+        || request.maximumBytes_ <= 0
+        || request.maximumBytes_ > maximumIpcBinaryResultBytes()
+        || !CapabilityBroker::requestFitsIpc(
+            request.requestId_, QStringLiteral("file"), request.operation_,
+            request.payload_)) {
+        return finalize(fileFailure(
+            QStringLiteral("capability.denied"),
+            QStringLiteral("Capability is not permitted.")));
+    }
+    if (selection.approvedMaximumBytes != request.maximumBytes_) {
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+
+    switch (selection.status) {
+    case FileDialogStatus::Cancelled:
+        return finalize(fileFailure(
+            QStringLiteral("file.cancelled"),
+            QStringLiteral("No file was selected.")));
+    case FileDialogStatus::TooLarge:
+        return finalize(fileFailure(
+            QStringLiteral("file.too_large"),
+            QStringLiteral("Selected file is too large.")));
+    case FileDialogStatus::Busy:
+        return finalize(fileFailure(
+            QStringLiteral("file.busy"),
+            QStringLiteral("File dialog is busy.")));
+    case FileDialogStatus::Failed:
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    case FileDialogStatus::Opened:
+        break;
+    default:
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+
+    if (selection.declaredSize < 0) {
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+    if (selection.declaredSize > request.maximumBytes_) {
+        return finalize(fileFailure(
+            QStringLiteral("file.too_large"),
+            QStringLiteral("Selected file is too large.")));
+    }
+    if (!isSafeFileLeafName(selection.name)
+        || selection.identityBeforeRead.isEmpty()
+        || selection.identityAfterRead.isEmpty()
+        || selection.identityBeforeRead.size() > maximumIdentityTokenBytes
+        || selection.identityAfterRead.size() > maximumIdentityTokenBytes
+        || selection.identityBeforeRead != selection.identityAfterRead) {
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+
+    const qint64 maximumBase64Bytes =
+        ((request.maximumBytes_ + 2) / 3) * 4;
+    if (selection.contentBase64.size() > maximumBase64Bytes) {
+        return finalize(fileFailure(
+            QStringLiteral("file.too_large"),
+            QStringLiteral("Selected file is too large.")));
+    }
+    const auto decoded = QByteArray::fromBase64Encoding(
+        selection.contentBase64, QByteArray::AbortOnBase64DecodingErrors);
+    if (!decoded
+        || decoded.decoded.toBase64(QByteArray::Base64Encoding)
+            != selection.contentBase64) {
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+    if (decoded.decoded.size() > request.maximumBytes_) {
+        return finalize(fileFailure(
+            QStringLiteral("file.too_large"),
+            QStringLiteral("Selected file is too large.")));
+    }
+    if (decoded.decoded.size() != selection.declaredSize) {
+        return finalize(fileFailure(
+            QStringLiteral("file.failed"),
+            QStringLiteral("Selected file is unavailable.")));
+    }
+
+    return finalize(BrokerResult::success(
+        QJsonObject{{QStringLiteral("name"), selection.name},
+                    {QStringLiteral("size"), selection.declaredSize},
+                    {QStringLiteral("contentBase64"),
+                     QString::fromLatin1(selection.contentBase64)}}));
+}
+
 BrokerResult FileBroker::invoke(const QString &operation,
                                 const QJsonObject &payload,
                                 const HostRequestContext &context)
 {
-    Q_UNUSED(context)
-    if (operation != QStringLiteral("open") || !payload.isEmpty()) {
-        return BrokerResult::failure(QStringLiteral("file.invalid_request"),
-                                     QStringLiteral("File request is invalid."));
+    PreparedFileRequestResult preparation = prepareFileRequest(
+        operation, payload, context);
+    if (!preparation.request.has_value()) {
+        return preparation.rejection;
     }
-    if (!policy_.open) {
-        return BrokerResult::failure(QStringLiteral("capability.denied"),
-                                     QStringLiteral("Capability is not permitted."));
-    }
+    const PreparedFileRequest &prepared = *preparation.request;
+    FileDialogSelection completed;
+    completed.approvedMaximumBytes = prepared.maximumBytes();
     if (!dialogMutex_.tryLock()) {
-        return BrokerResult::failure(QStringLiteral("file.failed"),
-                                     QStringLiteral("File dialog is unavailable."));
+        completed.status = FileDialogStatus::Busy;
+        return completeFileRequest(prepared, completed);
     }
     const auto unlock = qScopeGuard([this] { dialogMutex_.unlock(); });
-    const qint64 maximumBytes =
-        std::min(policy_.maximumBytes, maximumIpcBinaryResultBytes());
-    FileDialogResult selection = backend_.openFile(maximumBytes);
-    if (selection.status == FileDialogStatus::Cancelled) {
-        return BrokerResult::failure(QStringLiteral("file.cancelled"),
-                                     QStringLiteral("No file was selected."));
+    FileDialogResult selection = backend_.openFile(prepared.maximumBytes());
+    completed.status = selection.status;
+    if (selection.status != FileDialogStatus::Opened) {
+        return completeFileRequest(prepared, completed);
     }
-    if (selection.status == FileDialogStatus::TooLarge) {
-        return BrokerResult::failure(QStringLiteral("file.too_large"),
-                                     QStringLiteral("Selected file is too large."));
+    if (selection.stream == nullptr || !selection.stream->isOpen()
+        || !selection.stream->isReadable()) {
+        completed.status = FileDialogStatus::Failed;
+        return completeFileRequest(prepared, completed);
     }
-    if (selection.status != FileDialogStatus::Opened || selection.stream == nullptr
-        || !selection.stream->isOpen() || !selection.stream->isReadable()
-        || selection.size < 0 || selection.size > maximumBytes
-        || selection.name.isEmpty() || selection.name.size() > 255) {
-        return BrokerResult::failure(QStringLiteral("file.failed"),
-                                     QStringLiteral("Selected file is unavailable."));
+    if (selection.size > prepared.maximumBytes()) {
+        completed.status = FileDialogStatus::TooLarge;
+        return completeFileRequest(prepared, completed);
     }
-    for (const QChar character : selection.name) {
-        if (character.isNull() || character.category() == QChar::Other_Control) {
-            return BrokerResult::failure(QStringLiteral("file.failed"),
-                                         QStringLiteral("Selected file is unavailable."));
+
+    const QByteArray identityBeforeRead =
+        stableStreamIdentityToken(*selection.stream);
+    completed.name = std::move(selection.name);
+    completed.declaredSize = selection.size;
+    completed.identityBeforeRead = selection.identityBeforeRead.isEmpty()
+        ? identityBeforeRead
+        : selection.identityBeforeRead;
+    const qint64 readCapacity = prepared.maximumBytes() + 1;
+    QByteArray content;
+    content.resize(static_cast<qsizetype>(readCapacity));
+    qint64 totalBytesRead = 0;
+    while (totalBytesRead < readCapacity) {
+        const qint64 bytesRead = selection.stream->read(
+            content.data() + totalBytesRead,
+            readCapacity - totalBytesRead);
+        if (bytesRead < 0) {
+            completed.status = FileDialogStatus::Failed;
+            return completeFileRequest(prepared, completed);
         }
+        if (bytesRead == 0) {
+            break;
+        }
+        totalBytesRead += bytesRead;
     }
-    const QByteArray content = selection.stream->read(maximumBytes + 1);
-    if (content.size() > maximumBytes || content.size() != selection.size) {
-        return BrokerResult::failure(content.size() > maximumBytes
-                                         ? QStringLiteral("file.too_large")
-                                         : QStringLiteral("file.failed"),
-                                     content.size() > maximumBytes
-                                         ? QStringLiteral("Selected file is too large.")
-                                         : QStringLiteral("Selected file is unavailable."));
-    }
-    return BrokerResult::success(
-        QJsonObject{{QStringLiteral("name"), selection.name},
-                    {QStringLiteral("size"), content.size()},
-                    {QStringLiteral("contentBase64"),
-                     QString::fromLatin1(content.toBase64(QByteArray::Base64Encoding))}});
+    content.resize(static_cast<qsizetype>(totalBytesRead));
+    completed.contentBase64 = content.toBase64(QByteArray::Base64Encoding);
+    const QByteArray identityAfterRead =
+        stableStreamIdentityToken(*selection.stream);
+    completed.identityAfterRead = identityAfterRead.isEmpty()
+        ? selection.identityAfterRead
+        : identityAfterRead;
+    return completeFileRequest(prepared, completed);
 }

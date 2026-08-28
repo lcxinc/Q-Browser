@@ -6,6 +6,7 @@
 #include <QString>
 
 class UserGestureGrant;
+class FileBroker;
 
 struct HostRequestContext {
     QString appIdentity;
@@ -58,6 +59,18 @@ public:
                                         const HostRequestContext &context);
 
 private:
+    friend class FileBroker;
+    [[nodiscard]] static bool validRequestContext(
+        const HostRequestContext &context);
+    [[nodiscard]] static bool requestFitsIpc(
+        const QString &requestId,
+        const QString &capability,
+        const QString &operation,
+        const QJsonObject &payload);
+    [[nodiscard]] static BrokerResult boundResponseToIpc(
+        const QString &requestId,
+        BrokerResult result);
+
     EffectivePolicy policy_;
     CapabilityServices services_;
 };

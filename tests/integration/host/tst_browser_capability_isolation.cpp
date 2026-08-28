@@ -39,7 +39,8 @@ public:
         stream->setData(content);
         stream->open(QIODevice::ReadOnly);
         return FileDialogResult::opened(
-            QStringLiteral("report.txt"), content.size(), std::move(stream));
+            QStringLiteral("report.txt"), content.size(), std::move(stream),
+            QByteArray("blocking-file:1"), QByteArray("blocking-file:1"));
     }
 
     std::atomic<int> calls{0};
@@ -58,7 +59,7 @@ class BrowserCapabilityIsolationTest final : public QObject
 
 private slots:
     void processWideDialogBusyRejectsSiblingBeforeBackendCall();
-    void filePrepareAndCompleteValidationIsDeferred();
+    void filePrepareAndCompleteValidationUsesProductionBoundary();
     void ownerBoundTerminalCompletionIsDeferred_data();
     void ownerBoundTerminalCompletionIsDeferred();
     void pendingDialogSiblingProgressIsDeferred();
@@ -100,10 +101,35 @@ void BrowserCapabilityIsolationTest::
     QCOMPARE(siblingBackend.calls.load(), 0);
 }
 
-void BrowserCapabilityIsolationTest::filePrepareAndCompleteValidationIsDeferred()
+void BrowserCapabilityIsolationTest::
+    filePrepareAndCompleteValidationUsesProductionBoundary()
 {
-    QFAIL("TODO(Task16 Task2): production FileBroker has no prepare/complete seam; "
-          "replace this RED placeholder with malformed prepare and completion cases");
+    BlockingFileDialog backend;
+    FileBroker broker(EffectiveFilePolicy{true, 4}, backend);
+    PreparedFileRequestResult preparation = broker.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("app.owner"), QStringLiteral("file-two-phase")});
+    QVERIFY(preparation.request.has_value());
+    QCOMPARE(preparation.request->maximumBytes(), 4);
+    QCOMPARE(backend.calls.load(), 0);
+
+    FileDialogSelection selection;
+    selection.status = FileDialogStatus::Opened;
+    selection.name = QStringLiteral("report.txt");
+    selection.declaredSize = 4;
+    selection.contentBase64 = QByteArray("safe").toBase64();
+    selection.approvedMaximumBytes = 4;
+    selection.identityBeforeRead = QByteArray("stable-file:1");
+    selection.identityAfterRead = selection.identityBeforeRead;
+    QVERIFY(broker.completeFileRequest(*preparation.request, selection).ok);
+
+    selection.name = QStringLiteral("../report.txt");
+    QCOMPARE(broker.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.failed"));
+    selection.name = QStringLiteral("report.txt");
+    selection.identityAfterRead = QByteArray("stable-file:2");
+    QCOMPARE(broker.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.failed"));
 }
 
 void BrowserCapabilityIsolationTest::
@@ -120,13 +146,13 @@ void BrowserCapabilityIsolationTest::
 {
     QFETCH(QString, terminalStatus);
     Q_UNUSED(terminalStatus)
-    QFAIL("TODO(Task16 Task2): production has no asynchronous operation-token "
+    QFAIL("TODO(Task16 Tasks 3-4): production has no asynchronous operation-token "
           "adapter; cover switch, reopen, close/cancel, and late result discard");
 }
 
 void BrowserCapabilityIsolationTest::pendingDialogSiblingProgressIsDeferred()
 {
-    QFAIL("TODO(Task16 Task2): production file.open is synchronous; once the "
+    QFAIL("TODO(Task16 Task 3): production file.open is synchronous; once the "
           "async coordinator exists, prove sibling heartbeat/network/storage/"
           "clipboard progress while its dialog is pending");
 }
@@ -134,7 +160,7 @@ void BrowserCapabilityIsolationTest::pendingDialogSiblingProgressIsDeferred()
 void BrowserCapabilityIsolationTest::
     fullRequestAndSessionIdentityRoutingIsDeferred()
 {
-    QFAIL("TODO(Task16 Task2): final delivery currently lacks a testable full "
+    QFAIL("TODO(Task16 Tasks 4-5): final delivery currently lacks a testable full "
           "authority/request/session gate; bind this to the production IO seam");
 }
 

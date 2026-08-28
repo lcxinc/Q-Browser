@@ -29,6 +29,13 @@ static_assert(std::is_nothrow_move_constructible_v<UserGestureSession>);
 static_assert(!std::is_default_constructible_v<UserGestureGrant>);
 static_assert(!std::is_copy_constructible_v<UserGestureGrant>);
 static_assert(std::is_nothrow_move_constructible_v<UserGestureGrant>);
+static_assert(!std::is_default_constructible_v<PreparedFileRequest>);
+static_assert(!std::is_copy_constructible_v<PreparedFileRequest>);
+static_assert(std::is_nothrow_move_constructible_v<PreparedFileRequest>);
+static_assert(!std::is_copy_constructible_v<PreparedFileRequestResult>);
+static_assert(std::is_nothrow_move_constructible_v<PreparedFileRequestResult>);
+static_assert(std::is_copy_constructible_v<FileDialogSelection>);
+static_assert(std::is_copy_assignable_v<FileDialogSelection>);
 
 class RecordingService final : public CapabilityService
 {
@@ -79,6 +86,21 @@ public:
     ClipboardStatus writeStatus = ClipboardStatus::Success;
 };
 
+class FailingReadDevice final : public QIODevice
+{
+public:
+    FailingReadDevice()
+    {
+        open(QIODevice::ReadOnly);
+    }
+
+    [[nodiscard]] bool isSequential() const override { return true; }
+
+protected:
+    qint64 readData(char *, qint64) override { return -1; }
+    qint64 writeData(const char *, qint64) override { return -1; }
+};
+
 class RecordingFileDialog final : public FileDialogBackend
 {
 public:
@@ -93,12 +115,20 @@ public:
         if (status != FileDialogStatus::Opened) {
             return FileDialogResult::error(status);
         }
-        auto stream = std::make_unique<QBuffer>();
-        stream->setData(content);
-        stream->open(QIODevice::ReadOnly);
+        std::unique_ptr<QIODevice> stream;
+        if (failRead) {
+            stream = std::make_unique<FailingReadDevice>();
+        } else {
+            auto buffer = std::make_unique<QBuffer>();
+            buffer->setData(content);
+            buffer->open(QIODevice::ReadOnly);
+            stream = std::move(buffer);
+        }
         return FileDialogResult::opened(name,
                                         content.size(),
-                                        std::move(stream));
+                                        std::move(stream),
+                                        identityBeforeRead,
+                                        identityAfterRead);
     }
 
     int calls = 0;
@@ -106,6 +136,9 @@ public:
     FileDialogStatus status = FileDialogStatus::Cancelled;
     QString name = QStringLiteral("report.txt");
     QByteArray content;
+    QByteArray identityBeforeRead = QByteArray("recording-file:1");
+    QByteArray identityAfterRead = identityBeforeRead;
+    bool failRead = false;
     bool block = false;
     QSemaphore entered;
     QSemaphore proceed;
@@ -126,11 +159,15 @@ private slots:
     void revokingOneGestureSessionLeavesSiblingActive();
     void clipboardEnforcesNativeByteLimitAndStableStatuses();
     void enforcesExactIpcRequestAndResponseBudget();
+    void filePreparationIsMoveOnlyBoundedAndPure();
+    void filePreparationRejectsInvalidRequestsWithoutUi();
+    void fileCompletionValidatesValueBoundary();
+    void fileCompletionMapsStableTerminalStatuses();
+    void fileLegacyReadDistinguishesEmptyFromFailure();
     void fileCancellationAndSizeAreStable();
     void fileInvalidRequestsNeverOpenDialog();
-    void fileBackendRejectsUnsafeLeafNames();
+    void fileCompletionRejectsUnsafeLeafNames();
     void fileBackendStatusAndConcurrencyAreFailClosed();
-    void fileDialogBusyIsSharedAcrossBrokerInstances();
     void nativeFileDialogUsesStableShellStream();
     void nativeFileDialogReturnsBoundStreamAndChecksSizeBeforeRead();
     void nativeFileDialogRejectsReparseSelection();
@@ -435,6 +472,196 @@ void CapabilityBrokerTest::enforcesExactIpcRequestAndResponseBudget()
     QCOMPARE(result.errorCode, QStringLiteral("capability.response_too_large"));
 }
 
+void CapabilityBrokerTest::filePreparationIsMoveOnlyBoundedAndPure()
+{
+    RecordingFileDialog backend;
+    FileBroker service(
+        EffectiveFilePolicy{true, maximumIpcBinaryResultBytes() + 4096},
+        backend);
+    const HostRequestContext context{QStringLiteral("host.identity"),
+                                     QStringLiteral("file-prepare")};
+
+    PreparedFileRequestResult preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {}, context);
+
+    QVERIFY(preparation.request.has_value());
+    QVERIFY(preparation.rejection.errorCode.isEmpty());
+    QCOMPARE(preparation.request->operation(), QStringLiteral("open"));
+    QCOMPARE(preparation.request->payload(), QJsonObject{});
+    QCOMPARE(preparation.request->appIdentity(), context.appIdentity);
+    QCOMPARE(preparation.request->requestId(), context.requestId);
+    QCOMPARE(preparation.request->maximumBytes(),
+             maximumIpcBinaryResultBytes());
+    QCOMPARE(backend.calls, 0);
+}
+
+void CapabilityBrokerTest::filePreparationRejectsInvalidRequestsWithoutUi()
+{
+    RecordingFileDialog backend;
+    FileBroker service(EffectiveFilePolicy{true, 16}, backend);
+
+    PreparedFileRequestResult preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QString{}, QStringLiteral("file-invalid-identity")});
+    QVERIFY(!preparation.request.has_value());
+    QCOMPARE(preparation.rejection.errorCode,
+             QStringLiteral("capability.denied"));
+
+    preparation = service.prepareFileRequest(
+        QStringLiteral("save"), {},
+        {QStringLiteral("host.identity"), QStringLiteral("file-save")});
+    QVERIFY(!preparation.request.has_value());
+    QCOMPARE(preparation.rejection.errorCode,
+             QStringLiteral("file.invalid_request"));
+
+    preparation = service.prepareFileRequest(
+        QStringLiteral("open"),
+        {{QStringLiteral("path"), QStringLiteral("C:/untrusted.txt")}},
+        {QStringLiteral("host.identity"), QStringLiteral("file-path")});
+    QVERIFY(!preparation.request.has_value());
+    QCOMPARE(preparation.rejection.errorCode,
+             QStringLiteral("file.invalid_request"));
+
+    preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("host.identity"),
+         QString(static_cast<qsizetype>(FrameCodec::maximumPayloadBytes()),
+                 u'r')});
+    QVERIFY(!preparation.request.has_value());
+    QCOMPARE(preparation.rejection.errorCode,
+             QStringLiteral("capability.payload_too_large"));
+
+    FileBroker denied(EffectiveFilePolicy{false, 16}, backend);
+    preparation = denied.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("host.identity"), QStringLiteral("file-denied")});
+    QVERIFY(!preparation.request.has_value());
+    QCOMPARE(preparation.rejection.errorCode,
+             QStringLiteral("capability.denied"));
+    QCOMPARE(backend.calls, 0);
+}
+
+void CapabilityBrokerTest::fileCompletionValidatesValueBoundary()
+{
+    RecordingFileDialog backend;
+    FileBroker service(EffectiveFilePolicy{true, 4}, backend);
+    PreparedFileRequestResult preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("host.identity"), QStringLiteral("file-complete")});
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogSelection selection;
+    selection.status = FileDialogStatus::Opened;
+    selection.name = QStringLiteral("report.txt");
+    selection.declaredSize = 4;
+    selection.contentBase64 = QByteArray("safe").toBase64();
+    selection.approvedMaximumBytes = 4;
+    selection.identityBeforeRead = QByteArray("stable-file:1");
+    selection.identityAfterRead = selection.identityBeforeRead;
+
+    BrokerResult result = service.completeFileRequest(*preparation.request,
+                                                       selection);
+    QVERIFY(result.ok);
+    QCOMPARE(result.value.value(QStringLiteral("name")).toString(),
+             selection.name);
+    QCOMPARE(result.value.value(QStringLiteral("size")).toInteger(),
+             selection.declaredSize);
+    QCOMPARE(result.value.value(QStringLiteral("contentBase64")).toString(),
+             QString::fromLatin1(selection.contentBase64));
+
+    FileDialogSelection malformed = selection;
+    malformed.identityAfterRead = QByteArray("stable-file:2");
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+
+    malformed = selection;
+    malformed.contentBase64 = QByteArray("***");
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+
+    malformed = selection;
+    malformed.contentBase64.chop(1);
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+
+    malformed = selection;
+    malformed.declaredSize = 3;
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+
+    malformed = selection;
+    malformed.approvedMaximumBytes = 5;
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+
+    malformed = selection;
+    malformed.declaredSize = 5;
+    malformed.contentBase64 = QByteArray("large").toBase64();
+    result = service.completeFileRequest(*preparation.request, malformed);
+    QCOMPARE(result.errorCode, QStringLiteral("file.too_large"));
+    QCOMPARE(backend.calls, 0);
+}
+
+void CapabilityBrokerTest::fileCompletionMapsStableTerminalStatuses()
+{
+    RecordingFileDialog backend;
+    FileBroker service(EffectiveFilePolicy{true, 16}, backend);
+    PreparedFileRequestResult preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("host.identity"), QStringLiteral("file-terminal")});
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogSelection selection;
+    selection.approvedMaximumBytes = 16;
+
+    selection.status = FileDialogStatus::Cancelled;
+    QCOMPARE(service.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.cancelled"));
+
+    selection.status = FileDialogStatus::TooLarge;
+    QCOMPARE(service.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.too_large"));
+
+    selection.status = FileDialogStatus::Busy;
+    QCOMPARE(service.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.busy"));
+
+    selection.status = FileDialogStatus::Failed;
+    QCOMPARE(service.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.failed"));
+
+    selection.status = static_cast<FileDialogStatus>(-1);
+    selection.name = QStringLiteral("empty.txt");
+    selection.declaredSize = 0;
+    selection.contentBase64.clear();
+    selection.identityBeforeRead = QByteArray("stable-file:1");
+    selection.identityAfterRead = selection.identityBeforeRead;
+    QCOMPARE(service.completeFileRequest(*preparation.request, selection).errorCode,
+             QStringLiteral("file.failed"));
+    QCOMPARE(backend.calls, 0);
+}
+
+void CapabilityBrokerTest::fileLegacyReadDistinguishesEmptyFromFailure()
+{
+    RecordingFileDialog backend;
+    backend.status = FileDialogStatus::Opened;
+    backend.name = QStringLiteral("empty.txt");
+    FileBroker service(EffectiveFilePolicy{true, 16}, backend);
+    const HostRequestContext context{QStringLiteral("host.identity"),
+                                     QStringLiteral("file-read")};
+
+    const BrokerResult empty = service.invoke(QStringLiteral("open"), {}, context);
+    QVERIFY(empty.ok);
+    QCOMPARE(empty.value.value(QStringLiteral("size")).toInteger(), 0);
+    QCOMPARE(empty.value.value(QStringLiteral("contentBase64")).toString(),
+             QString());
+
+    backend.failRead = true;
+    const BrokerResult failed = service.invoke(QStringLiteral("open"), {}, context);
+    QVERIFY(!failed.ok);
+    QCOMPARE(failed.errorCode, QStringLiteral("file.failed"));
+}
+
 void CapabilityBrokerTest::fileCancellationAndSizeAreStable()
 {
     RecordingFileDialog backend;
@@ -488,31 +715,45 @@ void CapabilityBrokerTest::fileInvalidRequestsNeverOpenDialog()
     QCOMPARE(backend.calls, 0);
 }
 
-void CapabilityBrokerTest::fileBackendRejectsUnsafeLeafNames()
+void CapabilityBrokerTest::fileCompletionRejectsUnsafeLeafNames()
 {
     RecordingFileDialog backend;
-    backend.status = FileDialogStatus::Opened;
-    backend.content = QByteArray("stable");
     FileBroker service(EffectiveFilePolicy{true, 16}, backend);
     const HostRequestContext context{QStringLiteral("host.identity"),
                                      QStringLiteral("file-name")};
+    PreparedFileRequestResult preparation = service.prepareFileRequest(
+        QStringLiteral("open"), {}, context);
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogSelection selection;
+    selection.status = FileDialogStatus::Opened;
+    selection.declaredSize = 6;
+    selection.contentBase64 = QByteArray("stable").toBase64();
+    selection.approvedMaximumBytes = 16;
+    selection.identityBeforeRead = QByteArray("stable-file:1");
+    selection.identityAfterRead = selection.identityBeforeRead;
     const QStringList unsafeNames{
         QStringLiteral("../secret.txt"),
         QStringLiteral("folder/report.txt"),
         QStringLiteral("folder\\report.txt"),
+        QStringLiteral("C:secret.txt"),
+        QStringLiteral("report.txt."),
+        QStringLiteral("report.txt "),
         QStringLiteral("."),
         QStringLiteral(".."),
+        QStringLiteral("control") + QChar(1) + QStringLiteral(".txt"),
     };
 
     for (const QString &name : unsafeNames) {
-        backend.name = name;
-        const BrokerResult result = service.invoke(
-            QStringLiteral("open"), {}, context);
+        selection.name = name;
+        const BrokerResult result = service.completeFileRequest(
+            *preparation.request, selection);
         QVERIFY2(!result.ok,
                  qPrintable(QStringLiteral("unsafe file leaf accepted: %1")
                                 .arg(name)));
         QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
     }
+    QCOMPARE(backend.calls, 0);
 }
 
 void CapabilityBrokerTest::fileBackendStatusAndConcurrencyAreFailClosed()
@@ -546,41 +787,6 @@ void CapabilityBrokerTest::fileBackendStatusAndConcurrencyAreFailClosed()
     QVERIFY(owner.ok);
 }
 
-void CapabilityBrokerTest::fileDialogBusyIsSharedAcrossBrokerInstances()
-{
-    RecordingFileDialog firstBackend;
-    firstBackend.status = FileDialogStatus::Opened;
-    firstBackend.content = QByteArray("first");
-    firstBackend.block = true;
-    RecordingFileDialog siblingBackend;
-    siblingBackend.status = FileDialogStatus::Opened;
-    siblingBackend.content = QByteArray("sibling");
-    FileBroker firstBroker(EffectiveFilePolicy{true, 16}, firstBackend);
-    FileBroker siblingBroker(EffectiveFilePolicy{true, 16}, siblingBackend);
-    const HostRequestContext firstContext{QStringLiteral("app.first"),
-                                          QStringLiteral("file-first")};
-    const HostRequestContext siblingContext{QStringLiteral("app.sibling"),
-                                            QStringLiteral("file-sibling")};
-
-    auto first = std::async(std::launch::async, [&] {
-        return firstBroker.invoke(QStringLiteral("open"), {}, firstContext);
-    });
-    auto unblock = qScopeGuard([&] { firstBackend.proceed.release(); });
-    QVERIFY(firstBackend.entered.tryAcquire(1, 1000));
-    const BrokerResult sibling = siblingBroker.invoke(
-        QStringLiteral("open"), {}, siblingContext);
-    firstBackend.proceed.release();
-    unblock.dismiss();
-    QCOMPARE(first.wait_for(std::chrono::seconds(1)),
-             std::future_status::ready);
-    const BrokerResult owner = first.get();
-
-    QVERIFY(owner.ok);
-    QVERIFY(!sibling.ok);
-    QCOMPARE(sibling.errorCode, QStringLiteral("file.busy"));
-    QCOMPARE(siblingBackend.calls, 0);
-}
-
 void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()
 {
     QFile source(QStringLiteral(Q_BROWSER_FILE_BROKER_SOURCE_FILE));
@@ -596,6 +802,10 @@ void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()
         "if (dialog == nullptr || FAILED(dialog->GetResult(item.put()))) {\n"
         "            return S_FALSE;"));
     QVERIFY(implementation.contains("CreateFileW"));
+    QVERIFY(implementation.contains("FILE_ID_INFO"));
+    QVERIFY(implementation.contains("FileIdInfo"));
+    QVERIFY(implementation.contains("FILE_ID_128"));
+    QVERIFY(!implementation.contains("BY_HANDLE_FILE_INFORMATION"));
     QVERIFY(!implementation.contains("BindToHandler"));
     const qsizetype windowsBranch = implementation.indexOf("IFileOpenDialog");
     const qsizetype fallback = implementation.indexOf("QFileDialog::getOpenFileName");
@@ -627,11 +837,22 @@ void CapabilityBrokerTest::nativeFileDialogReturnsBoundStreamAndChecksSizeBefore
     FileDialogResult result = backend.openFile(4);
     QCOMPARE(result.status, FileDialogStatus::Opened);
     QVERIFY(result.stream != nullptr);
+    QVERIFY(result.identityBeforeRead.startsWith("win-id128:"));
     QCOMPARE(result.stream->readAll(), QByteArray("safe"));
 
     result = backend.openFile(3);
     QCOMPARE(result.status, FileDialogStatus::TooLarge);
     QVERIFY(result.stream == nullptr);
+
+    FileBroker service(EffectiveFilePolicy{true, 4}, backend);
+    const BrokerResult invoked = service.invoke(
+        QStringLiteral("open"), {},
+        {QStringLiteral("host.identity"), QStringLiteral("native-file")});
+    QVERIFY(invoked.ok);
+    QCOMPARE(QByteArray::fromBase64(
+                 invoked.value.value(QStringLiteral("contentBase64"))
+                     .toString().toLatin1()),
+             QByteArray("safe"));
 #endif
 }
 

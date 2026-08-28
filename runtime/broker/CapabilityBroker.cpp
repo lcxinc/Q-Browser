@@ -26,15 +26,6 @@ bool validHostIdentity(const QString &identity)
     return true;
 }
 
-bool requestFitsIpc(const QString &requestId,
-                    const QString &capability,
-                    const QString &operation,
-                    const QJsonObject &payload)
-{
-    const auto message = ProtocolMessage::request(requestId, capability, operation, payload);
-    return message.has_value() && !FrameCodec::encode(message->toJson()).isEmpty();
-}
-
 bool responseFitsIpc(const QString &requestId, const BrokerResult &result)
 {
     const auto message = result.ok
@@ -78,12 +69,39 @@ CapabilityBroker::CapabilityBroker(EffectivePolicy policy, CapabilityServices se
 {
 }
 
+bool CapabilityBroker::validRequestContext(const HostRequestContext &context)
+{
+    return validHostIdentity(context.appIdentity) && !context.requestId.isEmpty();
+}
+
+bool CapabilityBroker::requestFitsIpc(const QString &requestId,
+                                      const QString &capability,
+                                      const QString &operation,
+                                      const QJsonObject &payload)
+{
+    const auto message = ProtocolMessage::request(
+        requestId, capability, operation, payload);
+    return message.has_value()
+        && !FrameCodec::encode(message->toJson()).isEmpty();
+}
+
+BrokerResult CapabilityBroker::boundResponseToIpc(const QString &requestId,
+                                                   BrokerResult result)
+{
+    if (responseFitsIpc(requestId, result)) {
+        return result;
+    }
+    return BrokerResult::failure(
+        QStringLiteral("capability.response_too_large"),
+        QStringLiteral("Capability response is too large."));
+}
+
 BrokerResult CapabilityBroker::dispatch(const QString &capability,
                                         const QString &operation,
                                         const QJsonObject &payload,
                                         const HostRequestContext &context)
 {
-    if (!validHostIdentity(context.appIdentity) || context.requestId.isEmpty()) {
+    if (!validRequestContext(context)) {
         return denied();
     }
 
@@ -104,10 +122,6 @@ BrokerResult CapabilityBroker::dispatch(const QString &capability,
         return BrokerResult::failure(QStringLiteral("capability.payload_too_large"),
                                      QStringLiteral("Capability request is too large."));
     }
-    BrokerResult result = service->invoke(operation, payload, context);
-    if (!responseFitsIpc(context.requestId, result)) {
-        result = BrokerResult::failure(QStringLiteral("capability.response_too_large"),
-                                       QStringLiteral("Capability response is too large."));
-    }
-    return result;
+    return boundResponseToIpc(
+        context.requestId, service->invoke(operation, payload, context));
 }
