@@ -14,6 +14,7 @@
 #include <QTemporaryDir>
 #include <QSemaphore>
 
+#include <chrono>
 #include <future>
 #include <type_traits>
 #include <vector>
@@ -95,7 +96,7 @@ public:
         auto stream = std::make_unique<QBuffer>();
         stream->setData(content);
         stream->open(QIODevice::ReadOnly);
-        return FileDialogResult::opened(QStringLiteral("report.txt"),
+        return FileDialogResult::opened(name,
                                         content.size(),
                                         std::move(stream));
     }
@@ -103,6 +104,7 @@ public:
     int calls = 0;
     qint64 lastMaximumBytes = 0;
     FileDialogStatus status = FileDialogStatus::Cancelled;
+    QString name = QStringLiteral("report.txt");
     QByteArray content;
     bool block = false;
     QSemaphore entered;
@@ -125,7 +127,10 @@ private slots:
     void clipboardEnforcesNativeByteLimitAndStableStatuses();
     void enforcesExactIpcRequestAndResponseBudget();
     void fileCancellationAndSizeAreStable();
+    void fileInvalidRequestsNeverOpenDialog();
+    void fileBackendRejectsUnsafeLeafNames();
     void fileBackendStatusAndConcurrencyAreFailClosed();
+    void fileDialogBusyIsSharedAcrossBrokerInstances();
     void nativeFileDialogUsesStableShellStream();
     void nativeFileDialogReturnsBoundStreamAndChecksSizeBeforeRead();
     void nativeFileDialogRejectsReparseSelection();
@@ -458,6 +463,58 @@ void CapabilityBrokerTest::fileCancellationAndSizeAreStable()
              QByteArray("1234"));
 }
 
+void CapabilityBrokerTest::fileInvalidRequestsNeverOpenDialog()
+{
+    RecordingFileDialog backend;
+    backend.status = FileDialogStatus::Opened;
+    backend.content = QByteArray("stable");
+    const HostRequestContext context{QStringLiteral("host.identity"),
+                                     QStringLiteral("file-invalid")};
+    FileBroker service(EffectiveFilePolicy{true, 16}, backend);
+
+    QCOMPARE(service.invoke(QStringLiteral("save"), {}, context).errorCode,
+             QStringLiteral("file.invalid_request"));
+    QCOMPARE(service.invoke(QStringLiteral("open"),
+                            {{QStringLiteral("path"),
+                              QStringLiteral("C:/untrusted.txt")}},
+                            context)
+                 .errorCode,
+             QStringLiteral("file.invalid_request"));
+    QCOMPARE(backend.calls, 0);
+
+    FileBroker denied(EffectiveFilePolicy{false, 16}, backend);
+    QCOMPARE(denied.invoke(QStringLiteral("open"), {}, context).errorCode,
+             QStringLiteral("capability.denied"));
+    QCOMPARE(backend.calls, 0);
+}
+
+void CapabilityBrokerTest::fileBackendRejectsUnsafeLeafNames()
+{
+    RecordingFileDialog backend;
+    backend.status = FileDialogStatus::Opened;
+    backend.content = QByteArray("stable");
+    FileBroker service(EffectiveFilePolicy{true, 16}, backend);
+    const HostRequestContext context{QStringLiteral("host.identity"),
+                                     QStringLiteral("file-name")};
+    const QStringList unsafeNames{
+        QStringLiteral("../secret.txt"),
+        QStringLiteral("folder/report.txt"),
+        QStringLiteral("folder\\report.txt"),
+        QStringLiteral("."),
+        QStringLiteral(".."),
+    };
+
+    for (const QString &name : unsafeNames) {
+        backend.name = name;
+        const BrokerResult result = service.invoke(
+            QStringLiteral("open"), {}, context);
+        QVERIFY2(!result.ok,
+                 qPrintable(QStringLiteral("unsafe file leaf accepted: %1")
+                                .arg(name)));
+        QCOMPARE(result.errorCode, QStringLiteral("file.failed"));
+    }
+}
+
 void CapabilityBrokerTest::fileBackendStatusAndConcurrencyAreFailClosed()
 {
     RecordingFileDialog backend;
@@ -475,12 +532,53 @@ void CapabilityBrokerTest::fileBackendStatusAndConcurrencyAreFailClosed()
     auto first = std::async(std::launch::async, [&] {
         return service.invoke(QStringLiteral("open"), {}, context);
     });
+    auto unblock = qScopeGuard([&] { backend.proceed.release(); });
     QVERIFY(backend.entered.tryAcquire(1, 1000));
     const BrokerResult concurrent = service.invoke(QStringLiteral("open"), {}, context);
-    QCOMPARE(concurrent.errorCode, QStringLiteral("file.failed"));
-    QCOMPARE(backend.calls, 2); // failed status call plus one active dialog
     backend.proceed.release();
-    QVERIFY(first.get().ok);
+    unblock.dismiss();
+    QCOMPARE(first.wait_for(std::chrono::seconds(1)),
+             std::future_status::ready);
+    const BrokerResult owner = first.get();
+
+    QCOMPARE(concurrent.errorCode, QStringLiteral("file.busy"));
+    QCOMPARE(backend.calls, 2); // failed status call plus one active dialog
+    QVERIFY(owner.ok);
+}
+
+void CapabilityBrokerTest::fileDialogBusyIsSharedAcrossBrokerInstances()
+{
+    RecordingFileDialog firstBackend;
+    firstBackend.status = FileDialogStatus::Opened;
+    firstBackend.content = QByteArray("first");
+    firstBackend.block = true;
+    RecordingFileDialog siblingBackend;
+    siblingBackend.status = FileDialogStatus::Opened;
+    siblingBackend.content = QByteArray("sibling");
+    FileBroker firstBroker(EffectiveFilePolicy{true, 16}, firstBackend);
+    FileBroker siblingBroker(EffectiveFilePolicy{true, 16}, siblingBackend);
+    const HostRequestContext firstContext{QStringLiteral("app.first"),
+                                          QStringLiteral("file-first")};
+    const HostRequestContext siblingContext{QStringLiteral("app.sibling"),
+                                            QStringLiteral("file-sibling")};
+
+    auto first = std::async(std::launch::async, [&] {
+        return firstBroker.invoke(QStringLiteral("open"), {}, firstContext);
+    });
+    auto unblock = qScopeGuard([&] { firstBackend.proceed.release(); });
+    QVERIFY(firstBackend.entered.tryAcquire(1, 1000));
+    const BrokerResult sibling = siblingBroker.invoke(
+        QStringLiteral("open"), {}, siblingContext);
+    firstBackend.proceed.release();
+    unblock.dismiss();
+    QCOMPARE(first.wait_for(std::chrono::seconds(1)),
+             std::future_status::ready);
+    const BrokerResult owner = first.get();
+
+    QVERIFY(owner.ok);
+    QVERIFY(!sibling.ok);
+    QCOMPARE(sibling.errorCode, QStringLiteral("file.busy"));
+    QCOMPARE(siblingBackend.calls, 0);
 }
 
 void CapabilityBrokerTest::nativeFileDialogUsesStableShellStream()

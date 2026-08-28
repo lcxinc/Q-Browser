@@ -50,3 +50,19 @@ q_browser_enable_strict_warnings(tst_browser_shell)
 q_browser_add_qt_test(
   NAME browser_shell
   TARGET tst_browser_shell)
+
+add_executable(tst_browser_capability_isolation
+  tst_browser_capability_isolation.cpp)
+
+target_link_libraries(tst_browser_capability_isolation
+  PRIVATE
+    q_browser_host
+    Qt6::Test)
+
+q_browser_enable_strict_warnings(tst_browser_capability_isolation)
+q_browser_add_qt_test(
+  NAME browser_capability_isolation
+  TARGET tst_browser_capability_isolation)
+set_tests_properties(browser_capability_isolation
+  PROPERTIES
+    TIMEOUT 15)

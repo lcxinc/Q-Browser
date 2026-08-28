@@ -20,6 +20,9 @@ target_link_libraries(tst_host_capability_runtime
     Qt6::Network
     Qt6::Test
     Qt6::Widgets)
+target_compile_definitions(tst_host_capability_runtime
+  PRIVATE
+    Q_BROWSER_BROKER_TESTING)
 q_browser_enable_strict_warnings(tst_host_capability_runtime)
 q_browser_add_qt_test(NAME host_capability_runtime TARGET tst_host_capability_runtime)
 

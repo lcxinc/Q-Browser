@@ -1,5 +1,6 @@
 #include "AuthorityAdmissionToken.h"
 #include "BrowserCommand.h"
+#include "FileDialogTestHooks.h"
 #include "HostApplication.h"
 #include "HostCapabilityRuntime.h"
 #include "HostGestureRouter.h"
@@ -51,6 +52,13 @@ ManifestPermissions clipboardAndStoragePermissions()
     return permissions;
 }
 
+ManifestPermissions filePermission()
+{
+    ManifestPermissions permissions;
+    permissions.fileOpen = FileOpenPermission::UserBrokered;
+    return permissions;
+}
+
 TabCapabilityAuthority authority(
     const QString &tabId,
     const quint64 runtimeIncarnation,
@@ -96,6 +104,8 @@ private slots:
     void rejectsNonCanonicalMockOrigins();
     void validatesTrustedWorkerGestureEvidence();
     void clipboardRuntimesCanCoexist();
+    void backgroundFileRequestIsDeniedBeforeValidation();
+    void backgroundFileRequestNeverCreatesDialog();
     void onlyActiveAuthorityCanIssueAndConsumeGesture();
     void authorityTransitionsRevokeUnconsumedEvidence();
     void mainWindowDeactivationRevokesGestureEvidence();
@@ -209,6 +219,127 @@ void HostCapabilityRuntimeTest::clipboardRuntimesCanCoexist()
 
     QVERIFY2(firstCreated, qPrintable(firstError));
     QVERIFY2(secondCreated, qPrintable(secondError));
+}
+
+void HostCapabilityRuntimeTest::backgroundFileRequestIsDeniedBeforeValidation()
+{
+    QTemporaryDir activeStorage;
+    QTemporaryDir backgroundStorage;
+    QVERIFY(activeStorage.isValid());
+    QVERIFY(backgroundStorage.isValid());
+    const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority activeAuthority = authority(
+        QStringLiteral("tab-active"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority backgroundAuthority = authority(
+        QStringLiteral("tab-background"), 2, 42, 402, 9, 12);
+    auto activeToken = std::make_shared<AuthorityAdmissionToken>();
+    auto backgroundToken = std::make_shared<AuthorityAdmissionToken>();
+    QString activeError;
+    QString backgroundError;
+    auto active = HostCapabilityRuntime::create(
+        activeAuthority, activeToken, router.get(), filePermission(), origin,
+        activeStorage.path(), 100, &activeError);
+    QVERIFY2(active != nullptr, qPrintable(activeError));
+    auto activeCleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(active, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    auto background = HostCapabilityRuntime::create(
+        backgroundAuthority, backgroundToken, router.get(), filePermission(),
+        origin, backgroundStorage.path(), 100, &backgroundError);
+    QVERIFY2(background != nullptr, qPrintable(backgroundError));
+    auto backgroundCleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(background, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy completed(background.get(),
+                         &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(completed.isValid());
+    QVERIFY(router->activateBinding(activeAuthority));
+
+    background->dispatch(
+        backgroundAuthority.sessionGeneration,
+        QStringLiteral("background-file"), QStringLiteral("file"),
+        QStringLiteral("open"),
+        {{QStringLiteral("path"), QStringLiteral("C:/untrusted.txt")}});
+    QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 2'000);
+    const QList<QVariant> completion = completed.takeFirst();
+    QCOMPARE(completion.at(0).value<TabCapabilityAuthority>(),
+             backgroundAuthority);
+    QCOMPARE(completion.at(1).toULongLong(),
+             backgroundAuthority.sessionGeneration);
+    QCOMPARE(completion.at(2).toString(),
+             QStringLiteral("background-file"));
+    const BrokerResult result = completion.at(3).value<BrokerResult>();
+    QVERIFY(!result.ok);
+    QCOMPARE(result.errorCode, QStringLiteral("capability.denied"));
+}
+
+void HostCapabilityRuntimeTest::backgroundFileRequestNeverCreatesDialog()
+{
+#ifndef Q_OS_WIN
+    QSKIP("TODO(Task16 Task2): inject the portable asynchronous file backend");
+#else
+    int dialogCalls = 0;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.selectedPath = [&dialogCalls] {
+        ++dialogCalls;
+        return QString{};
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QTemporaryDir activeStorage;
+    QTemporaryDir backgroundStorage;
+    QVERIFY(activeStorage.isValid());
+    QVERIFY(backgroundStorage.isValid());
+    const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
+    auto router = HostGestureRouter::createForTesting(100);
+    QVERIFY(router != nullptr);
+    const TabCapabilityAuthority activeAuthority = authority(
+        QStringLiteral("tab-active"), 1, 41, 401, 7, 11);
+    const TabCapabilityAuthority backgroundAuthority = authority(
+        QStringLiteral("tab-background"), 2, 42, 402, 9, 12);
+    auto activeToken = std::make_shared<AuthorityAdmissionToken>();
+    auto backgroundToken = std::make_shared<AuthorityAdmissionToken>();
+    QString activeError;
+    QString backgroundError;
+    auto active = HostCapabilityRuntime::create(
+        activeAuthority, activeToken, router.get(), filePermission(), origin,
+        activeStorage.path(), 100, &activeError);
+    QVERIFY2(active != nullptr, qPrintable(activeError));
+    auto activeCleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(active, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    auto background = HostCapabilityRuntime::create(
+        backgroundAuthority, backgroundToken, router.get(), filePermission(),
+        origin, backgroundStorage.path(), 100, &backgroundError);
+    QVERIFY2(background != nullptr, qPrintable(backgroundError));
+    auto backgroundCleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(background, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy completed(background.get(),
+                         &HostCapabilityRuntime::authorityCompleted);
+    QVERIFY(completed.isValid());
+    QVERIFY(router->activateBinding(activeAuthority));
+
+    background->dispatch(
+        backgroundAuthority.sessionGeneration,
+        QStringLiteral("background-file-valid"), QStringLiteral("file"),
+        QStringLiteral("open"), {});
+    QTRY_COMPARE_WITH_TIMEOUT(completed.count(), 1, 2'000);
+    const BrokerResult result =
+        completed.takeFirst().at(3).value<BrokerResult>();
+    QCOMPARE(dialogCalls, 0);
+    QVERIFY(!result.ok);
+    QCOMPARE(result.errorCode, QStringLiteral("capability.denied"));
+#endif
 }
 
 void HostCapabilityRuntimeTest::onlyActiveAuthorityCanIssueAndConsumeGesture()

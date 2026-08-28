@@ -16,3 +16,6 @@ q_browser_enable_strict_warnings(tst_capability_broker)
 q_browser_add_qt_test(
   NAME capability_broker
   TARGET tst_capability_broker)
+set_tests_properties(capability_broker
+  PROPERTIES
+    TIMEOUT 30)
