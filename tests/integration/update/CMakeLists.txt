@@ -24,6 +24,9 @@ q_browser_add_update_test(
   tst_crash_rollback tst_crash_rollback.cpp crash_rollback)
 q_browser_add_update_test(
   tst_offline_lkg tst_offline_lkg.cpp offline_lkg)
+q_browser_add_update_test(
+  tst_app_runtime_coordinator tst_app_runtime_coordinator.cpp
+  app_runtime_coordinator)
 
 if(WIN32)
   target_sources(tst_crash_rollback PRIVATE
