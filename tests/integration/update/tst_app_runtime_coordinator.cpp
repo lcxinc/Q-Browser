@@ -4,6 +4,7 @@
 #include <QFileInfo>
 #include <QTest>
 
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -72,6 +73,7 @@ private slots:
     void newTabsUseCandidateWhileExistingTabsRemainPinned();
     void pinnedOldTabRestartsItsPinnedVersion();
     void candidateTabsHaveIndependentAttempts();
+    void admissionRequiresTheCompleteLaunchRequest();
     void firstHealthyCandidateMarksLkgExactlyOnce();
     void lkgGenerationChangeDoesNotPoisonSiblingAdmission();
     void revokedLeaseCannotPassAdmission();
@@ -127,7 +129,8 @@ void AppRuntimeCoordinatorTest::pinnedOldTabRestartsItsPinnedVersion()
     const AppRuntimeResult restarted = h.coordinator->workerExited(
         firstKey, WorkerExitReason::Crashed, 10);
     const auto &restart = onlyAction(restarted, AppRuntimeActionKind::Launch);
-    QCOMPARE(restart.launch->mode, PackageRevalidationMode::PinnedLease);
+    QCOMPARE(restart.launch->revalidationMode,
+             PackageRevalidationMode::PinnedLease);
     QCOMPARE(restart.launch->lease.version, QStringLiteral("1.0.0"));
     QVERIFY(restart.launch->recovery);
 }
@@ -155,6 +158,28 @@ void AppRuntimeCoordinatorTest::candidateTabsHaveIndependentAttempts()
     QCOMPARE(h.coordinator->admitAuthenticatedWorker(
                   keyB, b.actions.front().launch->lease)
                   .code,
+             AppRuntimeResultCode::Applied);
+}
+
+void AppRuntimeCoordinatorTest::admissionRequiresTheCompleteLaunchRequest()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    QVERIFY(h.coordinator->installAndActivate(h.package("one", "1.0.0"), 0)
+                .code == AppRuntimeResultCode::Applied);
+    const auto launch = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("a")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 1);
+    const auto &action = onlyAction(launch, AppRuntimeActionKind::Launch);
+    WorkerLaunchRequest altered = *action.launch;
+    altered.route = QStringLiteral("/late");
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(altered, 1).code,
+             AppRuntimeResultCode::Rejected);
+    altered = *action.launch;
+    altered.admission = std::make_shared<AuthorityAdmissionToken>();
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(altered, 1).code,
+             AppRuntimeResultCode::Rejected);
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(*action.launch, 1).code,
              AppRuntimeResultCode::Applied);
 }
 
@@ -244,8 +269,13 @@ void AppRuntimeCoordinatorTest::candidateCrashLoopRollsBackOnce()
     const FullAttemptKey key = fullKey(first);
     QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 2)
                 .code == AppRuntimeResultCode::Applied);
+    const auto candidateLaunch = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("a")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 3);
+    const auto &candidateAction = onlyAction(candidateLaunch,
+                                             AppRuntimeActionKind::Launch);
     const auto restart = h.coordinator->workerExited(
-        key, WorkerExitReason::Crashed, 10);
+        fullKey(candidateAction), WorkerExitReason::Crashed, 10);
     const auto &second = onlyAction(restart, AppRuntimeActionKind::Launch);
     const FullAttemptKey secondKey = fullKey(second);
     const AppRuntimeResult rollback = h.coordinator->workerExited(
@@ -290,8 +320,10 @@ void AppRuntimeCoordinatorTest::rollbackRevokesEveryFailedCandidateLease()
             || action.kind == AppRuntimeActionKind::AwaitAuthorityDrain;
     }));
     QVERIFY(std::ranges::none_of(rollback.actions, [&](const auto &action) {
-        return action.tabId == old.actions.front().tabId
-            || action.tabId == sibling.actions.front().tabId;
+        return action.tabId == old.actions.front().tabId;
+    }));
+    QVERIFY(std::ranges::any_of(rollback.actions, [&](const auto &action) {
+        return action.tabId == sibling.actions.front().tabId;
     }));
 }
 
@@ -301,12 +333,14 @@ void AppRuntimeCoordinatorTest::multiTabRollbackReturnsEveryActionInStableRevoke
     QVERIFY(h.keys.hasValue());
     QVERIFY(h.coordinator->installAndActivate(h.package("one", "1.0.0"), 0)
                 .code == AppRuntimeResultCode::Applied);
+    QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 1)
+                .code == AppRuntimeResultCode::Applied);
     const auto a = h.coordinator->requestTabLaunch(
         tab(QStringLiteral("z")), QStringLiteral("/"),
-        TabLaunchIntent::ActivateCurrent, 1);
+        TabLaunchIntent::ActivateCurrent, 2);
     const auto b = h.coordinator->requestTabLaunch(
         tab(QStringLiteral("a")), QStringLiteral("/"),
-        TabLaunchIntent::ActivateCurrent, 2);
+        TabLaunchIntent::ActivateCurrent, 3);
     const auto &aLaunch = onlyAction(a, AppRuntimeActionKind::Launch);
     const auto &bLaunch = onlyAction(b, AppRuntimeActionKind::Launch);
     const auto r1 = h.coordinator->workerExited(
@@ -416,15 +450,15 @@ void AppRuntimeCoordinatorTest::userReloadUsesCurrentCandidateWhileCrashRestartU
     const auto &firstAction = onlyAction(first, AppRuntimeActionKind::Launch);
     QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 2)
                 .code == AppRuntimeResultCode::Applied);
-    const auto reload = h.coordinator->requestTabLaunch(
-        tab(QStringLiteral("a")), QStringLiteral("/"),
-        TabLaunchIntent::ReloadCurrent, 3);
-    const auto &reloadAction = onlyAction(reload, AppRuntimeActionKind::Launch);
-    QCOMPARE(reloadAction.launch->lease.version, QStringLiteral("1.1.0"));
     const auto restart = h.coordinator->workerExited(
-        fullKey(firstAction), WorkerExitReason::Crashed, 4);
+        fullKey(firstAction), WorkerExitReason::Crashed, 3);
     const auto &restartAction = onlyAction(restart, AppRuntimeActionKind::Launch);
     QCOMPARE(restartAction.launch->lease.version, QStringLiteral("1.0.0"));
+    const auto reload = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("a")), QStringLiteral("/"),
+        TabLaunchIntent::ReloadCurrent, 4);
+    const auto &reloadAction = onlyAction(reload, AppRuntimeActionKind::Launch);
+    QCOMPARE(reloadAction.launch->lease.version, QStringLiteral("1.1.0"));
 }
 
 void AppRuntimeCoordinatorTest::drainTimeoutIsFailedClosedAndNeverRecovers()
@@ -436,9 +470,16 @@ void AppRuntimeCoordinatorTest::drainTimeoutIsFailedClosedAndNeverRecovers()
     const auto launch = h.coordinator->requestTabLaunch(
         tab(QStringLiteral("a")), QStringLiteral("/"),
         TabLaunchIntent::ActivateCurrent, 1);
-    const auto &first = onlyAction(launch, AppRuntimeActionKind::Launch);
+    (void)onlyAction(launch, AppRuntimeActionKind::Launch);
+    QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 2)
+                .code == AppRuntimeResultCode::Applied);
+    const auto candidate = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("a")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 3);
+    const auto &candidateAction = onlyAction(candidate,
+                                             AppRuntimeActionKind::Launch);
     const auto restart = h.coordinator->workerExited(
-        fullKey(first), WorkerExitReason::Crashed, 10);
+        fullKey(candidateAction), WorkerExitReason::Crashed, 10);
     const auto &second = onlyAction(restart, AppRuntimeActionKind::Launch);
     const auto pending = h.coordinator->workerExited(
         fullKey(second), WorkerExitReason::Crashed, 11);

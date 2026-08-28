@@ -92,6 +92,7 @@ public:
 private:
     friend class PackageInstaller;
     friend class UpdateLifecycleCoordinator;
+    friend class AppRuntimeCoordinator;
 
     [[nodiscard]] PackageStoreResult commitVerifiedCandidate(
         const QString &appId,
