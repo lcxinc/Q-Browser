@@ -19,6 +19,9 @@ private slots:
     void factoriesRejectInvalidArguments();
     void versionOneUnknownAdditionsStillFailClosed();
     void frozenLegacyVersionOneDecoderRejectsActualPageMetadataFrame();
+    void parsesVisibilityChangedWithExactActivePayload();
+    void rejectsVisibilityChangedPayloadViolations_data();
+    void rejectsVisibilityChangedPayloadViolations();
 };
 
 void ProtocolMessageTest::parsesValidMessages_data()
@@ -441,6 +444,44 @@ void ProtocolMessageTest::frozenLegacyVersionOneDecoderRejectsActualPageMetadata
     QCOMPARE(framed.frames.constFirst(), metadata->toJson());
     QCOMPARE(legacyDecode(framed.frames.constFirst()),
              LegacyDecodeResult::UnknownType);
+}
+
+void ProtocolMessageTest::parsesVisibilityChangedWithExactActivePayload()
+{
+    const auto message = ProtocolMessage::visibilityChanged(true);
+    QVERIFY(message.has_value());
+    QCOMPARE(message->type(), ProtocolType::VisibilityChanged);
+    const QJsonObject expected{{QStringLiteral("active"), true}};
+    QCOMPARE(message->payload(), expected);
+
+    const ProtocolParseResult parsed = ProtocolMessage::parse(message->toJson());
+    QVERIFY(parsed.message.has_value());
+    QCOMPARE(parsed.message->toJson(), message->toJson());
+}
+
+void ProtocolMessageTest::rejectsVisibilityChangedPayloadViolations_data()
+{
+    QTest::addColumn<QJsonObject>("object");
+
+    const auto frame = [](const QJsonObject &payload) {
+        return QJsonObject{{QStringLiteral("protocolVersion"), 1},
+                           {QStringLiteral("type"), QStringLiteral("visibilityChanged")},
+                           {QStringLiteral("payload"), payload}};
+    };
+    QTest::newRow("missing-active") << frame({});
+    QTest::newRow("non-bool-active")
+        << frame({{QStringLiteral("active"), QStringLiteral("true")}});
+    QTest::newRow("extra-key")
+        << frame({{QStringLiteral("active"), true}, {QStringLiteral("tab"), 1}});
+}
+
+void ProtocolMessageTest::rejectsVisibilityChangedPayloadViolations()
+{
+    QFETCH(QJsonObject, object);
+    const ProtocolParseResult result = ProtocolMessage::parse(object);
+    QVERIFY(!result.message.has_value());
+    QCOMPARE(result.error, ProtocolError::InvalidPayload);
+    QCOMPARE(result.errorCode, QStringLiteral("ipc.protocol.invalid_payload"));
 }
 
 QTEST_MAIN(ProtocolMessageTest)

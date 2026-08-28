@@ -193,6 +193,15 @@ void WorkerApplication::handleMessage(const ProtocolMessage &message)
         return;
     }
     switch (message.type()) {
+    case ProtocolType::VisibilityChanged:
+        if (session_ == nullptr || !session_->isAuthenticated()
+            || (state_ != State::Loading && state_ != State::Ready)) {
+            failClosed();
+            break;
+        }
+        runtimeFacade_.assignActive(
+            message.payload().value(QStringLiteral("active")).toBool());
+        break;
     case ProtocolType::RouteLoad: {
         const QString route = message.payload().value(QStringLiteral("route")).toString();
         runtimeFacade_.loadRoute(route);

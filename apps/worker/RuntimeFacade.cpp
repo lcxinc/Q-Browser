@@ -67,6 +67,7 @@ RuntimeFacade::RuntimeFacade(QObject *parent) : QObject(parent) {}
 QString RuntimeFacade::appIdentity() const { return appIdentity_; }
 QString RuntimeFacade::apiOrigin() const { return apiOrigin_; }
 QString RuntimeFacade::route() const { return route_; }
+bool RuntimeFacade::active() const { return active_; }
 
 void RuntimeFacade::assignAppIdentity(const QString &identity)
 {
@@ -87,6 +88,13 @@ void RuntimeFacade::loadRoute(const QString &route)
     if (route_ == route) return;
     route_ = route;
     emit routeChanged();
+}
+
+void RuntimeFacade::assignActive(const bool active)
+{
+    if (active_ == active) return;
+    active_ = active;
+    emit activeChanged();
 }
 
 QString RuntimeFacade::invoke(const QString &capability,

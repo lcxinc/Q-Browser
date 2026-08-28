@@ -18,6 +18,7 @@ private slots:
     void realWorkerExposesOnlyTypedRuntimeRequests();
     void rejectsOversizedMalformedAndReplayedFrames();
     void runtimeFacadeAddsOnlyBoundedPageMetadata();
+    void runtimeFacadeExposesReadOnlyActiveState();
 };
 
 void WorkerApiSurfaceTest::realWorkerExposesOnlyTypedRuntimeRequests()
@@ -165,6 +166,7 @@ void WorkerApiSurfaceTest::runtimeFacadeAddsOnlyBoundedPageMetadata()
                                QByteArrayLiteral("capabilityFinished(QString,QJsonObject)"),
                                QByteArrayLiteral("navigationRequested(QString,QString)"),
                                QByteArrayLiteral("navigationFinished(QString,QJsonObject)"),
+                               QByteArrayLiteral("activeChanged()"),
                                QByteArrayLiteral("pageMetadataChanged(QString,QString)")}));
 
     QSet<QByteArray> properties;
@@ -177,10 +179,24 @@ void WorkerApiSurfaceTest::runtimeFacadeAddsOnlyBoundedPageMetadata()
     QCOMPARE(properties,
              QSet<QByteArray>({QByteArrayLiteral("appIdentity"),
                                QByteArrayLiteral("apiOrigin"),
-                               QByteArrayLiteral("route")}));
+                               QByteArrayLiteral("route"),
+                               QByteArrayLiteral("active")}));
     QVERIFY(metaObject.indexOfMethod("sendMessage(QJsonObject)") < 0);
     QVERIFY(metaObject.indexOfMethod("postMessage(QVariant)") < 0);
     QVERIFY(metaObject.indexOfProperty("securityContext") < 0);
+}
+
+void WorkerApiSurfaceTest::runtimeFacadeExposesReadOnlyActiveState()
+{
+    RuntimeFacade facade;
+    const QMetaObject &metaObject = RuntimeFacade::staticMetaObject;
+    const int activeIndex = metaObject.indexOfProperty("active");
+    QVERIFY(activeIndex >= 0);
+    const QMetaProperty active = metaObject.property(activeIndex);
+    QVERIFY(active.isReadable());
+    QVERIFY(!active.isWritable());
+    QCOMPARE(active.notifySignal().methodSignature(), QByteArrayLiteral("activeChanged()"));
+    QVERIFY(!facade.active());
 }
 
 QTEST_MAIN(WorkerApiSurfaceTest)

@@ -59,6 +59,7 @@ public:
     bool sendNavigationRequest(const QString &requestId,
                                const QString &route,
                                int timeoutMs);
+    bool sendVisibilityChanged(bool active, int timeoutMs = 1000);
     SessionReceiveResult receive(int timeoutMs);
     SessionReceiveResult poll(int timeoutMs = 0);
     void setPageMetadataHandler(PageMetadataHandler handler);

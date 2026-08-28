@@ -12,7 +12,7 @@ bool outgoingTypeAllowed(const IpcRole role, const ProtocolType type)
     if (role == IpcRole::Host) {
         return type == ProtocolType::HandshakeAck || type == ProtocolType::RouteLoad
             || type == ProtocolType::Response || type == ProtocolType::Heartbeat
-            || type == ProtocolType::Shutdown;
+            || type == ProtocolType::VisibilityChanged || type == ProtocolType::Shutdown;
     }
     return type == ProtocolType::Handshake || type == ProtocolType::SurfaceReady
         || type == ProtocolType::Ready || type == ProtocolType::Request
@@ -131,6 +131,16 @@ bool IpcSession::sendNavigationRequest(const QString &requestId,
     return sendTracked(requestId,
                        ProtocolMessage::navigationRequest(requestId, route),
                        timeoutMs);
+}
+
+bool IpcSession::sendVisibilityChanged(const bool active, const int timeoutMs)
+{
+    const auto message = ProtocolMessage::visibilityChanged(active);
+    if (!message.has_value()) {
+        lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
+        return false;
+    }
+    return send(*message, timeoutMs);
 }
 
 SessionReceiveResult IpcSession::receive(const int timeoutMs)

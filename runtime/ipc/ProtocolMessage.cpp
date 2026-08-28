@@ -42,6 +42,8 @@ QString typeName(const ProtocolType type)
         return QStringLiteral("response");
     case ProtocolType::Heartbeat:
         return QStringLiteral("heartbeat");
+    case ProtocolType::VisibilityChanged:
+        return QStringLiteral("visibilityChanged");
     case ProtocolType::StructuredLog:
         return QStringLiteral("structuredLog");
     case ProtocolType::Shutdown:
@@ -62,6 +64,7 @@ std::optional<ProtocolType> parseType(const QString &name)
                                     ProtocolType::Request,
                                     ProtocolType::Response,
                                     ProtocolType::Heartbeat,
+                                    ProtocolType::VisibilityChanged,
                                     ProtocolType::StructuredLog,
                                     ProtocolType::Shutdown}) {
         if (name == typeName(type)) {
@@ -171,6 +174,9 @@ bool validPayload(const ProtocolType type, const QJsonObject &payload)
     case ProtocolType::Ready:
     case ProtocolType::Heartbeat:
         return payload.isEmpty();
+    case ProtocolType::VisibilityChanged:
+        return hasExactKeys(payload, {QStringLiteral("active")})
+            && payload.value(QStringLiteral("active")).isBool();
     case ProtocolType::RouteLoad:
     case ProtocolType::NavigationRequest: {
         if (!hasExactKeys(payload, {QStringLiteral("route")})) {
@@ -406,6 +412,13 @@ std::optional<ProtocolMessage> ProtocolMessage::errorResponse(const QString &req
 ProtocolMessage ProtocolMessage::heartbeat()
 {
     return {ProtocolType::Heartbeat, {}, {}};
+}
+
+std::optional<ProtocolMessage> ProtocolMessage::visibilityChanged(const bool active)
+{
+    return validated(ProtocolType::VisibilityChanged,
+                     {},
+                     QJsonObject{{QStringLiteral("active"), active}});
 }
 
 std::optional<ProtocolMessage> ProtocolMessage::structuredLog(const QString &level,

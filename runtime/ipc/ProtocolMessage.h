@@ -16,6 +16,7 @@ enum class ProtocolType {
     Request,
     Response,
     Heartbeat,
+    VisibilityChanged,
     StructuredLog,
     Shutdown,
 };
@@ -59,6 +60,7 @@ public:
                                                        const QString &code,
                                                        const QString &message);
     static ProtocolMessage heartbeat();
+    static std::optional<ProtocolMessage> visibilityChanged(bool active);
     static std::optional<ProtocolMessage> structuredLog(const QString &level,
                                                         const QString &category,
                                                         const QString &message);

@@ -38,6 +38,7 @@ private slots:
     void receiveUntilBoundsOverBudgetHeartbeatFlood();
     void wrongNonceFailsClosed();
     void eagerPageMetadataWaitsForReadyAndKeepsOnlyLastValue();
+    void hostVisibilityUpdatesWorkerRuntimeActiveProperty();
 };
 
 void WorkerHandshakeTest::directLaunchWithoutInheritedHandlesFailsClosed()
@@ -283,6 +284,47 @@ Item {
 
     QVERIFY(launch->hostSession.send(
         *ProtocolMessage::shutdown(QStringLiteral("metadata.complete")), 5000));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
+             SessionStatus::MessageReady);
+    QVERIFY(launch->process.waitForFinished(5000));
+    const auto closed = launch->process.close();
+    QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void WorkerHandshakeTest::hostVisibilityUpdatesWorkerRuntimeActiveProperty()
+{
+    const QByteArray qml = QByteArrayLiteral(R"QML(import QtQuick
+Item {
+    Connections {
+        target: Runtime
+        function onActiveChanged() {
+            Runtime.setPageMetadata(Runtime.active ? "Active" : "Inactive", "ready")
+        }
+    }
+}
+)QML");
+    WorkerTestEnvironment environment(qml);
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    auto launch = environment.launch(QStringLiteral("visibility-worker"),
+                                     QStringLiteral("visibility-worker"), 1000);
+    QVERIFY2(launch.has_value(), qPrintable(environment.error()));
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::SurfaceReady).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+
+    QVERIFY(launch->hostSession.sendVisibilityChanged(true));
+    const SessionReceiveResult metadata = receiveUntil(launch->hostSession,
+                                                       ProtocolType::PageMetadata,
+                                                       5000);
+    QCOMPARE(metadata.status, SessionStatus::MessageReady);
+    QCOMPARE(metadata.message->payload().value(QStringLiteral("title")).toString(),
+             QStringLiteral("Active"));
+
+    QVERIFY(launch->hostSession.send(
+        *ProtocolMessage::shutdown(QStringLiteral("visibility.complete")), 5000));
     QCOMPARE(receiveUntil(launch->hostSession, ProtocolType::Shutdown, 5000).status,
              SessionStatus::MessageReady);
     QVERIFY(launch->process.waitForFinished(5000));

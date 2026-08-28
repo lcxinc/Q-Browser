@@ -14,6 +14,7 @@ class RuntimeFacade final : public QObject
     Q_PROPERTY(QString appIdentity READ appIdentity NOTIFY appIdentityChanged FINAL)
     Q_PROPERTY(QString apiOrigin READ apiOrigin NOTIFY apiOriginChanged FINAL)
     Q_PROPERTY(QString route READ route NOTIFY routeChanged FINAL)
+    Q_PROPERTY(bool active READ active NOTIFY activeChanged FINAL)
 
 public:
     explicit RuntimeFacade(QObject *parent = nullptr);
@@ -21,6 +22,7 @@ public:
     QString appIdentity() const;
     QString apiOrigin() const;
     QString route() const;
+    bool active() const;
     void assignAppIdentity(const QString &identity);
     void assignApiOrigin(const QString &origin);
     void loadRoute(const QString &route);
@@ -37,6 +39,7 @@ signals:
     void appIdentityChanged();
     void apiOriginChanged();
     void routeChanged();
+    void activeChanged();
     void capabilityRequested(const QString &requestId,
                              const QString &capability,
                              const QString &operation,
@@ -56,9 +59,12 @@ private:
 
     friend class WorkerApplication;
 
+    void assignActive(bool active);
+
     QString appIdentity_;
     QString apiOrigin_;
     QString route_ = QStringLiteral("/");
+    bool active_ = false;
     QSet<QString> pendingNavigationRequests_;
     std::optional<PendingPageMetadata> pendingPageMetadata_;
 };

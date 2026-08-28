@@ -130,6 +130,7 @@ private slots:
     void pageMetadataRequiresWorkerReadyAndIsOneWay();
     void prematureMalformedAndUnknownMetadataFailClosed();
     void pageMetadataHandlerDeliveryIsAtMostOnceAndReentrantSafe();
+    void visibilityChangedIsHostOnlyAndAuthenticated();
 };
 
 void IpcSessionTest::anonymousPipeEndsHaveLeastInheritance()
@@ -914,6 +915,39 @@ void IpcSessionTest::pageMetadataHandlerDeliveryIsAtMostOnceAndReentrantSafe()
         QVERIFY(host->isClosed());
         QCOMPARE(host->receive(0).status, SessionStatus::Failed);
     }
+#endif
+}
+
+void IpcSessionTest::visibilityChangedIsHostOnlyAndAuthenticated()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    IpcSession host(pair.takeHost(), IpcRole::Host,
+                    HostLaunchContext{QStringLiteral("visibility-nonce"),
+                                      QStringLiteral("com.qbrowser.visibility")});
+    IpcSession worker(WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+                      IpcRole::Worker);
+
+    QVERIFY(!host.send(ProtocolMessage::visibilityChanged(true).value()));
+    QCOMPARE(host.lastErrorCode(), QStringLiteral("ipc.session.authentication_required"));
+    QVERIFY(!worker.send(ProtocolMessage::visibilityChanged(true).value()));
+    QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.authentication_required"));
+
+    QVERIFY(worker.send(*ProtocolMessage::handshake(QStringLiteral("visibility-nonce"))));
+    QCOMPARE(host.receive(1000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1000).status, SessionStatus::MessageReady);
+
+    QVERIFY(host.sendVisibilityChanged(true));
+    const SessionReceiveResult active = worker.receive(1000);
+    QCOMPARE(active.status, SessionStatus::MessageReady);
+    QVERIFY(active.message.has_value());
+    QCOMPARE(active.message->type(), ProtocolType::VisibilityChanged);
+    QCOMPARE(active.message->payload().value(QStringLiteral("active")).toBool(), true);
+
+    QVERIFY(!worker.send(ProtocolMessage::visibilityChanged(false).value()));
+    QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.unexpected_message_direction"));
 #endif
 }
 
