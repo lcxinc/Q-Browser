@@ -35,6 +35,7 @@
 #include <qt_windows.h>
 #include <Aclapi.h>
 
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <type_traits>
@@ -614,6 +615,7 @@ private slots:
     void launchThreadStartFailureHandlerCanDestroyHost();
     void observerThreadStartFailureHandlerCanDestroyHost();
     void retirementThreadStartFailureIsFatalAndRetryable();
+    void hostShutdownRetirementHandoffPrecedesManagerAdmissionClose();
     void checkedShutdownWaitsForInflightLaunchRegistration();
 };
 
@@ -3906,6 +3908,167 @@ void ProductionUpdateRuntimeTest::retirementThreadStartFailureIsFatalAndRetryabl
     QVERIFY(WorkerRetirementManager::instance().flush(10'000));
     QCOMPARE(completions.load(), 2);
     QVERIFY(WorkerRetirementManager::instance().status().isIdle());
+}
+
+void ProductionUpdateRuntimeTest::
+    hostShutdownRetirementHandoffPrecedesManagerAdmissionClose()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows package membership restoration is Windows-specific");
+#else
+    constexpr auto childEnvironment =
+        "Q_BROWSER_LIFECYCLE_HANDOFF_CHILD";
+    if (!qEnvironmentVariableIsSet(childEnvironment)) {
+        QProcess child;
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QString::fromLatin1(childEnvironment),
+                           QStringLiteral("1"));
+        child.setProcessEnvironment(environment);
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.setProgram(QCoreApplication::applicationFilePath());
+        child.setArguments(
+            {QStringLiteral(
+                 "hostShutdownRetirementHandoffPrecedesManagerAdmissionClose"),
+             QStringLiteral("-o"), QStringLiteral("-,txt")});
+        child.start();
+        QVERIFY2(child.waitForStarted(10'000), qPrintable(child.errorString()));
+        QVERIFY2(child.waitForFinished(120'000), qPrintable(child.errorString()));
+        const QByteArray output = child.readAll();
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        const QByteArray failure = QByteArrayLiteral("child exit code ")
+            + QByteArray::number(child.exitCode()) + QByteArrayLiteral(": ")
+            + output;
+        QVERIFY2(child.exitCode() == 0, failure.constData());
+        return;
+    }
+
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir temporary;
+    QTemporaryDir trustRoot;
+    QTemporaryDir telemetryRoot;
+    QVERIFY(temporary.isValid());
+    QVERIFY(trustRoot.isValid());
+    QVERIFY(telemetryRoot.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString publicKey = trustRoot.filePath(QStringLiteral("trusted.pem"));
+    const QString telemetry = telemetryRoot.filePath(QStringLiteral("telemetry"));
+    const QString storage = telemetryRoot.filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkpath(telemetry));
+    QVERIFY(QDir().mkpath(storage));
+    QVERIFY(writeNewFile(publicKey, keys.value().publicKeyPem));
+    QVERIFY(protectPath(publicKey));
+
+    const QString package = updateSignedPackage(
+        temporary, QStringLiteral("lifecycle-shutdown-handoff"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    PackageStore store(environment.packageRoot());
+    InstallPolicy installPolicy;
+    installPolicy.expectedAppId = environment.appId();
+    installPolicy.runtimeVersion = QStringLiteral("1.2.0");
+    installPolicy.allowedImports = {QStringLiteral("QtQuick"),
+                                    QStringLiteral("Company.Design")};
+    installPolicy.preflight = [](const Manifest &, const QString &) {
+        return true;
+    };
+    PackageInstaller installer(
+        store, keys.value().publicKeyPem, std::move(installPolicy));
+    const InstallResult seeded = installer.install(package);
+    QVERIFY2(seeded.succeeded(), qPrintable(seeded.stableError));
+
+    const QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + environment.packageRoot(),
+        QStringLiteral("--sandbox-temp=") + environment.sandboxTempRoot(),
+        QStringLiteral("--runtime-root=") + environment.runtimeRoot(),
+        QStringLiteral("--worker-executable=") + environment.workerExecutable(),
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--heartbeat-timeout-ms=30000"),
+    };
+    HostRuntimeConfigResult parsed = parseHostArguments(arguments, storage);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+
+    QSemaphore shutdownRetryEntered;
+    QSemaphore releaseShutdownRetry;
+    QSemaphore retirementCloseEntered;
+    QSemaphore releaseRetirementClose;
+    std::atomic_int restoreAttempts{0};
+    std::atomic_int shutdownRestoreAttempts{0};
+    std::atomic_bool shutdownPhase{false};
+    std::mutex failingPathMutex;
+    QString failingRestorePath;
+    qbrowser_package_installer_testing::
+        setImmutableMembershipRestoreFailureHook([&](const QString &path) {
+            {
+                std::lock_guard lock(failingPathMutex);
+                if (failingRestorePath.isEmpty()) failingRestorePath = path;
+                if (path != failingRestorePath) return false;
+            }
+            restoreAttempts.fetch_add(1, std::memory_order_acq_rel);
+            if (!shutdownPhase.load(std::memory_order_acquire)) return true;
+            const int shutdownAttempt = shutdownRestoreAttempts.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            if (shutdownAttempt == 1) {
+                shutdownRetryEntered.release();
+                releaseShutdownRetry.acquire();
+                return true;
+            }
+            if (shutdownAttempt == 2) {
+                retirementCloseEntered.release();
+                releaseRetirementClose.acquire();
+            }
+            return false;
+        });
+    const auto resetHooks = qScopeGuard([&] {
+        releaseShutdownRetry.release();
+        releaseRetirementClose.release();
+        qbrowser_package_installer_testing::
+            resetImmutableMembershipRestoreFailureHook();
+    });
+
+    auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
+    QVERIFY(host->start());
+    QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 30'000);
+    QCOMPARE(failed.first().at(0).toString(),
+             QStringLiteral("package.immutable_restore_failed"));
+    QCOMPARE(failed.first().at(1).toUInt(), quint32(ERROR_ACCESS_DENIED));
+    QVERIFY(restoreAttempts.load(std::memory_order_acquire) > 0);
+
+    shutdownPhase.store(true, std::memory_order_release);
+    QElapsedTimer destruction;
+    destruction.start();
+    host.reset();
+    const qint64 destructionMs = destruction.elapsed();
+    QVERIFY(destructionMs < 100);
+    QVERIFY(shutdownRetryEntered.tryAcquire(1, 30'000));
+
+    const bool returnedBeforeHandoff =
+        WorkerRetirementManager::instance().shutdownChecked(0);
+    if (returnedBeforeHandoff) {
+        releaseShutdownRetry.release();
+        releaseRetirementClose.release();
+        std::_Exit(86);
+    }
+
+    releaseShutdownRetry.release();
+    QVERIFY(retirementCloseEntered.tryAcquire(1, 30'000));
+    const bool returnedBeforeCleanup =
+        WorkerRetirementManager::instance().flush(0);
+    releaseRetirementClose.release();
+    const bool shutdownSucceeded =
+        WorkerRetirementManager::instance().flush(10'000);
+
+    QVERIFY(!returnedBeforeCleanup);
+    QVERIFY(shutdownSucceeded);
+    QCOMPARE(shutdownRestoreAttempts.load(std::memory_order_acquire), 2);
+#endif
 }
 
 void ProductionUpdateRuntimeTest::checkedShutdownWaitsForInflightLaunchRegistration()

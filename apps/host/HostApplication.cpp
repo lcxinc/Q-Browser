@@ -30,8 +30,10 @@
 #include <QTimer>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -86,6 +88,76 @@ QString pilotRouteTemplate(const QString &route)
     return {};
 }
 
+class HostLifecycleShutdownHandoff final
+{
+public:
+    void complete(
+        std::optional<UpdateLifecycleShutdownCleanup> cleanupOwner) noexcept
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (state_ != State::Pending) return;
+            cleanupOwner_ = std::move(cleanupOwner);
+            state_ = State::Completed;
+        }
+        changed_.notify_all();
+    }
+
+    void fail() noexcept
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (state_ != State::Pending) return;
+            state_ = State::Failed;
+        }
+        changed_.notify_all();
+    }
+
+    [[nodiscard]] WorkerRetirementAttemptResult attempt() noexcept
+    {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [this] { return state_ != State::Pending; });
+        if (state_ == State::Failed) {
+            return {false,
+                    QStringLiteral("host.launch.retirement_unavailable")};
+        }
+        if (!cleanupOwner_.has_value()) return {true, {}};
+
+        const ImmutablePackageGuardCloseResult closed = cleanupOwner_->close();
+        if (closed.value.has_value()) {
+            cleanupOwner_.reset();
+            nativeError_ = 0;
+            return {true, {}};
+        }
+        nativeError_ = closed.nativeError;
+        return {
+            false,
+            closed.errorCode.isEmpty()
+                ? QStringLiteral("package.immutable_restore_failed")
+                : closed.errorCode};
+    }
+
+    [[nodiscard]] quint32 nativeError() const noexcept
+    {
+        std::lock_guard lock(mutex_);
+        return nativeError_;
+    }
+
+private:
+    enum class State
+    {
+        Pending,
+        Completed,
+        Failed,
+    };
+
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    State state_ = State::Pending;
+    std::optional<UpdateLifecycleShutdownCleanup> cleanupOwner_;
+    quint32 nativeError_ = 0;
+};
+
 class HostLifecycleRuntime final : public QObject
 {
 public:
@@ -99,6 +171,8 @@ public:
         , recorder_(std::move(recorder))
         , coordinator_(std::move(coordinator))
         , publishFailure_(std::move(publishFailure))
+        , shutdownHandoff_(
+              std::make_shared<HostLifecycleShutdownHandoff>())
     {
     }
 
@@ -135,18 +209,68 @@ public:
         accepting_.store(false, std::memory_order_release);
     }
 
+    [[nodiscard]] std::shared_ptr<HostLifecycleShutdownHandoff>
+    reserveShutdownHandoff() noexcept
+    {
+        bool expected = false;
+        if (!shutdownHandoffRegistrationStarted_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return shutdownHandoffRegistered_.load(std::memory_order_acquire)
+                ? shutdownHandoff_ : nullptr;
+        }
+        try {
+            const std::shared_ptr<HostLifecycleShutdownHandoff> handoff =
+                shutdownHandoff_;
+            const WorkerRetirementManager::Ticket ticket =
+                WorkerRetirementManager::instance().retire(
+                    [handoff] { return handoff->attempt(); },
+                    [handoff, publishFailure = publishFailure_](
+                        const bool succeeded, const QString &stableError) {
+                        if (!succeeded && publishFailure) {
+                            publishFailure(stableError,
+                                           handoff->nativeError());
+                        }
+                    });
+            if (ticket == 0) {
+                shutdownHandoffRegistrationStarted_.store(
+                    false, std::memory_order_release);
+                return nullptr;
+            }
+            shutdownHandoffRegistered_.store(true, std::memory_order_release);
+            return handoff;
+        } catch (...) {
+            shutdownHandoffRegistrationStarted_.store(
+                false, std::memory_order_release);
+            return nullptr;
+        }
+    }
+
     [[nodiscard]] bool shutdown()
     {
         closeAdmission();
         if (!shutdownStarted_) {
             shutdownStarted_ = true;
-            if (coordinator_ == nullptr) return true;
+            if (coordinator_ == nullptr) {
+                if (shutdownHandoffRegistered_.load(
+                        std::memory_order_acquire)) {
+                    shutdownHandoff_->complete(std::nullopt);
+                }
+                return true;
+            }
             UpdateLifecycleShutdownResult result =
                 coordinator_->beginHostShutdown();
-            if (result.succeeded()) return true;
-            if (publishFailure_) {
-                publishFailure_(result.stableError, result.nativeError);
+            const bool succeeded = result.succeeded();
+            const bool handoffRegistered =
+                shutdownHandoffRegistered_.load(std::memory_order_acquire);
+            if (handoffRegistered) {
+                shutdownHandoff_->complete(std::move(result.cleanupOwner));
             }
+            if (publishFailure_) {
+                if (!succeeded) {
+                    publishFailure_(result.stableError, result.nativeError);
+                }
+            }
+            if (handoffRegistered || succeeded) return true;
             if (!result.cleanupOwner.has_value()) return true;
             pendingShutdownCleanup_.emplace(
                 std::move(*result.cleanupOwner));
@@ -179,8 +303,11 @@ private:
                     [cleanupOwner] {
                         const ImmutablePackageGuardCloseResult closed =
                             cleanupOwner->close();
+                        if (closed.value.has_value()) {
+                            return WorkerRetirementAttemptResult{true, {}};
+                        }
                         return WorkerRetirementAttemptResult{
-                            closed.value.has_value(),
+                            false,
                             closed.errorCode.isEmpty()
                                 ? QStringLiteral(
                                       "package.immutable_restore_failed")
@@ -218,10 +345,13 @@ private:
     std::unique_ptr<EventRecorder> recorder_;
     std::unique_ptr<UpdateLifecycleCoordinator> coordinator_;
     FailurePublisher publishFailure_;
+    std::shared_ptr<HostLifecycleShutdownHandoff> shutdownHandoff_;
     std::optional<UpdateLifecycleShutdownCleanup> pendingShutdownCleanup_;
     std::shared_ptr<UpdateLifecycleShutdownCleanup> sharedShutdownCleanup_;
     std::atomic<qsizetype> pending_{0};
     std::atomic_bool accepting_{true};
+    std::atomic_bool shutdownHandoffRegistrationStarted_{false};
+    std::atomic_bool shutdownHandoffRegistered_{false};
     bool shutdownStarted_ = false;
     bool shutdownCleanupRetryScheduled_ = false;
 };
@@ -249,14 +379,29 @@ HostApplication::~HostApplication()
 
     QPointer<HostLifecycleRuntime> runtime(
         static_cast<HostLifecycleRuntime *>(updateLifecycleRuntime_.data()));
-    if (runtime) runtime->closeAdmission();
+    std::shared_ptr<HostLifecycleShutdownHandoff> shutdownHandoff;
+    if (runtime) {
+        runtime->closeAdmission();
+        // Reserve retirement admission synchronously; only the detached
+        // retirement attempt waits for the queued lifecycle shutdown.
+        shutdownHandoff = runtime->reserveShutdownHandoff();
+    }
     QThread *const lifecycleThread = updateLifecycleThread_;
     if (runtime && lifecycleThread != nullptr) {
-        (void)QMetaObject::invokeMethod(
+        const bool queued = QMetaObject::invokeMethod(
             runtime,
-            [runtime, lifecycleThread] {
-                if (!runtime || runtime->shutdown()) lifecycleThread->quit();
+            [runtime, lifecycleThread, shutdownHandoff] {
+                if (!runtime) {
+                    if (shutdownHandoff) shutdownHandoff->fail();
+                    lifecycleThread->quit();
+                    return;
+                }
+                if (runtime->shutdown()) lifecycleThread->quit();
             }, Qt::QueuedConnection);
+        if (!queued) {
+            if (shutdownHandoff) shutdownHandoff->fail();
+            lifecycleThread->quit();
+        }
     } else if (lifecycleThread != nullptr) {
         lifecycleThread->quit();
     }
