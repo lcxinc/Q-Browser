@@ -4028,6 +4028,7 @@ void ProductionUpdateRuntimeTest::
     const auto resetHooks = qScopeGuard([&] {
         releaseShutdownRetry.release();
         releaseRetirementClose.release();
+        (void)WorkerRetirementManager::instance().flush(10'000);
         qbrowser_package_installer_testing::
             resetImmutableMembershipRestoreFailureHook();
     });
@@ -4035,6 +4036,10 @@ void ProductionUpdateRuntimeTest::
     auto host = std::make_unique<HostApplication>(std::move(*parsed.value));
     QSignalSpy failed(host.get(), &HostApplication::updateLifecycleFailed);
     QVERIFY(host->start());
+    if (qEnvironmentVariableIsSet(
+            "Q_BROWSER_LIFECYCLE_HANDOFF_QUEUE_FAILURE")) {
+        host->forceLifecycleShutdownQueueFailureForTesting();
+    }
     QTRY_VERIFY_WITH_TIMEOUT(!failed.isEmpty(), 30'000);
     QCOMPARE(failed.first().at(0).toString(),
              QStringLiteral("package.immutable_restore_failed"));

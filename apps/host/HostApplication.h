@@ -61,6 +61,7 @@ public:
     [[nodiscard]] HostWorkerSessionController *workerSessionController() const noexcept;
 #ifdef Q_BROWSER_HOST_TESTING
     void forceLifecycleQueueFullForTesting(bool full) noexcept;
+    void forceLifecycleShutdownQueueFailureForTesting() noexcept;
     [[nodiscard]] bool retryWorkerCleanupForTesting();
     [[nodiscard]] HostGestureRouter *gestureRouterForTesting() const noexcept;
 #endif
@@ -113,5 +114,6 @@ private:
     std::atomic_bool acceptingLifecycle_{true};
 #ifdef Q_BROWSER_HOST_TESTING
     bool lifecycleQueueFullForTesting_ = false;
+    bool forceLifecycleShutdownQueueFailureForTesting_ = false;
 #endif
 };

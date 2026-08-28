@@ -30,6 +30,7 @@
 #include <QTimer>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <limits>
@@ -116,7 +117,12 @@ public:
     [[nodiscard]] WorkerRetirementAttemptResult attempt() noexcept
     {
         std::unique_lock lock(mutex_);
-        changed_.wait(lock, [this] { return state_ != State::Pending; });
+        if (!changed_.wait_for(
+                lock, std::chrono::seconds(10),
+                [this] { return state_ != State::Pending; })) {
+            return {false,
+                    QStringLiteral("host.launch.retirement_unavailable")};
+        }
         if (state_ == State::Failed) {
             return {false,
                     QStringLiteral("host.launch.retirement_unavailable")};
@@ -207,6 +213,21 @@ public:
     void closeAdmission() noexcept
     {
         accepting_.store(false, std::memory_order_release);
+    }
+
+    void armShutdownOnThreadExit() noexcept
+    {
+        shutdownOnThreadExitRequested_.store(true,
+                                              std::memory_order_release);
+    }
+
+    void shutdownOnThreadExit() noexcept
+    {
+        if (!shutdownOnThreadExitRequested_.exchange(
+                false, std::memory_order_acq_rel)) {
+            return;
+        }
+        (void)shutdown();
     }
 
     [[nodiscard]] std::shared_ptr<HostLifecycleShutdownHandoff>
@@ -352,6 +373,7 @@ private:
     std::atomic_bool accepting_{true};
     std::atomic_bool shutdownHandoffRegistrationStarted_{false};
     std::atomic_bool shutdownHandoffRegistered_{false};
+    std::atomic_bool shutdownOnThreadExitRequested_{false};
     bool shutdownStarted_ = false;
     bool shutdownCleanupRetryScheduled_ = false;
 };
@@ -385,23 +407,37 @@ HostApplication::~HostApplication()
         // Reserve retirement admission synchronously; only the detached
         // retirement attempt waits for the queued lifecycle shutdown.
         shutdownHandoff = runtime->reserveShutdownHandoff();
+        runtime->armShutdownOnThreadExit();
     }
     QThread *const lifecycleThread = updateLifecycleThread_;
     if (runtime && lifecycleThread != nullptr) {
-        const bool queued = QMetaObject::invokeMethod(
-            runtime,
-            [runtime, lifecycleThread, shutdownHandoff] {
-                if (!runtime) {
-                    if (shutdownHandoff) shutdownHandoff->fail();
-                    lifecycleThread->quit();
-                    return;
-                }
-                if (runtime->shutdown()) lifecycleThread->quit();
-            }, Qt::QueuedConnection);
-        if (!queued) {
-            if (shutdownHandoff) shutdownHandoff->fail();
+        if (!lifecycleThread->isRunning()) {
+            (void)runtime->shutdown();
             lifecycleThread->quit();
+        } else {
+#ifdef Q_BROWSER_HOST_TESTING
+            const bool forceQueueFailure =
+                forceLifecycleShutdownQueueFailureForTesting_;
+#else
+            constexpr bool forceQueueFailure = false;
+#endif
+            const bool queued = forceQueueFailure
+                ? false
+                : QMetaObject::invokeMethod(
+                      runtime,
+                      [runtime, lifecycleThread, shutdownHandoff] {
+                          if (!runtime) {
+                              if (shutdownHandoff) shutdownHandoff->fail();
+                              lifecycleThread->quit();
+                              return;
+                          }
+                          if (runtime->shutdown()) lifecycleThread->quit();
+                      },
+                      Qt::QueuedConnection);
+            if (!queued) lifecycleThread->quit();
         }
+    } else if (runtime) {
+        (void)runtime->shutdown();
     } else if (lifecycleThread != nullptr) {
         lifecycleThread->quit();
     }
@@ -437,6 +473,11 @@ bool HostApplication::enqueueLifecycle(
 void HostApplication::forceLifecycleQueueFullForTesting(const bool full) noexcept
 {
     lifecycleQueueFullForTesting_ = full;
+}
+
+void HostApplication::forceLifecycleShutdownQueueFailureForTesting() noexcept
+{
+    forceLifecycleShutdownQueueFailureForTesting_ = true;
 }
 
 bool HostApplication::retryWorkerCleanupForTesting()
@@ -709,6 +750,9 @@ bool HostApplication::initializePackageRuntime()
     auto *const lifecycleThread = new QThread;
     lifecycleThread->setObjectName(QStringLiteral("host-update-lifecycle"));
     runtime->moveToThread(lifecycleThread);
+    connect(lifecycleThread, &QThread::finished, runtime,
+            [runtime] { runtime->shutdownOnThreadExit(); },
+            Qt::DirectConnection);
     connect(lifecycleThread, &QThread::finished, runtime, &QObject::deleteLater);
     connect(lifecycleThread, &QThread::finished,
             lifecycleThread, &QObject::deleteLater);
