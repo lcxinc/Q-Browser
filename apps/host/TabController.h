@@ -11,6 +11,7 @@
 #include <memory>
 
 class QLabel;
+class AppTabRuntimeController;
 class NewTabPage;
 class QStackedWidget;
 class QWidget;
@@ -48,9 +49,11 @@ public:
     [[nodiscard]] BrowserTabLifecycle lifecycle() const noexcept;
     [[nodiscard]] HostSurfaceKind surfaceKind() const noexcept;
     [[nodiscard]] QWidget *currentSurface() const noexcept;
+    [[nodiscard]] bool isActive() const noexcept;
     [[nodiscard]] NewTabPage *hostSurface() const noexcept;
     [[nodiscard]] WebSurface *webSurface() const noexcept;
     [[nodiscard]] WorkerSurface *workerSurface() const noexcept;
+    [[nodiscard]] AppTabRuntimeController *appRuntimeController() const noexcept;
     [[nodiscard]] QString workerPackageId() const;
     [[nodiscard]] QString trustedErrorText() const;
 
@@ -65,6 +68,11 @@ public:
                                       const QVariantMap &parameters,
                                       const QUrl &logicalUrl,
                                       quint64 navigationIncarnation);
+    [[nodiscard]] bool prepareAppLaunch(const QString &packageId,
+                                         quint64 navigationIncarnation);
+    [[nodiscard]] bool bindAppWorkerSurface(const QString &packageId,
+                                            quint64 navigationIncarnation);
+    [[nodiscard]] bool cancelAppLaunch();
     void stop();
     void showTrustedError(const QString &plainText,
                           bool retireWebSurface = false);
@@ -75,14 +83,23 @@ public:
 
     [[nodiscard]] bool attachLegacyWorkerSurface(
         std::unique_ptr<WorkerSurface> surface);
+    void adoptAppRuntimeController(
+        std::unique_ptr<AppTabRuntimeController> controller);
     void detachLegacyWorkerSurface();
     [[nodiscard]] bool beginClosing();
     [[nodiscard]] bool retire();
 
 signals:
+    void activeChanged(const QString &tabId, bool active);
     void addressActivated(const QString &tabId,
                           quint64 incarnation,
                           const QString &canonicalAddress);
+    void workerRouteRequestedForTab(const QString &tabId,
+                                    quint64 incarnation,
+                                    const QString &packageId,
+                                    const QString &entryPoint,
+                                    const QVariantMap &parameters,
+                                    const QUrl &appUrl);
     void workerRouteRequested(const QString &packageId,
                               const QString &entryPoint,
                               const QVariantMap &parameters,
@@ -129,4 +146,5 @@ private:
     bool active_ = false;
     bool retired_ = false;
     bool resourceMutationInProgress_ = false;
+    std::unique_ptr<AppTabRuntimeController> appRuntimeController_;
 };

@@ -516,6 +516,12 @@ void AppRuntimeCoordinatorTest::drainTimeoutIsFailedClosedAndNeverRecovers()
         return action.kind == AppRuntimeActionKind::Launch
             || action.kind == AppRuntimeActionKind::RecoverFromLkg;
     }));
+    QCOMPARE(h.coordinator->requestTabLaunch(
+                  tab(QStringLiteral("after-timeout")), QStringLiteral("/"),
+                  TabLaunchIntent::ActivateCurrent,
+                  h.drains.back().monotonicDeadlineMs + 3)
+                 .code,
+             AppRuntimeResultCode::FailedClosed);
     Q_UNUSED(pending);
 }
 

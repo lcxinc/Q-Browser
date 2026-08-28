@@ -25,8 +25,10 @@ container directly.
 ## Ownership and event flow
 
 `HostApplication` owns the shared `RuntimePackageAuthority`, one
-`AppRuntimeCoordinator` per app, the gesture router, a bounded authority-drain
-executor, and a map of `AppTabRuntimeController` instances. A controller owns
+`AppRuntimeCoordinator` per app, the gesture router, and a bounded
+authority-drain executor. Each `TabController` uniquely owns its
+`AppTabRuntimeController`; `HostApplication` keeps only a tab-keyed weak
+observation/routing table. A controller owns
 one launcher, one `HostWorkerSessionController`, one generation-bound
 `HostCapabilityRuntime`, one process lifetime, and one `WorkerSurface` attached
 to its `TabController`.
@@ -59,10 +61,12 @@ property, and never grants authority or suppresses heartbeat.
 
 ## Compatibility
 
-`UpdateLifecycleCoordinator` becomes a reserved legacy-tab adapter over the
-shared app coordinator. Existing lifecycle result/action names and telemetry
-remain available, while `AwaitAuthorityDrain` is surfaced without waiting on
-the GUI or lifecycle thread. Historical accessors (`workerSurface()`,
+`UpdateLifecycleCoordinator` remains a reserved compatibility path for the
+historical singleton worker while package App tabs use the shared
+`AppRuntimeCoordinator`; both paths share one `RuntimePackageAuthority`.
+Existing lifecycle result/action names and telemetry remain available, while
+`AwaitAuthorityDrain` is surfaced without waiting on the GUI or lifecycle
+thread. Historical accessors (`workerSurface()`,
 `workerSessionController()`, and ready/exited signals) resolve the active tab;
 new signals include tab ID, runtime incarnation, lease epoch, and process ID.
 

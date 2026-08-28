@@ -1,6 +1,7 @@
 #include "HostApplication.h"
 
 #include "EventRecorder.h"
+#include "AppTabRuntimeController.h"
 #include "BrowserChrome.h"
 #include "HostCapabilityRuntime.h"
 #include "HostGestureRouter.h"
@@ -12,6 +13,7 @@
 #include "PackageInstaller.h"
 #include "PackageStore.h"
 #include "RuntimePackageAuthority.h"
+#include "AppRuntimeCoordinator.h"
 #include "SandboxTrustBoundary.h"
 #include "UpdateLifecycleCoordinator.h"
 #include "TabCapabilityAuthority.h"
@@ -29,6 +31,7 @@
 #include <QThread>
 #include <QTimer>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -87,6 +90,23 @@ QString pilotRouteTemplate(const QString &route)
     if (order.match(route).hasMatch()) return QStringLiteral("/orders/:id");
     if (customer.match(route).hasMatch()) return QStringLiteral("/customers/:id");
     return {};
+}
+
+qint64 hostMonotonicNowMs() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+QString appHeartbeatKey(const WorkerLaunchRequest &request)
+{
+    return QStringLiteral("%1/%2/%3/%4/%5")
+        .arg(request.tabId)
+        .arg(request.runtimeIncarnation)
+        .arg(request.attempt.activation.value)
+        .arg(request.attempt.attempt.value)
+        .arg(request.lease.leaseAuthorityEpoch);
 }
 
 class HostLifecycleShutdownHandoff final
@@ -172,10 +192,12 @@ public:
     HostLifecycleRuntime(std::shared_ptr<RuntimePackageAuthority> authority,
                          std::unique_ptr<EventRecorder> recorder,
                          std::unique_ptr<UpdateLifecycleCoordinator> coordinator,
+                         std::unique_ptr<AppRuntimeCoordinator> appCoordinator,
                          FailurePublisher publishFailure)
         : authority_(std::move(authority))
         , recorder_(std::move(recorder))
         , coordinator_(std::move(coordinator))
+        , appCoordinator_(std::move(appCoordinator))
         , publishFailure_(std::move(publishFailure))
         , shutdownHandoff_(
               std::make_shared<HostLifecycleShutdownHandoff>())
@@ -208,6 +230,23 @@ public:
         if (!accepting_.load(std::memory_order_acquire) || !operation
             || coordinator_ == nullptr) return;
         operation(*coordinator_);
+    }
+
+    void executeApp(std::function<void(AppRuntimeCoordinator &)> operation)
+    {
+        struct PendingRelease final {
+            HostLifecycleRuntime *runtime;
+            ~PendingRelease() { runtime->release(); }
+        } releaseOnExit{this};
+        if (!accepting_.load(std::memory_order_acquire) || !operation
+            || appCoordinator_ == nullptr) return;
+        operation(*appCoordinator_);
+    }
+
+    [[nodiscard]] std::shared_ptr<RuntimePackageAuthority> authority() const
+        noexcept
+    {
+        return authority_;
     }
 
     void closeAdmission() noexcept
@@ -277,6 +316,9 @@ public:
                     shutdownHandoff_->complete(std::nullopt);
                 }
                 return true;
+            }
+            if (appCoordinator_ != nullptr) {
+                (void)appCoordinator_->beginShutdown();
             }
             UpdateLifecycleShutdownResult result =
                 coordinator_->beginHostShutdown();
@@ -365,6 +407,7 @@ private:
     std::shared_ptr<RuntimePackageAuthority> authority_;
     std::unique_ptr<EventRecorder> recorder_;
     std::unique_ptr<UpdateLifecycleCoordinator> coordinator_;
+    std::unique_ptr<AppRuntimeCoordinator> appCoordinator_;
     FailurePublisher publishFailure_;
     std::shared_ptr<HostLifecycleShutdownHandoff> shutdownHandoff_;
     std::optional<UpdateLifecycleShutdownCleanup> pendingShutdownCleanup_;
@@ -397,6 +440,14 @@ HostApplication::~HostApplication()
     acceptingLifecycle_.store(false, std::memory_order_release);
     if (updateHealthTimer_ != nullptr) updateHealthTimer_->stop();
     if (installedPackageLauncher_ != nullptr) installedPackageLauncher_->cancel();
+    const QList<QPointer<AppTabRuntimeController>> appRuntimeSnapshot =
+        appTabRuntimeControllers_.values();
+    for (const QPointer<AppTabRuntimeController> &controller :
+         appRuntimeSnapshot) {
+        if (!controller.isNull()) {
+            controller->close(QStringLiteral("host.application.stopping"));
+        }
+    }
     detachWorkerContext(QStringLiteral("host.application.stopping"));
 
     QPointer<HostLifecycleRuntime> runtime(
@@ -469,6 +520,663 @@ bool HostApplication::enqueueLifecycle(
     return queued;
 }
 
+bool HostApplication::enqueueAppRuntime(
+    std::function<void(AppRuntimeCoordinator &)> operation)
+{
+#ifdef Q_BROWSER_HOST_TESTING
+    if (lifecycleQueueFullForTesting_) return false;
+#endif
+    if (appRuntimeFailedClosed_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!operation || !acceptingLifecycle_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    QPointer<HostLifecycleRuntime> runtime(
+        static_cast<HostLifecycleRuntime *>(updateLifecycleRuntime_.data()));
+    if (!runtime || !runtime->reserve()) return false;
+    const bool queued = QMetaObject::invokeMethod(
+        runtime,
+        [runtime, operation = std::move(operation)]() mutable {
+            if (runtime) runtime->executeApp(std::move(operation));
+        },
+        Qt::QueuedConnection);
+    if (!queued && runtime) runtime->release();
+    return queued;
+}
+
+quint64 HostApplication::runtimeIncarnationForTab(const QString &tabId)
+{
+    if (tabId.isEmpty()) return 0;
+    const auto existing = appRuntimeIncarnations_.constFind(tabId);
+    if (existing != appRuntimeIncarnations_.cend()) return *existing;
+    if (nextCapabilityRuntimeIncarnation_ == 0
+        || nextCapabilityRuntimeIncarnation_
+               == std::numeric_limits<quint64>::max()) {
+        return 0;
+    }
+    const quint64 incarnation = nextCapabilityRuntimeIncarnation_++;
+    if (incarnation == 0) return 0;
+    appRuntimeIncarnations_.insert(tabId, incarnation);
+    return incarnation;
+}
+
+quint64 HostApplication::advanceRuntimeIncarnationForTab(const QString &tabId)
+{
+    if (tabId.isEmpty()) return 0;
+    if (runtimeIncarnationForTab(tabId) == 0) return 0;
+    if (nextCapabilityRuntimeIncarnation_ == 0
+        || nextCapabilityRuntimeIncarnation_
+               == std::numeric_limits<quint64>::max()) {
+        return 0;
+    }
+    const quint64 incarnation = nextCapabilityRuntimeIncarnation_++;
+    if (incarnation == 0) return 0;
+    appRuntimeIncarnations_[tabId] = incarnation;
+    return incarnation;
+}
+
+AppTabRuntimeController *HostApplication::ensureAppTabRuntimeController(
+    const QString &tabId)
+{
+    if (!runtimeConfig_.has_value()
+        || runtimeConfig_->mode() != HostRuntimeMode::Package
+        || packageAuthority_ == nullptr || mainWindow_ == nullptr
+        || gestureRouter_ == nullptr || tabId.isEmpty()) {
+        return nullptr;
+    }
+    TabController *const tab = mainWindow_->tabController(tabId);
+    if (tab == nullptr) return nullptr;
+    if (AppTabRuntimeController *const existing =
+            tab->appRuntimeController();
+        existing != nullptr) {
+        appTabRuntimeControllers_.insert(tabId, existing);
+        return existing;
+    }
+
+    const SandboxApprovedRoots roots{
+        runtimeConfig_->packageStoreRoot(), runtimeConfig_->sandboxTempRoot(),
+        runtimeConfig_->immutableRuntimeRoots()};
+    QPointer<HostApplication> guard(this);
+    const AppTabRuntimeController::AdmissionCallback admission =
+        [guard](const WorkerLaunchRequest &request,
+                InstalledPackageWorkerLauncher::AdmissionCompletion complete) {
+            if (!guard || !complete) return false;
+            const bool queued = guard->enqueueAppRuntime(
+                [guard, request, complete = std::move(complete)](
+                    AppRuntimeCoordinator &coordinator) mutable {
+                    const AppRuntimeResult result =
+                        coordinator.admitAuthenticatedWorker(request);
+                    const bool accepted =
+                        result.code == AppRuntimeResultCode::Applied;
+                    const bool ignoredStale =
+                        result.code == AppRuntimeResultCode::IgnoredStale;
+                    complete({accepted,
+                              accepted || ignoredStale
+                                  ? QString{}
+                                  : (result.stableError.isEmpty()
+                                         ? QStringLiteral(
+                                               "host.launch.admission_rejected")
+                                         : result.stableError),
+                              ignoredStale,
+                              accepted
+                                  ? std::optional<WorkerLaunchRequest>(request)
+                                  : std::nullopt});
+                    if (!result.actions.isEmpty()
+                        || result.code != AppRuntimeResultCode::Applied) {
+                        QMetaObject::invokeMethod(
+                            guard,
+                            [guard, result] {
+                                if (guard) guard->handleAppRuntimeResult(result);
+                            },
+                            Qt::QueuedConnection);
+                    }
+                });
+            if (!queued && guard) {
+                guard->failClosedAppRuntime(
+                    QStringLiteral("host.runtime.critical_event_dropped"));
+            }
+            return queued;
+        };
+    auto controller = std::make_unique<AppTabRuntimeController>(
+        tabId, tab, mainWindow_.get(), gestureRouter_.get(), packageAuthority_,
+        roots, runtimeConfig_->workerExecutable(),
+        runtimeConfig_->sandboxTempRoot(), runtimeConfig_->mockOrigin(),
+        runtimeConfig_->storageDirectory(),
+        static_cast<quintptr>(mainWindow_->winId()), admission,
+        appRuntimeTransportGate_, appRuntimeTransportMutex_);
+    if (!controller->isAccepting()) return nullptr;
+
+    AppTabRuntimeController *const raw = controller.get();
+    connect(raw, &AppTabRuntimeController::ready, this,
+            [this](const WorkerLaunchRequest &request, const quint32 processId) {
+                emit packageWorkerReadyForTab(
+                    request.tabId, request.runtimeIncarnation,
+                    request.lease.appId, request.lease.version,
+                    request.lease.packageDirectory,
+                    request.attempt.activation.value,
+                    request.attempt.attempt.value, processId,
+                    request.lease.leaseAuthorityEpoch);
+                if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr
+                    && mainWindow_->tabModel()->activeId() == request.tabId) {
+                    emit packageWorkerReady(
+                        request.lease.appId, request.lease.version,
+                        request.lease.packageDirectory,
+                        request.attempt.activation.value,
+                        request.attempt.attempt.value, processId);
+                }
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::workerExited, this,
+            [this](const WorkerLaunchRequest &request, const bool expected) {
+                emit packageWorkerExitedForTab(
+                    request.tabId, request.runtimeIncarnation,
+                    request.attempt.activation.value,
+                    request.attempt.attempt.value,
+                    request.lease.leaseAuthorityEpoch, expected);
+                if (!expected) {
+                    if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr
+                        && mainWindow_->tabModel()->activeId() == request.tabId) {
+                        emit packageWorkerExited(
+                            request.attempt.activation.value,
+                            request.attempt.attempt.value);
+                    }
+                }
+                const WorkerExitReason reason = expected
+                    ? WorkerExitReason::Clean : WorkerExitReason::Crashed;
+                const FullAttemptKey key{
+                    {request.tabId, request.runtimeIncarnation}, request.attempt,
+                    request.lease.leaseAuthorityEpoch};
+                QPointer<HostApplication> guard(this);
+                const bool queued = enqueueAppRuntime(
+                    [guard, key, reason](AppRuntimeCoordinator &coordinator) {
+                        const AppRuntimeResult result =
+                            coordinator.workerExited(key, reason, -1);
+                        if (!result.actions.isEmpty()
+                            || result.code != AppRuntimeResultCode::Applied) {
+                            QMetaObject::invokeMethod(
+                                guard,
+                                [guard, result] {
+                                    if (guard) guard->handleAppRuntimeResult(result);
+                                },
+                                Qt::QueuedConnection);
+                        }
+                    });
+                if (!queued) {
+                    failClosedAppRuntime(
+                        QStringLiteral("host.runtime.critical_event_dropped"));
+                }
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::workerFailed, this,
+            [this](const WorkerLaunchRequest &request, const QString &error,
+                   const quint32 nativeError) {
+                const bool cleanupFailure = error == QStringLiteral(
+                        "host.launch.temp_cleanup_failed")
+                    || error == QStringLiteral("host.launch.process_wait_failed")
+                    || error == QStringLiteral("host.launch.process_cleanup_failed")
+                    || error.startsWith(QStringLiteral("sandbox.process."))
+                    || error.startsWith(QStringLiteral("sandbox.job."))
+                    || error.startsWith(QStringLiteral("sandbox.acl."))
+                    || error.startsWith(QStringLiteral("package.immutable_"));
+                const bool admissionFailure =
+                    error.startsWith(QStringLiteral("host.launch.admission_"));
+                const FullAttemptKey key{
+                    {request.tabId, request.runtimeIncarnation}, request.attempt,
+                    request.lease.leaseAuthorityEpoch};
+                QPointer<HostApplication> guard(this);
+                const bool queued = enqueueAppRuntime(
+                    [guard, key, error, nativeError, cleanupFailure,
+                     admissionFailure](AppRuntimeCoordinator &coordinator) {
+                        const AppRuntimeResult result = cleanupFailure
+                            ? coordinator.workerCleanupFailed(
+                                  key, error, nativeError, -1)
+                            : admissionFailure
+                            ? coordinator.workerAdmissionFailed(key, error, -1)
+                            : coordinator.workerExited(
+                                  key, WorkerExitReason::StartupFailure, -1);
+                        QMetaObject::invokeMethod(
+                            guard,
+                            [guard, result] {
+                                if (guard) guard->handleAppRuntimeResult(result);
+                            },
+                            Qt::QueuedConnection);
+                    });
+                if (!queued) {
+                    failClosedAppRuntime(
+                        QStringLiteral("host.runtime.critical_event_dropped"));
+                }
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::heartbeatObserved, this,
+            [this](const WorkerLaunchRequest &request,
+                   const quint64 generation) {
+                Q_UNUSED(generation);
+                const qint64 receivedMonotonicMs = hostMonotonicNowMs();
+                const FullAttemptKey key{
+                    {request.tabId, request.runtimeIncarnation}, request.attempt,
+                    request.lease.leaseAuthorityEpoch};
+                const QString coalesceKey = appHeartbeatKey(request);
+                {
+                    std::lock_guard lock(appHeartbeatMutex_);
+                    const bool alreadyQueued =
+                        pendingAppHeartbeatTimes_.contains(coalesceKey);
+                    pendingAppHeartbeatTimes_.insert(coalesceKey,
+                                                     receivedMonotonicMs);
+                    if (alreadyQueued) return;
+                }
+                QPointer<HostApplication> guard(this);
+                const bool queued = enqueueAppRuntime(
+                    [guard, key, coalesceKey, receivedMonotonicMs](
+                        AppRuntimeCoordinator &coordinator) {
+                        const qint64 latestReceived = guard != nullptr
+                            ? guard->takePendingAppHeartbeat(coalesceKey)
+                                  .value_or(receivedMonotonicMs)
+                            : receivedMonotonicMs;
+                        const AppRuntimeResult result = coordinator.heartbeat(
+                            key, latestReceived);
+                        if (!result.actions.isEmpty()
+                            || result.code != AppRuntimeResultCode::Applied) {
+                            QMetaObject::invokeMethod(
+                                guard,
+                                [guard, result] {
+                                    if (guard) guard->handleAppRuntimeResult(result);
+                                },
+                                Qt::QueuedConnection);
+                        }
+                    });
+                if (!queued) (void)takePendingAppHeartbeat(coalesceKey);
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::routeLoadAcknowledged, this,
+            [this](const WorkerLaunchRequest &request, const QString &,
+                   const quint64) {
+                if (mainWindow_ == nullptr || mainWindow_->tabModel() == nullptr
+                    || mainWindow_->tabModel()->indexOfId(request.tabId) < 0) {
+                    return;
+                }
+                (void)mainWindow_->tabModel()->setLoadState(
+                    request.tabId, false, 100);
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::pageMetadataChanged, this,
+            [this](const WorkerLaunchRequest &request, const QString &title,
+                   const QString &) {
+                if (mainWindow_ == nullptr || mainWindow_->tabModel() == nullptr
+                    || mainWindow_->tabModel()->indexOfId(request.tabId) < 0) {
+                    return;
+                }
+                (void)mainWindow_->tabModel()->setTitle(request.tabId, title);
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::capabilityRequestObserved, this,
+            [this](const WorkerLaunchRequest &request, const QString &capability,
+                   const QString &operation, const QVariantMap &payload,
+                   const quint64 sessionGeneration) {
+                emit workerCapabilityRequestObservedForTab(
+                    request.tabId, request.runtimeIncarnation,
+                    sessionGeneration, capability, operation, payload,
+                    request.lease.leaseAuthorityEpoch);
+                if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr
+                    && mainWindow_->tabModel()->activeId() == request.tabId) {
+                    emit workerCapabilityRequestObserved(capability, operation,
+                                                         payload);
+                }
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::failed, this,
+            [this](const WorkerLaunchRequest &request, const QString &error,
+                   const quint64) {
+                const FullAttemptKey key{
+                    {request.tabId, request.runtimeIncarnation}, request.attempt,
+                    request.lease.leaseAuthorityEpoch};
+                QPointer<HostApplication> guard(this);
+                const bool queued = enqueueAppRuntime(
+                    [guard, key, error](AppRuntimeCoordinator &coordinator) {
+                        const AppRuntimeResult result = coordinator.workerExited(
+                            key, WorkerExitReason::Crashed, -1);
+                        Q_UNUSED(error);
+                        QMetaObject::invokeMethod(
+                            guard,
+                            [guard, result] {
+                                if (guard) guard->handleAppRuntimeResult(result);
+                            },
+                            Qt::QueuedConnection);
+                    });
+                if (!queued) {
+                    failClosedAppRuntime(
+                        QStringLiteral("host.runtime.critical_event_dropped"));
+                }
+            },
+            Qt::DirectConnection);
+    connect(raw, &AppTabRuntimeController::retired, this,
+            [this](const QString &tabId, const quint64) {
+                appTabRuntimeControllers_.remove(tabId);
+            },
+            Qt::DirectConnection);
+
+    tab->adoptAppRuntimeController(std::move(controller));
+    appTabRuntimeControllers_.insert(tabId, raw);
+    return raw;
+}
+
+void HostApplication::handleAppLaunchRequested(
+    const QString &tabId, const quint64 navigationIncarnation,
+    const QString &packageId, const QString &route,
+    const bool reload)
+{
+    if (!runtimeConfig_.has_value()
+        || runtimeConfig_->mode() != HostRuntimeMode::Package
+        || mainWindow_ == nullptr || route.isEmpty()
+        || packageId != runtimeConfig_->appId()) {
+        return;
+    }
+    TabController *const tab = mainWindow_->tabController(tabId);
+    if (tab == nullptr || mainWindow_->tabModel() == nullptr) return;
+    if (appRuntimeFailedClosed_.load(std::memory_order_acquire)) {
+        tab->showTrustedErrorForNavigation(
+            navigationIncarnation,
+            QStringLiteral("The package runtime is unavailable."));
+        return;
+    }
+    if (!ensureAppTabRuntimeController(tabId)) {
+        tab->showTrustedErrorForNavigation(
+            navigationIncarnation,
+            QStringLiteral("The package worker is unavailable."));
+        return;
+    }
+    const quint64 runtimeIncarnation = reload
+        ? advanceRuntimeIncarnationForTab(tabId)
+        : runtimeIncarnationForTab(tabId);
+    if (runtimeIncarnation == 0) {
+        tab->showTrustedErrorForNavigation(
+            navigationIncarnation,
+            QStringLiteral("The package runtime is unavailable."));
+        return;
+    }
+    pendingAppNavigationIncarnations_[tabId] = navigationIncarnation;
+    const TabLaunchAuthority authority{tabId, runtimeIncarnation};
+    QPointer<HostApplication> guard(this);
+    const bool queued = enqueueAppRuntime(
+        [guard, authority, route, tabId, navigationIncarnation](
+            AppRuntimeCoordinator &coordinator) {
+            const AppRuntimeResult result = coordinator.requestTabLaunch(
+                authority, route, TabLaunchIntent::ActivateCurrent, -1);
+            QMetaObject::invokeMethod(
+                guard,
+                [guard, result, tabId, navigationIncarnation] {
+                    if (!guard) return;
+                    if (result.code != AppRuntimeResultCode::Applied) {
+                        if (TabController *const tab =
+                                guard->mainWindow_ != nullptr
+                                    ? guard->mainWindow_->tabController(tabId)
+                                    : nullptr) {
+                            tab->showTrustedErrorForNavigation(
+                                navigationIncarnation,
+                                result.stableError.isEmpty()
+                                    ? QStringLiteral(
+                                          "The package worker is unavailable.")
+                                    : result.stableError);
+                        }
+                    }
+                    guard->handleAppRuntimeResult(result);
+                },
+                Qt::QueuedConnection);
+        });
+    if (!queued) {
+        tab->showTrustedErrorForNavigation(
+            navigationIncarnation,
+            QStringLiteral("The package runtime queue is unavailable."));
+        failClosedAppRuntime(
+            QStringLiteral("host.runtime.critical_event_dropped"));
+    }
+}
+
+void HostApplication::handleAppStopRequested(
+    const QString &tabId, const quint64 navigationIncarnation,
+    const quint64 runtimeIncarnation)
+{
+    Q_UNUSED(navigationIncarnation);
+    const quint64 effectiveRuntimeIncarnation = runtimeIncarnation != 0
+        ? runtimeIncarnation : appRuntimeIncarnations_.value(tabId, 0);
+    if (tabId.isEmpty() || effectiveRuntimeIncarnation == 0
+        || appRuntimeIncarnations_.value(tabId, 0)
+               != effectiveRuntimeIncarnation) {
+        return;
+    }
+    appRuntimeIncarnations_.remove(tabId);
+    pendingAppNavigationIncarnations_.remove(tabId);
+    const TabLaunchAuthority authority{tabId, effectiveRuntimeIncarnation};
+    QPointer<HostApplication> guard(this);
+    const bool queued = enqueueAppRuntime(
+        [guard, authority](AppRuntimeCoordinator &coordinator) {
+            const AppRuntimeResult result = coordinator.closeTab(authority, -1);
+            if (!result.actions.isEmpty()
+                || result.code != AppRuntimeResultCode::Applied) {
+                QMetaObject::invokeMethod(
+                    guard,
+                    [guard, result] {
+                        if (guard) guard->handleAppRuntimeResult(result);
+                    },
+                    Qt::QueuedConnection);
+            }
+        });
+    if (!queued) {
+        failClosedAppRuntime(
+            QStringLiteral("host.runtime.critical_event_dropped"));
+    }
+}
+
+void HostApplication::handleAppRuntimeFailure(const QString &stableError,
+                                              const quint32 nativeError)
+{
+    if (stableError.isEmpty()) return;
+    emit updateLifecycleFailed(stableError, nativeError);
+}
+
+void HostApplication::failClosedAppRuntime(const QString &stableError)
+{
+    const QString error = stableError.isEmpty()
+        ? QStringLiteral("host.runtime.critical_event_dropped")
+        : stableError;
+    if (appRuntimeFailedClosed_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    acceptingLifecycle_.store(false, std::memory_order_release);
+    if (appRuntimeTransportMutex_ != nullptr) {
+        std::lock_guard lock(*appRuntimeTransportMutex_);
+        if (appRuntimeTransportGate_ != nullptr) {
+            appRuntimeTransportGate_->store(false, std::memory_order_release);
+        }
+    } else if (appRuntimeTransportGate_ != nullptr) {
+        appRuntimeTransportGate_->store(false, std::memory_order_release);
+    }
+    QPointer<HostApplication> guard(this);
+    (void)QMetaObject::invokeMethod(
+        this,
+        [guard, error] {
+            if (!guard) return;
+            if (guard->installedPackageLauncher_ != nullptr) {
+                guard->installedPackageLauncher_->cancel();
+            }
+            guard->detachWorkerContext(error);
+            const QList<QPointer<AppTabRuntimeController>> controllers =
+                guard->appTabRuntimeControllers_.values();
+            for (const QPointer<AppTabRuntimeController> &controller :
+                 controllers) {
+                if (controller != nullptr) {
+                    controller->failClosed(error);
+                    controller->stop(error);
+                }
+            }
+            guard->handleAppRuntimeFailure(error);
+        },
+        Qt::QueuedConnection);
+}
+
+std::optional<qint64> HostApplication::takePendingAppHeartbeat(
+    const QString &key) noexcept
+{
+    if (key.isEmpty()) return std::nullopt;
+    std::lock_guard lock(appHeartbeatMutex_);
+    const auto found = pendingAppHeartbeatTimes_.find(key);
+    if (found == pendingAppHeartbeatTimes_.end()) return std::nullopt;
+    const qint64 result = found.value();
+    pendingAppHeartbeatTimes_.erase(found);
+    return result;
+}
+
+void HostApplication::handleAppRuntimeResult(const AppRuntimeResult &result)
+{
+    if (result.code == AppRuntimeResultCode::Rejected
+        || result.code == AppRuntimeResultCode::FailedClosed) {
+        handleAppRuntimeFailure(
+            result.stableError.isEmpty()
+                ? QStringLiteral("host.runtime.app_runtime_failed")
+                : result.stableError,
+            result.nativeError);
+    }
+    if (appRuntimeFailedClosed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    for (const AppRuntimeAction &action : result.actions) {
+        TabController *tab = mainWindow_ != nullptr
+            ? mainWindow_->tabController(action.tabId) : nullptr;
+        AppTabRuntimeController *runtime = tab != nullptr
+            ? tab->appRuntimeController() : nullptr;
+        const quint64 expectedRuntime = appRuntimeIncarnations_.value(
+            action.tabId, 0);
+        const quint64 currentRuntime = runtime != nullptr
+            && runtime->currentRequest().has_value()
+            ? runtime->currentRequest()->runtimeIncarnation
+            : runtime != nullptr ? runtime->runtimeIncarnation() : 0;
+        const bool actionTargetsCurrentRuntime =
+            action.runtimeIncarnation != 0
+            && expectedRuntime == action.runtimeIncarnation
+            && (action.kind == AppRuntimeActionKind::Launch
+                || currentRuntime == 0
+                || currentRuntime == action.runtimeIncarnation);
+        if (!actionTargetsCurrentRuntime && action.kind != AppRuntimeActionKind::AwaitAuthorityDrain) {
+            continue;
+        }
+        switch (action.kind) {
+        case AppRuntimeActionKind::Launch: {
+            if (!action.launch.has_value()) break;
+            if (tab == nullptr
+                || action.launch->tabId != action.tabId
+                || action.launch->runtimeIncarnation
+                       != action.runtimeIncarnation) {
+                break;
+            }
+            if (runtime == nullptr) runtime = ensureAppTabRuntimeController(
+                action.tabId);
+            if (runtime == nullptr) {
+                handleAppRuntimeFailure(
+                    QStringLiteral("host.runtime.app_launch_rejected"));
+                break;
+            }
+            const quint64 navigationIncarnation =
+                pendingAppNavigationIncarnations_.value(
+                    action.tabId, tab->incarnation());
+            if (navigationIncarnation == 0
+                || navigationIncarnation != tab->incarnation()
+                || !tab->prepareAppLaunch(action.launch->lease.appId,
+                                           navigationIncarnation)
+                || !runtime->requestLaunch(*action.launch)) {
+                handleAppRuntimeFailure(
+                    QStringLiteral("host.runtime.app_launch_rejected"));
+            }
+            break;
+        }
+        case AppRuntimeActionKind::Stop:
+            if (runtime != nullptr) {
+                runtime->stop(QStringLiteral("host.app_runtime.stop"));
+            }
+            break;
+        case AppRuntimeActionKind::IsolateSession:
+            if (runtime != nullptr) {
+                runtime->stop(QStringLiteral("host.app_runtime.isolate"));
+            }
+            break;
+        case AppRuntimeActionKind::TrustedCrash:
+        case AppRuntimeActionKind::FailedClosed:
+            if (tab != nullptr && tab->lifecycle() != BrowserTabLifecycle::Closing
+                && tab->lifecycle() != BrowserTabLifecycle::Retired) {
+                tab->showTrustedError(
+                    result.stableError.isEmpty()
+                        ? QStringLiteral("The package worker is unavailable.")
+                        : result.stableError,
+                    true);
+            }
+            break;
+        case AppRuntimeActionKind::AwaitAuthorityDrain:
+            if (!action.drain.has_value()) break;
+            {
+                const AuthorityDrainBatch batch = *action.drain;
+                QPointer<HostApplication> guard(this);
+                try {
+                    std::thread([guard, batch] {
+                        bool drained = true;
+                        for (const auto &ticket : batch.tickets) {
+                            if (!ticket.waitUntil(batch.monotonicDeadlineMs)) {
+                                drained = false;
+                                break;
+                            }
+                        }
+                        if (!guard) return;
+                        const qint64 observedNow = hostMonotonicNowMs();
+                        const qint64 completionNow = drained
+                            ? observedNow
+                            : std::max(observedNow,
+                                       batch.monotonicDeadlineMs + 1);
+                        const bool posted = QMetaObject::invokeMethod(
+                            guard,
+                            [guard, batch, drained, completionNow] {
+                                if (!guard) return;
+                                const bool queued = guard->enqueueAppRuntime(
+                                    [guard, batch, drained, completionNow](
+                                        AppRuntimeCoordinator &coordinator) {
+                                        const AppRuntimeResult result = drained
+                                            ? coordinator.authorityDrainCompleted(
+                                                  batch.id, completionNow)
+                                            : coordinator.authorityDrainTimedOut(
+                                                  batch.id, completionNow);
+                                        QMetaObject::invokeMethod(
+                                            guard,
+                                            [guard, result] {
+                                                if (guard) {
+                                                    guard->handleAppRuntimeResult(result);
+                                                }
+                                            },
+                                            Qt::QueuedConnection);
+                                    });
+                                if (!queued) {
+                                    guard->failClosedAppRuntime(
+                                        QStringLiteral(
+                                            "host.runtime.critical_event_dropped"));
+                                }
+                            },
+                            Qt::QueuedConnection);
+                        if (!posted && guard) {
+                            guard->failClosedAppRuntime(
+                                QStringLiteral(
+                                    "host.runtime.critical_event_dropped"));
+                        }
+                    }).detach();
+                } catch (...) {
+                    failClosedAppRuntime(
+                        QStringLiteral("host.runtime.drain_executor_unavailable"));
+                }
+            }
+            break;
+        case AppRuntimeActionKind::Revoke:
+        case AppRuntimeActionKind::RecoverFromLkg:
+        case AppRuntimeActionKind::None:
+            break;
+        }
+    }
+}
+
 #ifdef Q_BROWSER_HOST_TESTING
 void HostApplication::forceLifecycleQueueFullForTesting(const bool full) noexcept
 {
@@ -502,6 +1210,43 @@ bool HostApplication::requestPackageInstall(
     std::shared_ptr<const HostOwnedFileAuthority> sourceAuthority)
 {
     if (packagePath.isEmpty()) return false;
+    if (!appTabRuntimeControllers_.isEmpty()) {
+        QPointer<HostApplication> guard(this);
+        return enqueueAppRuntime(
+            [guard, packagePath,
+             sourceAuthority = std::move(sourceAuthority)](
+                AppRuntimeCoordinator &coordinator) mutable {
+                if (sourceAuthority && !sourceAuthority->revalidate()) {
+                    if (guard) {
+                        const QString error = QStringLiteral(
+                            "host.runtime.install_source_authority_changed");
+                        QMetaObject::invokeMethod(
+                            guard,
+                            [guard, error] {
+                                if (guard) emit guard->updateLifecycleFailed(error);
+                            },
+                            Qt::QueuedConnection);
+                    }
+                    return;
+                }
+                const AppRuntimeResult result = coordinator.installAndActivate(
+                    packagePath, hostMonotonicNowMs());
+                if (guard && result.code != AppRuntimeResultCode::Applied) {
+                    const QString error = result.stableError.isEmpty()
+                        ? QStringLiteral("host.runtime.install_rejected")
+                        : result.stableError;
+                    QMetaObject::invokeMethod(
+                        guard,
+                        [guard, error, result] {
+                            if (guard) {
+                                emit guard->updateLifecycleFailed(
+                                    error, result.nativeError);
+                            }
+                        },
+                        Qt::QueuedConnection);
+                }
+            });
+    }
     QPointer<HostApplication> guard(this);
     return enqueueLifecycle(
         [guard, packagePath,
@@ -517,7 +1262,7 @@ bool HostApplication::requestPackageInstall(
                 }
                 return;
             }
-            const UpdateLifecycleResult result = coordinator.installAndLaunch(
+             const UpdateLifecycleResult result = coordinator.installAndLaunch(
                 packagePath);
             if (!result.succeeded() && guard) {
                 const QString error = result.stableError;
@@ -527,12 +1272,59 @@ bool HostApplication::requestPackageInstall(
                         emit guard->updateLifecycleFailed(error, nativeError);
                     }
                 }, Qt::QueuedConnection);
+            } else if (result.succeeded() && guard) {
+                // Keep the new per-tab coordinator's verified descriptor in
+                // sync with the compatibility lifecycle adapter.  The
+                // adapter remains responsible for legacy startup; tab
+                // launches are issued only after this state is committed.
+                (void)guard->enqueueAppRuntime(
+                    [guard](AppRuntimeCoordinator &appCoordinator) {
+                        const AppRuntimeResult appResult =
+                            appCoordinator.startOffline(-1);
+                        if (appResult.code != AppRuntimeResultCode::Applied) {
+                            const QString error = appResult.stableError;
+                            QMetaObject::invokeMethod(
+                                guard,
+                                [guard, error] {
+                                    if (guard) {
+                                        guard->handleAppRuntimeFailure(
+                                            error.isEmpty()
+                                                ? QStringLiteral(
+                                                      "host.runtime.app_state_unavailable")
+                                                : error);
+                                    }
+                                },
+                                Qt::QueuedConnection);
+                        }
+                    });
             }
         });
 }
 
 bool HostApplication::requestOfflineStart()
 {
+    if (!appTabRuntimeControllers_.isEmpty()) {
+        QPointer<HostApplication> guard(this);
+        return enqueueAppRuntime(
+            [guard](AppRuntimeCoordinator &coordinator) {
+                const AppRuntimeResult result = coordinator.startOffline(
+                    hostMonotonicNowMs());
+                if (guard && result.code != AppRuntimeResultCode::Applied) {
+                    const QString error = result.stableError.isEmpty()
+                        ? QStringLiteral("host.runtime.offline_start_rejected")
+                        : result.stableError;
+                    QMetaObject::invokeMethod(
+                        guard,
+                        [guard, error, result] {
+                            if (guard) {
+                                emit guard->updateLifecycleFailed(
+                                    error, result.nativeError);
+                            }
+                        },
+                        Qt::QueuedConnection);
+                }
+            });
+    }
     QPointer<HostApplication> guard(this);
     return enqueueLifecycle([guard](UpdateLifecycleCoordinator &coordinator) {
         const UpdateLifecycleResult result = coordinator.startOffline();
@@ -541,9 +1333,30 @@ bool HostApplication::requestOfflineStart()
             const quint32 nativeError = result.nativeError;
             QMetaObject::invokeMethod(guard, [guard, error, nativeError] {
                 if (guard) {
-                    emit guard->updateLifecycleFailed(error, nativeError);
-                }
-            }, Qt::QueuedConnection);
+                        emit guard->updateLifecycleFailed(error, nativeError);
+                    }
+                }, Qt::QueuedConnection);
+        } else if (result.succeeded() && guard) {
+            (void)guard->enqueueAppRuntime(
+                [guard](AppRuntimeCoordinator &appCoordinator) {
+                    const AppRuntimeResult appResult =
+                        appCoordinator.startOffline(-1);
+                    if (appResult.code != AppRuntimeResultCode::Applied) {
+                        const QString error = appResult.stableError;
+                        QMetaObject::invokeMethod(
+                            guard,
+                            [guard, error] {
+                                if (guard) {
+                                    guard->handleAppRuntimeFailure(
+                                        error.isEmpty()
+                                            ? QStringLiteral(
+                                                  "host.runtime.app_state_unavailable")
+                                            : error);
+                                }
+                            },
+                            Qt::QueuedConnection);
+                    }
+                });
         }
     });
 }
@@ -578,6 +1391,12 @@ bool HostApplication::initializePackageRuntime()
     if (packageTabId.isEmpty() || nextCapabilityRuntimeIncarnation_ == 0) {
         emit updateLifecycleFailed(
             QStringLiteral("host.runtime.launch_authority_unavailable"));
+        return false;
+    }
+    if (mainWindow_ == nullptr
+        || !mainWindow_->reserveLegacyWorkerOwner(packageTabId)) {
+        emit updateLifecycleFailed(
+            QStringLiteral("host.runtime.legacy_owner_unavailable"));
         return false;
     }
     const quint64 runtimeIncarnation = nextCapabilityRuntimeIncarnation_++;
@@ -651,10 +1470,14 @@ bool HostApplication::initializePackageRuntime()
             }
 #endif
             if (!guard) return;
-            (void)guard->enqueueLifecycle(
+            const bool queued = guard->enqueueLifecycle(
                 [key](UpdateLifecycleCoordinator &coordinator) {
                     (void)coordinator.workerExited(key, WorkerExitReason::Crashed);
                 });
+            if (!queued) {
+                guard->failClosedAppRuntime(
+                    QStringLiteral("host.runtime.critical_event_dropped"));
+            }
         },
         [guard](const WorkerAttemptKey key,
                 const QString &stableError,
@@ -683,7 +1506,7 @@ bool HostApplication::initializePackageRuntime()
                 || error.startsWith(QStringLiteral("package.immutable_"));
             const bool admissionFailure = error.startsWith(
                 QStringLiteral("host.launch.admission_"));
-            (void)localGuard->enqueueLifecycle(
+            const bool queued = localGuard->enqueueLifecycle(
                 [key, cleanupFailure, admissionFailure](
                     UpdateLifecycleCoordinator &coordinator) {
                     if (cleanupFailure) {
@@ -695,6 +1518,9 @@ bool HostApplication::initializePackageRuntime()
                             key, WorkerExitReason::StartupFailure);
                     }
                 });
+            if (!queued && cleanupFailure) {
+                localGuard->failClosedAppRuntime(error);
+            }
         }, this);
     if (!installedPackageLauncher_->isAccepting()) {
         installedPackageLauncher_.reset();
@@ -733,9 +1559,18 @@ bool HostApplication::initializePackageRuntime()
         }
     });
 
+    auto appCoordinator = std::make_unique<AppRuntimeCoordinator>(
+        runtimeConfig_->appId(), authority->store(), authority->installer(),
+        WorkerSupervisionPolicy{runtimeConfig_->healthWindowMs(),
+                                runtimeConfig_->heartbeatTimeoutMs()},
+        LifecycleClock::system(), recorder.get(),
+        AppRuntimeCoordinator::DrainConsumer{}, 10'000);
+    packageAuthority_ = authority;
+
     auto *const runtime = new HostLifecycleRuntime(
         std::move(authority), std::move(recorder),
         std::move(coordinator),
+        std::move(appCoordinator),
         [guard](const QString &stableError, const quint32 nativeError) {
             if (!guard) return;
             (void)QMetaObject::invokeMethod(
@@ -786,6 +1621,59 @@ bool HostApplication::start()
     if (!window->hasValidWebSession()) {
         return false;
     }
+    const bool packageMode = runtimeConfig_.has_value()
+        && runtimeConfig_->mode() == HostRuntimeMode::Package;
+    window->setPackageRuntimeEnabled(packageMode);
+    connect(window.get(), &MainWindow::appLaunchRequested, this,
+            [this](const QString &tabId, const quint64 navigationIncarnation,
+                   const QString &packageId, const QString &route) {
+                handleAppLaunchRequested(tabId, navigationIncarnation,
+                                         packageId, route);
+            },
+            Qt::DirectConnection);
+    connect(window.get(), &MainWindow::appReloadRequested, this,
+            [this](const QString &tabId, const quint64 navigationIncarnation,
+                   const QString &packageId, const QString &route) {
+                handleAppLaunchRequested(tabId, navigationIncarnation,
+                                         packageId, route, true);
+            },
+            Qt::DirectConnection);
+    connect(window.get(), &MainWindow::appStopRequested, this,
+            [this](const QString &tabId, const quint64 navigationIncarnation,
+                   const quint64 runtimeIncarnation) {
+                handleAppStopRequested(tabId, navigationIncarnation,
+                                        runtimeIncarnation);
+            },
+            Qt::DirectConnection);
+    connect(window.get(), &MainWindow::tabClosing, this,
+            [this](const QString &tabId, const quint64) {
+                if (mainWindow_ == nullptr) return;
+                const auto incarnation = appRuntimeIncarnations_.find(tabId);
+                pendingAppNavigationIncarnations_.remove(tabId);
+                if (incarnation == appRuntimeIncarnations_.end()) return;
+                const TabLaunchAuthority authority{tabId, *incarnation};
+                appRuntimeIncarnations_.erase(incarnation);
+                QPointer<HostApplication> guard(this);
+                const bool queued = enqueueAppRuntime(
+                    [guard, authority](AppRuntimeCoordinator &coordinator) {
+                        const AppRuntimeResult result =
+                            coordinator.closeTab(authority, -1);
+                        if (!result.actions.isEmpty()
+                            || result.code != AppRuntimeResultCode::Applied) {
+                            QMetaObject::invokeMethod(
+                                guard,
+                                [guard, result] {
+                                    if (guard) guard->handleAppRuntimeResult(result);
+                                },
+                                Qt::QueuedConnection);
+                        }
+                    });
+                if (!queued) {
+                    failClosedAppRuntime(
+                        QStringLiteral("host.runtime.critical_event_dropped"));
+                }
+            },
+            Qt::DirectConnection);
     window->resize(1100, 720);
     window->show();
     recordHostDiagnosticPhase("start-main-window-shown");
@@ -796,7 +1684,42 @@ bool HostApplication::start()
     connect(gestureRouter_.get(), &HostGestureRouter::browserCommandRequested,
             mainWindow_->browserChrome(), &BrowserChrome::dispatchCommand);
     connect(mainWindow_->tabModel(), &BrowserTabModel::activeTabChanged,
-            this, [this] { synchronizeGestureAuthority(); },
+            this, [this] {
+                if (workerSessionController_ != nullptr
+                    && mainWindow_ != nullptr
+                    && workerSessionController_->state()
+                           == HostWorkerSessionState::Running) {
+                    const QString owner = mainWindow_->tabModel() != nullptr
+                        ? mainWindow_->tabModel()->activeId() : QString{};
+                    const bool active = !owner.isEmpty()
+                        && owner == (capabilityRuntime_ != nullptr
+                                         ? capabilityRuntime_->authority().tabId
+                                         : QString{});
+                    (void)workerSessionController_->sendVisibilityChanged(active);
+                }
+                synchronizeGestureAuthority();
+            },
+            Qt::DirectConnection);
+    connect(mainWindow_.get(), &MainWindow::currentUrlChanged, this,
+            [this](const QString &) {
+                synchronizeGestureAuthority();
+                if (workerSessionController_ == nullptr
+                    || mainWindow_ == nullptr
+                    || workerSessionController_->state()
+                           != HostWorkerSessionState::Running) {
+                    return;
+                }
+                const QString owner = capabilityRuntime_ != nullptr
+                    ? capabilityRuntime_->authority().tabId : QString{};
+                if (owner.isEmpty()
+                    || mainWindow_->tabModel() == nullptr
+                    || mainWindow_->tabModel()->activeId() != owner) {
+                    (void)workerSessionController_->sendVisibilityChanged(false);
+                    return;
+                }
+                (void)workerSessionController_->sendVisibilityChanged(
+                    mainWindow_->activeSurface() == HostSurfaceKind::Worker);
+            },
             Qt::DirectConnection);
     if (QGuiApplication *const application =
             qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
@@ -820,11 +1743,15 @@ bool HostApplication::start()
                 const std::optional<WorkerAttemptKey> failedKey = attachedWorkerKey_;
                 detachWorkerContext(QStringLiteral("host.worker_session.failed"));
                 if (failedKey.has_value()) {
-                    (void)enqueueLifecycle(
+                    const bool queued = enqueueLifecycle(
                         [failedKey](UpdateLifecycleCoordinator &coordinator) {
                             (void)coordinator.workerExited(
                                 *failedKey, WorkerExitReason::Crashed);
                         });
+                    if (!queued) {
+                        failClosedAppRuntime(
+                            QStringLiteral("host.runtime.critical_event_dropped"));
+                    }
                 }
             });
     connect(workerSessionController_.get(),
@@ -855,11 +1782,47 @@ bool HostApplication::start()
     updateHealthTimer_->setInterval(50);
     connect(updateHealthTimer_.get(), &QTimer::timeout, this, [this] {
         synchronizeGestureAuthority();
-        if (!attachedWorkerKey_.has_value()) return;
-        const WorkerAttemptKey key = *attachedWorkerKey_;
-        (void)enqueueLifecycle([key](UpdateLifecycleCoordinator &coordinator) {
-            (void)coordinator.checkHealth(key);
-        });
+        if (attachedWorkerKey_.has_value()) {
+            const WorkerAttemptKey key = *attachedWorkerKey_;
+            (void)enqueueLifecycle([key](UpdateLifecycleCoordinator &coordinator) {
+                (void)coordinator.checkHealth(key);
+            });
+        }
+        if (!appTabRuntimeControllers_.isEmpty()) {
+            bool expectedPending = false;
+            if (!appHealthCheckPending_.compare_exchange_strong(
+                    expectedPending, true, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return;
+            }
+            QPointer<HostApplication> guard(this);
+            const qint64 healthNowMs = hostMonotonicNowMs();
+            const bool queued = enqueueAppRuntime(
+                [guard, healthNowMs](AppRuntimeCoordinator &coordinator) {
+                    const AppRuntimeResult result = coordinator.checkHealth(
+                        healthNowMs);
+                    if (guard == nullptr) return;
+                    const bool posted = QMetaObject::invokeMethod(
+                        guard,
+                        [guard, result] {
+                            if (!guard) return;
+                            guard->appHealthCheckPending_.store(
+                                false, std::memory_order_release);
+                            if (!result.actions.isEmpty()
+                                || result.code != AppRuntimeResultCode::Applied) {
+                                guard->handleAppRuntimeResult(result);
+                            }
+                        },
+                        Qt::QueuedConnection);
+                    if (!posted) {
+                        guard->appHealthCheckPending_.store(
+                            false, std::memory_order_release);
+                    }
+                });
+            if (!queued) {
+                appHealthCheckPending_.store(false, std::memory_order_release);
+            }
+        }
     });
     updateHealthTimer_->start();
     recordHostDiagnosticPhase("start-health-timer-ready");
@@ -1059,18 +2022,42 @@ void HostApplication::detachWorkerContext(const QString &reason)
 void HostApplication::synchronizeGestureAuthority()
 {
     if (gestureRouter_ == nullptr) return;
-    if (capabilityRuntime_ == nullptr || mainWindow_ == nullptr
+    HostCapabilityRuntime *activeCapability = capabilityRuntime_.get();
+    HostWorkerSessionController *activeSession =
+        workerSessionController_.get();
+    QString activeTabId;
+    if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr) {
+        activeTabId = mainWindow_->tabModel()->activeId();
+        if (TabController *const activeTab =
+                mainWindow_->tabController(activeTabId);
+            activeTab != nullptr && activeTab->appRuntimeController() != nullptr) {
+            if (activeTab->appRuntimeController()->capabilityRuntime() != nullptr
+                && activeTab->surfaceKind() == HostSurfaceKind::Worker
+                && activeTab->currentSurface() == activeTab->workerSurface()) {
+                activeCapability =
+                    activeTab->appRuntimeController()->capabilityRuntime();
+                activeSession =
+                    activeTab->appRuntimeController()->sessionController();
+            } else {
+                // A per-tab runtime may remain alive while its tab shows Web,
+                // New Tab, or a trusted error.  Never reuse a compatibility
+                // capability from another surface in that state.
+                activeCapability = nullptr;
+                activeSession = nullptr;
+            }
+        }
+    }
+    if (activeCapability == nullptr || mainWindow_ == nullptr
         || mainWindow_->tabModel() == nullptr
         || QGuiApplication::applicationState() != Qt::ApplicationActive
-        || mainWindow_->tabModel()->activeId()
-               != capabilityRuntime_->authority().tabId) {
+        || activeTabId != activeCapability->authority().tabId) {
         gestureRouter_->hostDeactivated();
         return;
     }
-    const TabCapabilityAuthority &authority = capabilityRuntime_->authority();
-    if (workerSessionController_ == nullptr
-        || workerSessionController_->state() != HostWorkerSessionState::Running
-        || workerSessionController_->generation() != authority.sessionGeneration) {
+    const TabCapabilityAuthority &authority = activeCapability->authority();
+    if (activeSession == nullptr
+        || activeSession->state() != HostWorkerSessionState::Running
+        || activeSession->generation() != authority.sessionGeneration) {
         gestureRouter_->hostDeactivated();
         return;
     }
@@ -1081,6 +2068,13 @@ void HostApplication::synchronizeGestureAuthority()
 
 bool HostApplication::hasWorkerContext() const noexcept
 {
+    if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr) {
+        const QString activeId = mainWindow_->tabModel()->activeId();
+        if (TabController *const active = mainWindow_->tabController(activeId);
+            active != nullptr && active->appRuntimeController() != nullptr) {
+            return active->appRuntimeController()->hasWorkerContext();
+        }
+    }
     return workerProcessLifetime_ != nullptr;
 }
 
@@ -1091,5 +2085,12 @@ MainWindow *HostApplication::mainWindow() const noexcept
 
 HostWorkerSessionController *HostApplication::workerSessionController() const noexcept
 {
+    if (mainWindow_ != nullptr && mainWindow_->tabModel() != nullptr) {
+        if (TabController *const activeTab = mainWindow_->tabController(
+                mainWindow_->tabModel()->activeId());
+            activeTab != nullptr && activeTab->appRuntimeController() != nullptr) {
+            return activeTab->appRuntimeController()->sessionController();
+        }
+    }
     return workerSessionController_.get();
 }

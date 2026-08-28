@@ -379,7 +379,7 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
         replacement = closeTab(*previousIncarnation, now);
     }
 
-    const TabState *existing = findTab(tab);
+    TabState *existing = findTab(tab);
     const VersionDescriptor *descriptor = nullptr;
     std::optional<VersionDescriptor> pinned;
     PackageRevalidationMode mode = PackageRevalidationMode::PinnedLease;
@@ -400,6 +400,18 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
         mode = PackageRevalidationMode::PinnedLease;
     } else {
         return rejectedResult(QStringLiteral("current_unavailable"));
+    }
+    if (intent == TabLaunchIntent::ActivateCurrent && existing != nullptr
+        && existing->hasRequest && existing->admitted && !existing->revoked
+        && !existing->retired && !existing->failedClosed
+        && sameLeaseIdentity(existing->pinnedLease, descriptor->lease)
+        && existing->pinnedLease.activationGenerationAtIssue
+               == descriptor->lease.activationGenerationAtIssue) {
+        // A healthy worker already owns this tab/runtime authority.  A user
+        // route change updates the authority's restart route without creating
+        // a second process; the GUI dispatches the corresponding RouteLoad.
+        existing->request.route = route;
+        return replacement;
     }
     AppRuntimeResult launched = launchForTab(tab, route, *descriptor, mode,
                                              false, now);
@@ -973,6 +985,10 @@ AppRuntimeResult AppRuntimeCoordinator::timeoutDrain(const qint64 nowMs)
     if (!pendingDrain_.has_value()) return staleResult();
     if (pendingDrain_->timedOut) return staleResult();
     pendingDrain_->timedOut = true;
+    // A deadline breach is terminal for the app runtime.  Even if every
+    // outstanding use eventually drains, reopening the authority would make
+    // a late publication indistinguishable from a successful rollback.
+    failedClosed_ = true;
     AppRuntimeResult result = failedClosedResult(
         QStringLiteral("authority_drain_timeout"));
     appendDrainTimeoutActions(result, *pendingDrain_);
@@ -996,6 +1012,9 @@ AppRuntimeResult AppRuntimeCoordinator::finishDrain(const qint64 nowMs)
                 completed.failureError.isEmpty()
                     ? QStringLiteral("authority_drain_failed")
                     : completed.failureError);
+        }
+        if (completed.timedOut) {
+            return failedClosedResult(QStringLiteral("authority_drain_timeout"));
         }
         return {};
     }

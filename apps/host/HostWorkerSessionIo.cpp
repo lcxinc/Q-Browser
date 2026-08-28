@@ -159,6 +159,9 @@ void HostWorkerSessionIo::pollSession()
         case ProtocolType::Heartbeat:
             emit heartbeatObserved(generation_);
             break;
+        case ProtocolType::VisibilityChanged:
+            fail(QStringLiteral("host.worker_session.unexpected_message"));
+            return;
         case ProtocolType::PageMetadata:
             emit pageMetadataReceived(
                 generation_,

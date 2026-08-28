@@ -119,6 +119,12 @@ bool HostWorkerSessionController::attach(std::unique_ptr<IpcSession> session)
     return startSession(std::move(session));
 }
 
+bool HostWorkerSessionController::canAttachImmediately() const noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return io_ == nullptr && ioThread_ == nullptr && pendingSession_ == nullptr;
+}
+
 bool HostWorkerSessionController::startSession(std::unique_ptr<IpcSession> session)
 {
     if (session == nullptr || io_ != nullptr || ioThread_ != nullptr) return false;
@@ -248,6 +254,16 @@ bool HostWorkerSessionController::requestRouteLoad(const QString &route)
     return QThread::currentThread() == thread()
         && state_ == HostWorkerSessionState::Running
         && enqueueRouteLoad(route);
+}
+
+bool HostWorkerSessionController::sendVisibilityChanged(const bool active)
+{
+    if (QThread::currentThread() != thread()
+        || state_ != HostWorkerSessionState::Running) {
+        return false;
+    }
+    const auto message = ProtocolMessage::visibilityChanged(active);
+    return message.has_value() && enqueueMessage(*message);
 }
 
 quint64 HostWorkerSessionController::generation() const noexcept
@@ -567,6 +583,7 @@ void HostWorkerSessionController::handleIoThreadFinished(
     }
 
     state_ = cleanupFinalState_;
+    emit sessionDetached(generation_);
 }
 
 void HostWorkerSessionController::stopIoThreadForDestruction()

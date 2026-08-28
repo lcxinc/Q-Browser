@@ -32,13 +32,21 @@ public:
     ~MainWindow() override;
 
     [[nodiscard]] bool navigate(QStringView input);
+    void setPackageRuntimeEnabled(bool enabled) noexcept;
     [[nodiscard]] bool shutdown();
     [[nodiscard]] bool navigateFromWorker(const QString &packageId,
+                                          const QString &route);
+    [[nodiscard]] bool navigateFromWorker(const QString &tabId,
+                                          const QString &packageId,
                                           const QString &route);
     [[nodiscard]] bool goBack();
     [[nodiscard]] bool goForward();
     [[nodiscard]] bool attachWorkerSurface(std::unique_ptr<WorkerSurface> surface);
+    [[nodiscard]] bool attachWorkerSurface(const QString &tabId,
+                                           std::unique_ptr<WorkerSurface> surface);
+    [[nodiscard]] bool reserveLegacyWorkerOwner(const QString &tabId);
     void detachWorkerSurface();
+    void detachWorkerSurface(const QString &tabId);
     [[nodiscard]] bool isRunning() const noexcept;
     [[nodiscard]] bool isShutdownComplete() const noexcept;
     [[nodiscard]] bool hasValidWebSession() const noexcept;
@@ -57,6 +65,7 @@ public:
     [[nodiscard]] WebSessionProfile *webSessionProfile() const noexcept;
     [[nodiscard]] WebSurface *webSurface() const noexcept;
     [[nodiscard]] WorkerSurface *workerSurface() const noexcept;
+    [[nodiscard]] WorkerSurface *workerSurface(const QString &tabId) const noexcept;
 
 signals:
     void currentUrlChanged(const QString &url);
@@ -64,6 +73,24 @@ signals:
                               const QString &entryPoint,
                               const QVariantMap &parameters,
                               const QUrl &appUrl);
+    void workerRouteRequestedForTab(const QString &tabId,
+                                    quint64 incarnation,
+                                    const QString &packageId,
+                                    const QString &entryPoint,
+                                    const QVariantMap &parameters,
+                                    const QUrl &appUrl);
+    void tabClosing(const QString &tabId, quint64 incarnation);
+    void appLaunchRequested(const QString &tabId,
+                            quint64 navigationIncarnation,
+                            const QString &packageId,
+                            const QString &route);
+    void appReloadRequested(const QString &tabId,
+                            quint64 navigationIncarnation,
+                            const QString &packageId,
+                            const QString &route);
+    void appStopRequested(const QString &tabId,
+                          quint64 navigationIncarnation,
+                          quint64 runtimeIncarnation);
     void legacyWorkerRetirementRequested(const QString &tabId);
 
 private:
@@ -81,6 +108,7 @@ private:
         Engine engine = Engine::Invalid;
         QString packageId;
         QString entryPoint;
+        QString appRoute;
         QVariantMap parameters;
         QUrl physicalEntry;
     };
@@ -106,6 +134,8 @@ private:
 
     void createController(const QString &stableTabId);
     void removeController(const QString &stableTabId);
+    void trackRetiringController(TabController *controller);
+    void finalizeRetiringController(const QString &stableTabId);
     void activateStableTab(const QString &stableTabId);
     void closeStableTab(const QString &stableTabId);
     void moveStableTab(const QString &stableTabId, int destinationIndex);
@@ -124,10 +154,12 @@ private:
     BrowserChrome *browserChrome_ = nullptr;
     QStackedWidget *surfaceStack_ = nullptr;
     QHash<QString, TabController *> controllers_;
+    QHash<QString, TabController *> retiringControllers_;
     QString visibleTabId_;
     QString legacyWorkerOwnerId_;
     bool navigationInProgress_ = false;
     int resourceMutationDepth_ = 0;
     bool shutdownInProgress_ = false;
+    bool packageRuntimeEnabled_ = false;
     LifecycleState lifecycleState_ = LifecycleState::Running;
 };

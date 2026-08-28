@@ -1,5 +1,6 @@
 #include "TabController.h"
 
+#include "AppTabRuntimeController.h"
 #include "NewTabPage.h"
 #include "WebSessionProfile.h"
 #include "WebSurface.h"
@@ -60,6 +61,11 @@ QWidget *TabController::currentSurface() const noexcept
     return currentSurface_;
 }
 
+bool TabController::isActive() const noexcept
+{
+    return active_;
+}
+
 NewTabPage *TabController::hostSurface() const noexcept
 {
     return hostSurface_;
@@ -75,6 +81,11 @@ WorkerSurface *TabController::workerSurface() const noexcept
     return workerSurface_;
 }
 
+AppTabRuntimeController *TabController::appRuntimeController() const noexcept
+{
+    return appRuntimeController_.get();
+}
+
 QString TabController::workerPackageId() const
 {
     return workerPackageId_;
@@ -88,8 +99,10 @@ QString TabController::trustedErrorText() const
 void TabController::setActive(const bool active)
 {
     if (retired_) return;
+    const bool changed = active_ != active;
     active_ = active;
     updateVisibility();
+    if (changed) emit activeChanged(tabId_, active_);
     if (lifecycle_ == BrowserTabLifecycle::Dormant
         || lifecycle_ == BrowserTabLifecycle::Starting
         || lifecycle_ == BrowserTabLifecycle::Loading
@@ -125,7 +138,7 @@ bool TabController::startHost(const quint64 navigationIncarnation)
     connectHostSignals();
     currentSurface_ = hostSurface_;
     surfaceKind_ = HostSurfaceKind::Host;
-    workerPackageId_.clear();
+    if (appRuntimeController_ == nullptr) workerPackageId_.clear();
     updateVisibility();
     transitionTo(active_ ? BrowserTabLifecycle::Active
                          : BrowserTabLifecycle::Background);
@@ -152,7 +165,7 @@ bool TabController::startWeb(const QUrl &physicalEntry,
     (void)model_->setLoadState(tabId_, false, 0);
     destroyTrustedErrorSurface();
     destroyHostSurface();
-    workerPackageId_.clear();
+    if (appRuntimeController_ == nullptr) workerPackageId_.clear();
 
     if (webSurface_ != nullptr && webEntry_ != physicalEntry) {
         destroyWebSurface();
@@ -213,6 +226,8 @@ bool TabController::startLegacyApp(const QString &packageId,
     currentSurface_ = workerSurface_;
     surfaceKind_ = HostSurfaceKind::Worker;
     updateVisibility();
+    emit workerRouteRequestedForTab(tabId_, incarnation_, packageId, entryPoint,
+                                    parameters, logicalUrl);
     emit workerRouteRequested(packageId, entryPoint, parameters, logicalUrl);
     if (!isCurrentNavigation(navigationIncarnation)
         || workerSurface_ == nullptr || currentSurface_ != workerSurface_
@@ -224,13 +239,74 @@ bool TabController::startLegacyApp(const QString &packageId,
     return true;
 }
 
+bool TabController::prepareAppLaunch(const QString &packageId,
+                                      const quint64 navigationIncarnation)
+{
+    if (!isCurrentNavigation(navigationIncarnation) || packageId.isEmpty()) {
+        return false;
+    }
+    transitionTo(BrowserTabLifecycle::Starting);
+    (void)model_->setLoadState(tabId_, true, 0);
+    (void)model_->setVisualState(tabId_, BrowserVisualState::Normal);
+    destroyTrustedErrorSurface();
+    destroyHostSurface();
+    destroyWebSurface();
+    workerPackageId_ = packageId;
+    currentSurface_ = nullptr;
+    surfaceKind_ = HostSurfaceKind::Worker;
+    updateVisibility();
+    transitionTo(BrowserTabLifecycle::Loading);
+    return true;
+}
+
+bool TabController::bindAppWorkerSurface(const QString &packageId,
+                                         const quint64 navigationIncarnation)
+{
+    if (!isCurrentNavigation(navigationIncarnation) || packageId.isEmpty()
+        || workerPackageId_ != packageId || workerSurface_ == nullptr
+        || !workerSurface_->isValid()) {
+        return false;
+    }
+    workerPackageId_ = packageId;
+    currentSurface_ = workerSurface_;
+    surfaceKind_ = HostSurfaceKind::Worker;
+    updateVisibility();
+    transitionTo(active_ ? BrowserTabLifecycle::Active
+                         : BrowserTabLifecycle::Background);
+    return true;
+}
+
 void TabController::stop()
 {
+    if (appRuntimeController_ != nullptr
+        && (lifecycle_ == BrowserTabLifecycle::Starting
+            || lifecycle_ == BrowserTabLifecycle::Loading)) {
+        (void)cancelAppLaunch();
+        return;
+    }
     if (retired_ || webSurface_ == nullptr
         || currentSurface_ != webSurface_) {
         return;
     }
     webSurface_->stop();
+}
+
+bool TabController::cancelAppLaunch()
+{
+    if (retired_ || appRuntimeController_ == nullptr
+        || (lifecycle_ != BrowserTabLifecycle::Starting
+            && lifecycle_ != BrowserTabLifecycle::Loading)) {
+        return false;
+    }
+    appRuntimeController_->stop(QStringLiteral("host.app.stop"));
+    advanceIncarnation();
+    (void)model_->setLoadState(tabId_, false, 0);
+    if (workerSurface_ != nullptr) workerSurface_->hide();
+    currentSurface_ = nullptr;
+    surfaceKind_ = HostSurfaceKind::TrustedError;
+    transitionTo(BrowserTabLifecycle::Dormant);
+    updateVisibility();
+    return true;
 }
 
 void TabController::showTrustedError(const QString &plainText,
@@ -263,6 +339,15 @@ bool TabController::attachLegacyWorkerSurface(
     return true;
 }
 
+void TabController::adoptAppRuntimeController(
+    std::unique_ptr<AppTabRuntimeController> controller)
+{
+    if (retired_ || controller == nullptr || appRuntimeController_ != nullptr) {
+        return;
+    }
+    appRuntimeController_ = std::move(controller);
+}
+
 void TabController::detachLegacyWorkerSurface()
 {
     if (workerSurface_ == nullptr) return;
@@ -287,6 +372,9 @@ bool TabController::beginClosing()
     if (lifecycle_ == BrowserTabLifecycle::Closing) return true;
     advanceIncarnation();
     active_ = false;
+    if (appRuntimeController_ != nullptr) {
+        appRuntimeController_->close(QStringLiteral("host.tab.closing"));
+    }
     transitionTo(BrowserTabLifecycle::Closing);
     updateVisibility();
     return true;

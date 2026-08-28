@@ -409,6 +409,8 @@ class UnifiedNavigationTest final : public QObject
 
 private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
+    void tabKeyedWorkerSurfacesStayIndependent();
+    void packageNavigationPublishesTabLaunchRequest();
     void legacyWorkerAdapterRejectsASecondAppTab();
     void legacyWorkerDetachDuringRouteStartWinsTransition();
     void workerNavigationIsSameAppAndHistoryAware();
@@ -429,6 +431,7 @@ private slots:
     void sameAppSessionsRouteOnlyTheirOwnTab();
     void backgroundWorkerNavigationUpdatesOnlyOwningHistory();
     void retiredSessionRejectsLateTabNavigation();
+    void sessionDetachedMarksSafeRebindPoint();
     void pageMetadataFromOneSessionUpdatesOnlyOwningTab();
     void navigationCallbackExceptionFailsClosedWithoutAffectingSibling();
     void navigationCallbackMayDestroyOwningController();
@@ -824,6 +827,60 @@ void UnifiedNavigationTest::retiredSessionRejectsLateTabNavigation()
     QTRY_VERIFY_WITH_TIMEOUT(!controller->hasIoThread(), 6000);
 }
 
+void UnifiedNavigationTest::sessionDetachedMarksSafeRebindPoint()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    QSignalSpy detachedSpy(&controller,
+                           &HostWorkerSessionController::sessionDetached);
+
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(controller.attach(std::move(first->host)));
+    std::thread firstPeer([worker = std::move(first->worker)]() mutable {
+        const SessionReceiveResult request = worker->receive(5000);
+        if (request.status == SessionStatus::MessageReady
+            && request.message->type() == ProtocolType::Shutdown) {
+            const auto acknowledgement = ProtocolMessage::shutdown(
+                QStringLiteral("worker.ack"));
+            if (acknowledgement.has_value())
+                (void)worker->send(*acknowledgement, 1000);
+        }
+        worker->close();
+    });
+
+    QVERIFY(controller.shutdown(QStringLiteral("rebind")));
+    QVERIFY(!controller.canAttachImmediately());
+    QTRY_COMPARE_WITH_TIMEOUT(detachedSpy.count(), 1, 6000);
+    QVERIFY(controller.canAttachImmediately());
+    QCOMPARE(detachedSpy.at(0).at(0).toULongLong(), quint64(1));
+    firstPeer.join();
+
+    auto replacement = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(replacement.has_value());
+    QVERIFY(controller.attach(std::move(replacement->host)));
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+    QVERIFY(!controller.canAttachImmediately());
+    std::thread replacementPeer(
+        [worker = std::move(replacement->worker)]() mutable {
+            const SessionReceiveResult request = worker->receive(5000);
+            if (request.status == SessionStatus::MessageReady
+                && request.message->type() == ProtocolType::Shutdown) {
+                const auto acknowledgement = ProtocolMessage::shutdown(
+                    QStringLiteral("worker.ack"));
+                if (acknowledgement.has_value())
+                    (void)worker->send(*acknowledgement, 1000);
+            }
+            worker->close();
+        });
+    QVERIFY(controller.shutdown(QStringLiteral("rebind.done")));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(),
+                              HostWorkerSessionState::Detached, 6000);
+    replacementPeer.join();
+}
+
 void UnifiedNavigationTest::pageMetadataFromOneSessionUpdatesOnlyOwningTab()
 {
     HelpServer server;
@@ -1174,6 +1231,104 @@ void UnifiedNavigationTest::routeRegistryAloneSelectsOneActiveSurfaceAndStableHi
     QVERIFY(launch->process.waitForFinished(5000));
     const auto closed = launch->process.close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));
+}
+
+void UnifiedNavigationTest::tabKeyedWorkerSurfacesStayIndependent()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment firstEnvironment;
+    WorkerTestEnvironment secondEnvironment;
+    QVERIFY2(firstEnvironment.isValid(), qPrintable(firstEnvironment.error()));
+    QVERIFY2(secondEnvironment.isValid(), qPrintable(secondEnvironment.error()));
+
+    auto firstLaunch = firstEnvironment.launch(QStringLiteral("tab-one"),
+                                               QStringLiteral("tab-one"), 100);
+    auto secondLaunch = secondEnvironment.launch(QStringLiteral("tab-two"),
+                                                 QStringLiteral("tab-two"), 100);
+    QVERIFY2(firstLaunch.has_value(), qPrintable(firstEnvironment.error()));
+    QVERIFY2(secondLaunch.has_value(), qPrintable(secondEnvironment.error()));
+    QCOMPARE(receiveUntil(firstLaunch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto firstSurfaceReady = receiveUntil(firstLaunch->hostSession,
+                                                ProtocolType::SurfaceReady);
+    QCOMPARE(firstSurfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(firstLaunch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(secondLaunch->hostSession, ProtocolType::Handshake).status,
+             SessionStatus::MessageReady);
+    const auto secondSurfaceReady = receiveUntil(secondLaunch->hostSession,
+                                                 ProtocolType::SurfaceReady);
+    QCOMPARE(secondSurfaceReady.status, SessionStatus::MessageReady);
+    QCOMPARE(receiveUntil(secondLaunch->hostSession, ProtocolType::Ready).status,
+             SessionStatus::MessageReady);
+
+    auto firstSurface = std::unique_ptr<WorkerSurface>(WorkerSurface::create(
+        firstSurfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        firstLaunch->process.nativeProcessHandle(), WorkerAttemptId{201}));
+    auto secondSurface = std::unique_ptr<WorkerSurface>(WorkerSurface::create(
+        secondSurfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
+        secondLaunch->process.nativeProcessHandle(), WorkerAttemptId{202}));
+    QVERIFY(firstSurface != nullptr);
+    QVERIFY(secondSurface != nullptr);
+
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    const QString firstId = window.tabModel()->activeId();
+    QVERIFY(window.attachWorkerSurface(firstId, std::move(firstSurface)));
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/one")));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+
+    window.browserChrome()->dispatchCommand(BrowserCommand::NewTab);
+    const QString secondId = window.tabModel()->activeId();
+    QVERIFY(secondId != firstId);
+    QVERIFY(window.attachWorkerSurface(secondId, std::move(secondSurface)));
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/web-shaped-worker/two")));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QVERIFY(window.workerSurface(firstId) != nullptr);
+    QVERIFY(window.workerSurface(secondId) != nullptr);
+
+    const int firstHistory = window.tabModel()->snapshotAt(
+        window.tabModel()->indexOfId(firstId)).history.size();
+    QVERIFY(window.navigateFromWorker(firstId, QStringLiteral("com.qbrowser.pilot"),
+                                      "/orders"));
+    QCOMPARE(window.tabModel()->snapshotAt(window.tabModel()->indexOfId(firstId))
+                 .history.size(),
+             firstHistory + 1);
+    QCOMPARE(window.tabModel()->snapshotAt(window.tabModel()->indexOfId(secondId))
+                 .history.size(),
+             2);
+    QCOMPARE(window.currentAppUrl(), QStringLiteral("app://pilot/web-shaped-worker/two"));
+    window.close();
+    firstLaunch->hostSession.close();
+    secondLaunch->hostSession.close();
+    firstLaunch->process.terminate(ERROR_PROCESS_ABORTED);
+    secondLaunch->process.terminate(ERROR_PROCESS_ABORTED);
+    QVERIFY(firstLaunch->process.waitForFinished(5000));
+    QVERIFY(secondLaunch->process.waitForFinished(5000));
+    const auto firstClosed = firstLaunch->process.close();
+    const auto secondClosed = secondLaunch->process.close();
+    QVERIFY2(firstClosed.value.has_value(), qPrintable(firstClosed.errorCode));
+    QVERIFY2(secondClosed.value.has_value(), qPrintable(secondClosed.errorCode));
+}
+
+void UnifiedNavigationTest::packageNavigationPublishesTabLaunchRequest()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    window.setPackageRuntimeEnabled(true);
+    QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+
+    const QString tabId = window.tabModel()->activeId();
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
+    QCOMPARE(window.activeSurface(), HostSurfaceKind::Worker);
+    QCOMPARE(launchSpy.count(), 1);
+    QCOMPARE(launchSpy.at(0).at(0).toString(), tabId);
+    QCOMPARE(launchSpy.at(0).at(2).toString(),
+             QStringLiteral("com.qbrowser.pilot"));
+    QCOMPARE(launchSpy.at(0).at(3).toString(), QStringLiteral("/orders"));
+    QVERIFY(window.workerSurface(tabId) == nullptr);
+    window.close();
 }
 
 void UnifiedNavigationTest::legacyWorkerAdapterRejectsASecondAppTab()

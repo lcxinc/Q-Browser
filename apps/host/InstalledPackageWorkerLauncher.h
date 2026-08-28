@@ -92,6 +92,8 @@ public:
         const InstalledPackageWorkerLauncher &) = delete;
 
     [[nodiscard]] bool requestLaunch(const WorkerLaunchRequest &request);
+    [[nodiscard]] bool hasPendingActivity(const WorkerAttemptKey &key) const noexcept;
+    [[nodiscard]] bool hasPendingActivity() const noexcept;
     void stopCurrent();
     void cancel() noexcept;
     [[nodiscard]] bool isAccepting() const noexcept;
@@ -107,6 +109,9 @@ signals:
                quint64 attempt,
                quint32 processId);
     void unexpectedExit(quint64 activation, quint64 attempt);
+    void retirementCompleted(quint64 activation,
+                             quint64 attempt,
+                             bool succeeded);
 
 private:
     struct LaunchRetirementContext;

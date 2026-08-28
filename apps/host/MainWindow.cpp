@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 
+#include "AppTabRuntimeController.h"
 #include "BrowserAddress.h"
 #include "BrowserChrome.h"
 #include "NavigationBar.h"
@@ -144,7 +145,11 @@ bool MainWindow::shutdown()
         hide();
         const QList<TabController *> retiringControllers = controllers_.values();
         for (TabController *const controller : retiringControllers) {
-            if (controller != nullptr) (void)controller->beginClosing();
+            if (controller != nullptr) {
+                emit tabClosing(controller->tabId(), controller->incarnation());
+                trackRetiringController(controller);
+                (void)controller->beginClosing();
+            }
         }
         TabController *const legacyController =
             tabController(legacyWorkerOwnerId_);
@@ -157,6 +162,7 @@ bool MainWindow::shutdown()
         legacyWorkerOwnerId_.clear();
         for (TabController *const controller : retiringControllers) {
             if (controller == nullptr) continue;
+            if (retiringControllers_.contains(controller->tabId())) continue;
             (void)controller->retire();
             delete controller;
         }
@@ -175,10 +181,21 @@ bool MainWindow::navigate(const QStringView input)
     return navigateTab(activeStableId(), input);
 }
 
+void MainWindow::setPackageRuntimeEnabled(const bool enabled) noexcept
+{
+    packageRuntimeEnabled_ = enabled;
+}
+
 bool MainWindow::navigateFromWorker(const QString &packageId,
                                     const QString &route)
 {
-    const QString stableId = activeStableId();
+    return navigateFromWorker(activeStableId(), packageId, route);
+}
+
+bool MainWindow::navigateFromWorker(const QString &stableId,
+                                    const QString &packageId,
+                                    const QString &route)
+{
     TabController *const controller = tabController(stableId);
     if (!isRunning() || controller == nullptr
         || controller->surfaceKind() != HostSurfaceKind::Worker
@@ -197,6 +214,37 @@ bool MainWindow::navigateFromWorker(const QString &packageId,
         || match.record.packageId != packageId) {
         return false;
     }
+    if (controller->appRuntimeController() != nullptr
+        && controller->appRuntimeController()->hasWorkerContext()) {
+        // A worker-initiated navigation is already authenticated by this
+        // session.  Commit only the owning tab's history/address; the session
+        // controller will enqueue the single RouteLoad response.  Calling
+        // navigateTab here would re-enter package launch and replace a
+        // healthy worker for an ordinary in-app route change.
+        const int index = tabModel_->indexOfId(stableId);
+        if (index < 0) return false;
+        const BrowserTabSnapshot before = tabModel_->snapshotAt(index);
+        bool committed = false;
+        {
+            const QSignalBlocker blockModelSignals(tabModel_.get());
+            committed = tabModel_->navigateTab(
+                stableId, BrowserTabKind::App, parsed.canonical());
+            if (committed) {
+                const quint64 incarnation = controller->beginNavigation();
+                if (incarnation == 0) return false;
+            }
+        }
+        if (!committed) return false;
+        const BrowserTabSnapshot after = tabModel_->snapshotAt(index);
+        if (before != after) publishCommittedTabChange(stableId);
+        if (activeStableId() == stableId && before.address != after.address) {
+            emit currentUrlChanged(after.address);
+        }
+        if (before != after) emitPersistenceAfterTransition();
+        emit appLaunchRequested(stableId, controller->incarnation(), packageId,
+                                parsed.appPath());
+        return true;
+    }
     return navigateTab(stableId, candidate);
 }
 
@@ -213,17 +261,43 @@ bool MainWindow::goForward()
 bool MainWindow::attachWorkerSurface(std::unique_ptr<WorkerSurface> surface)
 {
     const QString stableId = activeStableId();
+    if (stableId.isEmpty()) return false;
+    if (!legacyWorkerOwnerId_.isEmpty() && legacyWorkerOwnerId_ != stableId) {
+        return false;
+    }
+    if (!attachWorkerSurface(stableId, std::move(surface))) return false;
+    legacyWorkerOwnerId_ = stableId;
+    return true;
+}
+
+bool MainWindow::reserveLegacyWorkerOwner(const QString &stableId)
+{
+    if (!isRunning() || stableId.isEmpty()
+        || tabController(stableId) == nullptr) {
+        return false;
+    }
+    if (legacyWorkerOwnerId_.isEmpty()) {
+        legacyWorkerOwnerId_ = stableId;
+        return true;
+    }
+    return legacyWorkerOwnerId_ == stableId;
+}
+
+bool MainWindow::attachWorkerSurface(const QString &stableId,
+                                     std::unique_ptr<WorkerSurface> surface)
+{
     TabController *const controller = tabController(stableId);
     if (!isRunning() || tabMutationInProgress() || surface == nullptr
         || controller == nullptr
-        || !legacyWorkerOwnerId_.isEmpty()) {
+        || (legacyWorkerOwnerId_ == stableId
+            && controller->workerSurface() != nullptr)
+        || stableId.isEmpty()) {
         return false;
     }
     QScopedValueRollback<bool> transaction(navigationInProgress_, true);
     if (!controller->attachLegacyWorkerSurface(std::move(surface))) return false;
-    legacyWorkerOwnerId_ = stableId;
     const int index = tabModel_->indexOfId(stableId);
-    if (index >= 0
+    if (!packageRuntimeEnabled_ && index >= 0
         && tabModel_->snapshotAt(index).kind == BrowserTabKind::App) {
         (void)startCurrentDescriptor(stableId);
     }
@@ -233,8 +307,15 @@ bool MainWindow::attachWorkerSurface(std::unique_ptr<WorkerSurface> surface)
 void MainWindow::detachWorkerSurface()
 {
     if (legacyWorkerOwnerId_.isEmpty()) return;
+    const QString stableId = legacyWorkerOwnerId_;
+    detachWorkerSurface(stableId);
+    legacyWorkerOwnerId_.clear();
+}
+
+void MainWindow::detachWorkerSurface(const QString &stableId)
+{
+    if (stableId.isEmpty()) return;
     QScopedValueRollback<bool> transaction(navigationInProgress_, true);
-    const QString stableId = std::exchange(legacyWorkerOwnerId_, QString{});
     TabController *const controller = tabController(stableId);
     if (controller != nullptr) controller->detachLegacyWorkerSurface();
 }
@@ -335,7 +416,12 @@ WebSurface *MainWindow::webSurface() const noexcept
 
 WorkerSurface *MainWindow::workerSurface() const noexcept
 {
-    TabController *const controller = tabController(activeStableId());
+    return workerSurface(activeStableId());
+}
+
+WorkerSurface *MainWindow::workerSurface(const QString &stableId) const noexcept
+{
+    TabController *const controller = tabController(stableId);
     return controller != nullptr ? controller->workerSurface() : nullptr;
 }
 
@@ -368,6 +454,7 @@ std::optional<MainWindow::ResolvedNavigation> MainWindow::resolveAddress(
     if (!match.isValid()) return fail(QStringLiteral("Route not found."));
     ResolvedNavigation resolved;
     resolved.canonicalAddress = parsed.canonical();
+    resolved.appRoute = parsed.appPath();
     resolved.engine = match.record.engine;
     resolved.packageId = match.record.packageId;
     resolved.entryPoint = match.record.entryPoint;
@@ -504,6 +591,10 @@ bool MainWindow::startResolved(const QString &stableTabId,
 {
     TabController *const controller = tabController(stableTabId);
     if (controller == nullptr) return false;
+    if (resolved.kind != BrowserTabKind::App
+        && controller->appRuntimeController() != nullptr) {
+        (void)controller->appRuntimeController()->sendVisibilityChanged(false);
+    }
     controller->setActive(activeStableId() == stableTabId);
     switch (resolved.kind) {
     case BrowserTabKind::Host:
@@ -512,7 +603,47 @@ bool MainWindow::startResolved(const QString &stableTabId,
         return controller->startWeb(
             resolved.physicalEntry, navigationIncarnation, reloadExisting);
     case BrowserTabKind::App:
-        if (legacyWorkerOwnerId_ != stableTabId) {
+        if (packageRuntimeEnabled_ && legacyWorkerOwnerId_ != stableTabId) {
+            if (!reloadExisting && controller->appRuntimeController() != nullptr
+                && controller->appRuntimeController()->hasWorkerContext()
+                && controller->workerPackageId() == resolved.packageId) {
+                if (!controller->bindAppWorkerSurface(
+                        resolved.packageId, navigationIncarnation)) {
+                    controller->showTrustedErrorForNavigation(
+                        navigationIncarnation,
+                        QStringLiteral("The package worker is unavailable."));
+                    return false;
+                }
+                (void)tabModel_->setLoadState(stableTabId, true, 0);
+                if (!controller->appRuntimeController()->requestRouteLoad(
+                        resolved.appRoute)) {
+                    controller->showTrustedErrorForNavigation(
+                        navigationIncarnation,
+                        QStringLiteral("The package worker is unavailable."));
+                    return false;
+                }
+                emit appLaunchRequested(stableTabId, navigationIncarnation,
+                                        resolved.packageId, resolved.appRoute);
+                return true;
+            }
+            // Package-mode tabs are launched through the shared app runtime
+            // coordinator.  Keep the tab in a loading state while the
+            // per-tab controller obtains and authenticates its worker.
+            if (!controller->prepareAppLaunch(
+                    resolved.packageId, navigationIncarnation)) {
+                return false;
+            }
+            if (reloadExisting) {
+                emit appReloadRequested(stableTabId, navigationIncarnation,
+                                        resolved.packageId, resolved.appRoute);
+            } else {
+                emit appLaunchRequested(stableTabId, navigationIncarnation,
+                                        resolved.packageId, resolved.appRoute);
+            }
+            return true;
+        }
+        if (controller->workerSurface() == nullptr
+            && legacyWorkerOwnerId_ != stableTabId) {
             controller->showTrustedErrorForNavigation(
                 navigationIncarnation,
                 QStringLiteral("The package worker is unavailable."));
@@ -618,19 +749,60 @@ void MainWindow::createController(const QString &stableTabId)
                 emit workerRouteRequested(
                     packageId, entryPoint, parameters, appUrl);
             });
+    connect(controller, &TabController::workerRouteRequestedForTab, this,
+            [this, stableTabId, controller](const QString &tabId,
+                                             const quint64 incarnation,
+                                             const QString &packageId,
+                                             const QString &entryPoint,
+                                             const QVariantMap &parameters,
+                                             const QUrl &appUrl) {
+                if (tabId != stableTabId || tabController(tabId) != controller) {
+                    return;
+                }
+                emit workerRouteRequestedForTab(tabId, incarnation, packageId,
+                                                entryPoint, parameters, appUrl);
+            });
 }
 
 void MainWindow::removeController(const QString &stableTabId)
 {
     TabController *const controller = controllers_.take(stableTabId);
     if (controller == nullptr) return;
+    trackRetiringController(controller);
     (void)controller->beginClosing();
+    if (retiringControllers_.contains(stableTabId)) return;
+    // A controller without a package runtime has no asynchronous retirement
+    // barrier and can be destroyed as soon as its model entry is removed.
     if (legacyWorkerOwnerId_ == stableTabId
         && controller->workerSurface() != nullptr) {
         emit legacyWorkerRetirementRequested(stableTabId);
     }
     if (legacyWorkerOwnerId_ == stableTabId) legacyWorkerOwnerId_.clear();
     if (visibleTabId_ == stableTabId) visibleTabId_.clear();
+    (void)controller->retire();
+    delete controller;
+}
+
+void MainWindow::trackRetiringController(TabController *const controller)
+{
+    if (controller == nullptr || retiringControllers_.contains(controller->tabId())) {
+        return;
+    }
+    AppTabRuntimeController *const runtime = controller->appRuntimeController();
+    if (runtime == nullptr) return;
+    retiringControllers_.insert(controller->tabId(), controller);
+    QPointer<MainWindow> guard(this);
+    connect(runtime, &AppTabRuntimeController::retired, this,
+            [guard](const QString &tabId, const quint64) {
+                if (guard) guard->finalizeRetiringController(tabId);
+            },
+            Qt::QueuedConnection);
+}
+
+void MainWindow::finalizeRetiringController(const QString &stableTabId)
+{
+    TabController *const controller = retiringControllers_.take(stableTabId);
+    if (controller == nullptr) return;
     (void)controller->retire();
     delete controller;
 }
@@ -662,13 +834,23 @@ void MainWindow::closeStableTab(const QString &stableTabId)
     TabController *const controller = tabController(stableTabId);
     if (index < 0 || controller == nullptr) return;
     QScopedValueRollback<bool> transaction(navigationInProgress_, true);
+    emit tabClosing(stableTabId, controller->incarnation());
     const bool retiresLegacyWorker = legacyWorkerOwnerId_ == stableTabId
         && controller->workerSurface() != nullptr;
-    (void)controller->beginClosing();
     if (retiresLegacyWorker) {
+        (void)controller->beginClosing();
         emit legacyWorkerRetirementRequested(stableTabId);
+        (void)controller->retire();
+    } else if (controller->appRuntimeController() != nullptr) {
+        // Keep the controller alive until its launcher/retirement barrier
+        // completes. The model entry may disappear now, but destroying the
+        // runtime tuple here would turn close into an unbounded use-after-
+        // retirement race for late worker callbacks.
+        trackRetiringController(controller);
+        (void)controller->beginClosing();
+    } else {
+        (void)controller->retire();
     }
-    (void)controller->retire();
 
     if (tabModel_->count() == 1) {
         bool closed = false;
@@ -812,7 +994,22 @@ void MainWindow::handleCommand(const BrowserCommand command)
     case BrowserCommand::Stop: {
         QScopedValueRollback<bool> transaction(navigationInProgress_, true);
         TabController *const controller = tabController(stableId);
-        if (controller != nullptr) controller->stop();
+        if (controller != nullptr) {
+            const AppTabRuntimeController *const runtime =
+                controller->appRuntimeController();
+            const bool loadingApp = runtime != nullptr
+                && (controller->lifecycle() == BrowserTabLifecycle::Starting
+                    || controller->lifecycle() == BrowserTabLifecycle::Loading);
+            const quint64 runtimeIncarnation = loadingApp
+                ? runtime->runtimeIncarnation() : 0;
+            const quint64 navigationIncarnation = controller->incarnation();
+            if (controller->cancelAppLaunch()) {
+                emit appStopRequested(stableId, navigationIncarnation,
+                                      runtimeIncarnation);
+            } else {
+                controller->stop();
+            }
+        }
         return;
     }
     case BrowserCommand::Home:

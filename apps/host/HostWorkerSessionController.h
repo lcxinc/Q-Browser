@@ -35,7 +35,9 @@ public:
     ~HostWorkerSessionController() override;
 
     [[nodiscard]] bool attach(std::unique_ptr<IpcSession> session);
+    [[nodiscard]] bool canAttachImmediately() const noexcept;
     [[nodiscard]] bool requestRouteLoad(const QString &route);
+    [[nodiscard]] bool sendVisibilityChanged(bool active);
     [[nodiscard]] bool shutdown(const QString &reason);
     [[nodiscard]] quint64 generation() const noexcept;
     [[nodiscard]] HostWorkerSessionState state() const noexcept;
@@ -50,6 +52,7 @@ public:
                             const BrokerResult &result);
 
 signals:
+    void sessionDetached(quint64 generation);
     void failed(const QString &errorCode, quint64 generation);
     void routeLoadAcknowledged(const QString &route, quint64 generation);
     void heartbeatObserved(quint64 generation);

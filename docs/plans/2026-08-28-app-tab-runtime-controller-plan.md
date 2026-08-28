@@ -29,12 +29,14 @@ fields with a tab-keyed controller map while retaining active-tab compatibility
 accessors. Dispatch ordered coordinator actions by tab authority and batch only
 heartbeat/health observations.
 
-## Step 5: Legacy adapter and RED update cases
+## Step 5: Legacy compatibility and RED update cases
 
-Adapt `UpdateLifecycleCoordinator` to the shared app coordinator for the
-reserved legacy tab, preserving existing tests and telemetry while returning
-`AwaitAuthorityDrain` nonblocking. Add update tests for multi-tab candidate
-rollback, late admission, and permanent timeout failure.
+Keep `UpdateLifecycleCoordinator` as the reserved compatibility path for the
+historical singleton worker while routing package App tabs through the shared
+`AppRuntimeCoordinator`; do not create another package authority. Preserve
+existing tests and telemetry, return `AwaitAuthorityDrain` nonblocking, and
+add update tests for multi-tab candidate rollback, late admission, and
+permanent timeout failure.
 
 ## Step 6: Verification
 

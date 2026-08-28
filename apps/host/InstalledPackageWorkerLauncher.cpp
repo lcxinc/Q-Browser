@@ -1040,6 +1040,33 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
     return true;
 }
 
+bool InstalledPackageWorkerLauncher::hasPendingActivity(
+    const WorkerAttemptKey &key) const noexcept
+{
+    if (currentKey_.has_value() && *currentKey_ == key) return true;
+    if (pendingRequest_.has_value() && pendingRequest_->attempt == key) {
+        return true;
+    }
+    if (currentRetirement_ != nullptr
+        && currentRetirement_->request.attempt == key) {
+        return true;
+    }
+    for (const auto &[unused, context] : inflight_) {
+        Q_UNUSED(unused);
+        if (context != nullptr && context->request.attempt == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool InstalledPackageWorkerLauncher::hasPendingActivity() const noexcept
+{
+    return currentKey_.has_value() || currentProcess_ != nullptr
+        || currentRetirement_ != nullptr || pendingRequest_.has_value()
+        || !inflight_.empty() || !fatalCleanup_.empty();
+}
+
 void InstalledPackageWorkerLauncher::requestAdmission(
     const quint64 serial,
     std::shared_ptr<ReadyPayload> payload)
@@ -1303,6 +1330,9 @@ void InstalledPackageWorkerLauncher::handleRetirement(
     if (context == nullptr) return;
     inflight_.erase(context->serial);
     if (!succeeded) {
+        emit retirementCompleted(context->request.attempt.activation.value,
+                                 context->request.attempt.attempt.value,
+                                 false);
         context->fatalCleanupObserved.store(true, std::memory_order_release);
         accepting_ = false;
         pendingRequest_.reset();
@@ -1337,6 +1367,9 @@ void InstalledPackageWorkerLauncher::handleRetirement(
             accepting_ = false;
             pendingRequest_.reset();
             expectedStop_.reset();
+            emit retirementCompleted(key.activation.value,
+                                     key.attempt.value,
+                                     false);
             fail(key, QStringLiteral("host.launch.process_observer_failed"));
             return;
         }
@@ -1397,6 +1430,7 @@ void InstalledPackageWorkerLauncher::handleRetirement(
     if (pending.has_value() && self) {
         (void)self->requestLaunch(*pending);
     }
+    emit retirementCompleted(key.activation.value, key.attempt.value, true);
 }
 
 void InstalledPackageWorkerLauncher::stopCurrent()
