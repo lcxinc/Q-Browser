@@ -179,6 +179,29 @@ bool HostWorkerSessionController::startSession(
     capabilityAuthority_ = capabilityBinding.has_value()
         ? std::optional<TabCapabilityAuthority>(capabilityBinding->authority)
         : std::nullopt;
+    if (capabilityRuntime_ != nullptr) {
+        const QPointer<HostWorkerSessionController> owningController(this);
+        const TabCapabilityAuthority immutableAuthority = *capabilityAuthority_;
+        if (!capabilityRuntime_->bindCompletionSubmitter(
+                immutableAuthority,
+                [owningController, immutableAuthority](
+                    const std::shared_ptr<CapabilityDeliveryState> &delivery) {
+                    HostWorkerSessionController *const controller =
+                        owningController.data();
+                    return controller != nullptr
+                        && QThread::currentThread() == controller->thread()
+                        && delivery != nullptr
+                        && delivery->authority == immutableAuthority
+                        && controller->submitCapabilityCompletion(delivery);
+                })) {
+            appIdentity_.clear();
+            capabilityRuntime_ = nullptr;
+            capabilityAuthority_.reset();
+            lastErrorCode_ =
+                QStringLiteral("host.worker_session.capability_bind_failed");
+            return false;
+        }
+    }
     pendingRouteLoads_.clear();
     outbound_.clear();
     activeCommand_.reset();
@@ -191,6 +214,10 @@ bool HostWorkerSessionController::startSession(
     const QPointer<HostWorkerSessionIo> attachedIo = io_;
     QThread *const attachedThread = ioThread_;
     if (!io_->moveToThread(ioThread_)) {
+        if (capabilityRuntime_ != nullptr && capabilityAuthority_.has_value()) {
+            capabilityRuntime_->unbindCompletionSubmitter(
+                *capabilityAuthority_);
+        }
         delete io_.data();
         io_ = nullptr;
         delete ioThread_;
@@ -424,11 +451,24 @@ void HostWorkerSessionController::handleCapabilityRequest(
     emit capabilityRequestObserved(capability, operation, payload.toVariantMap(),
                                    generation);
     if (!activeCapabilityRequestId_.isEmpty()) {
-        const auto busy = ProtocolMessage::errorResponse(
-            requestId, QStringLiteral("capability.busy"),
-            QStringLiteral("A capability request is already active."));
-        if (!busy.has_value() || !enqueueMessage(*busy))
+        if (capabilityRuntime_ == nullptr || !capabilityAuthority_.has_value()
+            || requestAuthority != *capabilityAuthority_
+            || capabilityRuntime_->authority() != *capabilityAuthority_) {
+            failClosed(QStringLiteral(
+                "host.worker_session.capability_authority_mismatch"));
+            return;
+        }
+        auto use = capabilityRuntime_->acquireResponseUse(
+            requestAuthority, generation);
+        if (use == nullptr
+            || !queueCapabilityResponse(
+                requestAuthority, std::move(use), generation, requestId,
+                BrokerResult::failure(
+                    QStringLiteral("capability.busy"),
+                    QStringLiteral("A capability request is already active.")),
+                false)) {
             failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
+        }
         return;
     }
     activeCapabilityRequestId_ = requestId;
@@ -439,10 +479,11 @@ void HostWorkerSessionController::handleCapabilityRequest(
                 "host.worker_session.capability_authority_mismatch"));
             return;
         }
-        queueCapabilityResponse(
-            std::nullopt, generation, requestId,
+        (void)queueCapabilityResponse(
+            std::nullopt, nullptr, generation, requestId,
             BrokerResult::failure(QStringLiteral("capability.denied"),
-                                  QStringLiteral("Capability is not permitted.")));
+                                  QStringLiteral("Capability is not permitted.")),
+            true);
         return;
     }
     if (requestAuthority != *capabilityAuthority_
@@ -456,59 +497,98 @@ void HostWorkerSessionController::handleCapabilityRequest(
                                  payload);
 }
 
-void HostWorkerSessionController::completeCapability(
-    const TabCapabilityAuthority &authority,
-    const quint64 generation, const QString &requestId,
-    const BrokerResult &result)
+bool HostWorkerSessionController::submitCapabilityCompletion(
+    const std::shared_ptr<CapabilityDeliveryState> &delivery)
 {
-    queueCapabilityResponse(authority, generation, requestId, result);
+    if (delivery == nullptr || delivery->use == nullptr
+        || QThread::currentThread() != thread()) {
+        return false;
+    }
+    return queueCapabilityResponse(delivery->authority, delivery->use,
+                                   delivery->generation, delivery->requestId,
+                                   delivery->result, true);
 }
 
-void HostWorkerSessionController::queueCapabilityResponse(
+bool HostWorkerSessionController::queueCapabilityResponse(
     std::optional<TabCapabilityAuthority> authority,
+    std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
     const quint64 generation, const QString &requestId,
-    const BrokerResult &result)
+    const BrokerResult &result,
+    const bool completesActiveRequest)
 {
     if (generation != generation_ || state_ != HostWorkerSessionState::Running
-        || requestId.isEmpty() || requestId != activeCapabilityRequestId_) return;
+        || requestId.isEmpty()
+        || (completesActiveRequest
+            && requestId != activeCapabilityRequestId_)
+        || (!completesActiveRequest
+            && (activeCapabilityRequestId_.isEmpty()
+                || requestId == activeCapabilityRequestId_
+                || result.ok
+                || result.errorCode != QStringLiteral("capability.busy")))) {
+        return false;
+    }
     if (authority.has_value()) {
-        if (!capabilityAuthority_.has_value()
+        if (use == nullptr || !capabilityAuthority_.has_value()
             || *authority != *capabilityAuthority_
             || capabilityRuntime_ == nullptr
             || capabilityRuntime_->authority() != *capabilityAuthority_) {
-            return;
+            return false;
         }
     } else if (capabilityAuthority_.has_value()
-               || capabilityRuntime_ != nullptr || result.ok
+               || use != nullptr || capabilityRuntime_ != nullptr || result.ok
                || result.errorCode != QStringLiteral("capability.denied")) {
-        return;
+        return false;
     }
     const auto response = result.ok
         ? ProtocolMessage::successResponse(requestId, result.value)
         : ProtocolMessage::errorResponse(requestId, result.errorCode,
                                          result.errorMessage);
     if (!response.has_value()) {
-        failClosed(QStringLiteral("host.worker_session.response_invalid"));
-        return;
+        (void)QMetaObject::invokeMethod(
+            this,
+            [this, generation] {
+                if (generation == generation_)
+                    failClosed(QStringLiteral("host.worker_session.response_invalid"));
+            },
+            Qt::QueuedConnection);
+        return false;
     }
-    if (!enqueueMessage(*response)) {
-        failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
-        return;
+    if (outbound_.size() + (activeCommand_.has_value() ? 1 : 0)
+        >= maximumQueuedCommands) {
+        (void)QMetaObject::invokeMethod(
+            this,
+            [this, generation] {
+                if (generation == generation_)
+                    failClosed(QStringLiteral(
+                        "host.worker_session.response_queue_failed"));
+            },
+            Qt::QueuedConnection);
+        return false;
     }
-    if (!outbound_.isEmpty()) outbound_.back().capabilityRequestId = requestId;
-    else if (activeCommand_.has_value())
-        activeCommand_->capabilityRequestId = requestId;
-    if (!outbound_.isEmpty()) {
-        outbound_.back().capabilityAuthority = std::move(authority);
-    } else if (activeCommand_.has_value()) {
-        activeCommand_->capabilityAuthority = std::move(authority);
-    }
-    emit capabilityResponseQueued(requestId, result.ok, result.errorCode,
-                                  generation);
+    OutboundCommand command;
+    command.id = ++nextCommandId_;
+    command.message = *response;
+    if (completesActiveRequest) command.capabilityRequestId = requestId;
+    command.capabilityAuthority = std::move(authority);
+    command.capabilityUse = std::move(use);
+    outbound_.enqueue(std::move(command));
+    pumpOutbound();
+    const bool ok = result.ok;
+    const QString resultErrorCode = result.errorCode;
+    (void)QMetaObject::invokeMethod(
+        this,
+        [this, requestId, ok, resultErrorCode, generation] {
+            if (generation == generation_)
+                emit capabilityResponseQueued(requestId, ok, resultErrorCode,
+                                              generation);
+        },
+        Qt::QueuedConnection);
+    return true;
 }
 
 void HostWorkerSessionController::handleCommandFinished(
     const quint64 generation, const quint64 commandId, const bool success,
+    const bool published,
     const QString &errorCode)
 {
     if (generation != generation_ || state_ != HostWorkerSessionState::Running
@@ -521,10 +601,13 @@ void HostWorkerSessionController::handleCommandFinished(
                                         : errorCode);
         return;
     }
-    if (!completedCapability.isEmpty()
+    if (published && !completedCapability.isEmpty()
         && completedCapability == activeCapabilityRequestId_) {
         activeCapabilityRequestId_.clear();
         emit capabilityResponseSent(completedCapability, generation);
+    } else if (!published && !completedCapability.isEmpty()
+               && completedCapability == activeCapabilityRequestId_) {
+        activeCapabilityRequestId_.clear();
     }
     pumpOutbound();
     if (resume && generation == generation_ && state_ == HostWorkerSessionState::Running)
@@ -575,7 +658,9 @@ void HostWorkerSessionController::pumpOutbound()
     QMetaObject::invokeMethod(io, [io, generation, command] {
         if (command.message.has_value())
             io->sendMessage(generation, command.id, *command.message,
-                            command.trackedRouteLoad, command.route);
+                            command.trackedRouteLoad, command.route,
+                            command.capabilityAuthority,
+                            command.capabilityUse);
     }, Qt::QueuedConnection);
 }
 
@@ -620,6 +705,9 @@ void HostWorkerSessionController::unbindCapabilityRuntime(
 void HostWorkerSessionController::invalidateCapabilityBinding() noexcept
 {
     HostCapabilityRuntime *const runtime = capabilityRuntime_.data();
+    if (runtime != nullptr && capabilityAuthority_.has_value()) {
+        runtime->unbindCompletionSubmitter(*capabilityAuthority_);
+    }
     capabilityRuntime_ = nullptr;
     capabilityAuthority_.reset();
     if (runtime != nullptr) runtime->invalidate();

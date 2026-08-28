@@ -10,11 +10,12 @@
 #include <QPointer>
 #include <QUrl>
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 
 class CapabilityWorkerLane;
-struct CapabilityDeliveryState;
 class ClipboardBroker;
 class FileBroker;
 class FileDialogCoordinator;
@@ -25,6 +26,32 @@ class QtFileDialogBackend;
 class HostGestureRouter;
 class QThread;
 struct PendingHostFileRequest;
+
+struct CapabilityDeliveryState final
+{
+    CapabilityDeliveryState(
+        TabCapabilityAuthority immutableAuthority,
+        quint64 immutableGeneration,
+        QString immutableRequestId,
+        BrokerResult immutableResult,
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> retainedUse)
+        : authority(std::move(immutableAuthority)),
+          generation(immutableGeneration),
+          requestId(std::move(immutableRequestId)),
+          result(std::move(immutableResult)),
+          use(std::move(retainedUse))
+    {
+    }
+
+    const TabCapabilityAuthority authority;
+    const quint64 generation = 0;
+    const QString requestId;
+    const BrokerResult result;
+    const std::shared_ptr<AuthorityAdmissionToken::UseGuard> use;
+};
+
+using CapabilityCompletionSubmitter = std::function<bool(
+    const std::shared_ptr<CapabilityDeliveryState> &delivery)>;
 
 #ifdef Q_BROWSER_HOST_TESTING
 struct HostWorkerGestureEvidence final
@@ -82,6 +109,14 @@ public:
     static void retire(std::shared_ptr<HostCapabilityRuntime> runtime) noexcept;
 
     [[nodiscard]] const TabCapabilityAuthority &authority() const noexcept;
+    [[nodiscard]] bool bindCompletionSubmitter(
+        const TabCapabilityAuthority &authority,
+        CapabilityCompletionSubmitter submitter);
+    void unbindCompletionSubmitter(
+        const TabCapabilityAuthority &authority) noexcept;
+    [[nodiscard]] std::shared_ptr<AuthorityAdmissionToken::UseGuard>
+    acquireResponseUse(const TabCapabilityAuthority &authority,
+                       quint64 generation);
 
     void dispatch(quint64 generation,
                   const QString &requestId,
@@ -156,6 +191,7 @@ private:
     std::unique_ptr<FileBroker> file_;
     std::unique_ptr<CapabilityBroker> guiBroker_;
     std::shared_ptr<PendingHostFileRequest> pendingFile_;
+    CapabilityCompletionSubmitter completionSubmitter_;
     bool gestureBindingRegistered_ = false;
     bool accepting_ = true;
 };

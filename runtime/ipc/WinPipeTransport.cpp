@@ -5,6 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <utility>
 
 namespace {
@@ -48,55 +52,281 @@ bool inheritedPipeHandleHasAccess(const HANDLE handle, const bool requiresRead)
                         : WriteFile(handle, &ignored, 0, &transferred, nullptr);
 }
 
-struct WriteContext {
-    HANDLE pipe = nullptr;
+#endif
+
+} // namespace
+
+struct PipeWriteOperation final
+{
+    explicit PipeWriteOperation(PipeWriteWork work)
+        : bytes(std::move(work.bytes)),
+          publicationGate(std::move(work.publicationGate)),
+          completion(std::move(work.completion))
+    {
+    }
+
+    void finish(PipeWriteResult result) noexcept
+    {
+        if (finished.exchange(true, std::memory_order_acq_rel)) return;
+        std::function<void(const PipeWriteResult &)> callback =
+            std::move(completion);
+        if (!callback) return;
+        try {
+            callback(result);
+        } catch (...) {
+        }
+    }
+
     QByteArray bytes;
-    std::atomic_bool cancelled = false;
-    bool succeeded = false;
-    DWORD error = ERROR_SUCCESS;
+    std::function<bool()> publicationGate;
+    std::function<void(const PipeWriteResult &)> completion;
+    std::atomic_bool cancellationRequested{false};
+    std::atomic_bool finished{false};
+    bool writeStarted = false;
 };
 
-DWORD WINAPI pipeWriter(void *const rawContext) noexcept
+struct PipeWriterState final
 {
-    auto &context = *static_cast<WriteContext *>(rawContext);
+    explicit PipeWriterState(const HANDLE adoptedPipe) : pipe(adoptedPipe) {}
+    ~PipeWriterState()
+    {
+#ifdef Q_OS_WIN
+        if (validHandle(thread)) CloseHandle(thread);
+#endif
+        thread = nullptr;
+    }
+
+    [[nodiscard]] bool cancel(
+        const std::shared_ptr<PipeWriteOperation> &operation) noexcept
+    {
+        if (operation == nullptr
+            || operation->finished.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::shared_ptr<PipeWriteOperation> queuedCancellation;
+        {
+            std::lock_guard lock(mutex);
+            if (operation->finished.load(std::memory_order_acquire)) return false;
+            const auto queued = std::find(queue.begin(), queue.end(), operation);
+            if (queued != queue.end()) {
+                queuedCancellation = *queued;
+                pendingBytes -= queuedCancellation->bytes.size();
+                --pendingCount;
+                queue.erase(queued);
+            } else if (current == operation) {
+                if (operation->writeStarted) return false;
+                operation->cancellationRequested.store(
+                    true, std::memory_order_release);
+            } else {
+                return false;
+            }
+        }
+        if (queuedCancellation != nullptr) {
+            queuedCancellation->finish(
+                {PipeIoStatus::Cancelled,
+                 QStringLiteral("ipc.send_cancelled")});
+            return true;
+        }
+        condition.notify_all();
+        return true;
+    }
+
+    HANDLE pipe = nullptr;
+    HANDLE thread = nullptr;
+#ifdef Q_OS_WIN
+    DWORD threadId = 0;
+#endif
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<std::shared_ptr<PipeWriteOperation>> queue;
+    std::shared_ptr<PipeWriteOperation> current;
+    qsizetype pendingCount = 0;
+    qsizetype pendingBytes = 0;
+    bool closing = false;
+};
+
+namespace {
+
+PipeWriteResult cancelledWrite()
+{
+    return {PipeIoStatus::Cancelled, QStringLiteral("ipc.send_cancelled")};
+}
+
+#ifdef Q_OS_WIN
+PipeWriteResult writeOperation(
+    PipeWriterState &writer,
+    const std::shared_ptr<PipeWriteOperation> &operation) noexcept
+{
+    if (operation->cancellationRequested.load(std::memory_order_acquire)) {
+        return cancelledWrite();
+    }
+    if (operation->publicationGate) {
+        bool admitted = false;
+        try {
+            admitted = operation->publicationGate();
+        } catch (...) {
+            admitted = false;
+        }
+        if (!admitted) return cancelledWrite();
+    }
+    {
+        std::lock_guard lock(writer.mutex);
+        if (operation->cancellationRequested.load(std::memory_order_acquire)) {
+            return cancelledWrite();
+        }
+        operation->writeStarted = true;
+    }
+
     qsizetype writtenTotal = 0;
-    while (writtenTotal < context.bytes.size()) {
-        if (context.cancelled.load(std::memory_order_acquire)) {
-            context.error = ERROR_OPERATION_ABORTED;
-            return 0;
+    while (writtenTotal < operation->bytes.size()) {
+        if (operation->cancellationRequested.load(std::memory_order_acquire)) {
+            return cancelledWrite();
         }
         const DWORD wanted = static_cast<DWORD>(std::min<qsizetype>(
-            context.bytes.size() - writtenTotal, static_cast<qsizetype>(64U * 1024U)));
+            operation->bytes.size() - writtenTotal,
+            static_cast<qsizetype>(64U * 1024U)));
         DWORD written = 0;
-        if (!WriteFile(context.pipe,
-                       context.bytes.constData() + writtenTotal,
+        if (!WriteFile(writer.pipe,
+                       operation->bytes.constData() + writtenTotal,
                        wanted,
                        &written,
                        nullptr)) {
-            context.error = GetLastError();
-            return 0;
+            const DWORD error = GetLastError();
+            if (error == ERROR_OPERATION_ABORTED
+                || operation->cancellationRequested.load(
+                    std::memory_order_acquire)) {
+                return cancelledWrite();
+            }
+            if (peerClosedError(error)) {
+                return {PipeIoStatus::PeerClosed,
+                        QStringLiteral("ipc.send_peer_closed")};
+            }
+            return {PipeIoStatus::Failed,
+                    QStringLiteral("ipc.send_failed")};
         }
         if (written == 0) {
-            context.error = ERROR_WRITE_FAULT;
-            return 0;
+            return {PipeIoStatus::Failed,
+                    QStringLiteral("ipc.send_failed")};
         }
         writtenTotal += static_cast<qsizetype>(written);
     }
-    context.succeeded = true;
-    return 0;
+    return {PipeIoStatus::Ok, {}};
 }
 
-void cancelAndJoinWriter(const HANDLE thread, WriteContext &context) noexcept
+DWORD WINAPI persistentPipeWriter(void *const rawContext) noexcept
 {
-    context.cancelled.store(true, std::memory_order_release);
+    std::unique_ptr<std::shared_ptr<PipeWriterState>> lifetime(
+        static_cast<std::shared_ptr<PipeWriterState> *>(rawContext));
+    const std::shared_ptr<PipeWriterState> writer = *lifetime;
     for (;;) {
-        CancelSynchronousIo(thread);
-        if (WaitForSingleObject(thread, 1) == WAIT_OBJECT_0) {
-            return;
+        std::shared_ptr<PipeWriteOperation> operation;
+        {
+            std::unique_lock lock(writer->mutex);
+            writer->condition.wait(lock, [&writer] {
+                return writer->closing || !writer->queue.empty();
+            });
+            if (writer->queue.empty()) {
+                if (writer->closing) return 0;
+                continue;
+            }
+            operation = std::move(writer->queue.front());
+            writer->queue.pop_front();
+            writer->current = operation;
+            if (writer->closing) {
+                operation->cancellationRequested.store(
+                    true, std::memory_order_release);
+            }
         }
+
+        const PipeWriteResult result = writeOperation(*writer, operation);
+        {
+            std::lock_guard lock(writer->mutex);
+            if (writer->current == operation) writer->current.reset();
+            writer->pendingBytes -= operation->bytes.size();
+            --writer->pendingCount;
+        }
+        operation->finish(result);
     }
 }
+
+std::shared_ptr<PipeWriterState> startPipeWriter(const HANDLE pipe)
+{
+    if (!validHandle(pipe)) return {};
+    auto writer = std::make_shared<PipeWriterState>(pipe);
+    auto *const lifetime = new std::shared_ptr<PipeWriterState>(writer);
+    DWORD threadId = 0;
+    HANDLE thread = CreateThread(nullptr, 0, persistentPipeWriter, lifetime,
+                                 CREATE_SUSPENDED, &threadId);
+    if (!validHandle(thread)) {
+        delete lifetime;
+        return {};
+    }
+    writer->thread = thread;
+    writer->threadId = threadId;
+    if (ResumeThread(thread) == static_cast<DWORD>(-1)) {
+        TerminateThread(thread, ERROR_OPERATION_ABORTED);
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+        writer->thread = nullptr;
+        delete lifetime;
+        return {};
+    }
+    return writer;
+}
+#else
+std::shared_ptr<PipeWriterState> startPipeWriter(const HANDLE)
+{
+    return {};
+}
 #endif
+
+void closePipeWriter(const std::shared_ptr<PipeWriterState> &writer) noexcept
+{
+    if (writer == nullptr) return;
+    HANDLE thread = nullptr;
+    std::deque<std::shared_ptr<PipeWriteOperation>> selfCancelled;
+#ifdef Q_OS_WIN
+    DWORD threadId = 0;
+#endif
+    {
+        std::lock_guard lock(writer->mutex);
+        if (!writer->closing) {
+            writer->closing = true;
+            if (writer->current != nullptr) {
+                writer->current->cancellationRequested.store(
+                    true, std::memory_order_release);
+            }
+        }
+        thread = writer->thread;
+#ifdef Q_OS_WIN
+        threadId = writer->threadId;
+        if (GetCurrentThreadId() == threadId && writer->current == nullptr) {
+            selfCancelled.swap(writer->queue);
+            for (const auto &operation : selfCancelled) {
+                writer->pendingBytes -= operation->bytes.size();
+                --writer->pendingCount;
+            }
+        }
+#endif
+    }
+    for (const auto &operation : selfCancelled) {
+        operation->finish(cancelledWrite());
+    }
+    writer->condition.notify_all();
+#ifdef Q_OS_WIN
+    if (!validHandle(thread)) return;
+    if (GetCurrentThreadId() == threadId) return;
+    for (;;) {
+        CancelSynchronousIo(thread);
+        if (WaitForSingleObject(thread, 1) == WAIT_OBJECT_0) break;
+    }
+    CloseHandle(thread);
+    std::lock_guard lock(writer->mutex);
+    writer->thread = nullptr;
+#else
+    Q_UNUSED(thread)
+#endif
+}
 
 } // namespace
 
@@ -164,6 +394,7 @@ WinPipeTransport::~WinPipeTransport()
 WinPipeTransport::WinPipeTransport(WinPipeTransport &&other) noexcept
     : readHandle_(std::exchange(other.readHandle_, nullptr)),
       writeHandle_(std::exchange(other.writeHandle_, nullptr)),
+      writer_(std::move(other.writer_)),
       lastStatus_(other.lastStatus_)
 {
 }
@@ -174,6 +405,7 @@ WinPipeTransport &WinPipeTransport::operator=(WinPipeTransport &&other) noexcept
         close();
         readHandle_ = std::exchange(other.readHandle_, nullptr);
         writeHandle_ = std::exchange(other.writeHandle_, nullptr);
+        writer_ = std::move(other.writer_);
         lastStatus_ = other.lastStatus_;
     }
     return *this;
@@ -274,7 +506,8 @@ std::optional<WinPipeTransport> WinPipeTransport::adoptInheritedHandles(
 
 bool WinPipeTransport::isValid() const noexcept
 {
-    return validHandle(readHandle_) && validHandle(writeHandle_);
+    return validHandle(readHandle_) && validHandle(writeHandle_)
+        && writer_ != nullptr;
 }
 
 HANDLE WinPipeTransport::nativeReadHandle() const noexcept
@@ -342,49 +575,76 @@ bool WinPipeTransport::writeAll(const QByteArrayView bytes, const int timeoutMs)
         return false;
     }
 
-#ifdef Q_OS_WIN
     constexpr qsizetype maximumWriteBytes = 1024 * 1024 + 4;
     if (bytes.size() > maximumWriteBytes) {
         lastStatus_ = PipeIoStatus::Failed;
         return false;
     }
 
-    WriteContext context;
-    context.pipe = writeHandle_;
-    context.bytes = QByteArray(bytes.data(), bytes.size());
-    HANDLE thread = CreateThread(nullptr, 0, pipeWriter, &context, 0, nullptr);
-    if (!validHandle(thread)) {
+    struct SynchronousCompletion final
+    {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::optional<PipeWriteResult> result;
+    };
+    const auto completion = std::make_shared<SynchronousCompletion>();
+    PipeWriteSubmission submission = submitWrite(PipeWriteWork{
+        QByteArray(bytes.data(), bytes.size()),
+        {},
+        [completion](const PipeWriteResult &result) {
+            {
+                std::lock_guard lock(completion->mutex);
+                completion->result = result;
+            }
+            completion->ready.notify_all();
+        }});
+    if (!submission.accepted) {
         lastStatus_ = PipeIoStatus::Failed;
         return false;
     }
 
-    const DWORD wait = WaitForSingleObject(thread, static_cast<DWORD>(timeoutMs));
-    if (wait == WAIT_TIMEOUT) {
-        cancelAndJoinWriter(thread, context);
-        CloseHandle(thread);
+    std::unique_lock lock(completion->mutex);
+    const bool finished = completion->ready.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs),
+        [&completion] { return completion->result.has_value(); });
+    if (!finished) {
+        lock.unlock();
+        (void)submission.cancellation.cancel();
         lastStatus_ = PipeIoStatus::TimedOut;
         return false;
     }
-    if (wait != WAIT_OBJECT_0) {
-        cancelAndJoinWriter(thread, context);
-        CloseHandle(thread);
-        lastStatus_ = PipeIoStatus::Failed;
-        return false;
+    lastStatus_ = completion->result->status;
+    return lastStatus_ == PipeIoStatus::Ok;
+}
+
+PipeWriteSubmission WinPipeTransport::submitWrite(PipeWriteWork work)
+{
+    constexpr qsizetype maximumWriteBytes = 1024 * 1024 + 4;
+    if (work.bytes.isEmpty() || work.bytes.size() > maximumWriteBytes) {
+        return {false, QStringLiteral("ipc.send_invalid"), {}};
     }
-    CloseHandle(thread);
-    if (!context.succeeded) {
-        lastStatus_ = peerClosedError(context.error) ? PipeIoStatus::PeerClosed
-                                                     : PipeIoStatus::Failed;
-        return false;
+    const std::shared_ptr<PipeWriterState> writer = writer_;
+    if (!isValid() || writer == nullptr) {
+        return {false, QStringLiteral("ipc.send_closed"), {}};
     }
-    lastStatus_ = PipeIoStatus::Ok;
-    return true;
-#else
-    Q_UNUSED(bytes)
-    Q_UNUSED(timeoutMs)
-    lastStatus_ = PipeIoStatus::Failed;
-    return false;
-#endif
+
+    auto operation = std::make_shared<PipeWriteOperation>(std::move(work));
+    {
+        std::lock_guard lock(writer->mutex);
+        if (writer->closing) {
+            return {false, QStringLiteral("ipc.send_closed"), {}};
+        }
+        if (writer->pendingCount >= maximumPendingWriteCount()
+            || operation->bytes.size()
+                    > maximumPendingWriteBytes() - writer->pendingBytes) {
+            return {false, QStringLiteral("ipc.send_queue_full"), {}};
+        }
+        ++writer->pendingCount;
+        writer->pendingBytes += operation->bytes.size();
+        writer->queue.push_back(operation);
+    }
+    writer->condition.notify_one();
+    return {true, {}, PipeWriteCancellation(writer, operation)};
 }
 
 PipeIoStatus WinPipeTransport::lastStatus() const noexcept
@@ -394,13 +654,41 @@ PipeIoStatus WinPipeTransport::lastStatus() const noexcept
 
 void WinPipeTransport::close() noexcept
 {
+    closePipeWriter(writer_);
+    writer_.reset();
     closeHandle(readHandle_);
     closeHandle(writeHandle_);
 }
 
 WinPipeTransport::WinPipeTransport(const HANDLE readHandle, const HANDLE writeHandle)
-    : readHandle_(readHandle), writeHandle_(writeHandle)
+    : readHandle_(readHandle), writeHandle_(writeHandle),
+      writer_(startPipeWriter(writeHandle))
 {
+    if (writer_ == nullptr) {
+        closeHandle(readHandle_);
+        closeHandle(writeHandle_);
+        lastStatus_ = PipeIoStatus::Failed;
+    }
+}
+
+PipeWriteCancellation::PipeWriteCancellation(
+    std::weak_ptr<PipeWriterState> writer,
+    std::weak_ptr<PipeWriteOperation> operation)
+    : writer_(std::move(writer)), operation_(std::move(operation))
+{
+}
+
+bool PipeWriteCancellation::cancel() const noexcept
+{
+    const std::shared_ptr<PipeWriterState> writer = writer_.lock();
+    const std::shared_ptr<PipeWriteOperation> operation = operation_.lock();
+    return writer != nullptr && operation != nullptr
+        && writer->cancel(operation);
+}
+
+bool PipeWriteCancellation::isValid() const noexcept
+{
+    return !writer_.expired() && !operation_.expired();
 }
 
 WinPipePair::WinPipePair(WinPipePair &&other) noexcept

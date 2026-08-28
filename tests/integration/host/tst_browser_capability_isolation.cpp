@@ -1,11 +1,19 @@
+#include "AuthorityAdmissionToken.h"
 #include "FileBroker.h"
 #include "FileDialogCoordinator.h"
 #include "FileDialogTestHooks.h"
+#include "HostCapabilityRuntime.h"
+#include "HostGestureRouter.h"
+#include "HostWorkerSessionController.h"
+#include "IpcSession.h"
+#include "WorkerRetirementManager.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QScopeGuard>
 #include <QSemaphore>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -101,6 +109,33 @@ qbrowser_broker_testing::FileDialogTestShowResult openedPath(
     const QString &path)
 {
     return {FileDialogStatus::Opened, path};
+}
+
+struct AuthenticatedSessions final
+{
+    std::unique_ptr<IpcSession> host;
+    std::unique_ptr<IpcSession> worker;
+};
+
+std::optional<AuthenticatedSessions> authenticatedSessions(
+    const QString &appIdentity)
+{
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    if (!pair.isValid()) return std::nullopt;
+    auto host = std::make_unique<IpcSession>(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("bounded-final-send"), appIdentity});
+    auto worker = std::make_unique<IpcSession>(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    const auto handshake = ProtocolMessage::handshake(
+        QStringLiteral("bounded-final-send"));
+    if (!handshake.has_value() || !worker->send(*handshake, 1'000)
+        || host->receive(1'000).status != SessionStatus::MessageReady
+        || worker->receive(1'000).status != SessionStatus::MessageReady) {
+        return std::nullopt;
+    }
+    return AuthenticatedSessions{std::move(host), std::move(worker)};
 }
 }
 
@@ -883,9 +918,125 @@ void BrowserCapabilityIsolationTest::
 void BrowserCapabilityIsolationTest::
     boundedFinalSendGateIsDeferred()
 {
-    QFAIL("TODO(Task16 Task5): Host Task4 gates immutable completion before the "
-          "existing response queue; retaining UseGuard through owned bounded "
-          "transport completion remains the Task5 send seam");
+    const QString appIdentity = QStringLiteral("com.qbrowser.final-send");
+    auto sessions = authenticatedSessions(appIdentity);
+    QVERIFY(sessions.has_value());
+    HostWorkerSessionController controller(
+        [](const QString &, const QString &) { return true; });
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    auto router = HostGestureRouter::createForTesting(1);
+    QVERIFY(router != nullptr);
+    ManifestPermissions permissions;
+    permissions.storage = StoragePermission::AppPrivate;
+    const TabCapabilityAuthority authority{
+        QStringLiteral("tab-final-send"), 1, appIdentity, 91, 901,
+        controller.generation() + 1, 17};
+    auto admission = std::make_shared<AuthorityAdmissionToken>();
+    QString errorCode;
+    auto runtime = HostCapabilityRuntime::create(
+        authority, admission, router.get(), permissions,
+        QUrl(QStringLiteral("http://127.0.0.1:32191/")), storage.path(),
+        1, &errorCode, nullptr);
+    QVERIFY2(runtime != nullptr, qPrintable(errorCode));
+    const auto cleanup = qScopeGuard([&] {
+        controller.unbindCapabilityRuntime(authority);
+        HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+        if (sessions.has_value() && sessions->worker != nullptr) {
+            sessions->worker->close();
+        }
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+
+    QVERIFY(controller.attach(std::move(sessions->host), runtime.get()));
+    QSignalSpy responseQueued(
+        &controller, &HostWorkerSessionController::capabilityResponseQueued);
+    QSignalSpy responseSent(
+        &controller, &HostWorkerSessionController::capabilityResponseSent);
+    QSignalSpy requests(
+        &controller, &HostWorkerSessionController::capabilityRequestObserved);
+    QSignalSpy heartbeatObserved(
+        &controller, &HostWorkerSessionController::heartbeatObserved);
+    QVERIFY(responseQueued.isValid());
+    QVERIFY(responseSent.isValid());
+    QVERIFY(requests.isValid());
+    QVERIFY(heartbeatObserved.isValid());
+
+    constexpr int routeCount = 40;
+    for (int index = 0; index < routeCount; ++index) {
+        const QString route = QStringLiteral("/")
+            + QString(2'030, u'r') + QString::number(index);
+        QVERIFY(controller.requestRouteLoad(route));
+    }
+    QTest::qWait(50);
+
+    QVERIFY(sessions->worker->sendRequest(
+        QStringLiteral("final-send-request"), QStringLiteral("storage"),
+        QStringLiteral("get"),
+        QJsonObject{{QStringLiteral("key"), QStringLiteral("bounded")}},
+        10'000));
+    QVERIFY(sessions->worker->send(ProtocolMessage::heartbeat(), 1'000));
+    QTRY_COMPARE_WITH_TIMEOUT(responseQueued.count(), 1, 3'000);
+    QTRY_VERIFY_WITH_TIMEOUT(heartbeatObserved.count() > 0, 3'000);
+    QVERIFY(sessions->worker->sendRequest(
+        QStringLiteral("final-send-busy"), QStringLiteral("storage"),
+        QStringLiteral("get"),
+        QJsonObject{{QStringLiteral("key"), QStringLiteral("second")}},
+        10'000));
+    QTRY_COMPARE_WITH_TIMEOUT(requests.count(), 2, 3'000);
+    QTRY_COMPARE_WITH_TIMEOUT(responseQueued.count(), 2, 3'000);
+    QCOMPARE(responseQueued.at(1).at(0).toString(),
+             QStringLiteral("final-send-busy"));
+    QCOMPARE(responseQueued.at(1).at(2).toString(),
+             QStringLiteral("capability.busy"));
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+
+    const AuthorityAdmissionToken::RevocationTicket revocation =
+        admission->beginRevoke();
+    QVERIFY2(!revocation.isDrained(),
+             "UseGuard was released before transport terminal completion");
+
+    int receivedRoutes = 0;
+    bool firstResponseObserved = false;
+    bool busyResponseObserved = false;
+    bool drainObserved = false;
+    QElapsedTimer drainTimer;
+    QElapsedTimer afterDrainTimer;
+    drainTimer.start();
+    while (drainTimer.elapsed() < 3'000
+           && (receivedRoutes != routeCount || !drainObserved
+               || afterDrainTimer.elapsed() < 250)) {
+        QCoreApplication::processEvents();
+        const SessionReceiveResult received = sessions->worker->poll(0);
+        if (received.status == SessionStatus::MessageReady
+            && received.message.has_value()) {
+            if (received.message->type() == ProtocolType::RouteLoad) {
+                ++receivedRoutes;
+            } else if (received.message->type() == ProtocolType::Response
+                       && received.message->requestId()
+                           == QStringLiteral("final-send-request")) {
+                firstResponseObserved = true;
+            } else if (received.message->type() == ProtocolType::Response
+                       && received.message->requestId()
+                           == QStringLiteral("final-send-busy")) {
+                busyResponseObserved = true;
+            }
+        }
+        if (!drainObserved && revocation.isDrained()) {
+            drainObserved = true;
+            afterDrainTimer.start();
+        }
+        QTest::qWait(1);
+    }
+
+    QCOMPARE(receivedRoutes, routeCount);
+    QVERIFY(drainObserved);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.pendingCapabilityCount(), qsizetype(0),
+                              1'000);
+    QTRY_VERIFY_WITH_TIMEOUT(revocation.isDrained(), 1'000);
+    QCOMPARE(responseSent.count(), 0);
+    QVERIFY(!firstResponseObserved);
+    QVERIFY(!busyResponseObserved);
 }
 
 QTEST_GUILESS_MAIN(BrowserCapabilityIsolationTest)

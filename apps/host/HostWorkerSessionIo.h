@@ -27,7 +27,11 @@ public:
                      quint64 commandId,
                      const ProtocolMessage &message,
                      bool trackedRouteLoad,
-                     const QString &route);
+                     const QString &route,
+                     std::optional<TabCapabilityAuthority>
+                         capabilityAuthority = std::nullopt,
+                     std::shared_ptr<AuthorityAdmissionToken::UseGuard>
+                         capabilityUse = nullptr);
     void resumePolling(quint64 generation);
     void beginShutdown(quint64 generation, const QString &reason);
     void abort(quint64 generation);
@@ -37,6 +41,7 @@ signals:
     void commandFinished(quint64 generation,
                          quint64 commandId,
                          bool success,
+                         bool published,
                          const QString &errorCode);
     void navigationRequested(quint64 generation,
                              const QString &requestId,
@@ -61,7 +66,6 @@ private:
     void pollSession();
     void fail(const QString &errorCode);
 
-    static constexpr int sendTimeoutMs = 5000;
     static constexpr int routeLoadTimeoutMs = 5000;
     static constexpr int maximumMessagesPerTurn = 8;
 

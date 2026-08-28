@@ -52,42 +52,38 @@ bool IpcSession::send(const ProtocolMessage &message, const int timeoutMs)
     return sendInternal(message, timeoutMs, false);
 }
 
+IpcSendSubmission IpcSession::submitSend(const ProtocolMessage &message,
+                                         IpcSendWork work)
+{
+    return submitInternal(message, std::move(work), false);
+}
+
+IpcSendSubmission IpcSession::submitInternal(const ProtocolMessage &message,
+                                             IpcSendWork work,
+                                             const bool allowTrackedMessage)
+{
+    std::optional<QByteArray> frame = prepareSend(message, allowTrackedMessage);
+    if (!frame.has_value()) return {false, lastErrorCode_, {}};
+
+    PipeWriteSubmission submission = transport_.submitWrite(PipeWriteWork{
+        std::move(*frame), std::move(work.publicationGate),
+        std::move(work.completion)});
+    if (!submission.accepted) {
+        lastErrorCode_ = submission.errorCode;
+        return submission;
+    }
+    noteAcceptedSend(message);
+    return submission;
+}
+
 bool IpcSession::sendInternal(const ProtocolMessage &message,
                               const int timeoutMs,
                               const bool allowTrackedMessage)
 {
-    if (closed_) {
-        return false;
-    }
-    if (!allowTrackedMessage
-        && (message.type() == ProtocolType::Request
-            || message.type() == ProtocolType::RouteLoad
-            || message.type() == ProtocolType::NavigationRequest)) {
-        lastErrorCode_ = QStringLiteral("ipc.session.tracking_required");
-        return false;
-    }
-    if (!authenticated_) {
-        if (role_ != IpcRole::Worker || message.type() != ProtocolType::Handshake
-            || !outboundNonce_.isEmpty()) {
-            lastErrorCode_ = QStringLiteral("ipc.session.authentication_required");
-            return false;
-        }
-    } else if (!outgoingTypeAllowed(role_, message.type())) {
-        lastErrorCode_ = QStringLiteral("ipc.session.unexpected_message_direction");
-        return false;
-    }
-    if (role_ == IpcRole::Worker && message.type() == ProtocolType::PageMetadata
-        && !readySent_) {
-        lastErrorCode_ = QStringLiteral("ipc.session.ready_required");
-        return false;
-    }
-    const ProtocolParseResult validated = ProtocolMessage::parse(message.toJson());
-    if (!validated.message.has_value()) {
-        lastErrorCode_ = validated.errorCode;
-        return false;
-    }
-    const QByteArray frame = FrameCodec::encode(message.toJson());
-    if (frame.isEmpty() || !transport_.writeAll(frame, timeoutMs)) {
+    const std::optional<QByteArray> frame =
+        prepareSend(message, allowTrackedMessage);
+    if (!frame.has_value()) return false;
+    if (!transport_.writeAll(*frame, timeoutMs)) {
         const PipeIoStatus status = transport_.lastStatus();
         if (status == PipeIoStatus::TimedOut) {
             fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
@@ -98,12 +94,57 @@ bool IpcSession::sendInternal(const ProtocolMessage &message,
         }
         return false;
     }
+    noteAcceptedSend(message);
+    return true;
+}
+
+std::optional<QByteArray> IpcSession::prepareSend(
+    const ProtocolMessage &message,
+    const bool allowTrackedMessage)
+{
+    if (closed_) return std::nullopt;
+    if (!allowTrackedMessage
+        && (message.type() == ProtocolType::Request
+            || message.type() == ProtocolType::RouteLoad
+            || message.type() == ProtocolType::NavigationRequest)) {
+        lastErrorCode_ = QStringLiteral("ipc.session.tracking_required");
+        return std::nullopt;
+    }
+    if (!authenticated_) {
+        if (role_ != IpcRole::Worker || message.type() != ProtocolType::Handshake
+            || !outboundNonce_.isEmpty()) {
+            lastErrorCode_ = QStringLiteral("ipc.session.authentication_required");
+            return std::nullopt;
+        }
+    } else if (!outgoingTypeAllowed(role_, message.type())) {
+        lastErrorCode_ = QStringLiteral("ipc.session.unexpected_message_direction");
+        return std::nullopt;
+    }
+    if (role_ == IpcRole::Worker && message.type() == ProtocolType::PageMetadata
+        && !readySent_) {
+        lastErrorCode_ = QStringLiteral("ipc.session.ready_required");
+        return std::nullopt;
+    }
+    const ProtocolParseResult validated = ProtocolMessage::parse(message.toJson());
+    if (!validated.message.has_value()) {
+        lastErrorCode_ = validated.errorCode;
+        return std::nullopt;
+    }
+    QByteArray frame = FrameCodec::encode(message.toJson());
+    if (frame.isEmpty()) {
+        lastErrorCode_ = QStringLiteral("ipc.session.frame_encode_failed");
+        return std::nullopt;
+    }
+    return frame;
+}
+
+void IpcSession::noteAcceptedSend(const ProtocolMessage &message)
+{
     if (role_ == IpcRole::Worker && message.type() == ProtocolType::Handshake) {
         outboundNonce_ = message.payload().value(QStringLiteral("nonce")).toString();
     } else if (role_ == IpcRole::Worker && message.type() == ProtocolType::Ready) {
         readySent_ = true;
     }
-    return true;
 }
 
 bool IpcSession::sendRequest(const QString &requestId,
@@ -122,6 +163,39 @@ bool IpcSession::sendRouteLoad(const QString &requestId,
                                const int timeoutMs)
 {
     return sendTracked(requestId, ProtocolMessage::routeLoad(requestId, route), timeoutMs);
+}
+
+IpcSendSubmission IpcSession::submitRouteLoad(const QString &requestId,
+                                              const QString &route,
+                                              const int responseTimeoutMs,
+                                              IpcSendWork work)
+{
+    if (closed_) return {false, lastErrorCode_, {}};
+    if (responseTimeoutMs < 0) {
+        lastErrorCode_ = QStringLiteral("ipc.session.invalid_timeout");
+        return {false, lastErrorCode_, {}};
+    }
+    if (pendingRequests_.contains(requestId)) {
+        lastErrorCode_ = QStringLiteral("ipc.session.duplicate_request_id");
+        return {false, lastErrorCode_, {}};
+    }
+    constexpr qsizetype maximumPendingRequests = 1024;
+    if (pendingRequests_.size() >= maximumPendingRequests) {
+        lastErrorCode_ = QStringLiteral("ipc.session.pending_request_limit");
+        return {false, lastErrorCode_, {}};
+    }
+    const auto message = ProtocolMessage::routeLoad(requestId, route);
+    if (!message.has_value()) {
+        lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
+        return {false, lastErrorCode_, {}};
+    }
+    IpcSendSubmission submission = submitInternal(
+        *message, std::move(work), true);
+    if (submission.accepted) {
+        pendingRequests_.insert(requestId,
+                                clock_.elapsed() + responseTimeoutMs);
+    }
+    return submission;
 }
 
 bool IpcSession::sendNavigationRequest(const QString &requestId,

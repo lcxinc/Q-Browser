@@ -1726,16 +1726,6 @@ void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondReques
             sessions->worker->close();
         (void)WorkerRetirementManager::instance().flush(10'000);
     });
-    connect(runtime.get(), &HostCapabilityRuntime::authorityCompleted,
-            &controller,
-            [&controller](const TabCapabilityAuthority &authority,
-                          const quint64 generation,
-                          const QString &requestId,
-                          const BrokerResult &result) {
-                controller.completeCapability(
-                    authority, generation, requestId, result);
-            },
-            Qt::QueuedConnection);
     QVERIFY(controller.attach(std::move(sessions->host), runtime.get()));
     QSignalSpy heartbeats(&controller,
                           &HostWorkerSessionController::heartbeatObserved);

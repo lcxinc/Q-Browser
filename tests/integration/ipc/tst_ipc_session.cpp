@@ -1,13 +1,19 @@
 #include "IpcSession.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QSemaphore>
 #include <QTest>
 #include <QtEndian>
 
+#include <atomic>
+#include <array>
 #include <chrono>
 #include <future>
-#include <type_traits>
+#include <mutex>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
@@ -22,6 +28,27 @@ QByteArray rawJsonFrame(const QByteArray &json)
                  reinterpret_cast<uchar *>(frame.data()));
     frame.append(json);
     return frame;
+}
+
+std::optional<QByteArray> readExactly(WinPipeTransport &transport,
+                                      const qsizetype wantedBytes,
+                                      const int timeoutMs)
+{
+    QElapsedTimer timer;
+    timer.start();
+    QByteArray received;
+    received.reserve(wantedBytes);
+    while (received.size() < wantedBytes) {
+        const int remaining = std::max(
+            0, timeoutMs - static_cast<int>(timer.elapsed()));
+        const PipeReadResult next = transport.readSome(
+            wantedBytes - received.size(), remaining);
+        if (next.status != PipeIoStatus::Ok || next.bytes.isEmpty()) {
+            return std::nullopt;
+        }
+        received.append(next.bytes);
+    }
+    return received;
 }
 
 #ifdef Q_OS_WIN
@@ -118,6 +145,16 @@ private slots:
     void rejectsInvalidInheritedHandles();
     void adoptsInheritedHandlesInRealChildProcess();
     void pipeWriteTimeoutIsBounded();
+    void ipcSessionSubmissionIsPromptWhilePeerIsBlocked();
+    void asynchronousSubmissionIsPromptAndOwnsBytes();
+    void asynchronousWriterPreservesFifoAndCompletesExactlyOnce();
+    void asynchronousWriterEnforcesExactFrameAndByteLimits();
+    void asynchronousCloseCancelsEveryAcceptedWriteExactlyOnce();
+    void queuedCancellationCompletesExactlyOnceAndPreservesFifo();
+    void inFlightCancellationCannotTruncateFollowingFrame();
+    void completionCanCloseItsTransportAndQuiescesQueuedWrites();
+    void blockedWriterDoesNotDelaySiblingTransport();
+    void publicationGateRunsAtDequeueAndCanDiscard();
     void authenticatesNonceAndUsesHostAssignedIdentity();
     void rejectsWrongNonceAndMalformedPeer();
     void correlatesResponsesAndRejectsDuplicateRequestIds();
@@ -261,6 +298,555 @@ void IpcSessionTest::pipeWriteTimeoutIsBounded()
     QCOMPARE(completion, std::future_status::ready);
     QVERIFY(!result);
     QCOMPARE(host.lastStatus(), PipeIoStatus::TimedOut);
+#endif
+}
+
+void IpcSessionTest::ipcSessionSubmissionIsPromptWhilePeerIsBlocked()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    IpcSession host(pair.takeHost(), IpcRole::Host,
+                    HostLaunchContext{QStringLiteral("async-nonce"),
+                                      QStringLiteral("com.qbrowser.async")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("async-nonce"))));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    const auto message = ProtocolMessage::successResponse(
+        QStringLiteral("async-response"),
+        QJsonObject{{QStringLiteral("content"),
+                     QString(512 * 1024, u'x')}});
+    QVERIFY(message.has_value());
+    QSemaphore completed;
+    std::atomic<int> completionCalls{0};
+    std::atomic<PipeIoStatus> completionStatus{PipeIoStatus::Failed};
+    QElapsedTimer timer;
+    timer.start();
+    IpcSendSubmission submission = host.submitSend(
+        *message,
+        IpcSendWork{
+            {},
+            [&](const PipeWriteResult &result) {
+                completionStatus.store(result.status,
+                                       std::memory_order_release);
+                completionCalls.fetch_add(1, std::memory_order_relaxed);
+                completed.release();
+            }});
+    const qint64 elapsedMs = timer.elapsed();
+
+    QVERIFY(submission.accepted);
+    QVERIFY2(elapsedMs < 50,
+             qPrintable(QStringLiteral("IpcSession::submitSend blocked for %1 ms")
+                            .arg(elapsedMs)));
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 0);
+    host.close();
+    QVERIFY(completed.tryAcquire(1, 1'000));
+    QCOMPARE(completionStatus.load(std::memory_order_acquire),
+             PipeIoStatus::Cancelled);
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
+#endif
+}
+
+void IpcSessionTest::asynchronousSubmissionIsPromptAndOwnsBytes()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+
+    QByteArray ownedCandidate(256 * 1024, 'a');
+    QSemaphore completed;
+    std::atomic<int> completionCalls{0};
+    std::atomic<PipeIoStatus> completionStatus{PipeIoStatus::Failed};
+    QElapsedTimer submitTimer;
+    submitTimer.start();
+    PipeWriteSubmission submission = sender.submitWrite(PipeWriteWork{
+        ownedCandidate,
+        {},
+        [&](const PipeWriteResult &result) {
+            completionStatus.store(result.status, std::memory_order_release);
+            completionCalls.fetch_add(1, std::memory_order_relaxed);
+            completed.release();
+        }});
+    const qint64 submitElapsedMs = submitTimer.elapsed();
+
+    QVERIFY(submission.accepted);
+    QVERIFY2(submitElapsedMs < 50,
+             qPrintable(QStringLiteral("submission blocked for %1 ms")
+                            .arg(submitElapsedMs)));
+    ownedCandidate.fill('b');
+    const std::optional<QByteArray> received =
+        readExactly(receiver, 256 * 1024, 2'000);
+    QVERIFY(received.has_value());
+    QCOMPARE(*received, QByteArray(256 * 1024, 'a'));
+    QVERIFY(completed.tryAcquire(1, 1'000));
+    QCOMPARE(completionStatus.load(std::memory_order_acquire), PipeIoStatus::Ok);
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
+
+    sender.close();
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
+#endif
+}
+
+void IpcSessionTest::asynchronousWriterPreservesFifoAndCompletesExactlyOnce()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+
+    const QList<QByteArray> frames{
+        QByteArray(48 * 1024, '1'),
+        QByteArray(48 * 1024, '2'),
+        QByteArray(48 * 1024, '3')};
+    QByteArray expected;
+    QSemaphore completed;
+    std::mutex completionMutex;
+    std::vector<int> completionOrder;
+    std::array<std::atomic<int>, 3> completionCalls{};
+    for (int index = 0; index < 3; ++index) {
+        expected.append(frames.at(index));
+        PipeWriteSubmission submission = sender.submitWrite(PipeWriteWork{
+            frames.at(index),
+            {},
+            [&, index](const PipeWriteResult &result) {
+                QCOMPARE(result.status, PipeIoStatus::Ok);
+                completionCalls.at(static_cast<std::size_t>(index))
+                    .fetch_add(1, std::memory_order_relaxed);
+                {
+                    const std::lock_guard lock(completionMutex);
+                    completionOrder.push_back(index);
+                }
+                completed.release();
+            }});
+        QVERIFY(submission.accepted);
+    }
+
+    const std::optional<QByteArray> received =
+        readExactly(receiver, expected.size(), 2'000);
+    QVERIFY(received.has_value());
+    QCOMPARE(*received, expected);
+    QVERIFY(completed.tryAcquire(3, 1'000));
+    {
+        const std::lock_guard lock(completionMutex);
+        QCOMPARE(completionOrder, std::vector<int>({0, 1, 2}));
+    }
+    for (const std::atomic<int> &calls : completionCalls) {
+        QCOMPARE(calls.load(std::memory_order_relaxed), 1);
+    }
+    sender.close();
+    for (const std::atomic<int> &calls : completionCalls) {
+        QCOMPARE(calls.load(std::memory_order_relaxed), 1);
+    }
+#endif
+}
+
+void IpcSessionTest::asynchronousWriterEnforcesExactFrameAndByteLimits()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    QCOMPARE(WinPipeTransport::maximumPendingWriteCount(), qsizetype(64));
+    QCOMPARE(WinPipeTransport::maximumPendingWriteBytes(),
+             qsizetype(4 * 1024 * 1024));
+
+    {
+        WinPipePair pair = WinPipeTransport::createHostPair();
+        QVERIFY(pair.isValid());
+        WinPipeTransport sender = pair.takeHost();
+        WinPipeTransport receiver =
+            WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+        std::vector<PipeWriteSubmission> accepted;
+        accepted.reserve(64);
+        accepted.push_back(sender.submitWrite(
+            PipeWriteWork{QByteArray(1024 * 1024, 'x'), {}, {}}));
+        QVERIFY(accepted.back().accepted);
+        for (qsizetype index = 1;
+             index < WinPipeTransport::maximumPendingWriteCount(); ++index) {
+            accepted.push_back(sender.submitWrite(
+                PipeWriteWork{QByteArray(1, 'x'), {}, {}}));
+            QVERIFY(accepted.back().accepted);
+        }
+        PipeWriteSubmission rejected = sender.submitWrite(
+            PipeWriteWork{QByteArray(1, 'x'), {}, {}});
+        QVERIFY(!rejected.accepted);
+        QCOMPARE(rejected.errorCode, QStringLiteral("ipc.send_queue_full"));
+        sender.close();
+    }
+
+    {
+        WinPipePair pair = WinPipeTransport::createHostPair();
+        QVERIFY(pair.isValid());
+        WinPipeTransport sender = pair.takeHost();
+        WinPipeTransport receiver =
+            WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+        std::vector<PipeWriteSubmission> accepted;
+        accepted.reserve(4);
+        for (int index = 0; index < 4; ++index) {
+            accepted.push_back(sender.submitWrite(
+                PipeWriteWork{QByteArray(1024 * 1024, 'x'), {}, {}}));
+            QVERIFY(accepted.back().accepted);
+        }
+        PipeWriteSubmission rejected = sender.submitWrite(
+            PipeWriteWork{QByteArray(1, 'x'), {}, {}});
+        QVERIFY(!rejected.accepted);
+        QCOMPARE(rejected.errorCode, QStringLiteral("ipc.send_queue_full"));
+        sender.close();
+    }
+#endif
+}
+
+void IpcSessionTest::asynchronousCloseCancelsEveryAcceptedWriteExactlyOnce()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+    constexpr int writeCount = 4;
+    QSemaphore completed;
+    std::array<std::atomic<int>, writeCount> completionCalls{};
+    std::array<std::atomic<PipeIoStatus>, writeCount> completionStatuses{};
+    for (int index = 0; index < writeCount; ++index) {
+        completionStatuses.at(static_cast<std::size_t>(index))
+            .store(PipeIoStatus::Failed, std::memory_order_relaxed);
+        PipeWriteSubmission submission = sender.submitWrite(PipeWriteWork{
+            QByteArray(1024 * 1024, static_cast<char>('a' + index)),
+            {},
+            [&, index](const PipeWriteResult &result) {
+                completionStatuses.at(static_cast<std::size_t>(index))
+                    .store(result.status, std::memory_order_release);
+                completionCalls.at(static_cast<std::size_t>(index))
+                    .fetch_add(1, std::memory_order_relaxed);
+                completed.release();
+            }});
+        QVERIFY(submission.accepted);
+    }
+
+    sender.close();
+    QVERIFY(completed.tryAcquire(writeCount, 1'000));
+    for (int index = 0; index < writeCount; ++index) {
+        QCOMPARE(completionCalls.at(static_cast<std::size_t>(index))
+                     .load(std::memory_order_relaxed),
+                 1);
+        QCOMPARE(completionStatuses.at(static_cast<std::size_t>(index))
+                     .load(std::memory_order_acquire),
+                 PipeIoStatus::Cancelled);
+    }
+    sender.close();
+    QTest::qWait(10);
+    for (const std::atomic<int> &calls : completionCalls) {
+        QCOMPARE(calls.load(std::memory_order_relaxed), 1);
+    }
+#endif
+}
+
+void IpcSessionTest::queuedCancellationCompletesExactlyOnceAndPreservesFifo()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+
+    const QByteArray firstFrame(256 * 1024, 'f');
+    const QByteArray cancelledFrame = QByteArrayLiteral("cancelled");
+    const QByteArray survivingFrame = QByteArrayLiteral("surviving");
+    QSemaphore firstCompleted;
+    QSemaphore cancelledCompleted;
+    QSemaphore survivingCompleted;
+    std::atomic<int> firstCalls{0};
+    std::atomic<int> cancelledCalls{0};
+    std::atomic<int> survivingCalls{0};
+    std::atomic<PipeIoStatus> cancelledStatus{PipeIoStatus::Failed};
+
+    PipeWriteSubmission first = sender.submitWrite(PipeWriteWork{
+        firstFrame,
+        {},
+        [&](const PipeWriteResult &result) {
+            if (result.status == PipeIoStatus::Ok) {
+                firstCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+            firstCompleted.release();
+        }});
+    PipeWriteSubmission cancelled = sender.submitWrite(PipeWriteWork{
+        cancelledFrame,
+        {},
+        [&](const PipeWriteResult &result) {
+            cancelledStatus.store(result.status, std::memory_order_release);
+            cancelledCalls.fetch_add(1, std::memory_order_relaxed);
+            cancelledCompleted.release();
+        }});
+    PipeWriteSubmission surviving = sender.submitWrite(PipeWriteWork{
+        survivingFrame,
+        {},
+        [&](const PipeWriteResult &result) {
+            if (result.status == PipeIoStatus::Ok) {
+                survivingCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+            survivingCompleted.release();
+        }});
+    QVERIFY(first.accepted);
+    QVERIFY(cancelled.accepted);
+    QVERIFY(surviving.accepted);
+    QVERIFY(cancelled.cancellation.cancel());
+    QVERIFY(cancelledCompleted.tryAcquire(1, 1'000));
+    QCOMPARE(cancelledStatus.load(std::memory_order_acquire),
+             PipeIoStatus::Cancelled);
+    QCOMPARE(cancelledCalls.load(std::memory_order_relaxed), 1);
+
+    const std::optional<QByteArray> received = readExactly(
+        receiver, firstFrame.size() + survivingFrame.size(), 2'000);
+    QVERIFY(received.has_value());
+    QCOMPARE(*received, firstFrame + survivingFrame);
+    QVERIFY(firstCompleted.tryAcquire(1, 1'000));
+    QVERIFY(survivingCompleted.tryAcquire(1, 1'000));
+    QCOMPARE(firstCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(survivingCalls.load(std::memory_order_relaxed), 1);
+
+    sender.close();
+    QCOMPARE(cancelledCalls.load(std::memory_order_relaxed), 1);
+#endif
+}
+
+void IpcSessionTest::inFlightCancellationCannotTruncateFollowingFrame()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+
+    const QByteArray firstFrame(256 * 1024, 'i');
+    const QByteArray followingFrame = QByteArrayLiteral("following");
+    QSemaphore firstCompleted;
+    QSemaphore followingCompleted;
+    std::atomic<int> firstCalls{0};
+    std::atomic<int> followingCalls{0};
+    std::atomic<PipeIoStatus> firstStatus{PipeIoStatus::Failed};
+
+    PipeWriteSubmission first = sender.submitWrite(PipeWriteWork{
+        firstFrame,
+        {},
+        [&](const PipeWriteResult &result) {
+            firstStatus.store(result.status, std::memory_order_release);
+            firstCalls.fetch_add(1, std::memory_order_relaxed);
+            firstCompleted.release();
+        }});
+    QVERIFY(first.accepted);
+    QVERIFY(first.cancellation.isValid());
+
+    const PipeReadResult prefix = receiver.readSome(64 * 1024, 1'000);
+    QCOMPARE(prefix.status, PipeIoStatus::Ok);
+    QVERIFY(!prefix.bytes.isEmpty());
+    QVERIFY(prefix.bytes.size() < firstFrame.size());
+    QCOMPARE(prefix.bytes, QByteArray(prefix.bytes.size(), 'i'));
+
+    QVERIFY2(!first.cancellation.cancel(),
+             "An in-flight frame cannot be cancelled without truncating the stream");
+    PipeWriteSubmission following = sender.submitWrite(PipeWriteWork{
+        followingFrame,
+        {},
+        [&](const PipeWriteResult &result) {
+            if (result.status == PipeIoStatus::Ok) {
+                followingCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+            followingCompleted.release();
+        }});
+    QVERIFY(following.accepted);
+
+    const std::optional<QByteArray> remainder = readExactly(
+        receiver, firstFrame.size() - prefix.bytes.size(), 2'000);
+    QVERIFY(remainder.has_value());
+    QCOMPARE(prefix.bytes + *remainder, firstFrame);
+    QVERIFY(firstCompleted.tryAcquire(1, 1'000));
+    QCOMPARE(firstStatus.load(std::memory_order_acquire), PipeIoStatus::Ok);
+    QCOMPARE(firstCalls.load(std::memory_order_relaxed), 1);
+
+    const std::optional<QByteArray> receivedFollowing = readExactly(
+        receiver, followingFrame.size(), 1'000);
+    QVERIFY(receivedFollowing.has_value());
+    QCOMPARE(*receivedFollowing, followingFrame);
+    QVERIFY(followingCompleted.tryAcquire(1, 1'000));
+    QCOMPARE(followingCalls.load(std::memory_order_relaxed), 1);
+
+    sender.close();
+    QCOMPARE(firstCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(followingCalls.load(std::memory_order_relaxed), 1);
+#endif
+}
+
+void IpcSessionTest::completionCanCloseItsTransportAndQuiescesQueuedWrites()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+    QSemaphore completed;
+    std::atomic<int> firstCalls{0};
+    std::atomic<int> secondCalls{0};
+    std::atomic_bool queuedQuiescedBeforeCloseReturned{false};
+
+    PipeWriteSubmission first = sender.submitWrite(PipeWriteWork{
+        QByteArray(256 * 1024, 'f'),
+        {},
+        [&](const PipeWriteResult &result) {
+            if (result.status == PipeIoStatus::Ok) {
+                firstCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+            sender.close();
+            queuedQuiescedBeforeCloseReturned.store(
+                secondCalls.load(std::memory_order_acquire) == 1,
+                std::memory_order_release);
+            completed.release();
+        }});
+    PipeWriteSubmission second = sender.submitWrite(PipeWriteWork{
+        QByteArrayLiteral("queued"),
+        {},
+        [&](const PipeWriteResult &result) {
+            if (result.status == PipeIoStatus::Cancelled) {
+                secondCalls.fetch_add(1, std::memory_order_release);
+            }
+            completed.release();
+        }});
+    QVERIFY(first.accepted);
+    QVERIFY(second.accepted);
+    QVERIFY(readExactly(receiver, 256 * 1024, 2'000).has_value());
+    QVERIFY(completed.tryAcquire(2, 1'000));
+    QCOMPARE(firstCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(secondCalls.load(std::memory_order_acquire), 1);
+    QVERIFY(queuedQuiescedBeforeCloseReturned.load(std::memory_order_acquire));
+    sender.close();
+    QCOMPARE(firstCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(secondCalls.load(std::memory_order_acquire), 1);
+#endif
+}
+
+void IpcSessionTest::blockedWriterDoesNotDelaySiblingTransport()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair blockedPair = WinPipeTransport::createHostPair();
+    WinPipePair siblingPair = WinPipeTransport::createHostPair();
+    QVERIFY(blockedPair.isValid());
+    QVERIFY(siblingPair.isValid());
+    WinPipeTransport blockedSender = blockedPair.takeHost();
+    WinPipeTransport blockedReceiver =
+        WinPipeTransport::adoptWorkerEnds(blockedPair.takeWorkerEnds());
+    WinPipeTransport siblingSender = siblingPair.takeHost();
+    WinPipeTransport siblingReceiver =
+        WinPipeTransport::adoptWorkerEnds(siblingPair.takeWorkerEnds());
+
+    PipeWriteSubmission blocked = blockedSender.submitWrite(
+        PipeWriteWork{QByteArray(1024 * 1024, 'b'), {}, {}});
+    QVERIFY(blocked.accepted);
+
+    QSemaphore siblingCompleted;
+    QElapsedTimer siblingTimer;
+    siblingTimer.start();
+    PipeWriteSubmission sibling = siblingSender.submitWrite(PipeWriteWork{
+        QByteArrayLiteral("sibling"),
+        {},
+        [&](const PipeWriteResult &result) {
+            QCOMPARE(result.status, PipeIoStatus::Ok);
+            siblingCompleted.release();
+        }});
+    QVERIFY(sibling.accepted);
+    const std::optional<QByteArray> received =
+        readExactly(siblingReceiver, 7, 250);
+    QVERIFY(received.has_value());
+    QCOMPARE(*received, QByteArrayLiteral("sibling"));
+    QVERIFY(siblingCompleted.tryAcquire(1, 250));
+    QVERIFY2(siblingTimer.elapsed() < 250,
+             qPrintable(QStringLiteral("sibling stalled for %1 ms")
+                            .arg(siblingTimer.elapsed())));
+
+    auto blockedClose = std::async(std::launch::async,
+                                   [&blockedSender] { blockedSender.close(); });
+    PipeWriteSubmission secondSibling = siblingSender.submitWrite(
+        PipeWriteWork{QByteArrayLiteral("still-responsive"), {}, {}});
+    QVERIFY(secondSibling.accepted);
+    QVERIFY(readExactly(siblingReceiver, 16, 250).has_value());
+    QCOMPARE(blockedClose.wait_for(std::chrono::seconds(1)),
+             std::future_status::ready);
+    blockedClose.get();
+#endif
+}
+
+void IpcSessionTest::publicationGateRunsAtDequeueAndCanDiscard()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    WinPipeTransport sender = pair.takeHost();
+    WinPipeTransport receiver =
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds());
+
+    QSemaphore firstCompleted;
+    PipeWriteSubmission first = sender.submitWrite(PipeWriteWork{
+        QByteArray(1024 * 1024, 'x'),
+        {},
+        [&](const PipeWriteResult &) { firstCompleted.release(); }});
+    QVERIFY(first.accepted);
+
+    std::atomic_bool admitted{true};
+    std::atomic<int> gateCalls{0};
+    std::atomic<int> completionCalls{0};
+    QSemaphore discarded;
+    PipeWriteSubmission gated = sender.submitWrite(PipeWriteWork{
+        QByteArrayLiteral("must-not-publish"),
+        [&] {
+            gateCalls.fetch_add(1, std::memory_order_relaxed);
+            return admitted.load(std::memory_order_acquire);
+        },
+        [&](const PipeWriteResult &result) {
+            QCOMPARE(result.status, PipeIoStatus::Cancelled);
+            completionCalls.fetch_add(1, std::memory_order_relaxed);
+            discarded.release();
+        }});
+    QVERIFY(gated.accepted);
+    QCOMPARE(gateCalls.load(std::memory_order_relaxed), 0);
+    admitted.store(false, std::memory_order_release);
+
+    QVERIFY(readExactly(receiver, 1024 * 1024, 2'000).has_value());
+    QVERIFY(firstCompleted.tryAcquire(1, 1'000));
+    QVERIFY(discarded.tryAcquire(1, 1'000));
+    QCOMPARE(gateCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
+    QCOMPARE(receiver.readSome(64, 20).status, PipeIoStatus::TimedOut);
+    sender.close();
+    QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
 #endif
 }
 

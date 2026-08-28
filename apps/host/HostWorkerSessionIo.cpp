@@ -36,20 +36,78 @@ void HostWorkerSessionIo::sendMessage(const quint64 generation,
                                       const quint64 commandId,
                                       const ProtocolMessage &message,
                                       const bool trackedRouteLoad,
-                                      const QString &route)
+                                      const QString &route,
+                                      std::optional<TabCapabilityAuthority>
+                                          capabilityAuthority,
+                                      std::shared_ptr<
+                                          AuthorityAdmissionToken::UseGuard>
+                                          capabilityUse)
 {
     if (generation != generation_ || terminal_ || stopping_
         || session_ == nullptr) {
-        emit commandFinished(generation, commandId, false,
+        emit commandFinished(generation, commandId, false, false,
                              QStringLiteral("host.worker_session.stale_command"));
         return;
     }
-    const bool sent = trackedRouteLoad
-        ? session_->sendRouteLoad(message.requestId(), route, routeLoadTimeoutMs)
-        : session_->send(message, sendTimeoutMs);
-    const QString errorCode = sent ? QString{} : session_->lastErrorCode();
-    emit commandFinished(generation, commandId, sent, errorCode);
-    if (!sent) {
+    const bool capabilitySend = capabilityAuthority.has_value()
+        || capabilityUse != nullptr;
+    if (capabilitySend
+        && (!capabilityAuthority.has_value() || capabilityUse == nullptr
+            || !capabilityAuthority_.has_value()
+            || *capabilityAuthority != *capabilityAuthority_)) {
+        const QString errorCode = QStringLiteral(
+            "host.worker_session.capability_authority_mismatch");
+        emit commandFinished(generation, commandId, false, false, errorCode);
+        fail(errorCode);
+        return;
+    }
+
+    IpcSendWork work;
+    if (capabilitySend) {
+        const TabCapabilityAuthority immutableAuthority =
+            *capabilityAuthority;
+        const TabCapabilityAuthority boundAuthority = *capabilityAuthority_;
+        work.publicationGate =
+            [immutableAuthority, boundAuthority,
+             use = std::move(capabilityUse)] {
+                return immutableAuthority == boundAuthority && use != nullptr
+                    && use->publishIfStillAdmitted([] { return true; });
+            };
+    }
+    work.completion = [this, generation, commandId, capabilitySend](
+                          const PipeWriteResult &result) {
+        (void)QMetaObject::invokeMethod(
+            this,
+            [this, generation, commandId, capabilitySend, result] {
+                if (generation != generation_ || terminal_) return;
+                if (result.status == PipeIoStatus::Ok) {
+                    emit commandFinished(generation, commandId, true, true,
+                                         QString{});
+                    return;
+                }
+                if (result.status == PipeIoStatus::Cancelled
+                    && capabilitySend) {
+                    emit commandFinished(generation, commandId, true, false,
+                                         result.errorCode);
+                    return;
+                }
+                const QString errorCode = result.errorCode.isEmpty()
+                    ? QStringLiteral("host.worker_session.send_failed")
+                    : result.errorCode;
+                emit commandFinished(generation, commandId, false, false,
+                                     errorCode);
+                fail(errorCode);
+            },
+            Qt::QueuedConnection);
+    };
+    IpcSendSubmission submission = trackedRouteLoad
+        ? session_->submitRouteLoad(message.requestId(), route,
+                                    routeLoadTimeoutMs, std::move(work))
+        : session_->submitSend(message, std::move(work));
+    if (!submission.accepted) {
+        const QString errorCode = submission.errorCode.isEmpty()
+            ? session_->lastErrorCode() : submission.errorCode;
+        emit commandFinished(generation, commandId, false, false, errorCode);
         fail(errorCode.isEmpty()
                  ? QStringLiteral("host.worker_session.send_failed")
                  : errorCode);
@@ -77,7 +135,30 @@ void HostWorkerSessionIo::beginShutdown(const quint64 generation,
     stopping_ = true;
     awaitingGui_ = false;
     const auto message = ProtocolMessage::shutdown(reason);
-    if (!message.has_value() || !session_->send(*message, sendTimeoutMs)) {
+    if (!message.has_value()) {
+        fail(QStringLiteral("host.worker_session.shutdown_send_failed"));
+        return;
+    }
+    IpcSendSubmission submission = session_->submitSend(
+        *message,
+        IpcSendWork{
+            {},
+            [this, generation](const PipeWriteResult &result) {
+                (void)QMetaObject::invokeMethod(
+                    this,
+                    [this, generation, result] {
+                        if (generation != generation_ || terminal_
+                            || result.status == PipeIoStatus::Ok) {
+                            return;
+                        }
+                        fail(result.errorCode.isEmpty()
+                                 ? QStringLiteral(
+                                       "host.worker_session.shutdown_send_failed")
+                                 : result.errorCode);
+                    },
+                    Qt::QueuedConnection);
+            }});
+    if (!submission.accepted) {
         fail(session_->lastErrorCode().isEmpty()
                  ? QStringLiteral("host.worker_session.shutdown_send_failed")
                  : session_->lastErrorCode());

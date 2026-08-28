@@ -591,24 +591,6 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         || pending.capability->authority() != authority) {
         return rollback();
     }
-    QPointer<HostWorkerSessionController> owningController(
-        sessionController_.get());
-    connect(pending.capability.get(), &HostCapabilityRuntime::authorityCompleted,
-            sessionController_.get(),
-            [owningController, authority](
-                const TabCapabilityAuthority &completedAuthority,
-                const quint64 generation, const QString &requestId,
-                const BrokerResult &result) {
-                if (owningController == nullptr
-                    || completedAuthority != authority
-                    || generation != authority.sessionGeneration) {
-                    return;
-                }
-                owningController->completeCapability(
-                    completedAuthority, generation, requestId, result);
-            },
-            Qt::QueuedConnection);
-
     {
         std::unique_lock<std::mutex> transportLock;
         if (transportGateMutex_ != nullptr) {

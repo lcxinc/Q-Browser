@@ -265,6 +265,45 @@ const TabCapabilityAuthority &HostCapabilityRuntime::authority() const noexcept
     return authority_;
 }
 
+bool HostCapabilityRuntime::bindCompletionSubmitter(
+    const TabCapabilityAuthority &authority,
+    CapabilityCompletionSubmitter submitter)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (QThread::currentThread() != thread() || !accepting_ || !submitter
+        || authority != authority_ || completionSubmitter_) {
+        return false;
+    }
+    completionSubmitter_ = std::move(submitter);
+    return true;
+}
+
+void HostCapabilityRuntime::unbindCompletionSubmitter(
+    const TabCapabilityAuthority &authority) noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (QThread::currentThread() == thread() && authority == authority_) {
+        completionSubmitter_ = {};
+    }
+}
+
+std::shared_ptr<AuthorityAdmissionToken::UseGuard>
+HostCapabilityRuntime::acquireResponseUse(
+    const TabCapabilityAuthority &authority,
+    const quint64 generation)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (QThread::currentThread() != thread() || !accepting_
+        || admissionToken_ == nullptr || authority != authority_
+        || !generationMatches(generation)) {
+        return nullptr;
+    }
+    auto acquired = admissionToken_->tryAcquireUse();
+    if (!acquired.has_value()) return nullptr;
+    return std::make_shared<AuthorityAdmissionToken::UseGuard>(
+        std::move(*acquired));
+}
+
 void HostCapabilityRuntime::retire(
     std::shared_ptr<HostCapabilityRuntime> runtime) noexcept
 {
@@ -628,29 +667,16 @@ bool HostCapabilityRuntime::queueCompletion(
     if (use == nullptr) return false;
     const TabCapabilityAuthority immutableAuthority = authority_;
     const std::weak_ptr<HostCapabilityRuntime> weakRuntime = weak_from_this();
-    return use->publishIfStillAdmitted(
-        [this, weakRuntime, immutableAuthority, generation, requestId,
-         result] {
-            return QMetaObject::invokeMethod(
-                this,
-                [weakRuntime, immutableAuthority, generation, requestId,
-                 result] {
-                    const auto runtime = weakRuntime.lock();
-                    if (runtime == nullptr || !runtime->accepting_
-                        || immutableAuthority != runtime->authority_
-                        || !runtime->generationMatches(generation)
-                        || runtime->admissionToken_ == nullptr) {
-                        return;
-                    }
-                    auto acquired = runtime->admissionToken_->tryAcquireUse();
-                    if (!acquired.has_value()) return;
-                    (void)runtime->publishCompletion(
-                        std::make_shared<AuthorityAdmissionToken::UseGuard>(
-                            std::move(*acquired)),
-                        immutableAuthority, generation, requestId, result);
-                },
-                Qt::QueuedConnection);
-        });
+    return QMetaObject::invokeMethod(
+        this,
+        [weakRuntime, use = std::move(use), immutableAuthority, generation,
+         requestId, result] {
+            const auto runtime = weakRuntime.lock();
+            if (runtime == nullptr) return;
+            (void)runtime->publishCompletion(
+                use, immutableAuthority, generation, requestId, result);
+        },
+        Qt::QueuedConnection);
 }
 
 bool HostCapabilityRuntime::publishCompletion(
@@ -665,16 +691,26 @@ bool HostCapabilityRuntime::publishCompletion(
         || !generationMatches(generation)) {
         return false;
     }
+    const auto delivery = std::make_shared<CapabilityDeliveryState>(
+        immutableAuthority, generation, requestId, result, use);
     return use->publishIfStillAdmitted(
-        [this, immutableAuthority, generation, requestId, result] {
+        [this, delivery] {
+            const TabCapabilityAuthority &immutableAuthority =
+                delivery->authority;
+            const quint64 generation = delivery->generation;
             if (!accepting_ || immutableAuthority != authority_
                 || !generationMatches(generation)) {
                 return false;
             }
+            if (completionSubmitter_) {
+                const CapabilityCompletionSubmitter submitter =
+                    completionSubmitter_;
+                return submitter && submitter(delivery);
+            }
             emit authorityCompleted(immutableAuthority, generation,
-                                    requestId, result);
+                                    delivery->requestId, delivery->result);
 #ifdef Q_BROWSER_HOST_TESTING
-            emit completed(generation, requestId, result);
+            emit completed(generation, delivery->requestId, delivery->result);
 #endif
             return true;
         });
@@ -684,6 +720,7 @@ void HostCapabilityRuntime::invalidate() noexcept
 {
     if (!accepting_) return;
     accepting_ = false;
+    completionSubmitter_ = {};
     if (pendingFile_ != nullptr && pendingFile_->operation.has_value()) {
         (void)pendingFile_->operation->cancellation.cancel();
     }

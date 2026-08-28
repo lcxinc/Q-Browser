@@ -1979,22 +1979,6 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
                 : capabilityError);
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
-    QPointer<HostWorkerSessionController> owningController(
-        workerSessionController_.get());
-    connect(capabilityRuntime.get(), &HostCapabilityRuntime::authorityCompleted,
-            workerSessionController_.get(),
-            [owningController, authority](
-                const TabCapabilityAuthority &completedAuthority,
-                const quint64 generation, const QString &requestId,
-                const BrokerResult &result) {
-                if (owningController == nullptr
-                    || completedAuthority != authority
-                    || generation != authority.sessionGeneration) {
-                    return;
-                }
-                owningController->completeCapability(
-                    completedAuthority, generation, requestId, result);
-            }, Qt::QueuedConnection);
     if (!workerSessionController_->attach(std::move(context.session),
                                           capabilityRuntime.get())) {
         mainWindow_->detachWorkerSurface();

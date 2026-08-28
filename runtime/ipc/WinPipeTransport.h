@@ -1,7 +1,10 @@
 #pragma once
 
 #include <QByteArray>
+#include <QString>
 
+#include <functional>
+#include <memory>
 #include <optional>
 
 #ifdef Q_OS_WIN
@@ -13,6 +16,7 @@ using HANDLE = void *;
 enum class PipeIoStatus {
     Ok,
     TimedOut,
+    Cancelled,
     PeerClosed,
     Failed,
 };
@@ -20,6 +24,46 @@ enum class PipeIoStatus {
 struct PipeReadResult {
     PipeIoStatus status = PipeIoStatus::Failed;
     QByteArray bytes;
+};
+
+struct PipeWriteResult final
+{
+    PipeIoStatus status = PipeIoStatus::Failed;
+    QString errorCode;
+};
+
+struct PipeWriteWork final
+{
+    QByteArray bytes;
+    std::function<bool()> publicationGate;
+    std::function<void(const PipeWriteResult &)> completion;
+};
+
+struct PipeWriterState;
+struct PipeWriteOperation;
+
+class PipeWriteCancellation final
+{
+public:
+    PipeWriteCancellation() = default;
+
+    [[nodiscard]] bool cancel() const noexcept;
+    [[nodiscard]] bool isValid() const noexcept;
+
+private:
+    friend class WinPipeTransport;
+    PipeWriteCancellation(std::weak_ptr<PipeWriterState> writer,
+                          std::weak_ptr<PipeWriteOperation> operation);
+
+    std::weak_ptr<PipeWriterState> writer_;
+    std::weak_ptr<PipeWriteOperation> operation_;
+};
+
+struct PipeWriteSubmission final
+{
+    bool accepted = false;
+    QString errorCode;
+    PipeWriteCancellation cancellation;
 };
 
 class WorkerPipeEnds final
@@ -71,15 +115,26 @@ public:
     HANDLE nativeReadHandle() const noexcept;
     HANDLE nativeWriteHandle() const noexcept;
     PipeReadResult readSome(qsizetype maximumBytes, int timeoutMs);
+    [[nodiscard]] PipeWriteSubmission submitWrite(PipeWriteWork work);
     bool writeAll(QByteArrayView bytes, int timeoutMs);
     PipeIoStatus lastStatus() const noexcept;
     void close() noexcept;
+
+    static constexpr qsizetype maximumPendingWriteCount() noexcept
+    {
+        return 64;
+    }
+    static constexpr qsizetype maximumPendingWriteBytes() noexcept
+    {
+        return 4 * 1024 * 1024;
+    }
 
 private:
     WinPipeTransport(HANDLE readHandle, HANDLE writeHandle);
 
     HANDLE readHandle_ = nullptr;
     HANDLE writeHandle_ = nullptr;
+    std::shared_ptr<PipeWriterState> writer_;
     PipeIoStatus lastStatus_ = PipeIoStatus::Ok;
 };
 

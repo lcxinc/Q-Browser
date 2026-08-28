@@ -34,6 +34,14 @@ struct SessionReceiveResult {
     QString errorCode;
 };
 
+struct IpcSendWork final
+{
+    std::function<bool()> publicationGate;
+    std::function<void(const PipeWriteResult &)> completion;
+};
+
+using IpcSendSubmission = PipeWriteSubmission;
+
 class IpcSession final
 {
 public:
@@ -50,12 +58,20 @@ public:
     IpcSession &operator=(IpcSession &&) = default;
 
     bool send(const ProtocolMessage &message, int timeoutMs = 1000);
+    [[nodiscard]] IpcSendSubmission submitSend(
+        const ProtocolMessage &message,
+        IpcSendWork work = {});
     bool sendRequest(const QString &requestId,
                      const QString &capability,
                      const QString &operation,
                      const QJsonObject &payload,
                      int timeoutMs);
     bool sendRouteLoad(const QString &requestId, const QString &route, int timeoutMs);
+    [[nodiscard]] IpcSendSubmission submitRouteLoad(
+        const QString &requestId,
+        const QString &route,
+        int responseTimeoutMs,
+        IpcSendWork work = {});
     bool sendNavigationRequest(const QString &requestId,
                                const QString &route,
                                int timeoutMs);
@@ -90,6 +106,14 @@ private:
     bool sendInternal(const ProtocolMessage &message,
                       int timeoutMs,
                       bool allowTrackedMessage);
+    [[nodiscard]] std::optional<QByteArray> prepareSend(
+        const ProtocolMessage &message,
+        bool allowTrackedMessage);
+    [[nodiscard]] IpcSendSubmission submitInternal(
+        const ProtocolMessage &message,
+        IpcSendWork work,
+        bool allowTrackedMessage);
+    void noteAcceptedSend(const ProtocolMessage &message);
 
     WinPipeTransport transport_;
     IpcRole role_;

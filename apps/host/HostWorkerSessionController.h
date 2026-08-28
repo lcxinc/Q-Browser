@@ -19,6 +19,7 @@ class IpcSession;
 class MainWindow;
 class QThread;
 struct BrokerResult;
+struct CapabilityDeliveryState;
 
 enum class HostWorkerSessionState { Detached, Running, ShuttingDown, Failed };
 Q_DECLARE_METATYPE(HostWorkerSessionState)
@@ -51,10 +52,8 @@ public:
     [[nodiscard]] bool ioThreadRunning() const noexcept;
     void unbindCapabilityRuntime(
         const TabCapabilityAuthority &authority) noexcept;
-    void completeCapability(const TabCapabilityAuthority &authority,
-                            quint64 generation,
-                            const QString &requestId,
-                            const BrokerResult &result);
+    [[nodiscard]] bool submitCapabilityCompletion(
+        const std::shared_ptr<CapabilityDeliveryState> &delivery);
 
 signals:
     void sessionDetached(quint64 generation);
@@ -91,6 +90,7 @@ private:
         bool resumePollingAfter = false;
         QString capabilityRequestId;
         std::optional<TabCapabilityAuthority> capabilityAuthority;
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> capabilityUse;
     };
 
     struct CapabilityBinding final {
@@ -110,6 +110,7 @@ private:
     void handleCommandFinished(quint64 generation,
                                quint64 commandId,
                                bool success,
+                               bool published,
                                const QString &errorCode);
     bool enqueueMessage(const ProtocolMessage &message,
                         bool resumePollingAfter = false);
@@ -119,11 +120,13 @@ private:
     void failClosed(const QString &errorCode);
     bool startSession(std::unique_ptr<IpcSession> session,
                       std::optional<CapabilityBinding> capabilityBinding);
-    void queueCapabilityResponse(
+    [[nodiscard]] bool queueCapabilityResponse(
         std::optional<TabCapabilityAuthority> authority,
+        std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
         quint64 generation,
         const QString &requestId,
-        const BrokerResult &result);
+        const BrokerResult &result,
+        bool completesActiveRequest);
     void invalidateCapabilityBinding() noexcept;
     void requestIoStop();
     void handleIoThreadFinished(QPointer<HostWorkerSessionIo> oldIo,
