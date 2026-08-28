@@ -11,7 +11,8 @@ function(q_browser_add_update_test target source test_name)
   target_compile_definitions(${target}
     PRIVATE
       Q_BROWSER_ARCHIVE_TESTING
-      Q_BROWSER_PACKAGE_INSTALLER_TESTING)
+      Q_BROWSER_PACKAGE_INSTALLER_TESTING
+      Q_BROWSER_PACKAGE_STORE_TESTING)
   q_browser_enable_strict_warnings(${target})
   q_browser_add_qt_test(
     NAME ${test_name}

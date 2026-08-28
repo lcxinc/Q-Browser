@@ -189,6 +189,8 @@ private:
         AuthorityDrainBatch batch;
         QVector<TabLaunchAuthority> affected;
         bool timedOut = false;
+        bool terminalFailure = false;
+        QString failureError;
     };
     struct AuthorityLess
     {
@@ -218,7 +220,8 @@ private:
         PackageRevalidationMode mode,
         bool recovery,
         qint64 nowMs,
-        bool reuseActivation = false);
+        bool reuseActivation = false,
+        bool emitRetireActions = true);
     [[nodiscard]] AppRuntimeResult restartTab(TabState &state,
                                               qint64 nowMs,
                                               bool recovery = true);
@@ -228,6 +231,13 @@ private:
                                     const VerifiedPackageLease &lease) const;
     [[nodiscard]] bool candidateLease(
         const VerifiedPackageLease &lease) const;
+    [[nodiscard]] bool currentCandidateTab(const TabState &state) const;
+    [[nodiscard]] AppRuntimeResult failClosedTab(
+        TabState &state,
+        const QString &stableError,
+        bool trustedCrash = false);
+    void appendDrainTimeoutActions(AppRuntimeResult &result,
+                                   const PendingDrain &pending) const;
     [[nodiscard]] AppRuntimeResult promoteCandidate(qint64 nowMs);
     [[nodiscard]] AppRuntimeResult beginCandidateRollback(qint64 nowMs);
     [[nodiscard]] AppRuntimeResult finishDrain(qint64 nowMs);
@@ -262,4 +272,5 @@ private:
     bool candidatePromoted_ = false;
     bool rollbackStarted_ = false;
     bool shuttingDown_ = false;
+    bool failedClosed_ = false;
 };

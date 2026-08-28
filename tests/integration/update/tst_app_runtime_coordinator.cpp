@@ -1,8 +1,10 @@
 #include "AppRuntimeCoordinator.h"
+#include "PackageStoreTestHooks.h"
 #include "UpdateTestSupport.h"
 
 #include <QFileInfo>
 #include <QDir>
+#include <QFile>
 #include <QTest>
 
 #include <algorithm>
@@ -28,7 +30,7 @@ struct CoordinatorHarness final
             *store, keys.value().publicKeyPem, updateInstallPolicy());
         coordinator = std::make_unique<AppRuntimeCoordinator>(
             QStringLiteral("company.pilot"), *store, *installer,
-            WorkerSupervisionPolicy{100, 30}, clock.source(), nullptr,
+            WorkerSupervisionPolicy{100, 1'000}, clock.source(), nullptr,
             [this](const AuthorityDrainBatch &batch) {
                 drains.push_back(batch);
             });
@@ -59,9 +61,16 @@ FullAttemptKey fullKey(const AppRuntimeAction &action)
 const AppRuntimeAction &onlyAction(const AppRuntimeResult &result,
                                    const AppRuntimeActionKind kind)
 {
-    Q_ASSERT(result.actions.size() == 1);
-    Q_ASSERT(result.actions.front().kind == kind);
-    return result.actions.front();
+    const auto found = std::ranges::find_if(
+        result.actions,
+        [kind](const AppRuntimeAction &action) { return action.kind == kind; });
+    Q_ASSERT(found != result.actions.cend());
+    Q_ASSERT(std::ranges::count_if(
+                 result.actions,
+                 [kind](const AppRuntimeAction &action) {
+                     return action.kind == kind;
+                 }) == 1);
+    return *found;
 }
 
 } // namespace
@@ -205,7 +214,7 @@ void AppRuntimeCoordinatorTest::firstHealthyCandidateMarksLkgExactlyOnce()
     QVERIFY(h.coordinator->admitAuthenticatedWorker(key,
                                                     action.launch->lease)
                 .code == AppRuntimeResultCode::Applied);
-    QCOMPARE(h.coordinator->heartbeat(key, 100).code,
+    QCOMPARE(h.coordinator->heartbeat(key, 90).code,
              AppRuntimeResultCode::Applied);
     QCOMPARE(h.coordinator->heartbeat(key, 101).code,
              AppRuntimeResultCode::Applied);
@@ -213,7 +222,7 @@ void AppRuntimeCoordinatorTest::firstHealthyCandidateMarksLkgExactlyOnce()
         QStringLiteral("company.pilot")).state;
     QCOMPARE(state.lastKnownGood, state.current);
     const qint64 generation = state.generation;
-    QCOMPARE(h.coordinator->heartbeat(key, 200).code,
+    QCOMPARE(h.coordinator->heartbeat(key, 110).code,
              AppRuntimeResultCode::Applied);
     QCOMPARE(h.store->activationState(QStringLiteral("company.pilot"))
                  .state.generation,
@@ -240,6 +249,10 @@ void AppRuntimeCoordinatorTest::lkgGenerationChangeDoesNotPoisonSiblingAdmission
                 .code == AppRuntimeResultCode::Applied);
     QVERIFY(h.coordinator->admitAuthenticatedWorker(keyB, bAction.launch->lease)
                 .code == AppRuntimeResultCode::Applied);
+    QVERIFY(h.coordinator->heartbeat(keyA, 90).code
+            == AppRuntimeResultCode::Applied);
+    QVERIFY(h.coordinator->heartbeat(keyB, 91).code
+            == AppRuntimeResultCode::Applied);
     QVERIFY(h.coordinator->heartbeat(keyA, 101).code
             == AppRuntimeResultCode::Applied);
     QVERIFY(h.coordinator->heartbeat(keyB, 102).code
@@ -543,6 +556,8 @@ void AppRuntimeCoordinatorTest::staleCandidateEventsCannotAffectNewCandidate()
     QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 2)
                 .code == AppRuntimeResultCode::Applied);
 
+    QVERIFY(h.coordinator->heartbeat(oldKey, 90).code
+            == AppRuntimeResultCode::Applied);
     const AppRuntimeResult late = h.coordinator->heartbeat(oldKey, 101);
     QVERIFY(late.code == AppRuntimeResultCode::Applied
             || late.code == AppRuntimeResultCode::IgnoredStale);
@@ -566,7 +581,7 @@ void AppRuntimeCoordinatorTest::lateHeartbeatCannotPromoteCandidate()
     QVERIFY(h.coordinator->admitAuthenticatedWorker(key,
                                                     action.launch->lease, 1)
                 .code == AppRuntimeResultCode::Applied);
-    const AppRuntimeResult late = h.coordinator->heartbeat(key, 102);
+    const AppRuntimeResult late = h.coordinator->heartbeat(key, 1'002);
     QVERIFY(std::ranges::any_of(late.actions, [](const auto &value) {
         return value.kind == AppRuntimeActionKind::Launch;
     }));
@@ -592,6 +607,8 @@ void AppRuntimeCoordinatorTest::promotionIssuesLeasesWithNewGeneration()
     QVERIFY(h.coordinator->admitAuthenticatedWorker(
                 key, firstAction.launch->lease, 2)
                 .code == AppRuntimeResultCode::Applied);
+    QVERIFY(h.coordinator->heartbeat(key, 90).code
+            == AppRuntimeResultCode::Applied);
     QVERIFY(h.coordinator->heartbeat(key, 102).code
             == AppRuntimeResultCode::Applied);
     const ActivationState state = h.store->activationState(
@@ -646,10 +663,18 @@ void AppRuntimeCoordinatorTest::rollbackFailureStopsAndPermanentlyIsolates()
         tab(QStringLiteral("a")), QStringLiteral("/"),
         TabLaunchIntent::ActivateCurrent, 1);
     QVERIFY(!old.actions.isEmpty());
-    const auto oldPath = old.actions.front().launch->lease.packageDirectory;
     QVERIFY(h.coordinator->installAndActivate(h.package("two", "1.1.0"), 2)
                 .code == AppRuntimeResultCode::Applied);
-    QVERIFY(QDir(oldPath).removeRecursively());
+    qbrowser_package_store_testing::PackageStoreTestHooks hooks;
+    hooks.afterActivationLockAcquired =
+        [&h](const QString &appId, const QString &operation) {
+            if (appId == QStringLiteral("company.pilot")
+                && operation == QStringLiteral("rollback")) {
+                QVERIFY(QFile::remove(h.store->appRoot(appId)
+                                      + QStringLiteral("/activation.json")));
+            }
+        };
+    qbrowser_package_store_testing::setPackageStoreTestHooks(std::move(hooks));
     const auto candidate = h.coordinator->requestTabLaunch(
         tab(QStringLiteral("a")), QStringLiteral("/"),
         TabLaunchIntent::ActivateCurrent, 3);
@@ -660,6 +685,7 @@ void AppRuntimeCoordinatorTest::rollbackFailureStopsAndPermanentlyIsolates()
     const auto &restartAction = onlyAction(restart, AppRuntimeActionKind::Launch);
     const AppRuntimeResult failed = h.coordinator->workerExited(
         fullKey(restartAction), WorkerExitReason::Crashed, 11);
+    qbrowser_package_store_testing::resetPackageStoreTestHooks();
     QCOMPARE(failed.code, AppRuntimeResultCode::FailedClosed);
     QVERIFY(std::ranges::any_of(failed.actions, [](const auto &value) {
         return value.kind == AppRuntimeActionKind::Stop;

@@ -222,6 +222,12 @@ AppRuntimeResult AppRuntimeCoordinator::installAndActivate(
 {
     Q_UNUSED(nowMs);
     if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
+    if (pendingDrain_.has_value()) {
+        return pendingDrain_->timedOut || pendingDrain_->terminalFailure
+                   ? failedClosedResult(QStringLiteral("authority_drain_pending"))
+                   : rejectedResult(QStringLiteral("authority_drain_pending"));
+    }
     if (packagePath.isEmpty()) {
         return rejectedResult(QStringLiteral("invalid_package_path"));
     }
@@ -261,6 +267,10 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
 {
     Q_UNUSED(nowMs);
     if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
+    if (pendingDrain_.has_value()) {
+        return rejectedResult(QStringLiteral("authority_drain_pending"));
+    }
     const ActivationStateResult state = store_.activationState(appId_);
     if (!state.hasValue() || state.state.current.isEmpty()) {
         return rejectedResult(QStringLiteral("state_unavailable"));
@@ -271,7 +281,33 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
     }
     const InstallResult verified = installer_.reverifyInstalledVersion(
         appId_, *binding);
-    const auto current = descriptorFromResult(verified, *binding);
+    auto current = descriptorFromResult(verified, *binding);
+    if (!current.has_value()
+        && !state.state.lastKnownGood.isEmpty()
+        && state.state.lastKnownGood != state.state.current) {
+        const InstallResult lkgVerified = installer_.verifyInstalled(
+            appId_, state.state.lastKnownGood);
+        const qsizetype separator = state.state.lastKnownGood.lastIndexOf(
+            QLatin1Char('-'));
+        if (lkgVerified.succeeded() && separator > 0) {
+            const ActivationBinding lkgBinding{
+                state.state.lastKnownGood,
+                state.state.lastKnownGood.sliced(separator + 1).toLatin1(),
+                state.state.generation};
+            if (const auto lkgCandidate = descriptorFromResult(
+                    lkgVerified, lkgBinding);
+                lkgCandidate.has_value()) {
+                const PackageStoreResult recovered =
+                    store_.recoverLastKnownGood(appId_, *binding);
+                if (!recovered.succeeded()
+                    || !recovered.activationBinding.has_value()) {
+                    return rejectedResult(QStringLiteral("lkg_recovery_failed"));
+                }
+                current = descriptorFromResult(lkgVerified,
+                                               *recovered.activationBinding);
+            }
+        }
+    }
     if (!current.has_value()) {
         return rejectedResult(QStringLiteral("installed_content_invalid"));
     }
@@ -309,12 +345,40 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
     const qint64 nowMs)
 {
     if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
+    if (pendingDrain_.has_value()) {
+        return pendingDrain_->timedOut || pendingDrain_->terminalFailure
+                   ? failedClosedResult(QStringLiteral("authority_drain_pending"))
+                   : rejectedResult(QStringLiteral("authority_drain_pending"));
+    }
     if (!validAuthority(tab) || route.isEmpty() || route.size() > 256
         || !route.startsWith(QLatin1Char('/')) || route.contains(QLatin1Char('?'))
         || route.contains(QLatin1Char('#')) || route.contains(QLatin1Char('\\'))) {
         return rejectedResult(QStringLiteral("invalid_launch_request"));
     }
     const qint64 now = resolveNow(nowMs);
+    const auto exact = tabs_.find(tab);
+    if (exact != tabs_.end()
+        && (exact->second->retired || exact->second->failedClosed)) {
+        return exact->second->failedClosed
+                   ? failedClosedResult(QStringLiteral("authority_failed_closed"))
+                   : rejectedResult(QStringLiteral("authority_retired"));
+    }
+
+    std::optional<TabLaunchAuthority> previousIncarnation;
+    for (const auto &entry : tabs_) {
+        if (entry.first.tabId == tab.tabId
+            && entry.first.runtimeIncarnation != tab.runtimeIncarnation
+            && !entry.second->retired && !entry.second->failedClosed) {
+            previousIncarnation = entry.first;
+            break;
+        }
+    }
+    AppRuntimeResult replacement;
+    if (previousIncarnation.has_value()) {
+        replacement = closeTab(*previousIncarnation, now);
+    }
+
     const TabState *existing = findTab(tab);
     const VersionDescriptor *descriptor = nullptr;
     std::optional<VersionDescriptor> pinned;
@@ -337,7 +401,15 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
     } else {
         return rejectedResult(QStringLiteral("current_unavailable"));
     }
-    return launchForTab(tab, route, *descriptor, mode, false, now);
+    AppRuntimeResult launched = launchForTab(tab, route, *descriptor, mode,
+                                             false, now);
+    replacement.actions += launched.actions;
+    if (launched.code != AppRuntimeResultCode::Applied) {
+        replacement.code = launched.code;
+        replacement.stableError = launched.stableError;
+        replacement.nativeError = launched.nativeError;
+    }
+    return replacement;
 }
 
 AppRuntimeResult AppRuntimeCoordinator::launchForTab(
@@ -347,15 +419,29 @@ AppRuntimeResult AppRuntimeCoordinator::launchForTab(
     const PackageRevalidationMode mode,
     const bool recovery,
     const qint64 nowMs,
-    const bool reuseActivation)
+    const bool reuseActivation,
+    const bool emitRetireActions)
 {
+    if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
+    if (pendingDrain_.has_value()) {
+        return rejectedResult(QStringLiteral("authority_drain_pending"));
+    }
     auto found = tabs_.find(tab);
+    AppRuntimeResult replacement;
     if (found == tabs_.end()) {
         found = tabs_.emplace(
                      tab,
                      std::make_unique<TabState>(tab, supervisionPolicy_))
                     .first;
     } else {
+        if (emitRetireActions && found->second->hasRequest
+            && !found->second->retired && !found->second->revoked) {
+            replacement.actions.push_back(
+                makeTabAction(AppRuntimeActionKind::Revoke, tab));
+            replacement.actions.push_back(
+                makeTabAction(AppRuntimeActionKind::Stop, tab));
+        }
         revokeSilently(*found->second);
     }
     TabState &state = *found->second;
@@ -371,7 +457,11 @@ AppRuntimeResult AppRuntimeCoordinator::launchForTab(
         state.supervisor->beginAttempt(activation, nowMs);
     if (!attempt.has_value()) {
         state.failedClosed = true;
-        return failedClosedResult(QStringLiteral("attempt_unavailable"));
+        replacement.code = AppRuntimeResultCode::FailedClosed;
+        replacement.stableError = QStringLiteral("attempt_unavailable");
+        replacement.actions.push_back(
+            makeTabAction(AppRuntimeActionKind::FailedClosed, tab));
+        return replacement;
     }
 
     VerifiedPackageLease lease = descriptor.lease;
@@ -401,7 +491,7 @@ AppRuntimeResult AppRuntimeCoordinator::launchForTab(
                             tab.runtimeIncarnation,
                             state.request,
                             std::nullopt};
-    AppRuntimeResult result;
+    AppRuntimeResult result = std::move(replacement);
     result.actions.push_back(std::move(action));
     return result;
 }
@@ -428,6 +518,56 @@ bool AppRuntimeCoordinator::candidateLease(
     return candidate_.has_value()
         && sameLeaseIdentity(candidate_->lease, lease)
         && !candidatePromoted_;
+}
+
+bool AppRuntimeCoordinator::currentCandidateTab(const TabState &state) const
+{
+    return state.candidate && !candidatePromoted_ && candidate_.has_value()
+        && sameLeaseIdentity(state.pinnedLease, candidate_->lease);
+}
+
+AppRuntimeResult AppRuntimeCoordinator::failClosedTab(
+    TabState &state,
+    const QString &stableError,
+    const bool trustedCrash)
+{
+    if (state.failedClosed) return staleResult();
+    AppRuntimeResult result = failedClosedResult(
+        stableError.isEmpty() ? QStringLiteral("worker_failed_closed")
+                              : stableError);
+    if (state.token != nullptr) {
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
+                                               state.authority));
+    }
+    result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
+                                           state.authority));
+    result.actions.push_back(makeTabAction(AppRuntimeActionKind::IsolateSession,
+                                           state.authority));
+    result.actions.push_back(makeTabAction(
+        trustedCrash ? AppRuntimeActionKind::TrustedCrash
+                     : AppRuntimeActionKind::FailedClosed,
+        state.authority));
+    revokeSilently(state);
+    state.failedClosed = true;
+    return result;
+}
+
+void AppRuntimeCoordinator::appendDrainTimeoutActions(
+    AppRuntimeResult &result,
+    const PendingDrain &pending) const
+{
+    for (const TabLaunchAuthority &tab : pending.affected) {
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::FailedClosed,
+                                                tab));
+    }
+    for (const TabLaunchAuthority &tab : pending.affected) {
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
+                                                tab));
+    }
+    for (const TabLaunchAuthority &tab : pending.affected) {
+        result.actions.push_back(makeTabAction(
+            AppRuntimeActionKind::IsolateSession, tab));
+    }
 }
 
 AppRuntimeResult AppRuntimeCoordinator::admitAuthenticatedWorker(
@@ -461,7 +601,6 @@ AppRuntimeResult AppRuntimeCoordinator::admitAuthenticatedWorker(
     if (!leaseMatches(*state, lease)) {
         return rejectedResult(QStringLiteral("lease_mismatch"));
     }
-    if (state->admitted) return {};
     if (state->token == nullptr) {
         return rejectedResult(QStringLiteral("authority_revoked"));
     }
@@ -470,8 +609,12 @@ AppRuntimeResult AppRuntimeCoordinator::admitAuthenticatedWorker(
         || !use->publishIfStillAdmitted([] { return true; })) {
         return rejectedResult(QStringLiteral("authority_revoked"));
     }
+    if (state->admitted) return {};
+    if (receivedMonotonicMs < state->attemptStartMs) {
+        return rejectedResult(QStringLiteral("admission_timestamp_invalid"));
+    }
     if (!state->supervisor->authenticatedHandshake(
-            key.attempt, std::max(receivedMonotonicMs, state->attemptStartMs))) {
+            key.attempt, receivedMonotonicMs)) {
         return rejectedResult(QStringLiteral("admission_rejected"));
     }
     state->admitted = true;
@@ -508,11 +651,29 @@ AppRuntimeResult AppRuntimeCoordinator::heartbeat(
     if (!state->admitted) {
         return rejectedResult(QStringLiteral("worker_not_admitted"));
     }
+    const WorkerSupervisionAction healthAction = state->supervisor->checkHealth(
+        key.attempt, receivedMonotonicMs);
+    if (healthAction == WorkerSupervisionAction::IgnoredStaleAttempt
+        || healthAction == WorkerSupervisionAction::IgnoredDuplicateFailure) {
+        return staleResult();
+    }
+    if (healthAction == WorkerSupervisionAction::Restart) {
+        return restartTab(*state, receivedMonotonicMs);
+    }
+    if (healthAction == WorkerSupervisionAction::CrashLoopRollback
+        || healthAction == WorkerSupervisionAction::StartupRollback) {
+        if (currentCandidateTab(*state)) {
+            return beginCandidateRollback(receivedMonotonicMs);
+        }
+        return failClosedTab(*state, QStringLiteral("worker_crash_loop"), true);
+    }
     state->supervisor->heartbeat(key.attempt, receivedMonotonicMs);
     if (!state->healthy
         && state->supervisor->isHealthy(key.attempt, receivedMonotonicMs)) {
         state->healthy = true;
-        if (state->candidate) return promoteCandidate(receivedMonotonicMs);
+        if (currentCandidateTab(*state)) {
+            return promoteCandidate(receivedMonotonicMs);
+        }
     }
     return {};
 }
@@ -529,6 +690,7 @@ AppRuntimeResult AppRuntimeCoordinator::promoteCandidate(const qint64 nowMs)
     candidate_->binding = *marked.activationBinding;
     candidate_->lease.activationGenerationAtIssue =
         marked.activationBinding->generation;
+    current_ = candidate_;
     lkg_ = candidate_;
     record(SafeEventPhase::Health, SafeEventCode::Healthy,
            candidate_->lease.version, nowMs);
@@ -562,7 +724,10 @@ AppRuntimeResult AppRuntimeCoordinator::checkHealth(const qint64 nowMs)
             }
         } else if (action == WorkerSupervisionAction::CrashLoopRollback
                    || action == WorkerSupervisionAction::StartupRollback) {
-            const AppRuntimeResult rollback = beginCandidateRollback(nowMs);
+            const AppRuntimeResult rollback = currentCandidateTab(state)
+                ? beginCandidateRollback(nowMs)
+                : failClosedTab(state, QStringLiteral("worker_crash_loop"),
+                                true);
             result.actions += rollback.actions;
             if (rollback.code != AppRuntimeResultCode::Applied) {
                 result.code = rollback.code;
@@ -617,10 +782,10 @@ AppRuntimeResult AppRuntimeCoordinator::workerExited(
     }
     if (action == WorkerSupervisionAction::CrashLoopRollback
         || action == WorkerSupervisionAction::StartupRollback) {
-        if (state->candidate && !candidatePromoted_) {
+        if (currentCandidateTab(*state)) {
             return beginCandidateRollback(nowMs);
         }
-        return restartTab(*state, nowMs);
+        return failClosedTab(*state, QStringLiteral("worker_crash_loop"), true);
     }
     return {};
 }
@@ -632,14 +797,13 @@ AppRuntimeResult AppRuntimeCoordinator::workerAdmissionFailed(
 {
     TabState *state = findTab(key);
     if (state == nullptr) return staleResult();
-    if (state->candidate && !candidatePromoted_) {
+    if (currentCandidateTab(*state)) {
         return beginCandidateRollback(resolveNow(nowMs));
     }
-    revokeSilently(*state);
-    state->failedClosed = true;
-    return failedClosedResult(stableError.isEmpty()
-                                  ? QStringLiteral("worker_admission_failed")
-                                  : stableError);
+    return failClosedTab(*state,
+                         stableError.isEmpty()
+                             ? QStringLiteral("worker_admission_failed")
+                             : stableError);
 }
 
 AppRuntimeResult AppRuntimeCoordinator::workerCleanupFailed(
@@ -708,7 +872,31 @@ AppRuntimeResult AppRuntimeCoordinator::beginCandidateRollback(
         for (const TabLaunchAuthority &tab : pending.affected) {
             tabs_.at(tab)->failedClosed = true;
         }
-        return failedClosedResult(QStringLiteral("rollback_unavailable"));
+        pending.terminalFailure = true;
+        pending.failureError = QStringLiteral("rollback_unavailable");
+        pendingDrain_ = pending;
+        rollbackStarted_ = true;
+        failedClosed_ = true;
+        AppRuntimeResult result = failedClosedResult(
+            pending.failureError);
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
+                                                    tab));
+        }
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
+                                                    tab));
+        }
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(
+                AppRuntimeActionKind::IsolateSession, tab));
+        }
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::FailedClosed,
+                                                {}));
+        result.actions.push_back({AppRuntimeActionKind::AwaitAuthorityDrain,
+                                  {}, 0, std::nullopt, pending.batch});
+        if (drainConsumer_) drainConsumer_(pending.batch);
+        return result;
     }
     const InstallResult recovered = installer_.verifyInstalled(
         appId_, QFileInfo(rolled.path).fileName());
@@ -718,7 +906,31 @@ AppRuntimeResult AppRuntimeCoordinator::beginCandidateRollback(
         for (const TabLaunchAuthority &tab : pending.affected) {
             tabs_.at(tab)->failedClosed = true;
         }
-        return failedClosedResult(QStringLiteral("lkg_unavailable"));
+        pending.terminalFailure = true;
+        pending.failureError = QStringLiteral("lkg_unavailable");
+        pendingDrain_ = pending;
+        rollbackStarted_ = true;
+        failedClosed_ = true;
+        AppRuntimeResult result = failedClosedResult(
+            pending.failureError);
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
+                                                    tab));
+        }
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
+                                                    tab));
+        }
+        for (const TabLaunchAuthority &tab : pending.affected) {
+            result.actions.push_back(makeTabAction(
+                AppRuntimeActionKind::IsolateSession, tab));
+        }
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::FailedClosed,
+                                                {}));
+        result.actions.push_back({AppRuntimeActionKind::AwaitAuthorityDrain,
+                                  {}, 0, std::nullopt, pending.batch});
+        if (drainConsumer_) drainConsumer_(pending.batch);
+        return result;
     }
     current_ = recoveredDescriptor;
     lkg_ = recoveredDescriptor;
@@ -742,8 +954,6 @@ AppRuntimeResult AppRuntimeCoordinator::beginCandidateRollback(
          pending.batch});
     pendingDrain_ = std::move(pending);
     if (drainConsumer_) drainConsumer_(pendingDrain_->batch);
-    record(SafeEventPhase::Rollback, SafeEventCode::Recovered,
-           candidate_->lease.version, nowMs);
     return result;
 }
 
@@ -765,18 +975,7 @@ AppRuntimeResult AppRuntimeCoordinator::timeoutDrain(const qint64 nowMs)
     pendingDrain_->timedOut = true;
     AppRuntimeResult result = failedClosedResult(
         QStringLiteral("authority_drain_timeout"));
-    for (const TabLaunchAuthority &tab : pendingDrain_->affected) {
-        result.actions.push_back(makeTabAction(AppRuntimeActionKind::FailedClosed,
-                                                tab));
-    }
-    for (const TabLaunchAuthority &tab : pendingDrain_->affected) {
-        result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
-                                                tab));
-    }
-    for (const TabLaunchAuthority &tab : pendingDrain_->affected) {
-        result.actions.push_back(makeTabAction(
-            AppRuntimeActionKind::IsolateSession, tab));
-    }
+    appendDrainTimeoutActions(result, *pendingDrain_);
     return result;
 }
 
@@ -786,16 +985,20 @@ AppRuntimeResult AppRuntimeCoordinator::finishDrain(const qint64 nowMs)
     if (!allTicketsDrained()) {
         return rejectedResult(QStringLiteral("authority_drain_pending"));
     }
-    if (pendingDrain_->timedOut) {
-        for (const TabLaunchAuthority &tab : pendingDrain_->affected) {
-            tabs_.erase(tab);
+    const PendingDrain completed = *pendingDrain_;
+    const QVector<TabLaunchAuthority> affected = completed.affected;
+    pendingDrain_.reset();
+    if (completed.timedOut || completed.terminalFailure || shuttingDown_
+        || failedClosed_) {
+        for (const TabLaunchAuthority &tab : affected) tabs_.erase(tab);
+        if (completed.terminalFailure) {
+            return failedClosedResult(
+                completed.failureError.isEmpty()
+                    ? QStringLiteral("authority_drain_failed")
+                    : completed.failureError);
         }
-        pendingDrain_.reset();
         return {};
     }
-
-    const QVector<TabLaunchAuthority> affected = pendingDrain_->affected;
-    pendingDrain_.reset();
     AppRuntimeResult result;
     for (const TabLaunchAuthority &tab : affected) {
         result.actions.push_back(makeTabAction(AppRuntimeActionKind::RecoverFromLkg,
@@ -804,10 +1007,14 @@ AppRuntimeResult AppRuntimeCoordinator::finishDrain(const qint64 nowMs)
         if (state == nullptr || !lkg_.has_value()) continue;
         const AppRuntimeResult launch = launchForTab(
             tab, state->request.route, *lkg_,
-            PackageRevalidationMode::PinnedLease, true, nowMs);
+            PackageRevalidationMode::PinnedLease, true, nowMs, false, false);
         result.actions += launch.actions;
     }
     rollbackStarted_ = false;
+    if (lkg_.has_value()) {
+        record(SafeEventPhase::Rollback, SafeEventCode::Recovered,
+               lkg_->lease.version, nowMs);
+    }
     return result;
 }
 
@@ -831,9 +1038,18 @@ AppRuntimeResult AppRuntimeCoordinator::authorityDrainCompleted(
     if (!pendingDrain_.has_value() || pendingDrain_->batch.id != batchId) {
         return staleResult();
     }
-    if (!pendingDrain_->timedOut
-        && nowMs > pendingDrain_->batch.monotonicDeadlineMs) {
-        (void)timeoutDrain(nowMs);
+    AppRuntimeResult timeoutResult;
+    if (nowMs > pendingDrain_->batch.monotonicDeadlineMs) {
+        if (!pendingDrain_->timedOut) {
+            timeoutResult = timeoutDrain(nowMs);
+        } else {
+            timeoutResult = failedClosedResult(
+                QStringLiteral("authority_drain_timeout"));
+            appendDrainTimeoutActions(timeoutResult, *pendingDrain_);
+        }
+        if (!allTicketsDrained()) return timeoutResult;
+        (void)finishDrain(nowMs);
+        return timeoutResult;
     }
     return finishDrain(nowMs);
 }
@@ -846,11 +1062,14 @@ AppRuntimeResult AppRuntimeCoordinator::closeTab(
     if (!validAuthority(tab)) return rejectedResult(QStringLiteral("invalid_tab"));
     const auto found = tabs_.find(tab);
     if (found == tabs_.end()) return staleResult();
+    if (found->second->retired) return staleResult();
     AppRuntimeResult result;
-    if (found->second->token != nullptr) {
+    if (found->second->token != nullptr && !found->second->revoked) {
         result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke, tab));
     }
-    result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop, tab));
+    if (!found->second->revoked) {
+        result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop, tab));
+    }
     revokeSilently(*found->second);
     found->second->retired = true;
     return result;
@@ -866,15 +1085,25 @@ AppRuntimeResult AppRuntimeCoordinator::beginShutdown(const qint64 nowMs)
     authorities.reserve(static_cast<qsizetype>(tabs_.size()));
     for (const auto &entry : tabs_) authorities.push_back(entry.first);
     for (const TabLaunchAuthority &tab : authorities) {
-        result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
-                                                tab));
+        const TabState *state = findTab(tab);
+        if (state == nullptr || state->retired) continue;
+        if (!state->revoked && state->token != nullptr) {
+            result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
+                                                    tab));
+        }
     }
     for (const TabLaunchAuthority &tab : authorities) {
+        const TabState *state = findTab(tab);
+        if (state == nullptr || state->retired || state->revoked) continue;
         result.actions.push_back(makeTabAction(AppRuntimeActionKind::Stop,
                                                 tab));
     }
     for (const TabLaunchAuthority &tab : authorities) {
-        if (TabState *state = findTab(tab); state != nullptr) revokeSilently(*state);
+        if (TabState *state = findTab(tab); state != nullptr
+            && !state->retired) {
+            revokeSilently(*state);
+            state->retired = true;
+        }
     }
     return result;
 }
