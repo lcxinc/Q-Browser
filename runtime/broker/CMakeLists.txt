@@ -5,6 +5,8 @@ add_library(q_browser_broker STATIC
   ClipboardBroker.h
   FileBroker.cpp
   FileBroker.h
+  FileDialogCoordinator.cpp
+  FileDialogCoordinator.h
   FileDialogTestHooks.cpp
   FileDialogTestHooks.h
   NetworkBroker.cpp
@@ -31,7 +33,7 @@ target_link_libraries(q_browser_broker
     Qt6::Widgets)
 
 if(WIN32)
-  target_link_libraries(q_browser_broker PRIVATE Ole32 Shell32)
+  target_link_libraries(q_browser_broker PRIVATE Ole32 Shell32 User32)
 endif()
 
 if(BUILD_TESTING)

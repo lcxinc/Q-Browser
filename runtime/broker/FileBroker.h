@@ -15,6 +15,7 @@ enum class FileDialogStatus {
     Failed,
     TooLarge,
     Busy,
+    Denied,
 };
 
 class PreparedFileRequest final

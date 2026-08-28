@@ -1,56 +1,107 @@
 #include "FileBroker.h"
-#include "TabCapabilityAuthority.h"
+#include "FileDialogCoordinator.h"
+#include "FileDialogTestHooks.h"
 
-#include <QBuffer>
+#include <QDir>
+#include <QFile>
 #include <QScopeGuard>
 #include <QSemaphore>
+#include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
+#include <thread>
+#include <type_traits>
 #include <utility>
+#include <vector>
+
+static_assert(!std::is_default_constructible_v<FileDialogOperationToken>);
+static_assert(!std::is_constructible_v<FileDialogOperationToken, quint64>);
+static_assert(std::is_copy_constructible_v<FileDialogOperationToken>);
+static_assert(!std::is_default_constructible_v<FileDialogOpenRequest>);
 
 namespace {
-TabCapabilityAuthority authority(const QString &tabId,
-                                 const quint64 runtimeIncarnation,
-                                 const quint32 workerProcessId,
-                                 const quintptr workerWindowId,
-                                 const quint64 sessionGeneration,
-                                 const quint64 leaseAuthorityEpoch)
+PreparedFileRequestResult prepareOpen(FileBroker &broker,
+                                      const QString &requestId)
 {
-    return {tabId, runtimeIncarnation, QStringLiteral("com.qbrowser.same"),
-            workerProcessId, workerWindowId, sessionGeneration,
-            leaseAuthorityEpoch};
+    return broker.prepareFileRequest(
+        QStringLiteral("open"), {},
+        {QStringLiteral("com.qbrowser.owner"), requestId});
 }
 
-class BlockingFileDialog final : public FileDialogBackend
+void writeFile(const QString &path, const QByteArray &content)
+{
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(content), content.size());
+    file.close();
+}
+
+class CompletionProbe final
 {
 public:
-    FileDialogResult openFile(const qint64 maximumBytes) override
+    FileDialogCompletion callback()
     {
-        lastMaximumBytes = maximumBytes;
-        ++calls;
-        if (block) {
-            entered.release();
-            proceed.acquire();
-        }
-        auto stream = std::make_unique<QBuffer>();
-        stream->setData(content);
-        stream->open(QIODevice::ReadOnly);
-        return FileDialogResult::opened(
-            QStringLiteral("report.txt"), content.size(), std::move(stream),
-            QByteArray("blocking-file:1"), QByteArray("blocking-file:1"));
+        return [this](const FileDialogOperationToken &token,
+                      FileDialogSelection selection) {
+            {
+                const std::scoped_lock lock(mutex_);
+                tokens_.push_back(token);
+                selections_.push_back(std::move(selection));
+                callbackThreads_.push_back(std::this_thread::get_id());
+            }
+            calls_.fetch_add(1, std::memory_order_release);
+            called_.release();
+        };
     }
 
-    std::atomic<int> calls{0};
-    qint64 lastMaximumBytes = 0;
-    QByteArray content = QByteArray("stable");
-    bool block = false;
-    QSemaphore entered;
-    QSemaphore proceed;
+    [[nodiscard]] bool wait(const int timeoutMs = 1'000)
+    {
+        return called_.tryAcquire(1, timeoutMs);
+    }
+
+    [[nodiscard]] int calls() const noexcept
+    {
+        return calls_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] FileDialogSelection selection(const qsizetype index = 0) const
+    {
+        const std::scoped_lock lock(mutex_);
+        return selections_.at(index);
+    }
+
+    [[nodiscard]] FileDialogOperationToken token(const qsizetype index = 0) const
+    {
+        const std::scoped_lock lock(mutex_);
+        return tokens_.at(index);
+    }
+
+    [[nodiscard]] std::thread::id callbackThread(
+        const qsizetype index = 0) const
+    {
+        const std::scoped_lock lock(mutex_);
+        return callbackThreads_.at(index);
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<FileDialogOperationToken> tokens_;
+    std::vector<FileDialogSelection> selections_;
+    std::vector<std::thread::id> callbackThreads_;
+    std::atomic<int> calls_{0};
+    QSemaphore called_;
 };
 
+qbrowser_broker_testing::FileDialogTestShowResult openedPath(
+    const QString &path)
+{
+    return {FileDialogStatus::Opened, path};
+}
 }
 
 class BrowserCapabilityIsolationTest final : public QObject
@@ -58,112 +109,786 @@ class BrowserCapabilityIsolationTest final : public QObject
     Q_OBJECT
 
 private slots:
-    void processWideDialogBusyRejectsSiblingBeforeBackendCall();
-    void filePrepareAndCompleteValidationUsesProductionBoundary();
-    void ownerBoundTerminalCompletionIsDeferred_data();
-    void ownerBoundTerminalCompletionIsDeferred();
-    void pendingDialogSiblingProgressIsDeferred();
+    void backgroundAdmissionRejectsBeforeDialogCreationAndNeverCallsInline();
+    void processWideDialogBusyRejectsSiblingWithItsOwnCallback();
+    void switchingOwnerDoesNotRebindPendingOperation();
+    void ownerBoundTerminalCompletion_data();
+    void ownerBoundTerminalCompletion();
+    void cancellationIsExactOnceAndLateResultCannotReachReopenedOwner();
+    void guiStaysResponsiveWhileShowAndReadAreBlocked();
+    void oversizedStableFileIsRejectedBeforeReadOrEncode();
+    void quiescenceCannotExposeANonTerminalOperation();
+    void shutdownCannotLoseImmediateCompletion();
+    void callbackCanRequestShutdown();
+    void shutdownCancelsAllAndWaitsForCallbackQuiescence();
     void fullRequestAndSessionIdentityRoutingIsDeferred();
 };
 
 void BrowserCapabilityIsolationTest::
-    processWideDialogBusyRejectsSiblingBeforeBackendCall()
+    backgroundAdmissionRejectsBeforeDialogCreationAndNeverCallsInline()
 {
-    BlockingFileDialog ownerBackend;
-    ownerBackend.block = true;
-    BlockingFileDialog siblingBackend;
-    FileBroker ownerBroker(EffectiveFilePolicy{true, 16}, ownerBackend);
-    FileBroker siblingBroker(EffectiveFilePolicy{true, 16}, siblingBackend);
-    const TabCapabilityAuthority owner = authority(
-        QStringLiteral("tab-owner"), 1, 41, 401, 7, 11);
-    const TabCapabilityAuthority sibling = authority(
-        QStringLiteral("tab-sibling"), 2, 42, 402, 9, 12);
-
-    auto pending = std::async(std::launch::async, [&] {
-        return ownerBroker.invoke(
-            QStringLiteral("open"), {},
-            {owner.appIdentity, QStringLiteral("file-owner")});
+    std::atomic<int> dialogCreations{0};
+    std::atomic<int> showCalls{0};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorDialogCreated = [&] { ++dialogCreations; };
+    hooks.coordinatorShow = [&](const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        ++showCalls;
+        complete({FileDialogStatus::Failed, {}});
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
     });
-    auto unblock = qScopeGuard([&] { ownerBackend.proceed.release(); });
-    QVERIFY(ownerBackend.entered.tryAcquire(1, 1'000));
-    const BrokerResult concurrent = siblingBroker.invoke(
-        QStringLiteral("open"), {},
-        {sibling.appIdentity, QStringLiteral("file-sibling")});
-    ownerBackend.proceed.release();
-    unblock.dismiss();
-    QCOMPARE(pending.wait_for(std::chrono::seconds(1)),
-             std::future_status::ready);
-    const BrokerResult ownerResult = pending.get();
 
-    QVERIFY(ownerResult.ok);
-    QVERIFY(!concurrent.ok);
-    QCOMPARE(concurrent.errorCode, QStringLiteral("file.busy"));
-    QCOMPARE(siblingBackend.calls.load(), 0);
-}
-
-void BrowserCapabilityIsolationTest::
-    filePrepareAndCompleteValidationUsesProductionBoundary()
-{
-    BlockingFileDialog backend;
-    FileBroker broker(EffectiveFilePolicy{true, 4}, backend);
-    PreparedFileRequestResult preparation = broker.prepareFileRequest(
-        QStringLiteral("open"), {},
-        {QStringLiteral("app.owner"), QStringLiteral("file-two-phase")});
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("background"));
     QVERIFY(preparation.request.has_value());
-    QCOMPARE(preparation.request->maximumBytes(), 4);
-    QCOMPARE(backend.calls.load(), 0);
 
-    FileDialogSelection selection;
-    selection.status = FileDialogStatus::Opened;
-    selection.name = QStringLiteral("report.txt");
-    selection.declaredSize = 4;
-    selection.contentBase64 = QByteArray("safe").toBase64();
-    selection.approvedMaximumBytes = 4;
-    selection.identityBeforeRead = QByteArray("stable-file:1");
-    selection.identityAfterRead = selection.identityBeforeRead;
-    QVERIFY(broker.completeFileRequest(*preparation.request, selection).ok);
+    const std::thread::id callerThread = std::this_thread::get_id();
+    CompletionProbe completion;
+    FileDialogCoordinator coordinator;
+    std::atomic<int> admissionChecks{0};
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [&] {
+            ++admissionChecks;
+            return false;
+        }),
+        completion.callback());
 
-    selection.name = QStringLiteral("../report.txt");
-    QCOMPARE(broker.completeFileRequest(*preparation.request, selection).errorCode,
-             QStringLiteral("file.failed"));
-    selection.name = QStringLiteral("report.txt");
-    selection.identityAfterRead = QByteArray("stable-file:2");
-    QCOMPARE(broker.completeFileRequest(*preparation.request, selection).errorCode,
-             QStringLiteral("file.failed"));
+    QVERIFY(operation.has_value());
+    QVERIFY(completion.wait());
+    QCOMPARE(admissionChecks.load(), 1);
+    QCOMPARE(dialogCreations.load(), 0);
+    QCOMPARE(showCalls.load(), 0);
+    QCOMPARE(completion.calls(), 1);
+    QCOMPARE(completion.selection().status, FileDialogStatus::Denied);
+    QCOMPARE(completion.selection().approvedMaximumBytes, 8);
+    QVERIFY(completion.token() == operation->token);
+    QVERIFY(completion.callbackThread() != callerThread);
+    QCOMPARE(broker.completeFileRequest(*preparation.request,
+                                        completion.selection()).errorCode,
+             QStringLiteral("capability.denied"));
+    coordinator.shutdown();
 }
 
 void BrowserCapabilityIsolationTest::
-    ownerBoundTerminalCompletionIsDeferred_data()
+    processWideDialogBusyRejectsSiblingWithItsOwnCallback()
 {
-    QTest::addColumn<QString>("terminalStatus");
-    QTest::newRow("success") << QStringLiteral("success");
-    QTest::newRow("cancelled") << QStringLiteral("file.cancelled");
-    QTest::newRow("failed") << QStringLiteral("file.failed");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("owner.txt"));
+    writeFile(selected, QByteArray("12345678"));
+
+    std::mutex showMutex;
+    std::vector<qbrowser_broker_testing::FileDialogTestShowCompletion>
+        showCompletions;
+    QSemaphore showEntered;
+    std::atomic<int> dialogCreations{0};
+    std::atomic<qint64> shownMaximumBytes{0};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorDialogCreated = [&] { ++dialogCreations; };
+    hooks.coordinatorShow = [&](const qint64 maximumBytes,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        shownMaximumBytes.store(maximumBytes);
+        {
+            const std::scoped_lock lock(showMutex);
+            showCompletions.push_back(std::move(complete));
+        }
+        showEntered.release();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend ownerLegacyBackend;
+    QtFileDialogBackend siblingLegacyBackend;
+    FileBroker ownerBroker(EffectiveFilePolicy{true, 8}, ownerLegacyBackend);
+    FileBroker siblingBroker(EffectiveFilePolicy{true, 8}, siblingLegacyBackend);
+    PreparedFileRequestResult ownerPreparation = prepareOpen(
+        ownerBroker, QStringLiteral("owner"));
+    PreparedFileRequestResult siblingPreparation = prepareOpen(
+        siblingBroker, QStringLiteral("sibling"));
+    QVERIFY(ownerPreparation.request.has_value());
+    QVERIFY(siblingPreparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    CompletionProbe ownerCompletion;
+    CompletionProbe siblingCompletion;
+    const auto ownerOperation = coordinator.openAsync(
+        FileDialogOpenRequest(*ownerPreparation.request, [] { return true; }),
+        ownerCompletion.callback());
+    QVERIFY(ownerOperation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+    QCOMPARE(shownMaximumBytes.load(), 8);
+
+    const auto siblingOperation = coordinator.openAsync(
+        FileDialogOpenRequest(*siblingPreparation.request, [] { return true; }),
+        siblingCompletion.callback());
+    QVERIFY(siblingOperation.has_value());
+    QVERIFY(siblingCompletion.wait());
+    QCOMPARE(siblingCompletion.calls(), 1);
+    QCOMPARE(siblingCompletion.selection().status, FileDialogStatus::Busy);
+    QVERIFY(siblingCompletion.token() == siblingOperation->token);
+    QCOMPARE(dialogCreations.load(), 1);
+    QCOMPARE(siblingBroker.completeFileRequest(*siblingPreparation.request,
+                                               siblingCompletion.selection())
+                 .errorCode,
+             QStringLiteral("file.busy"));
+    QCOMPARE(ownerCompletion.calls(), 0);
+
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeOwner;
+    {
+        const std::scoped_lock lock(showMutex);
+        QCOMPARE(showCompletions.size(), size_t{1});
+        completeOwner = showCompletions.front();
+    }
+    completeOwner(openedPath(selected));
+    QVERIFY(ownerCompletion.wait());
+    QCOMPARE(ownerCompletion.selection().status, FileDialogStatus::Opened);
+    QVERIFY(ownerBroker.completeFileRequest(*ownerPreparation.request,
+                                           ownerCompletion.selection()).ok);
+    coordinator.shutdown();
 }
 
 void BrowserCapabilityIsolationTest::
-    ownerBoundTerminalCompletionIsDeferred()
+    switchingOwnerDoesNotRebindPendingOperation()
 {
-    QFETCH(QString, terminalStatus);
-    Q_UNUSED(terminalStatus)
-    QFAIL("TODO(Task16 Tasks 3-4): production has no asynchronous operation-token "
-          "adapter; cover switch, reopen, close/cancel, and late result discard");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("original-owner.txt"));
+    writeFile(selected, QByteArray("bound"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion finishShow;
+    QSemaphore showEntered;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        {
+            const std::scoped_lock lock(showMutex);
+            finishShow = std::move(complete);
+        }
+        showEntered.release();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("switch-owner"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    CompletionProbe originalOwner;
+    CompletionProbe newlyActiveOwner;
+    std::atomic<bool> originalIsOwner{true};
+    std::atomic<int> admissionChecks{0};
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [&] {
+            ++admissionChecks;
+            return originalIsOwner.load();
+        }),
+        originalOwner.callback());
+    QVERIFY(operation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    originalIsOwner.store(false);
+    qbrowser_broker_testing::FileDialogTestShowCompletion complete;
+    {
+        const std::scoped_lock lock(showMutex);
+        complete = finishShow;
+    }
+    complete(openedPath(selected));
+
+    QVERIFY(originalOwner.wait());
+    QCOMPARE(admissionChecks.load(), 1);
+    QCOMPARE(originalOwner.calls(), 1);
+    QCOMPARE(newlyActiveOwner.calls(), 0);
+    QVERIFY(originalOwner.token() == operation->token);
+    coordinator.shutdown();
 }
 
-void BrowserCapabilityIsolationTest::pendingDialogSiblingProgressIsDeferred()
+void BrowserCapabilityIsolationTest::ownerBoundTerminalCompletion_data()
 {
-    QFAIL("TODO(Task16 Task 3): production file.open is synchronous; once the "
-          "async coordinator exists, prove sibling heartbeat/network/storage/"
-          "clipboard progress while its dialog is pending");
+    QTest::addColumn<int>("terminalStatus");
+    QTest::addColumn<QString>("expectedError");
+    QTest::newRow("success") << static_cast<int>(FileDialogStatus::Opened)
+                             << QString();
+    QTest::newRow("cancelled") << static_cast<int>(FileDialogStatus::Cancelled)
+                               << QStringLiteral("file.cancelled");
+    QTest::newRow("failed") << static_cast<int>(FileDialogStatus::Failed)
+                            << QStringLiteral("file.failed");
+}
+
+void BrowserCapabilityIsolationTest::ownerBoundTerminalCompletion()
+{
+    QFETCH(int, terminalStatus);
+    QFETCH(QString, expectedError);
+    const auto status = static_cast<FileDialogStatus>(terminalStatus);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("terminal.txt"));
+    writeFile(selected, QByteArray("done"));
+
+    std::thread::id showThread;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        showThread = std::this_thread::get_id();
+        complete({status,
+                  status == FileDialogStatus::Opened ? selected : QString()});
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("terminal"));
+    QVERIFY(preparation.request.has_value());
+
+    const std::thread::id callerThread = std::this_thread::get_id();
+    CompletionProbe completion;
+    FileDialogCoordinator coordinator;
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return true; }),
+        completion.callback());
+    QVERIFY(operation.has_value());
+    QVERIFY(completion.wait());
+    QCOMPARE(completion.calls(), 1);
+    QCOMPARE(completion.selection().status, status);
+    QVERIFY(showThread != callerThread);
+    QVERIFY(completion.callbackThread() != callerThread);
+    const BrokerResult result = broker.completeFileRequest(
+        *preparation.request, completion.selection());
+    if (expectedError.isEmpty()) {
+        QVERIFY(result.ok);
+        QCOMPARE(completion.selection().name, QStringLiteral("terminal.txt"));
+        QCOMPARE(completion.selection().declaredSize, 4);
+#ifdef Q_OS_WIN
+        QVERIFY(completion.selection().identityBeforeRead.startsWith(
+            QByteArray("win-id128:")));
+#else
+        QVERIFY(!completion.selection().identityBeforeRead.isEmpty());
+#endif
+        QCOMPARE(completion.selection().identityBeforeRead,
+                 completion.selection().identityAfterRead);
+        QCOMPARE(QByteArray::fromBase64(
+                     result.value.value(QStringLiteral("contentBase64"))
+                         .toString().toLatin1()),
+                 QByteArray("done"));
+    } else {
+        QVERIFY(!result.ok);
+        QCOMPARE(result.errorCode, expectedError);
+    }
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    oversizedStableFileIsRejectedBeforeReadOrEncode()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("oversized.txt"));
+    writeFile(selected, QByteArray("123456789"));
+
+    std::atomic<int> readCalls{0};
+    std::atomic<int> encodeCalls{0};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [selected](
+                                const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        complete(openedPath(selected));
+    };
+    hooks.coordinatorBeforeRead = [&](const qint64) { ++readCalls; };
+    hooks.coordinatorBeforeEncode = [&] { ++encodeCalls; };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("oversized"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    CompletionProbe completion;
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return true; }),
+        completion.callback());
+    QVERIFY(operation.has_value());
+    QVERIFY(completion.wait());
+    QCOMPARE(completion.selection().status, FileDialogStatus::TooLarge);
+    QCOMPARE(readCalls.load(), 0);
+    QCOMPARE(encodeCalls.load(), 0);
+    QCOMPARE(broker.completeFileRequest(*preparation.request,
+                                        completion.selection()).errorCode,
+             QStringLiteral("file.too_large"));
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    cancellationIsExactOnceAndLateResultCannotReachReopenedOwner()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString oldPath = QDir(directory.path()).filePath(
+        QStringLiteral("old-owner.txt"));
+    const QString reopenedPath = QDir(directory.path()).filePath(
+        QStringLiteral("reopened-owner.txt"));
+    writeFile(oldPath, QByteArray("old"));
+    writeFile(reopenedPath, QByteArray("new"));
+
+    std::mutex showMutex;
+    std::vector<qbrowser_broker_testing::FileDialogTestShowCompletion>
+        showCompletions;
+    QSemaphore showEntered;
+    QSemaphore cancelObserved;
+    QSemaphore allowCancelDelivery;
+    QSemaphore operationQuiesced;
+    std::atomic<int> cancelCalls{0};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        {
+            const std::scoped_lock lock(showMutex);
+            showCompletions.push_back(std::move(complete));
+        }
+        showEntered.release();
+    };
+    hooks.coordinatorCancel = [&] {
+        ++cancelCalls;
+        cancelObserved.release();
+        allowCancelDelivery.acquire();
+    };
+    hooks.coordinatorOperationQuiesced = [&] { operationQuiesced.release(); };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult oldPreparation = prepareOpen(
+        broker, QStringLiteral("old-operation"));
+    PreparedFileRequestResult reopenedPreparation = prepareOpen(
+        broker, QStringLiteral("reopened-operation"));
+    QVERIFY(oldPreparation.request.has_value());
+    QVERIFY(reopenedPreparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    const auto unblockCancellation = qScopeGuard([&] {
+        allowCancelDelivery.release();
+    });
+    CompletionProbe oldCompletion;
+    CompletionProbe reopenedCompletion;
+    const auto oldOperation = coordinator.openAsync(
+        FileDialogOpenRequest(*oldPreparation.request, [] { return true; }),
+        oldCompletion.callback());
+    QVERIFY(oldOperation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    QVERIFY(oldOperation->cancellation.cancel());
+    QVERIFY(!oldOperation->cancellation.cancel());
+    QVERIFY(!coordinator.cancel(oldOperation->token));
+    QVERIFY(oldCompletion.wait());
+    QCOMPARE(oldCompletion.calls(), 1);
+    QCOMPARE(oldCompletion.selection().status, FileDialogStatus::Cancelled);
+    QVERIFY(cancelObserved.tryAcquire(1, 1'000));
+    QCOMPARE(cancelCalls.load(), 1);
+
+    CompletionProbe whileClosingCompletion;
+    const auto whileClosingOperation = coordinator.openAsync(
+        FileDialogOpenRequest(*reopenedPreparation.request,
+                              [] { return true; }),
+        whileClosingCompletion.callback());
+    QVERIFY(whileClosingOperation.has_value());
+    QVERIFY(whileClosingCompletion.wait());
+    QCOMPARE(whileClosingCompletion.selection().status,
+             FileDialogStatus::Busy);
+    {
+        const std::scoped_lock lock(showMutex);
+        QCOMPARE(showCompletions.size(), size_t{1});
+    }
+
+    allowCancelDelivery.release();
+    QVERIFY(operationQuiesced.tryAcquire(1, 1'000));
+
+    const auto reopenedOperation = coordinator.openAsync(
+        FileDialogOpenRequest(*reopenedPreparation.request,
+                              [] { return true; }),
+        reopenedCompletion.callback());
+    QVERIFY(reopenedOperation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    qbrowser_broker_testing::FileDialogTestShowCompletion lateOld;
+    qbrowser_broker_testing::FileDialogTestShowCompletion completeReopened;
+    {
+        const std::scoped_lock lock(showMutex);
+        QCOMPARE(showCompletions.size(), size_t{2});
+        lateOld = showCompletions.at(0);
+        completeReopened = showCompletions.at(1);
+    }
+    lateOld(openedPath(oldPath));
+    completeReopened(openedPath(reopenedPath));
+    QVERIFY(reopenedCompletion.wait());
+    QCOMPARE(reopenedCompletion.calls(), 1);
+    QCOMPARE(reopenedCompletion.selection().status, FileDialogStatus::Opened);
+    QVERIFY(reopenedCompletion.token() == reopenedOperation->token);
+    QCOMPARE(oldCompletion.calls(), 1);
+    QCOMPARE(cancelCalls.load(), 1);
+    const BrokerResult reopened = broker.completeFileRequest(
+        *reopenedPreparation.request, reopenedCompletion.selection());
+    QVERIFY(reopened.ok);
+    QCOMPARE(QByteArray::fromBase64(
+                 reopened.value.value(QStringLiteral("contentBase64"))
+                     .toString().toLatin1()),
+             QByteArray("new"));
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    guiStaysResponsiveWhileShowAndReadAreBlocked()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("responsive.txt"));
+    writeFile(selected, QByteArray("12345678"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion finishShow;
+    QSemaphore showEntered;
+    QSemaphore readEntered;
+    QSemaphore allowRead;
+    QSemaphore encodeObserved;
+    std::atomic<qint64> readCapacity{0};
+    std::thread::id showThread;
+    std::thread::id readThread;
+    std::thread::id encodeThread;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        showThread = std::this_thread::get_id();
+        {
+            const std::scoped_lock lock(showMutex);
+            finishShow = std::move(complete);
+        }
+        showEntered.release();
+    };
+    hooks.coordinatorBeforeRead = [&](const qint64 capacity) {
+        readThread = std::this_thread::get_id();
+        readCapacity.store(capacity);
+        readEntered.release();
+        allowRead.acquire();
+    };
+    hooks.coordinatorBeforeEncode = [&] {
+        encodeThread = std::this_thread::get_id();
+        encodeObserved.release();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("responsive"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    const auto unblockRead = qScopeGuard([&] { allowRead.release(); });
+    CompletionProbe completion;
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return true; }),
+        completion.callback());
+    QVERIFY(operation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    int guiTicks = 0;
+    QTimer timer;
+    connect(&timer, &QTimer::timeout, this, [&] { ++guiTicks; });
+    timer.start(1);
+    QTRY_VERIFY_WITH_TIMEOUT(guiTicks >= 3, 500);
+    QCOMPARE(completion.calls(), 0);
+
+    qbrowser_broker_testing::FileDialogTestShowCompletion complete;
+    {
+        const std::scoped_lock lock(showMutex);
+        complete = finishShow;
+    }
+    complete(openedPath(selected));
+    QVERIFY(readEntered.tryAcquire(1, 1'000));
+    const int ticksBeforeBlockedRead = guiTicks;
+    QTRY_VERIFY_WITH_TIMEOUT(guiTicks >= ticksBeforeBlockedRead + 3, 500);
+    QCOMPARE(completion.calls(), 0);
+
+    allowRead.release();
+    QVERIFY(encodeObserved.tryAcquire(1, 1'000));
+    QVERIFY(completion.wait());
+    QCOMPARE(completion.selection().status, FileDialogStatus::Opened);
+    QCOMPARE(completion.selection().declaredSize, 8);
+    QCOMPARE(readCapacity.load(), 9);
+    const std::thread::id callerThread = std::this_thread::get_id();
+    QVERIFY(showThread != callerThread);
+    QVERIFY(showThread == readThread);
+    QVERIFY(readThread == encodeThread);
+    QVERIFY(broker.completeFileRequest(*preparation.request,
+                                      completion.selection()).ok);
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    quiescenceCannotExposeANonTerminalOperation()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString selected = QDir(directory.path()).filePath(
+        QStringLiteral("quiesced.txt"));
+    writeFile(selected, QByteArray("done"));
+
+    std::mutex showMutex;
+    qbrowser_broker_testing::FileDialogTestShowCompletion finishShow;
+    QSemaphore showEntered;
+    QSemaphore quiescenceEntered;
+    QSemaphore allowQuiescenceReturn;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](
+                                const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion
+                                    complete) {
+        {
+            const std::scoped_lock lock(showMutex);
+            finishShow = std::move(complete);
+        }
+        showEntered.release();
+    };
+    hooks.coordinatorOperationQuiesced = [&] {
+        quiescenceEntered.release();
+        allowQuiescenceReturn.acquire();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("quiescence-terminal-order"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    const auto unblockQuiescence = qScopeGuard([&] {
+        allowQuiescenceReturn.release();
+    });
+    CompletionProbe completion;
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return true; }),
+        completion.callback());
+    QVERIFY(operation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    qbrowser_broker_testing::FileDialogTestShowCompletion complete;
+    {
+        const std::scoped_lock lock(showMutex);
+        complete = finishShow;
+    }
+    complete(openedPath(selected));
+    QVERIFY(quiescenceEntered.tryAcquire(1, 1'000));
+
+    QVERIFY2(completion.wait(200),
+             "the old operation was still non-terminal after its physical "
+             "reservation became observable as quiesced");
+    QCOMPARE(completion.calls(), 1);
+    QCOMPARE(completion.selection().status, FileDialogStatus::Opened);
+    allowQuiescenceReturn.release();
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    shutdownCannotLoseImmediateCompletion()
+{
+    QSemaphore immediateEntered;
+    QSemaphore allowImmediateCompletion;
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorBeforeImmediateCompletion = [&] {
+        immediateEntered.release();
+        allowImmediateCompletion.acquire();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("immediate-shutdown-race"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    const auto unblockImmediate = qScopeGuard([&] {
+        allowImmediateCompletion.release();
+    });
+    CompletionProbe completion;
+    auto opening = std::async(std::launch::async, [&] {
+        return coordinator.openAsync(
+            FileDialogOpenRequest(*preparation.request, [] { return false; }),
+            completion.callback());
+    });
+    QVERIFY(immediateEntered.tryAcquire(1, 1'000));
+
+    auto stopping = std::async(std::launch::async, [&] {
+        coordinator.shutdown();
+    });
+    const bool shutdownReturnedBeforeEnqueue =
+        stopping.wait_for(std::chrono::milliseconds(50))
+        == std::future_status::ready;
+    allowImmediateCompletion.release();
+
+    const auto operation = opening.get();
+    QCOMPARE(stopping.wait_for(std::chrono::seconds(1)),
+             std::future_status::ready);
+    stopping.get();
+    const bool callbackArrived = completion.wait(200);
+
+    QVERIFY2(!shutdownReturnedBeforeEnqueue,
+             "shutdown returned while an admitted immediate callback had not "
+             "yet been queued");
+    QVERIFY(callbackArrived);
+    QVERIFY(operation.has_value());
+    QCOMPARE(completion.calls(), 1);
+    QCOMPARE(completion.selection().status, FileDialogStatus::Denied);
+}
+
+void BrowserCapabilityIsolationTest::callbackCanRequestShutdown()
+{
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("callback-shutdown"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    QSemaphore callbackReturned;
+    std::atomic<int> callbackCalls{0};
+    std::atomic<int> callbackStatus{
+        static_cast<int>(FileDialogStatus::Failed)};
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return false; }),
+        [&](const FileDialogOperationToken &, FileDialogSelection selection) {
+            callbackStatus.store(static_cast<int>(selection.status));
+            ++callbackCalls;
+            coordinator.shutdown();
+            callbackReturned.release();
+        });
+
+    QVERIFY(operation.has_value());
+    QVERIFY(callbackReturned.tryAcquire(1, 1'000));
+    QCOMPARE(callbackCalls.load(), 1);
+    QCOMPARE(static_cast<FileDialogStatus>(callbackStatus.load()),
+             FileDialogStatus::Denied);
+    coordinator.shutdown();
+}
+
+void BrowserCapabilityIsolationTest::
+    shutdownCancelsAllAndWaitsForCallbackQuiescence()
+{
+    QSemaphore showEntered;
+    QSemaphore cancelObserved;
+    QSemaphore callbackEntered;
+    QSemaphore allowCallbackReturn;
+    std::atomic<int> cancelCalls{0};
+    std::atomic<int> callbackCalls{0};
+    std::atomic<int> callbackStatus{
+        static_cast<int>(FileDialogStatus::Failed)};
+    qbrowser_broker_testing::FileDialogTestHooks hooks;
+    hooks.coordinatorShow = [&](
+                                const qint64,
+                                qbrowser_broker_testing::FileDialogTestShowCompletion) {
+        showEntered.release();
+    };
+    hooks.coordinatorCancel = [&] {
+        ++cancelCalls;
+        cancelObserved.release();
+    };
+    qbrowser_broker_testing::setFileDialogTestHooks(std::move(hooks));
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetFileDialogTestHooks();
+    });
+
+    QtFileDialogBackend legacyBackend;
+    FileBroker broker(EffectiveFilePolicy{true, 8}, legacyBackend);
+    PreparedFileRequestResult preparation = prepareOpen(
+        broker, QStringLiteral("shutdown"));
+    QVERIFY(preparation.request.has_value());
+
+    FileDialogCoordinator coordinator;
+    const auto unblockCallback = qScopeGuard([&] {
+        allowCallbackReturn.release();
+    });
+    const auto operation = coordinator.openAsync(
+        FileDialogOpenRequest(*preparation.request, [] { return true; }),
+        [&](const FileDialogOperationToken &, FileDialogSelection selection) {
+            callbackStatus.store(static_cast<int>(selection.status));
+            ++callbackCalls;
+            callbackEntered.release();
+            allowCallbackReturn.acquire();
+        });
+    QVERIFY(operation.has_value());
+    QVERIFY(showEntered.tryAcquire(1, 1'000));
+
+    auto shutdown = std::async(std::launch::async, [&] {
+        coordinator.shutdown();
+    });
+    const auto unblockCallbackBeforeFutureJoin = qScopeGuard([&] {
+        allowCallbackReturn.release();
+    });
+    QVERIFY(cancelObserved.tryAcquire(1, 1'000));
+    QVERIFY(callbackEntered.tryAcquire(1, 1'000));
+    QCOMPARE(shutdown.wait_for(std::chrono::milliseconds(20)),
+             std::future_status::timeout);
+    allowCallbackReturn.release();
+    QCOMPARE(shutdown.wait_for(std::chrono::seconds(1)),
+             std::future_status::ready);
+    shutdown.get();
+    QCOMPARE(cancelCalls.load(), 1);
+    QCOMPARE(callbackCalls.load(), 1);
+    QCOMPARE(static_cast<FileDialogStatus>(callbackStatus.load()),
+             FileDialogStatus::Cancelled);
 }
 
 void BrowserCapabilityIsolationTest::
     fullRequestAndSessionIdentityRoutingIsDeferred()
 {
-    QFAIL("TODO(Task16 Tasks 4-5): final delivery currently lacks a testable full "
-          "authority/request/session gate; bind this to the production IO seam");
+    QFAIL("TODO(Task16 Tasks 4-5): final delivery still belongs to the Host "
+          "full-authority/request/session admission and bounded IO seam; Task 3 "
+          "only guarantees an immutable operation callback and retired-token "
+          "discard inside the process-owned coordinator");
 }
 
-QTEST_APPLESS_MAIN(BrowserCapabilityIsolationTest)
+QTEST_GUILESS_MAIN(BrowserCapabilityIsolationTest)
 
 #include "tst_browser_capability_isolation.moc"

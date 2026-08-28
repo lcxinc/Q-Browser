@@ -59,6 +59,10 @@ target_link_libraries(tst_browser_capability_isolation
     q_browser_host
     Qt6::Test)
 
+target_compile_definitions(tst_browser_capability_isolation
+  PRIVATE
+    Q_BROWSER_BROKER_TESTING)
+
 q_browser_enable_strict_warnings(tst_browser_capability_isolation)
 q_browser_add_qt_test(
   NAME browser_capability_isolation

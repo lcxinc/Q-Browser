@@ -645,6 +645,10 @@ BrokerResult FileBroker::completeFileRequest(
         return finalize(fileFailure(
             QStringLiteral("file.busy"),
             QStringLiteral("File dialog is busy.")));
+    case FileDialogStatus::Denied:
+        return finalize(fileFailure(
+            QStringLiteral("capability.denied"),
+            QStringLiteral("Capability is not permitted.")));
     case FileDialogStatus::Failed:
         return finalize(fileFailure(
             QStringLiteral("file.failed"),
