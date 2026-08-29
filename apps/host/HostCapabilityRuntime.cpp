@@ -129,31 +129,46 @@ struct PendingHostFileRequest final
 class CapabilityWorkerLane final : public QObject
 {
 public:
-    CapabilityWorkerLane(EffectivePolicy policy,
-                         const QString &storageDirectory,
-                         QString *errorCode)
+    [[nodiscard]] QString initialize(
+        EffectivePolicy policy, const QString &storageDirectory)
     {
+        Q_ASSERT(QThread::currentThread() == thread());
+        if (QThread::currentThread()->isInterruptionRequested()) {
+            return QStringLiteral("host.capability.worker_unavailable");
+        }
         if (policy.network.has_value()) {
             network_ = std::make_unique<NetworkBroker>(*policy.network);
         }
         if (policy.storage.has_value()) {
-            storage_ = StorageBroker::create(*policy.storage, storageDirectory,
-                                             errorCode);
-            if (storage_ == nullptr) return;
+            QString storageError;
+            do {
+                storage_ = StorageBroker::create(
+                    *policy.storage, storageDirectory, &storageError);
+            } while (storage_ == nullptr
+                     && storageError == QStringLiteral("storage.busy")
+                     && !QThread::currentThread()->isInterruptionRequested());
+            if (storage_ == nullptr) {
+                return storageError.isEmpty()
+                    ? QStringLiteral("host.capability.worker_unavailable")
+                    : storageError;
+            }
         }
         broker_ = std::make_unique<CapabilityBroker>(
             std::move(policy),
             CapabilityServices{network_.get(), storage_.get(), nullptr, nullptr});
-        valid_ = true;
+        return {};
     }
-
-    [[nodiscard]] bool isValid() const noexcept { return valid_; }
 
     [[nodiscard]] BrokerResult dispatch(const QString &capability,
                                         const QString &operation,
                                         const QJsonObject &payload,
                                         const HostRequestContext &context)
     {
+        if (broker_ == nullptr) {
+            return BrokerResult::failure(
+                QStringLiteral("capability.unavailable"),
+                QStringLiteral("Capability service is unavailable."));
+        }
         return broker_->dispatch(capability, operation, payload, context);
     }
 
@@ -161,7 +176,6 @@ private:
     std::unique_ptr<NetworkBroker> network_;
     std::unique_ptr<StorageBroker> storage_;
     std::unique_ptr<CapabilityBroker> broker_;
-    bool valid_ = false;
 };
 
 HostCapabilityRuntime::HostCapabilityRuntime(
@@ -265,12 +279,31 @@ const TabCapabilityAuthority &HostCapabilityRuntime::authority() const noexcept
     return authority_;
 }
 
+bool HostCapabilityRuntime::isWorkerInitializationComplete() const noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return workerInitializationComplete_;
+}
+
+bool HostCapabilityRuntime::isWorkerReady() const noexcept
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return workerReady_;
+}
+
+QString HostCapabilityRuntime::workerInitializationError() const
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    return workerInitializationError_;
+}
+
 bool HostCapabilityRuntime::bindCompletionSubmitter(
     const TabCapabilityAuthority &authority,
     CapabilityCompletionSubmitter submitter)
 {
     Q_ASSERT(QThread::currentThread() == thread());
-    if (QThread::currentThread() != thread() || !accepting_ || !submitter
+    if (QThread::currentThread() != thread() || !accepting_ || !workerReady_
+        || !submitter
         || authority != authority_ || completionSubmitter_) {
         return false;
     }
@@ -368,17 +401,9 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
         }
         return false;
     }
-    auto *const lane = new CapabilityWorkerLane(policy_, storageDirectory, errorCode);
+    auto *const lane = new CapabilityWorkerLane;
     auto *const thread = new QThread;
     thread->setObjectName(QStringLiteral("host-capability-worker"));
-    if (!lane->isValid()) {
-        delete lane;
-        delete thread;
-        if (errorCode != nullptr && errorCode->isEmpty()) {
-            *errorCode = QStringLiteral("host.capability.worker_unavailable");
-        }
-        return false;
-    }
     clipboardBackend_ = std::make_unique<QtClipboardBackend>();
     fileBackend_ = std::make_unique<QtFileDialogBackend>();
     gestureGrants_ = std::make_shared<UserGestureGrantStore>();
@@ -428,10 +453,56 @@ bool HostCapabilityRuntime::initialize(const QString &storageDirectory,
         return false;
     }
     connect(thread, &QThread::finished, lane, &QObject::deleteLater);
+    thread->start();
+    const QPointer<HostCapabilityRuntime> runtime(this);
+    if (!QMetaObject::invokeMethod(
+            lane,
+            [lane, policy = policy_, storageDirectory, runtime]() mutable {
+                const QString initializationError = lane->initialize(
+                    std::move(policy), storageDirectory);
+                if (runtime != nullptr) {
+                    (void)QMetaObject::invokeMethod(
+                        runtime.data(),
+                        [runtime, initializationError] {
+                            if (runtime != nullptr) {
+                                runtime->completeWorkerInitialization(
+                                    initializationError);
+                            }
+                        },
+                        Qt::QueuedConnection);
+                }
+            },
+            Qt::QueuedConnection)) {
+        thread->requestInterruption();
+        thread->quit();
+        (void)thread->wait();
+        delete thread;
+        if (gestureBindingRegistered_ && gestureRouter_ != nullptr) {
+            gestureRouter_->unregisterBinding(authority_);
+            gestureBindingRegistered_ = false;
+        }
+        if (errorCode != nullptr) {
+            *errorCode = QStringLiteral("host.capability.worker_unavailable");
+        }
+        return false;
+    }
     workerLane_ = lane;
     workerThread_ = thread;
-    thread->start();
     return true;
+}
+
+void HostCapabilityRuntime::completeWorkerInitialization(
+    const QString &errorCode)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (workerInitializationComplete_ || !accepting_) {
+        return;
+    }
+    workerInitializationComplete_ = true;
+    workerInitializationError_ = errorCode;
+    workerReady_ = errorCode.isEmpty();
+    emit workerInitializationFinished(
+        workerReady_, workerInitializationError_);
 }
 
 void HostCapabilityRuntime::dispatch(const quint64 generation,

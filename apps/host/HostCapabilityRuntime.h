@@ -109,6 +109,9 @@ public:
     static void retire(std::shared_ptr<HostCapabilityRuntime> runtime) noexcept;
 
     [[nodiscard]] const TabCapabilityAuthority &authority() const noexcept;
+    [[nodiscard]] bool isWorkerInitializationComplete() const noexcept;
+    [[nodiscard]] bool isWorkerReady() const noexcept;
+    [[nodiscard]] QString workerInitializationError() const;
     [[nodiscard]] bool bindCompletionSubmitter(
         const TabCapabilityAuthority &authority,
         CapabilityCompletionSubmitter submitter);
@@ -126,6 +129,7 @@ public:
     void invalidate() noexcept;
 
 signals:
+    void workerInitializationFinished(bool ready, const QString &errorCode);
 #ifdef Q_BROWSER_HOST_TESTING
     void completed(quint64 generation,
                    const QString &requestId,
@@ -148,6 +152,7 @@ private:
                           FileDialogCoordinator *fileDialogCoordinator);
     [[nodiscard]] bool initialize(const QString &storageDirectory,
                                   QString *errorCode);
+    void completeWorkerInitialization(const QString &errorCode);
     [[nodiscard]] bool queueCompletion(
         std::shared_ptr<AuthorityAdmissionToken::UseGuard> use,
         quint64 generation,
@@ -192,7 +197,10 @@ private:
     std::unique_ptr<CapabilityBroker> guiBroker_;
     std::shared_ptr<PendingHostFileRequest> pendingFile_;
     CapabilityCompletionSubmitter completionSubmitter_;
+    QString workerInitializationError_;
     bool gestureBindingRegistered_ = false;
+    bool workerInitializationComplete_ = false;
+    bool workerReady_ = false;
     bool accepting_ = true;
 };
 

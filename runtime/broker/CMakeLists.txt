@@ -13,8 +13,6 @@ add_library(q_browser_broker STATIC
   NetworkBroker.h
   StorageBroker.cpp
   StorageBroker.h
-  StorageTestHooks.cpp
-  StorageTestHooks.h
   UserGestureGrantStore.cpp
   UserGestureGrantStore.h)
 
@@ -37,6 +35,9 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+  target_sources(q_browser_broker PRIVATE
+    StorageTestHooks.cpp
+    StorageTestHooks.h)
   target_compile_definitions(q_browser_broker PRIVATE Q_BROWSER_BROKER_TESTING)
 endif()
 

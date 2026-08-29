@@ -1,18 +1,30 @@
 #include "StorageBroker.h"
 #include "StorageTestHooks.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QCryptographicHash>
 #include <QFile>
+#include <QLockFile>
+#include <QMutex>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QScopeGuard>
+#include <QSemaphore>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QThread>
 
+#include <atomic>
 #include <future>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #include <Aclapi.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -27,6 +39,14 @@ QJsonObject keyPayload(const QString &key)
     return {{QStringLiteral("key"), key}};
 }
 
+void writeFile(const QString &path, const QByteArray &content)
+{
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(content), content.size());
+    file.close();
+}
+
 std::unique_ptr<StorageBroker> createBroker(const EffectiveStoragePolicy policy,
                                             const QString &root)
 {
@@ -39,6 +59,27 @@ std::unique_ptr<StorageBroker> createBroker(const EffectiveStoragePolicy policy,
 }
 
 #ifdef Q_OS_WIN
+QString rootTransactionMutexName(const QString &root)
+{
+    QString canonical = QDir::cleanPath(QDir::fromNativeSeparators(
+        QFileInfo(root).canonicalFilePath())).toCaseFolded();
+    const QByteArray digest = QCryptographicHash::hash(
+        canonical.toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QStringLiteral("Local\\QBrowser.Storage.Root.")
+        + QString::fromLatin1(digest);
+}
+
+QString rootTransactionLockPath(const QString &root)
+{
+    const QString canonical = QDir::cleanPath(QDir::fromNativeSeparators(
+        QFileInfo(root).canonicalFilePath())).toCaseFolded();
+    const QByteArray digest = QCryptographicHash::hash(
+        canonical.toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QDir(QDir::tempPath()).filePath(
+        QStringLiteral(".qbrowser-storage-root-%1.lock")
+            .arg(QString::fromLatin1(digest)));
+}
+
 bool grantWorldAccess(const QString &path)
 {
     BYTE worldBuffer[SECURITY_MAX_SID_SIZE]{};
@@ -180,13 +221,25 @@ private slots:
     void rejectsPayloadIdentityAndInvalidKeys();
     void rejectsExistingNamespaceOverQuota();
     void validatesAndTightensExistingNamespaceLayout();
+    void descriptorMembershipReconciliationHandlesNonEmptyRoot();
     void rejectsUnexpectedExistingStorageObjects();
     void invalidLayoutDoesNotMutateAcls();
     void rejectsAggregateExistingDataOverQuota();
     void aclMigrationFailureRollsBackEveryObject();
     void aclPostcheckFailureRollsBackCurrentObject();
     void freezesMembershipDuringValidationAndAclMigration();
+    void canonicalRootAliasesSerializeInitialization();
+    void failedInitializationReleasesRootLockAndRestoresState();
+    void sameRootInitializationSerializesWithUpdates();
+    void guiInitializationReturnsBusyWhileRootTransactionIsActive();
+    void honorsInterprocessRootTransactionLock();
+    void holdInterprocessRootTransactionLockForTest();
     void serializesConcurrentQuotaUpdates();
+    void rejectsReplacedRootIdentity();
+    void initializationRejectsReplacementRootBeforePermissionMigration();
+    void rejectsHardLinkedNamespaceFile();
+    void storageIoDoesNotFollowReplacedRoot();
+    void permissionMigrationDoesNotFollowReplacedMember();
     void rejectsReparseRoot();
     void rejectsReparseNamespaceFile();
 };
@@ -317,6 +370,35 @@ void StorageBrokerTest::validatesAndTightensExistingNamespaceLayout()
                                                {identity, QStringLiteral("request")});
     QVERIFY(result.ok);
     QCOMPARE(result.value.value(QStringLiteral("value")).toString(), QStringLiteral("dark"));
+#endif
+}
+
+void StorageBrokerTest::descriptorMembershipReconciliationHandlesNonEmptyRoot()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX independent directory-stream offset coverage");
+#else
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString namespacePath = QDir(root.path()).filePath(
+        QString(64, u'd') + QStringLiteral(".json"));
+    writeFile(namespacePath, QByteArrayLiteral("{}"));
+    const QFileDevice::Permissions broadPermissions =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadGroup | QFileDevice::WriteGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther;
+    QVERIFY(QFile::setPermissions(namespacePath, broadPermissions));
+
+    QString error;
+    auto broker = StorageBroker::create(
+        EffectiveStoragePolicy{1024}, root.path(), &error);
+    QVERIFY2(broker != nullptr, qPrintable(error));
+    const QFileDevice::Permissions migrated =
+        QFileInfo(namespacePath).permissions();
+    QVERIFY(migrated.testFlag(QFileDevice::ReadOwner));
+    QVERIFY(migrated.testFlag(QFileDevice::WriteOwner));
+    QVERIFY(!(migrated & (QFileDevice::ReadGroup | QFileDevice::WriteGroup
+                         | QFileDevice::ReadOther | QFileDevice::WriteOther)));
 #endif
 }
 
@@ -522,6 +604,368 @@ void StorageBrokerTest::freezesMembershipDuringValidationAndAclMigration()
 #endif
 }
 
+void StorageBrokerTest::canonicalRootAliasesSerializeInitialization()
+{
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    const QString sibling = QDir(parent.path()).filePath(QStringLiteral("alias-base"));
+    QVERIFY(QDir().mkdir(root));
+    QVERIFY(QDir().mkdir(sibling));
+    const QString rootAlias = QDir(sibling).filePath(QStringLiteral("../storage"));
+
+    QSemaphore firstEntered;
+    QSemaphore releaseFirst;
+    QSemaphore initializationContended;
+    std::atomic_int entries{0};
+    std::atomic_int active{0};
+    std::atomic_int maximumActive{0};
+    QMutex lockedRootsMutex;
+    QStringList lockedRoots;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = [&](const QString &canonicalRoot) {
+             const int entry = entries.fetch_add(1) + 1;
+             const int nowActive = active.fetch_add(1) + 1;
+             int observed = maximumActive.load();
+             while (nowActive > observed
+                    && !maximumActive.compare_exchange_weak(observed, nowActive)) {
+             }
+             {
+                 QMutexLocker locker(&lockedRootsMutex);
+                 lockedRoots.append(canonicalRoot);
+             }
+             if (entry == 1) {
+                 firstEntered.release();
+                 releaseFirst.acquire();
+             }
+             active.fetch_sub(1);
+         },
+         .initializationLockContended = [&](const QString &) {
+             initializationContended.release();
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    auto first = std::async(std::launch::async, [&] {
+        QString error;
+        auto broker = StorageBroker::create(EffectiveStoragePolicy{1024}, root, &error);
+        return std::pair{std::move(broker), error};
+    });
+    const bool observedFirst = firstEntered.tryAcquire(1, 2'000);
+    if (!observedFirst) {
+        releaseFirst.release();
+        const auto firstResult = first.get();
+        Q_UNUSED(firstResult);
+        QFAIL("Storage initialization did not expose the root-lock hook");
+    }
+
+    auto second = std::async(std::launch::async, [&] {
+        QString error;
+        auto broker = StorageBroker::create(EffectiveStoragePolicy{1024}, rootAlias, &error);
+        return std::pair{std::move(broker), error};
+    });
+    const bool secondContended = initializationContended.tryAcquire(1, 2'000);
+    releaseFirst.release();
+    auto firstResult = first.get();
+    auto secondResult = second.get();
+
+    QVERIFY2(secondContended, "Canonical aliases did not contend on one root lock");
+    QVERIFY2(firstResult.first != nullptr, qPrintable(firstResult.second));
+    QVERIFY2(secondResult.first != nullptr, qPrintable(secondResult.second));
+    QCOMPARE(entries.load(), 2);
+    QCOMPARE(maximumActive.load(), 1);
+    QCOMPARE(lockedRoots.size(), 2);
+    QCOMPARE(lockedRoots.at(0), lockedRoots.at(1));
+}
+
+void StorageBrokerTest::failedInitializationReleasesRootLockAndRestoresState()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString namespacePath = QDir(root.path()).filePath(
+        QString(64, u'a') + QStringLiteral(".json"));
+    QFile file(namespacePath);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write("{}"), 2);
+    file.close();
+#ifdef Q_OS_WIN
+    QVERIFY(grantWorldAccess(namespacePath));
+    QVERIFY(grantWorldAccess(root.path()));
+    const QByteArray rootBefore = aclSnapshot(root.path());
+    const QByteArray namespaceBefore = aclSnapshot(namespacePath);
+    QVERIFY(!rootBefore.isEmpty());
+    QVERIFY(!namespaceBefore.isEmpty());
+#else
+    const QFileDevice::Permissions broadFilePermissions =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadGroup | QFileDevice::WriteGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther;
+    const QFileDevice::Permissions broadDirectoryPermissions =
+        broadFilePermissions | QFileDevice::ExeOwner | QFileDevice::ExeGroup
+        | QFileDevice::ExeOther;
+    QVERIFY(QFile::setPermissions(namespacePath, broadFilePermissions));
+    QVERIFY(QFile::setPermissions(root.path(), broadDirectoryPermissions));
+    const QFileDevice::Permissions rootBefore = QFileInfo(root.path()).permissions();
+    const QFileDevice::Permissions namespaceBefore =
+        QFileInfo(namespacePath).permissions();
+#endif
+
+    std::atomic_int lockEntries{0};
+    std::atomic_bool failFirstApply{true};
+#ifdef Q_OS_WIN
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = [&](const QString &path, const qsizetype) {
+             return path != root.path() || !failFirstApply.exchange(false);
+         },
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = [&](const QString &) {
+             lockEntries.fetch_add(1);
+         }});
+#else
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = [&](const QString &) {
+             lockEntries.fetch_add(1);
+         },
+         .initializationLockContended = {},
+         .storageOperationLockContended = {},
+         .afterStorageOperationLockAcquired = {},
+         .allowPermissionApply = [&](const QString &path, const qsizetype) {
+             return path != root.path() || !failFirstApply.exchange(false);
+         }});
+#endif
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    QString firstError;
+    auto first = StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &firstError);
+    QVERIFY(first == nullptr);
+    QCOMPARE(firstError, QStringLiteral("storage.invalid_root"));
+#ifdef Q_OS_WIN
+    QVERIFY(!QFileInfo::exists(rootTransactionLockPath(root.path())));
+    QCOMPARE(aclSnapshot(root.path()), rootBefore);
+    QCOMPARE(aclSnapshot(namespacePath), namespaceBefore);
+#else
+    QVERIFY(!QFileInfo::exists(
+        QDir(root.path()).filePath(
+            QStringLiteral(".qbrowser-storage-root.lock"))));
+    QCOMPARE(QFileInfo(root.path()).permissions(), rootBefore);
+    QCOMPARE(QFileInfo(namespacePath).permissions(), namespaceBefore);
+#endif
+
+    QString secondError;
+    auto second = StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &secondError);
+    QVERIFY2(second != nullptr, qPrintable(secondError));
+    QCOMPARE(lockEntries.load(), 2);
+}
+
+void StorageBrokerTest::sameRootInitializationSerializesWithUpdates()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    auto existing = createBroker(EffectiveStoragePolicy{1024}, root.path());
+    QVERIFY(existing != nullptr);
+    auto retiredSibling = createBroker(EffectiveStoragePolicy{1024}, root.path());
+    QVERIFY(retiredSibling != nullptr);
+    retiredSibling.reset();
+    const HostRequestContext context{QStringLiteral("host.app"),
+                                     QStringLiteral("request")};
+
+    QSemaphore initializationEntered;
+    QSemaphore releaseInitialization;
+    QSemaphore operationContended;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = [&](const QString &) {
+             initializationEntered.release();
+             releaseInitialization.acquire();
+         },
+         .initializationLockContended = {},
+         .storageOperationLockContended = [&](const QString &) {
+             operationContended.release();
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    auto initializer = std::async(std::launch::async, [&] {
+        QString error;
+        auto broker = StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error);
+        return std::pair{std::move(broker), error};
+    });
+    const bool observedInitialization = initializationEntered.tryAcquire(1, 2'000);
+    if (!observedInitialization) {
+        releaseInitialization.release();
+        const auto initialized = initializer.get();
+        Q_UNUSED(initialized);
+        QFAIL("Storage initialization did not expose the root-lock hook");
+    }
+
+    auto update = std::async(std::launch::async, [&] {
+        return existing->invoke(QStringLiteral("set"),
+                                setPayload(QStringLiteral("theme"), QStringLiteral("dark")),
+                                context);
+    });
+    const bool updateContended = operationContended.tryAcquire(1, 2'000);
+    releaseInitialization.release();
+    auto initialized = initializer.get();
+    const BrokerResult updateResult = update.get();
+
+    QVERIFY2(updateContended, "A storage update bypassed same-root initialization");
+    QVERIFY2(initialized.first != nullptr, qPrintable(initialized.second));
+    QVERIFY2(updateResult.ok, qPrintable(updateResult.errorCode));
+    const BrokerResult value = initialized.first->invoke(
+        QStringLiteral("get"), keyPayload(QStringLiteral("theme")), context);
+    QVERIFY2(value.ok, qPrintable(value.errorCode));
+    QCOMPARE(value.value.value(QStringLiteral("value")).toString(), QStringLiteral("dark"));
+}
+
+void StorageBrokerTest::guiInitializationReturnsBusyWhileRootTransactionIsActive()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    auto existing = createBroker(EffectiveStoragePolicy{1024}, root.path());
+    QVERIFY(existing != nullptr);
+    const HostRequestContext context{QStringLiteral("host.app"),
+                                     QStringLiteral("request")};
+
+    QSemaphore operationEntered;
+    QSemaphore releaseOperation;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = {},
+         .initializationLockContended = {},
+         .storageOperationLockContended = {},
+         .afterStorageOperationLockAcquired = [&](const QString &) {
+             operationEntered.release();
+             releaseOperation.acquire();
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    auto update = std::async(std::launch::async, [&] {
+        return existing->invoke(QStringLiteral("set"),
+                                setPayload(QStringLiteral("key"), QStringLiteral("value")),
+                                context);
+    });
+    const bool observedOperation = operationEntered.tryAcquire(1, 2'000);
+    if (!observedOperation) {
+        releaseOperation.release();
+        const BrokerResult updateResult = update.get();
+        Q_UNUSED(updateResult);
+        QFAIL("Storage operation did not expose the root-lock hook");
+    }
+
+    QSemaphore createReturned;
+    auto watchdog = std::async(std::launch::async, [&] {
+        if (!createReturned.tryAcquire(1, 1'000)) {
+            releaseOperation.release();
+        }
+    });
+    QString error;
+    auto sibling = StorageBroker::create(EffectiveStoragePolicy{1024}, root.path(), &error);
+    createReturned.release();
+    releaseOperation.release();
+    watchdog.get();
+    const BrokerResult updateResult = update.get();
+
+    QVERIFY(sibling == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.busy"));
+    QVERIFY2(updateResult.ok, qPrintable(updateResult.errorCode));
+}
+
+void StorageBrokerTest::honorsInterprocessRootTransactionLock()
+{
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkdir(root));
+    const QString ready = QDir(parent.path()).filePath(QStringLiteral("lock-ready"));
+    const QString release = QDir(parent.path()).filePath(
+        QStringLiteral("lock-release"));
+    QProcess holder;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QStringLiteral("Q_BROWSER_STORAGE_LOCK_ROOT"), root);
+    environment.insert(QStringLiteral("Q_BROWSER_STORAGE_LOCK_READY"), ready);
+    environment.insert(QStringLiteral("Q_BROWSER_STORAGE_LOCK_RELEASE"), release);
+    holder.setProcessEnvironment(environment);
+    holder.setProgram(QCoreApplication::applicationFilePath());
+    holder.setArguments({QStringLiteral("holdInterprocessRootTransactionLockForTest")});
+    holder.start();
+    QVERIFY(holder.waitForStarted(2'000));
+    const auto stopHolder = qScopeGuard([&holder] {
+        if (holder.state() != QProcess::NotRunning) {
+            holder.kill();
+            (void)holder.waitForFinished(2'000);
+        }
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(ready), 2'000);
+
+    QString error;
+    auto broker = StorageBroker::create(EffectiveStoragePolicy{1024}, root, &error);
+    QVERIFY(broker == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.busy"));
+    writeFile(release, QByteArrayLiteral("release"));
+    QVERIFY(holder.waitForFinished(5'000));
+    QCOMPARE(holder.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(holder.exitCode(), 0);
+}
+
+void StorageBrokerTest::holdInterprocessRootTransactionLockForTest()
+{
+    const QString root = qEnvironmentVariable("Q_BROWSER_STORAGE_LOCK_ROOT");
+    const QString ready = qEnvironmentVariable("Q_BROWSER_STORAGE_LOCK_READY");
+    const QString release = qEnvironmentVariable(
+        "Q_BROWSER_STORAGE_LOCK_RELEASE");
+    if (root.isEmpty() || ready.isEmpty() || release.isEmpty()) {
+        QSKIP("interprocess storage-lock helper only");
+    }
+#ifdef Q_OS_WIN
+    const QString mutexName = rootTransactionMutexName(root);
+    HANDLE mutex = CreateMutexW(
+        nullptr, FALSE,
+        reinterpret_cast<LPCWSTR>(mutexName.utf16()));
+    QVERIFY(mutex != nullptr);
+    const DWORD waitResult = WaitForSingleObject(mutex, 0);
+    QVERIFY(waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED);
+    const auto releaseMutex = qScopeGuard([mutex] {
+        (void)ReleaseMutex(mutex);
+        CloseHandle(mutex);
+    });
+    QLockFile lock(rootTransactionLockPath(root));
+    lock.setStaleLockTime(0);
+    QVERIFY(lock.tryLock());
+#else
+    const QByteArray encoded = QFile::encodeName(root);
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int descriptor = ::open(encoded.constData(), flags);
+    QVERIFY(descriptor >= 0);
+    const auto closeDescriptor = qScopeGuard([descriptor] {
+        (void)::flock(descriptor, LOCK_UN);
+        (void)::close(descriptor);
+    });
+    QVERIFY(::flock(descriptor, LOCK_EX | LOCK_NB) == 0);
+#endif
+    writeFile(ready, QByteArrayLiteral("ready"));
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(release), 5'000);
+}
+
 void StorageBrokerTest::serializesConcurrentQuotaUpdates()
 {
     QTemporaryDir root;
@@ -547,6 +991,245 @@ void StorageBrokerTest::serializesConcurrentQuotaUpdates()
     QVERIFY2(rightResult.ok, qPrintable(rightResult.errorCode));
     QVERIFY(broker->invoke(QStringLiteral("get"), keyPayload(QStringLiteral("left")), context).ok);
     QVERIFY(broker->invoke(QStringLiteral("get"), keyPayload(QStringLiteral("right")), context).ok);
+}
+
+void StorageBrokerTest::rejectsReplacedRootIdentity()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX device/inode replacement coverage");
+#else
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    const QString retired = QDir(parent.path()).filePath(QStringLiteral("retired"));
+    QVERIFY(QDir().mkdir(root));
+    auto broker = createBroker(EffectiveStoragePolicy{1024}, root);
+    QVERIFY(broker != nullptr);
+
+    QVERIFY(QDir().rename(root, retired));
+    QVERIFY(QDir().mkdir(root));
+    const BrokerResult result = broker->invoke(
+        QStringLiteral("get"),
+        keyPayload(QStringLiteral("key")),
+        {QStringLiteral("host.app"), QStringLiteral("request")});
+    QVERIFY(!result.ok);
+    QCOMPARE(result.errorCode, QStringLiteral("storage.failed"));
+#endif
+}
+
+void StorageBrokerTest::initializationRejectsReplacementRootBeforePermissionMigration()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX descriptor-anchored membership coverage");
+#else
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    const QString replacement = QDir(parent.path()).filePath(
+        QStringLiteral("replacement"));
+    const QString retired = QDir(parent.path()).filePath(
+        QStringLiteral("retired"));
+    QVERIFY(QDir().mkdir(root));
+    QVERIFY(QDir().mkdir(replacement));
+    const QString originalNamespace = QDir(root).filePath(
+        QString(64, u'a') + QStringLiteral(".json"));
+    const QString replacementNamespace = QDir(replacement).filePath(
+        QString(64, u'b') + QStringLiteral(".json"));
+    writeFile(originalNamespace, QByteArrayLiteral("{}"));
+    writeFile(replacementNamespace, QByteArrayLiteral("{}"));
+    const QFileDevice::Permissions broadPermissions =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadGroup | QFileDevice::WriteGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther;
+    QVERIFY(QFile::setPermissions(originalNamespace, broadPermissions));
+    QVERIFY(QFile::setPermissions(replacementNamespace, broadPermissions));
+    const QFileDevice::Permissions originalBefore =
+        QFileInfo(originalNamespace).permissions();
+    const QFileDevice::Permissions replacementBefore =
+        QFileInfo(replacementNamespace).permissions();
+
+    bool hookCalled = false;
+    bool swapSucceeded = false;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = [&] {
+             hookCalled = true;
+             swapSucceeded = QDir().rename(root, retired)
+                 && QDir().rename(replacement, root);
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    QString error;
+    auto broker = StorageBroker::create(
+        EffectiveStoragePolicy{1024}, root, &error);
+    QVERIFY(hookCalled);
+    QVERIFY(swapSucceeded);
+    QVERIFY(broker == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    QCOMPARE(QFileInfo(QDir(retired).filePath(
+                           QFileInfo(originalNamespace).fileName()))
+                 .permissions(),
+             originalBefore);
+    QCOMPARE(QFileInfo(QDir(root).filePath(
+                           QFileInfo(replacementNamespace).fileName()))
+                 .permissions(),
+             replacementBefore);
+#endif
+}
+
+void StorageBrokerTest::rejectsHardLinkedNamespaceFile()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX hard-link permission-alias coverage");
+#else
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkdir(root));
+    const QString outside = QDir(parent.path()).filePath(
+        QStringLiteral("outside.json"));
+    writeFile(outside, QByteArrayLiteral("{}"));
+    const QFileDevice::Permissions broadPermissions =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadGroup | QFileDevice::WriteGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther;
+    QVERIFY(QFile::setPermissions(outside, broadPermissions));
+    const QFileDevice::Permissions outsideBefore =
+        QFileInfo(outside).permissions();
+    const QString linkedNamespace = QDir(root).filePath(
+        QString(64, u'c') + QStringLiteral(".json"));
+    const QByteArray encodedOutside = QFile::encodeName(outside);
+    const QByteArray encodedNamespace = QFile::encodeName(linkedNamespace);
+    QVERIFY(::link(encodedOutside.constData(), encodedNamespace.constData()) == 0);
+
+    QString error;
+    auto broker = StorageBroker::create(
+        EffectiveStoragePolicy{1024}, root, &error);
+    QVERIFY(broker == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    QCOMPARE(QFileInfo(outside).permissions(), outsideBefore);
+    QFile outsideFile(outside);
+    QVERIFY(outsideFile.open(QIODevice::ReadOnly));
+    QCOMPARE(outsideFile.readAll(), QByteArrayLiteral("{}"));
+#endif
+}
+
+void StorageBrokerTest::storageIoDoesNotFollowReplacedRoot()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX directory-fd storage I/O coverage");
+#else
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    const QString retired = QDir(parent.path()).filePath(QStringLiteral("retired"));
+    QVERIFY(QDir().mkdir(root));
+    auto broker = createBroker(EffectiveStoragePolicy{1024}, root);
+    QVERIFY(broker != nullptr);
+    const HostRequestContext context{QStringLiteral("host.app"),
+                                     QStringLiteral("request")};
+    QVERIFY(broker->invoke(
+        QStringLiteral("set"),
+        setPayload(QStringLiteral("key"), QStringLiteral("original")),
+        context).ok);
+    const QString dataName = QString::fromLatin1(
+        QCryptographicHash::hash(context.appIdentity.toUtf8(),
+                                 QCryptographicHash::Sha256).toHex())
+        + QStringLiteral(".json");
+
+    QByteArray replacementBytes = QByteArrayLiteral(
+        "{\"key\":\"replacement\"}");
+    bool replaced = false;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = {},
+         .initializationLockContended = {},
+         .storageOperationLockContended = {},
+         .afterStorageOperationLockAcquired = {},
+         .beforeStorageIo = [&](const QString &) {
+             replaced = QDir().rename(root, retired)
+                 && QDir().mkdir(root);
+             if (replaced) {
+                 writeFile(QDir(root).filePath(dataName), replacementBytes);
+             }
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    const BrokerResult result = broker->invoke(
+        QStringLiteral("set"),
+        setPayload(QStringLiteral("key"), QStringLiteral("mutated")),
+        context);
+    QVERIFY(replaced);
+    QVERIFY(!result.ok);
+    QCOMPARE(result.errorCode, QStringLiteral("storage.failed"));
+    QFile replacement(QDir(root).filePath(dataName));
+    QVERIFY(replacement.open(QIODevice::ReadOnly));
+    QCOMPARE(replacement.readAll(), replacementBytes);
+    QCOMPARE(QDir(root).entryList(QDir::Files | QDir::Hidden),
+             QStringList{dataName});
+#endif
+}
+
+void StorageBrokerTest::permissionMigrationDoesNotFollowReplacedMember()
+{
+#ifdef Q_OS_WIN
+    QSKIP("POSIX descriptor-anchored permission migration coverage");
+#else
+    QTemporaryDir parent;
+    QVERIFY(parent.isValid());
+    const QString root = QDir(parent.path()).filePath(QStringLiteral("storage"));
+    QVERIFY(QDir().mkdir(root));
+    const QString namespacePath = QDir(root).filePath(
+        QString(64, u'a') + QStringLiteral(".json"));
+    const QString outsidePath = QDir(parent.path()).filePath(
+        QStringLiteral("outside.json"));
+    writeFile(namespacePath, QByteArrayLiteral("{}"));
+    writeFile(outsidePath, QByteArrayLiteral("{}"));
+    const QFileDevice::Permissions broadFilePermissions =
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+        | QFileDevice::ReadGroup | QFileDevice::WriteGroup
+        | QFileDevice::ReadOther | QFileDevice::WriteOther;
+    const QFileDevice::Permissions broadDirectoryPermissions =
+        broadFilePermissions | QFileDevice::ExeOwner | QFileDevice::ExeGroup
+        | QFileDevice::ExeOther;
+    QVERIFY(QFile::setPermissions(namespacePath, broadFilePermissions));
+    QVERIFY(QFile::setPermissions(outsidePath, broadFilePermissions));
+    QVERIFY(QFile::setPermissions(root, broadDirectoryPermissions));
+    const QFileDevice::Permissions outsideBefore =
+        QFileInfo(outsidePath).permissions();
+
+    bool replaced = false;
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = {},
+         .initializationLockContended = {},
+         .storageOperationLockContended = {},
+         .afterStorageOperationLockAcquired = {},
+         .allowPermissionApply = [&](const QString &path, const qsizetype) {
+             if (path == namespacePath) {
+                 replaced = QFile::remove(namespacePath)
+                     && QFile::link(outsidePath, namespacePath);
+             }
+             return true;
+         }});
+    const auto reset = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    QString error;
+    auto broker = StorageBroker::create(EffectiveStoragePolicy{1024}, root, &error);
+    QVERIFY(broker == nullptr);
+    QCOMPARE(error, QStringLiteral("storage.invalid_root"));
+    QVERIFY(replaced);
+    QCOMPARE(QFileInfo(outsidePath).permissions(), outsideBefore);
+#endif
 }
 
 void StorageBrokerTest::rejectsReparseRoot()
@@ -619,5 +1302,5 @@ void StorageBrokerTest::rejectsReparseNamespaceFile()
 #endif
 }
 
-QTEST_APPLESS_MAIN(StorageBrokerTest)
+QTEST_GUILESS_MAIN(StorageBrokerTest)
 #include "tst_storage_broker.moc"

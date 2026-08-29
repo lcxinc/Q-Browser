@@ -474,11 +474,35 @@ AppTabRuntimeController::realizeAttach(
     }
     if (transportLock.owns_lock()) transportLock.unlock();
 
-    if (!sessionController_->canAttachImmediately()) {
+    if (pending.capability->isWorkerInitializationComplete()
+        && !pending.capability->isWorkerReady()) {
+        if (pending.process != nullptr) {
+            pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        }
+        HostCapabilityRuntime::retire(std::move(pending.capability));
+        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    }
+
+    if (!pending.capability->isWorkerInitializationComplete()
+        || !sessionController_->canAttachImmediately()) {
         if (pendingAttach_.has_value()) {
             return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
         }
+        HostCapabilityRuntime *const pendingRuntime = pending.capability.get();
         pendingAttach_ = std::move(pending);
+        connect(
+            pendingRuntime,
+            &HostCapabilityRuntime::workerInitializationFinished,
+            this,
+            [this, pendingRuntime](const bool, const QString &) {
+                if (pendingAttach_.has_value()
+                    && pendingAttach_->capability.get() == pendingRuntime) {
+                    completePendingAttach(
+                        sessionController_ != nullptr
+                            ? sessionController_->generation()
+                            : 0);
+                }
+            });
         if (sessionController_->state() == HostWorkerSessionState::Running
             && !sessionController_->shutdown(
                 QStringLiteral("host.worker.rebind"))) {
@@ -514,6 +538,23 @@ void AppTabRuntimeController::completePendingAttach(
         || (transportGate_ != nullptr
             && !transportGate_->load(std::memory_order_acquire))) {
         clearPendingAttach();
+        return;
+    }
+    if (pendingAttach_->capability == nullptr) {
+        clearPendingAttach();
+        return;
+    }
+    if (!pendingAttach_->capability->isWorkerInitializationComplete()) {
+        return;
+    }
+    if (!pendingAttach_->capability->isWorkerReady()) {
+        const WorkerLaunchRequest request = pendingAttach_->request;
+        QString errorCode = pendingAttach_->capability->workerInitializationError();
+        if (errorCode.isEmpty()) {
+            errorCode = QStringLiteral("host.capability.worker_unavailable");
+        }
+        clearPendingAttach();
+        emit workerFailed(request, errorCode, 0);
         return;
     }
     if (!sessionController_->canAttachImmediately()) return;
@@ -573,6 +614,7 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
     };
     if (pending.session != nullptr || pending.surface == nullptr
         || pending.process == nullptr || pending.capability == nullptr
+        || !pending.capability->isWorkerReady()
         || sessionController_ == nullptr || tabController_.isNull()
         || mainWindow_.isNull()
         || sessionController_->state() != HostWorkerSessionState::Running

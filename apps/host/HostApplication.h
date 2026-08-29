@@ -145,6 +145,10 @@ private:
             InstalledPackageWorkerLauncher::CommittedAttachTransaction transaction);
     [[nodiscard]] InstalledPackageWorkerLauncher::AttachResult
         realizeWorkerContext(WorkerAttachContext context);
+    [[nodiscard]] bool attachInitializedWorkerContext(
+        WorkerAttachContext context);
+    void completePendingWorkerContext();
+    void clearPendingWorkerContext() noexcept;
     void synchronizeGestureAuthority();
 
     std::optional<HostRuntimeConfig> runtimeConfig_;
@@ -154,6 +158,7 @@ private:
     std::unique_ptr<FileDialogCoordinator> fileDialogCoordinator_;
     std::unique_ptr<HostWorkerSessionController> workerSessionController_;
     std::shared_ptr<HostCapabilityRuntime> capabilityRuntime_;
+    std::unique_ptr<WorkerAttachContext> pendingWorkerAttach_;
     std::shared_ptr<void> workerProcessLifetime_;
     std::function<void()> stopWorkerProcess_;
     std::unique_ptr<InstalledPackageWorkerLauncher> installedPackageLauncher_;

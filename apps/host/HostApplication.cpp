@@ -50,6 +50,7 @@ struct HostApplication::WorkerAttachContext final
     WorkerLaunchRequest launchRequest;
     quint32 processId = 0;
     std::function<void()> stopProcess;
+    std::shared_ptr<HostCapabilityRuntime> capability;
 };
 
 namespace
@@ -443,6 +444,7 @@ HostApplication::~HostApplication()
     acceptingLifecycle_.store(false, std::memory_order_release);
     if (updateHealthTimer_ != nullptr) updateHealthTimer_->stop();
     if (installedPackageLauncher_ != nullptr) installedPackageLauncher_->cancel();
+    clearPendingWorkerContext();
     const QList<QPointer<AppTabRuntimeController>> appRuntimeSnapshot =
         appTabRuntimeControllers_.values();
     for (const QPointer<AppTabRuntimeController> &controller :
@@ -1537,7 +1539,21 @@ bool HostApplication::initializePackageRuntime()
     }
     connect(installedPackageLauncher_.get(),
             &InstalledPackageWorkerLauncher::ready,
-            this, &HostApplication::packageWorkerReady);
+            this,
+            [this](const QString &appId, const QString &version,
+                   const QString &packageDirectory,
+                   const quint64 activation, const quint64 attempt,
+                   const quint32 processId) {
+                if (pendingWorkerAttach_ != nullptr
+                    && pendingWorkerAttach_->launchRequest.attempt
+                        == WorkerAttemptKey{WorkerActivationId{activation},
+                                            WorkerAttemptId{attempt}}) {
+                    return;
+                }
+                emit packageWorkerReady(
+                    appId, version, packageDirectory, activation, attempt,
+                    processId);
+            });
     connect(installedPackageLauncher_.get(),
             &InstalledPackageWorkerLauncher::unexpectedExit,
             this, &HostApplication::packageWorkerExited);
@@ -1923,7 +1939,8 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
         || fileDialogCoordinator_ == nullptr
         || context.session == nullptr || context.surface == nullptr
         || context.processLifetime == nullptr || !context.stopProcess
-        || workerProcessLifetime_ != nullptr || !runtimeConfig_.has_value()
+        || workerProcessLifetime_ != nullptr || pendingWorkerAttach_ != nullptr
+        || !runtimeConfig_.has_value()
         || runtimeConfig_->mode() != HostRuntimeMode::Package
         || request.admission == nullptr || request.tabId.isEmpty()
         || request.runtimeIncarnation == 0
@@ -1943,15 +1960,6 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
     }
     const quintptr workerWindowId = static_cast<quintptr>(
         context.surface->nativeWindowId());
-    WorkerSurface *const surface = context.surface.get();
-    if (!mainWindow_->attachWorkerSurface(std::move(context.surface))) {
-        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    }
-    if (mainWindow_->tabModel()->activeId() != tabId
-        || mainWindow_->tabController(tabId) != owningTab) {
-        mainWindow_->detachWorkerSurface();
-        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
-    }
     const TabCapabilityAuthority authority{
         request.tabId,
         request.runtimeIncarnation,
@@ -1961,7 +1969,6 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
         workerSessionController_->generation() + 1,
         request.lease.leaseAuthorityEpoch};
     if (!authority.isValid()) {
-        mainWindow_->detachWorkerSurface();
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     QString capabilityError;
@@ -1972,30 +1979,147 @@ HostApplication::realizeWorkerContext(WorkerAttachContext context)
         static_cast<quintptr>(mainWindow_->winId()), &capabilityError,
         fileDialogCoordinator_.get());
     if (capabilityRuntime == nullptr) {
-        mainWindow_->detachWorkerSurface();
         emit updateLifecycleFailed(
             capabilityError.isEmpty()
                 ? QStringLiteral("host.capability.initialization_failed")
                 : capabilityError);
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
-    if (!workerSessionController_->attach(std::move(context.session),
-                                          capabilityRuntime.get())) {
-        mainWindow_->detachWorkerSurface();
-        HostCapabilityRuntime::retire(std::move(capabilityRuntime));
-        return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+    context.capability = std::move(capabilityRuntime);
+    if (context.capability->isWorkerInitializationComplete()) {
+        if (!context.capability->isWorkerReady()) {
+            emit updateLifecycleFailed(
+                context.capability->workerInitializationError().isEmpty()
+                    ? QStringLiteral("host.capability.initialization_failed")
+                    : context.capability->workerInitializationError());
+            HostCapabilityRuntime::retire(std::move(context.capability));
+            return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+        }
+        if (!attachInitializedWorkerContext(std::move(context))) {
+            return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
+        }
+        return InstalledPackageWorkerLauncher::AttachResult::Attached;
     }
-    capabilityRuntime_ = std::move(capabilityRuntime);
+
+    HostCapabilityRuntime *const pendingCapability = context.capability.get();
+    pendingWorkerAttach_ = std::make_unique<WorkerAttachContext>(
+        std::move(context));
+    connect(
+        pendingCapability,
+        &HostCapabilityRuntime::workerInitializationFinished,
+        this,
+        [this, pendingCapability](const bool, const QString &) {
+            if (pendingWorkerAttach_ != nullptr
+                && pendingWorkerAttach_->capability.get()
+                    == pendingCapability) {
+                completePendingWorkerContext();
+            }
+        });
+    return InstalledPackageWorkerLauncher::AttachResult::Attached;
+}
+
+bool HostApplication::attachInitializedWorkerContext(
+    WorkerAttachContext context)
+{
+    bool surfaceAttached = false;
+    const auto rollback = [this, &context, &surfaceAttached] {
+        if (surfaceAttached && mainWindow_ != nullptr) {
+            mainWindow_->detachWorkerSurface();
+        }
+        if (context.stopProcess) {
+            context.stopProcess();
+        }
+        HostCapabilityRuntime::retire(std::move(context.capability));
+        return false;
+    };
+    const WorkerLaunchRequest &request = context.launchRequest;
+    BrowserTabModel *const tabModel = mainWindow_ != nullptr
+        ? mainWindow_->tabModel() : nullptr;
+    const QString tabId = tabModel != nullptr ? tabModel->activeId() : QString{};
+    TabController *const owningTab = mainWindow_ != nullptr
+        ? mainWindow_->tabController(tabId) : nullptr;
+    if (mainWindow_ == nullptr || workerSessionController_ == nullptr
+        || context.session == nullptr || context.surface == nullptr
+        || context.processLifetime == nullptr || !context.stopProcess
+        || context.capability == nullptr || !context.capability->isWorkerReady()
+        || workerProcessLifetime_ != nullptr || tabId.isEmpty()
+        || tabId != request.tabId || owningTab == nullptr
+        || context.capability->authority().sessionGeneration
+            != workerSessionController_->generation() + 1) {
+        return rollback();
+    }
+
+    WorkerSurface *const surface = context.surface.get();
+    if (!mainWindow_->attachWorkerSurface(std::move(context.surface))) {
+        return rollback();
+    }
+    surfaceAttached = true;
+    if (mainWindow_->tabModel()->activeId() != tabId
+        || mainWindow_->tabController(tabId) != owningTab
+        || !workerSessionController_->attach(
+            std::move(context.session), context.capability.get())) {
+        return rollback();
+    }
+    capabilityRuntime_ = std::move(context.capability);
     workerProcessLifetime_ = std::move(context.processLifetime);
     stopWorkerProcess_ = std::move(context.stopProcess);
     attachedWorkerKey_ = request.attempt;
     synchronizeGestureAuthority();
     Q_ASSERT(mainWindow_->workerSurface() == surface);
-    return InstalledPackageWorkerLauncher::AttachResult::Attached;
+    return true;
+}
+
+void HostApplication::completePendingWorkerContext()
+{
+    if (pendingWorkerAttach_ == nullptr
+        || pendingWorkerAttach_->capability == nullptr
+        || !pendingWorkerAttach_->capability
+                ->isWorkerInitializationComplete()) {
+        return;
+    }
+    WorkerAttachContext context = std::move(*pendingWorkerAttach_);
+    pendingWorkerAttach_.reset();
+    const WorkerLaunchRequest request = context.launchRequest;
+    const quint32 processId = context.processId;
+    if (!context.capability->isWorkerReady()) {
+        const QString errorCode =
+            context.capability->workerInitializationError().isEmpty()
+            ? QStringLiteral("host.capability.initialization_failed")
+            : context.capability->workerInitializationError();
+        if (context.stopProcess) {
+            context.stopProcess();
+        }
+        HostCapabilityRuntime::retire(std::move(context.capability));
+        emit updateLifecycleFailed(errorCode);
+        return;
+    }
+    if (!attachInitializedWorkerContext(std::move(context))) {
+        emit updateLifecycleFailed(
+            QStringLiteral("host.capability.initialization_failed"));
+        return;
+    }
+    emit packageWorkerReady(
+        request.lease.appId, request.lease.version,
+        request.lease.packageDirectory, request.attempt.activation.value,
+        request.attempt.attempt.value, processId);
+}
+
+void HostApplication::clearPendingWorkerContext() noexcept
+{
+    if (pendingWorkerAttach_ == nullptr) {
+        return;
+    }
+    if (pendingWorkerAttach_->stopProcess) {
+        pendingWorkerAttach_->stopProcess();
+    }
+    HostCapabilityRuntime::retire(
+        std::move(pendingWorkerAttach_->capability));
+    pendingWorkerAttach_.reset();
 }
 
 void HostApplication::detachWorkerContext(const QString &reason)
 {
+    clearPendingWorkerContext();
     if (workerProcessLifetime_ == nullptr) return;
     if (workerSessionController_ != nullptr
         && workerSessionController_->state() == HostWorkerSessionState::Running) {

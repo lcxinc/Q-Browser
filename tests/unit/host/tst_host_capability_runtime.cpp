@@ -6,6 +6,7 @@
 #include "HostCapabilityRuntime.h"
 #include "HostGestureRouter.h"
 #include "MainWindow.h"
+#include "StorageTestHooks.h"
 #include "TabCapabilityAuthority.h"
 #include "WorkerRetirementManager.h"
 
@@ -135,6 +136,8 @@ private slots:
     void queuedBrowserCommandCannotReviveAfterBindingRoundTrip();
     void heldBrowserChordRemainsSuppressedAcrossBindingSwitch();
     void revocationClosesUseAndPublicationUntilGuardDrains();
+    void storageInitializationRunsOffGuiAndEventuallySerializes();
+    void storageInitializationFailureRemainsFailClosed();
     void retiringRuntimeLeavesSiblingGestureStorageAndCompletionActive();
     void repeatedRetireClaimsWorkerExactlyOnce();
     void slowRequestRetiresWithoutBlockingOrLateDelivery();
@@ -1260,6 +1263,140 @@ void HostCapabilityRuntimeTest::revocationClosesUseAndPublicationUntilGuardDrain
              std::future_status::ready);
     QVERIFY(drained.get());
     QVERIFY(ticket.isDrained());
+}
+
+void HostCapabilityRuntimeTest::storageInitializationRunsOffGuiAndEventuallySerializes()
+{
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
+
+    QSemaphore firstInitializationEntered;
+    QSemaphore releaseFirstInitialization;
+    QSemaphore secondInitializationContended;
+    std::atomic_int initializationEntries{0};
+    qbrowser_broker_testing::setStorageTestHooks(
+        {.afterMembershipFrozen = {},
+         .allowAclApply = {},
+         .allowAclPostcheck = {},
+         .afterInitializationLockAcquired = [&](const QString &) {
+             if (initializationEntries.fetch_add(1) == 0) {
+                 firstInitializationEntered.release();
+                 releaseFirstInitialization.acquire();
+             }
+         },
+         .initializationLockContended = [&](const QString &) {
+             secondInitializationContended.release();
+         }});
+    const auto resetHooks = qScopeGuard([] {
+        qbrowser_broker_testing::resetStorageTestHooks();
+    });
+
+    QSemaphore firstCreateReturned;
+    std::atomic_bool firstCreateBlocked{false};
+    auto watchdog = std::async(std::launch::async, [&] {
+        if (!firstCreateReturned.tryAcquire(1, 1'000)) {
+            firstCreateBlocked.store(true);
+            releaseFirstInitialization.release();
+        }
+    });
+    QString firstError;
+    auto first = HostCapabilityRuntime::create(
+        QStringLiteral("com.qbrowser.shared"),
+        clipboardAndStoragePermissions(), origin, storage.path(),
+        0, 0, 0, &firstError);
+    firstCreateReturned.release();
+    const bool firstEntered = firstInitializationEntered.tryAcquire(1, 2'000);
+
+    QSemaphore secondCreateReturned;
+    std::atomic_bool secondCreateBlocked{false};
+    auto secondWatchdog = std::async(std::launch::async, [&] {
+        if (!secondCreateReturned.tryAcquire(1, 1'000)) {
+            secondCreateBlocked.store(true);
+            releaseFirstInitialization.release();
+        }
+    });
+    QString secondError;
+    auto second = HostCapabilityRuntime::create(
+        QStringLiteral("com.qbrowser.shared"),
+        clipboardAndStoragePermissions(), origin, storage.path(),
+        0, 0, 0, &secondError);
+    secondCreateReturned.release();
+    const bool secondContended = secondInitializationContended.tryAcquire(1, 2'000);
+    releaseFirstInitialization.release();
+    watchdog.get();
+    secondWatchdog.get();
+
+    auto cleanup = qScopeGuard([&] {
+        releaseFirstInitialization.release();
+        HostCapabilityRuntime::retire(std::exchange(first, {}));
+        HostCapabilityRuntime::retire(std::exchange(second, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QVERIFY2(first != nullptr, qPrintable(firstError));
+    QVERIFY2(second != nullptr, qPrintable(secondError));
+    QVERIFY(firstEntered);
+    QVERIFY2(!firstCreateBlocked.load(), "First GUI create blocked for one second");
+    QVERIFY2(!secondCreateBlocked.load(),
+             "Sibling GUI create blocked for one second");
+    QVERIFY2(secondContended,
+             "Sibling initialization did not enter the canonical-root lock");
+
+    QSignalSpy firstCompleted(first.get(), &HostCapabilityRuntime::completed);
+    QSignalSpy secondCompleted(second.get(), &HostCapabilityRuntime::completed);
+    QVERIFY(firstCompleted.isValid());
+    QVERIFY(secondCompleted.isValid());
+    first->dispatch(
+        1, QStringLiteral("set-after-initialization"),
+        QStringLiteral("storage"), QStringLiteral("set"),
+        {{QStringLiteral("key"), QStringLiteral("ready")},
+         {QStringLiteral("value"), true}});
+    QTRY_COMPARE_WITH_TIMEOUT(firstCompleted.count(), 1, 5'000);
+    QVERIFY2(firstCompleted.at(0).at(2).value<BrokerResult>().ok,
+             qPrintable(firstCompleted.at(0).at(2).value<BrokerResult>().errorCode));
+
+    second->dispatch(
+        1, QStringLiteral("get-after-initialization"),
+        QStringLiteral("storage"), QStringLiteral("get"),
+        {{QStringLiteral("key"), QStringLiteral("ready")}});
+    QTRY_COMPARE_WITH_TIMEOUT(secondCompleted.count(), 1, 5'000);
+    const BrokerResult result = secondCompleted.at(0).at(2).value<BrokerResult>();
+    QVERIFY2(result.ok, qPrintable(result.errorCode));
+    QCOMPARE(result.value.value(QStringLiteral("value")).toBool(), true);
+    QCOMPARE(initializationEntries.load(), 2);
+}
+
+void HostCapabilityRuntimeTest::storageInitializationFailureRemainsFailClosed()
+{
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    QVERIFY(QDir(storage.path()).mkdir(QStringLiteral("unexpected")));
+    const QUrl origin(QStringLiteral("http://127.0.0.1:8080/"));
+
+    QString error;
+    auto runtime = HostCapabilityRuntime::create(
+        QStringLiteral("com.qbrowser.invalid-storage"),
+        clipboardAndStoragePermissions(), origin, storage.path(),
+        0, 0, 0, &error);
+    QVERIFY2(runtime != nullptr, qPrintable(error));
+    const auto cleanup = qScopeGuard([&] {
+        HostCapabilityRuntime::retire(std::exchange(runtime, {}));
+        (void)WorkerRetirementManager::instance().flush(10'000);
+    });
+    QSignalSpy initialized(
+        runtime.get(), &HostCapabilityRuntime::workerInitializationFinished);
+    QVERIFY(initialized.isValid());
+
+    QTRY_VERIFY_WITH_TIMEOUT(runtime->isWorkerInitializationComplete(), 5'000);
+    QCOMPARE(initialized.count(), 1);
+    QVERIFY(!runtime->isWorkerReady());
+    QCOMPARE(runtime->workerInitializationError(),
+             QStringLiteral("storage.invalid_root"));
+    QVERIFY(!runtime->bindCompletionSubmitter(
+        runtime->authority(),
+        [](const std::shared_ptr<CapabilityDeliveryState> &) {
+            return true;
+        }));
 }
 
 void HostCapabilityRuntimeTest::retiringRuntimeLeavesSiblingGestureStorageAndCompletionActive()

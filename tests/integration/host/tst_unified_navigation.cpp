@@ -1726,6 +1726,9 @@ void UnifiedNavigationTest::capabilityPendingKeepsHeartbeatAndBoundsSecondReques
             sessions->worker->close();
         (void)WorkerRetirementManager::instance().flush(10'000);
     });
+    QTRY_VERIFY_WITH_TIMEOUT(runtime->isWorkerInitializationComplete(), 5'000);
+    QVERIFY2(runtime->isWorkerReady(),
+             qPrintable(runtime->workerInitializationError()));
     QVERIFY(controller.attach(std::move(sessions->host), runtime.get()));
     QSignalSpy heartbeats(&controller,
                           &HostWorkerSessionController::heartbeatObserved);
@@ -2163,7 +2166,7 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
     QCOMPARE(application.attachWorkerContextForTesting(std::move(context)),
              InstalledPackageWorkerLauncher::AttachResult::Attached);
-    QVERIFY(application.hasWorkerContext());
+    QTRY_VERIFY_WITH_TIMEOUT(application.hasWorkerContext(), 5'000);
     QCOMPARE(application.mainWindow()->workerSurface(), surfacePointer);
     QCOMPARE(application.workerSessionController()->state(),
              HostWorkerSessionState::Running);

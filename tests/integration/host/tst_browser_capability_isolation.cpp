@@ -939,6 +939,9 @@ void BrowserCapabilityIsolationTest::
         QUrl(QStringLiteral("http://127.0.0.1:32191/")), storage.path(),
         1, &errorCode, nullptr);
     QVERIFY2(runtime != nullptr, qPrintable(errorCode));
+    QTRY_VERIFY_WITH_TIMEOUT(runtime->isWorkerInitializationComplete(), 5'000);
+    QVERIFY2(runtime->isWorkerReady(),
+             qPrintable(runtime->workerInitializationError()));
     const auto cleanup = qScopeGuard([&] {
         controller.unbindCapabilityRuntime(authority);
         HostCapabilityRuntime::retire(std::exchange(runtime, {}));
