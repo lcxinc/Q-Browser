@@ -3,9 +3,87 @@
 #include <QScopedValueRollback>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
+#include <mutex>
+
+struct IpcPendingRequestState final
+{
+    enum class Phase { Reserved, Published, Terminal };
+
+    std::atomic<qint64> deadlineMonotonicMs{0};
+    std::atomic<Phase> phase{Phase::Reserved};
+};
 
 namespace {
+
+qint64 steadyMonotonicMs() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+class ArmableSendCompletion final
+{
+public:
+    explicit ArmableSendCompletion(
+        std::function<void(const PipeWriteResult &)> callback)
+        : callback_(std::move(callback))
+    {
+    }
+
+    void complete(const PipeWriteResult &result) noexcept
+    {
+        std::function<void(const PipeWriteResult &)> callback;
+        {
+            const std::lock_guard lock(mutex_);
+            if (delivered_) return;
+            if (!armed_) {
+                result_ = result;
+                return;
+            }
+            delivered_ = true;
+            callback = std::move(callback_);
+        }
+        invoke(callback, result);
+    }
+
+    void arm() noexcept
+    {
+        std::function<void(const PipeWriteResult &)> callback;
+        std::optional<PipeWriteResult> result;
+        {
+            const std::lock_guard lock(mutex_);
+            if (armed_) return;
+            armed_ = true;
+            if (!result_.has_value()) return;
+            delivered_ = true;
+            result = std::move(result_);
+            callback = std::move(callback_);
+        }
+        invoke(callback, *result);
+    }
+
+private:
+    static void invoke(
+        const std::function<void(const PipeWriteResult &)> &callback,
+        const PipeWriteResult &result) noexcept
+    {
+        if (!callback) return;
+        try {
+            callback(result);
+        } catch (...) {
+        }
+    }
+
+    std::mutex mutex_;
+    std::function<void(const PipeWriteResult &)> callback_;
+    std::optional<PipeWriteResult> result_;
+    bool armed_ = false;
+    bool delivered_ = false;
+};
 
 bool outgoingTypeAllowed(const IpcRole role, const ProtocolType type)
 {
@@ -60,19 +138,39 @@ IpcSendSubmission IpcSession::submitSend(const ProtocolMessage &message,
 
 IpcSendSubmission IpcSession::submitInternal(const ProtocolMessage &message,
                                              IpcSendWork work,
-                                             const bool allowTrackedMessage)
+                                             const bool allowTrackedMessage,
+                                             std::function<void(
+                                                 const PipeWriteResult &)>
+                                                 terminalObserver,
+                                             std::function<void()>
+                                                 rejectionObserver)
 {
     std::optional<QByteArray> frame = prepareSend(message, allowTrackedMessage);
-    if (!frame.has_value()) return {false, lastErrorCode_, {}};
+    if (!frame.has_value()) {
+        if (rejectionObserver) rejectionObserver();
+        return {false, lastErrorCode_, {}};
+    }
+
+    const auto completion = std::make_shared<ArmableSendCompletion>(
+        std::move(work.completion));
 
     PipeWriteSubmission submission = transport_.submitWrite(PipeWriteWork{
         std::move(*frame), std::move(work.publicationGate),
-        std::move(work.completion)});
+        [completion, observer = std::move(terminalObserver)](
+            const PipeWriteResult &result) {
+            if (observer) observer(result);
+            completion->complete(result);
+        }});
     if (!submission.accepted) {
+        if (rejectionObserver) rejectionObserver();
         lastErrorCode_ = submission.errorCode;
         return submission;
     }
     noteAcceptedSend(message);
+    // This is deliberately the final operation which can invoke user code.
+    // A tiny write may have completed on the transport thread before
+    // submitWrite returned, but session bookkeeping is now committed first.
+    completion->arm();
     return submission;
 }
 
@@ -147,6 +245,50 @@ void IpcSession::noteAcceptedSend(const ProtocolMessage &message)
     }
 }
 
+std::shared_ptr<IpcPendingRequestState>
+IpcSession::reservePendingRequest(const QString &requestId)
+{
+    pruneTerminalPendingRequests();
+    if (pendingRequests_.contains(requestId)) {
+        lastErrorCode_ = QStringLiteral("ipc.session.duplicate_request_id");
+        return {};
+    }
+    constexpr qsizetype maximumPendingRequests = 1024;
+    if (pendingRequests_.size() >= maximumPendingRequests) {
+        lastErrorCode_ = QStringLiteral("ipc.session.pending_request_limit");
+        return {};
+    }
+    auto reservation = std::make_shared<IpcPendingRequestState>();
+    pendingRequests_.insert(requestId, reservation);
+    return reservation;
+}
+
+void IpcSession::removePendingRequest(
+    const QString &requestId,
+    const std::shared_ptr<IpcPendingRequestState> &expected)
+{
+    const auto iterator = pendingRequests_.find(requestId);
+    if (iterator != pendingRequests_.end() && iterator.value() == expected) {
+        pendingRequests_.erase(iterator);
+    }
+}
+
+void IpcSession::pruneTerminalPendingRequests()
+{
+    for (auto iterator = pendingRequests_.begin();
+         iterator != pendingRequests_.end();) {
+        const std::shared_ptr<IpcPendingRequestState> &request =
+            iterator.value();
+        if (request == nullptr
+            || request->phase.load(std::memory_order_acquire)
+                == IpcPendingRequestState::Phase::Terminal) {
+            iterator = pendingRequests_.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+}
+
 bool IpcSession::sendRequest(const QString &requestId,
                             const QString &capability,
                             const QString &operation,
@@ -175,27 +317,37 @@ IpcSendSubmission IpcSession::submitRouteLoad(const QString &requestId,
         lastErrorCode_ = QStringLiteral("ipc.session.invalid_timeout");
         return {false, lastErrorCode_, {}};
     }
-    if (pendingRequests_.contains(requestId)) {
-        lastErrorCode_ = QStringLiteral("ipc.session.duplicate_request_id");
-        return {false, lastErrorCode_, {}};
-    }
-    constexpr qsizetype maximumPendingRequests = 1024;
-    if (pendingRequests_.size() >= maximumPendingRequests) {
-        lastErrorCode_ = QStringLiteral("ipc.session.pending_request_limit");
-        return {false, lastErrorCode_, {}};
-    }
+    const std::shared_ptr<IpcPendingRequestState> reservation =
+        reservePendingRequest(requestId);
+    if (reservation == nullptr) return {false, lastErrorCode_, {}};
     const auto message = ProtocolMessage::routeLoad(requestId, route);
     if (!message.has_value()) {
+        removePendingRequest(requestId, reservation);
         lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
         return {false, lastErrorCode_, {}};
     }
-    IpcSendSubmission submission = submitInternal(
-        *message, std::move(work), true);
-    if (submission.accepted) {
-        pendingRequests_.insert(requestId,
-                                clock_.elapsed() + responseTimeoutMs);
-    }
-    return submission;
+
+    return submitInternal(
+        *message, std::move(work), true,
+        [reservation, responseTimeoutMs](const PipeWriteResult &result) {
+            if (result.status != PipeIoStatus::Ok) {
+                reservation->phase.store(
+                    IpcPendingRequestState::Phase::Terminal,
+                    std::memory_order_release);
+                return;
+            }
+            reservation->deadlineMonotonicMs.store(
+                steadyMonotonicMs() + responseTimeoutMs,
+                std::memory_order_relaxed);
+            reservation->phase.store(
+                IpcPendingRequestState::Phase::Published,
+                std::memory_order_release);
+        },
+        [reservation] {
+            reservation->phase.store(
+                IpcPendingRequestState::Phase::Terminal,
+                std::memory_order_release);
+        });
 }
 
 bool IpcSession::sendNavigationRequest(const QString &requestId,
@@ -284,11 +436,13 @@ SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
     QElapsedTimer receiveTimer;
     receiveTimer.start();
     for (;;) {
-        const qint64 now = clock_.elapsed();
+        const qint64 now = steadyMonotonicMs();
         const int callerRemaining = std::max(
             0, timeoutMs - static_cast<int>(receiveTimer.elapsed()));
         int remaining = callerRemaining;
-        if (const auto requestDeadline = nearestPendingDeadline();
+        bool publicationPending = false;
+        if (const auto requestDeadline =
+                nearestPendingDeadline(publicationPending);
             requestDeadline.has_value()) {
             const qint64 requestRemaining = *requestDeadline - now;
             if (requestRemaining <= 0) {
@@ -299,12 +453,20 @@ SessionReceiveResult IpcSession::receiveImpl(const int timeoutMs,
                                                 requestRemaining,
                                                 std::numeric_limits<int>::max())));
         }
+        if (publicationPending) {
+            // Publication and its response deadline are armed by the writer
+            // thread. Re-sample briefly so a route published after this loop
+            // entered readSome cannot inherit the caller's much longer wait.
+            constexpr int publicationStatePollMs = 5;
+            remaining = std::min(remaining, publicationStatePollMs);
+        }
         const PipeReadResult read = transport_.readSome(64 * 1024, remaining);
         if (read.status == PipeIoStatus::TimedOut) {
             if (pendingRequestExpired()) {
                 return fail(SessionStatus::TimedOut,
                             QStringLiteral("ipc.session.request_timeout"));
             }
+            if (receiveTimer.elapsed() < timeoutMs) continue;
             if (closeOnCallerTimeout) {
                 return fail(SessionStatus::TimedOut, QStringLiteral("ipc.session.timeout"));
             }
@@ -369,7 +531,16 @@ QString IpcSession::lastErrorCode() const
 
 qsizetype IpcSession::pendingRequestCount() const noexcept
 {
-    return pendingRequests_.size();
+    qsizetype active = 0;
+    for (const std::shared_ptr<IpcPendingRequestState> &request :
+         pendingRequests_) {
+        if (request != nullptr
+            && request->phase.load(std::memory_order_acquire)
+                != IpcPendingRequestState::Phase::Terminal) {
+            ++active;
+        }
+    }
+    return active;
 }
 
 qint64 IpcSession::lastPeerActivityMonotonicMs() const noexcept
@@ -459,9 +630,12 @@ SessionReceiveResult IpcSession::processFrame(const QJsonObject &object)
         }
         receivedRequestIds_.insert(message.requestId());
     } else if (message.type() == ProtocolType::Response) {
-        if (!pendingRequests_.remove(message.requestId())) {
+        pruneTerminalPendingRequests();
+        const auto pending = pendingRequests_.find(message.requestId());
+        if (pending == pendingRequests_.end()) {
             return fail(SessionStatus::Failed, QStringLiteral("ipc.session.unknown_response"));
         }
+        pendingRequests_.erase(pending);
     }
     lastPeerActivityMs_ = std::max<qint64>(1, clock_.elapsed());
     return {SessionStatus::MessageReady, message, {}};
@@ -474,27 +648,42 @@ SessionReceiveResult IpcSession::fail(const SessionStatus status, const QString 
     return {status, std::nullopt, code};
 }
 
-bool IpcSession::pendingRequestExpired() const
+bool IpcSession::pendingRequestExpired()
 {
-    const qint64 now = clock_.elapsed();
-    for (auto iterator = pendingRequests_.constBegin();
-         iterator != pendingRequests_.constEnd();
-         ++iterator) {
-        if (iterator.value() <= now) {
+    pruneTerminalPendingRequests();
+    const qint64 now = steadyMonotonicMs();
+    for (const std::shared_ptr<IpcPendingRequestState> &request :
+         pendingRequests_) {
+        if (request != nullptr
+            && request->phase.load(std::memory_order_acquire)
+                == IpcPendingRequestState::Phase::Published
+            && request->deadlineMonotonicMs.load(std::memory_order_relaxed)
+                <= now) {
             return true;
         }
     }
     return false;
 }
 
-std::optional<qint64> IpcSession::nearestPendingDeadline() const
+std::optional<qint64> IpcSession::nearestPendingDeadline(
+    bool &publicationPending) const
 {
+    publicationPending = false;
     std::optional<qint64> nearest;
-    for (auto iterator = pendingRequests_.constBegin();
-         iterator != pendingRequests_.constEnd();
-         ++iterator) {
-        if (!nearest.has_value() || iterator.value() < *nearest) {
-            nearest = iterator.value();
+    for (const std::shared_ptr<IpcPendingRequestState> &request :
+         pendingRequests_) {
+        if (request == nullptr) continue;
+        const IpcPendingRequestState::Phase phase = request->phase.load(
+            std::memory_order_acquire);
+        if (phase == IpcPendingRequestState::Phase::Reserved) {
+            publicationPending = true;
+            continue;
+        }
+        if (phase != IpcPendingRequestState::Phase::Published) continue;
+        const qint64 deadline = request->deadlineMonotonicMs.load(
+            std::memory_order_relaxed);
+        if (!nearest.has_value() || deadline < *nearest) {
+            nearest = deadline;
         }
     }
     return nearest;
@@ -507,22 +696,21 @@ bool IpcSession::sendTracked(const QString &requestId,
     if (closed_) {
         return false;
     }
-    if (pendingRequests_.contains(requestId)) {
-        lastErrorCode_ = QStringLiteral("ipc.session.duplicate_request_id");
-        return false;
-    }
-    constexpr qsizetype maximumPendingRequests = 1024;
-    if (pendingRequests_.size() >= maximumPendingRequests) {
-        lastErrorCode_ = QStringLiteral("ipc.session.pending_request_limit");
-        return false;
-    }
+    const std::shared_ptr<IpcPendingRequestState> reservation =
+        reservePendingRequest(requestId);
+    if (reservation == nullptr) return false;
     if (!message.has_value()) {
+        removePendingRequest(requestId, reservation);
         lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
         return false;
     }
     if (!sendInternal(*message, timeoutMs, true)) {
+        removePendingRequest(requestId, reservation);
         return false;
     }
-    pendingRequests_.insert(requestId, clock_.elapsed() + timeoutMs);
+    reservation->deadlineMonotonicMs.store(
+        steadyMonotonicMs() + timeoutMs, std::memory_order_relaxed);
+    reservation->phase.store(IpcPendingRequestState::Phase::Published,
+                             std::memory_order_release);
     return true;
 }

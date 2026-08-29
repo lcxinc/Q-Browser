@@ -155,6 +155,10 @@ private slots:
     void completionCanCloseItsTransportAndQuiescesQueuedWrites();
     void blockedWriterDoesNotDelaySiblingTransport();
     void publicationGateRunsAtDequeueAndCanDiscard();
+    void asynchronousRouteDeadlineStartsAfterSuccessfulPublication();
+    void asynchronousRouteDeadlineWakesBlockingReceive();
+    void cancelledRoutePublicationReleasesItsReservation();
+    void asynchronousCompletionCanDestroyItsSession();
     void authenticatesNonceAndUsesHostAssignedIdentity();
     void rejectsWrongNonceAndMalformedPeer();
     void correlatesResponsesAndRejectsDuplicateRequestIds();
@@ -298,6 +302,20 @@ void IpcSessionTest::pipeWriteTimeoutIsBounded()
     QCOMPARE(completion, std::future_status::ready);
     QVERIFY(!result);
     QCOMPARE(host.lastStatus(), PipeIoStatus::TimedOut);
+
+    DWORD bufferedAtReturn = 0;
+    QVERIFY(PeekNamedPipe(worker.nativeReadHandle(), nullptr, 0, nullptr,
+                          &bufferedAtReturn, nullptr));
+    QVERIFY(bufferedAtReturn > 0);
+    const PipeReadResult buffered = worker.readSome(
+        static_cast<qsizetype>(bufferedAtReturn), 100);
+    QCOMPARE(buffered.status, PipeIoStatus::Ok);
+    QCOMPARE(buffered.bytes.size(), static_cast<qsizetype>(bufferedAtReturn));
+    QTest::qWait(50);
+    const PipeReadResult afterReturn = worker.readSome(1, 50);
+    QVERIFY(afterReturn.status == PipeIoStatus::PeerClosed
+            || afterReturn.status == PipeIoStatus::TimedOut);
+    QVERIFY(afterReturn.bytes.isEmpty());
 #endif
 }
 
@@ -847,6 +865,249 @@ void IpcSessionTest::publicationGateRunsAtDequeueAndCanDiscard()
     QCOMPARE(receiver.readSome(64, 20).status, PipeIoStatus::TimedOut);
     sender.close();
     QCOMPARE(completionCalls.load(std::memory_order_relaxed), 1);
+#endif
+}
+
+void IpcSessionTest::asynchronousRouteDeadlineStartsAfterSuccessfulPublication()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    IpcSession host(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("deferred-route-deadline"),
+                          QStringLiteral("com.qbrowser.deferred-route")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("deferred-route-deadline"))));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    QVERIFY(worker.sendRequest(
+        QStringLiteral("blocking-response"), QStringLiteral("storage"),
+        QStringLiteral("get"), QJsonObject{}, 1'000));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    const auto blockingResponse = ProtocolMessage::successResponse(
+        QStringLiteral("blocking-response"),
+        QJsonObject{{QStringLiteral("content"), QString(512 * 1024, u'x')}});
+    QVERIFY(blockingResponse.has_value());
+    IpcSendSubmission blocker = host.submitSend(*blockingResponse);
+    QVERIFY(blocker.accepted);
+
+    QSemaphore published;
+    std::atomic<PipeIoStatus> publicationStatus{PipeIoStatus::Failed};
+    IpcSendSubmission route = host.submitRouteLoad(
+        QStringLiteral("deferred-route"), QStringLiteral("/orders"), 25,
+        IpcSendWork{
+            {},
+            [&](const PipeWriteResult &result) {
+                publicationStatus.store(result.status,
+                                        std::memory_order_release);
+                published.release();
+            }});
+    QVERIFY(route.accepted);
+    QCOMPARE(host.pendingRequestCount(), qsizetype(1));
+
+    QTest::qWait(75);
+    const SessionReceiveResult beforePublication = host.poll(0);
+    QCOMPARE(beforePublication.status, SessionStatus::TimedOut);
+    QVERIFY(!host.isClosed());
+    QCOMPARE(host.pendingRequestCount(), qsizetype(1));
+
+    const SessionReceiveResult blocking = worker.receive(2'000);
+    QCOMPARE(blocking.status, SessionStatus::MessageReady);
+    QCOMPARE(blocking.message->requestId(),
+             QStringLiteral("blocking-response"));
+    const SessionReceiveResult routed = worker.receive(2'000);
+    QCOMPARE(routed.status, SessionStatus::MessageReady);
+    QCOMPARE(routed.message->requestId(), QStringLiteral("deferred-route"));
+    QVERIFY(published.tryAcquire(1, 1'000));
+    QCOMPARE(publicationStatus.load(std::memory_order_acquire),
+             PipeIoStatus::Ok);
+
+    QTest::qWait(50);
+    QCOMPARE(host.poll(0).status, SessionStatus::TimedOut);
+    QCOMPARE(host.lastErrorCode(),
+             QStringLiteral("ipc.session.request_timeout"));
+    QVERIFY(host.isClosed());
+#endif
+}
+
+void IpcSessionTest::asynchronousRouteDeadlineWakesBlockingReceive()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    IpcSession host(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("published-route-wakeup"),
+                          QStringLiteral("com.qbrowser.route-wakeup")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("published-route-wakeup"))));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    QSemaphore existingPublished;
+    QVERIFY(host.submitRouteLoad(
+                    QStringLiteral("existing-long-route"),
+                    QStringLiteral("/existing"), 5'000,
+                    IpcSendWork{
+                        {},
+                        [&existingPublished](const PipeWriteResult &result) {
+                            if (result.status == PipeIoStatus::Ok)
+                                existingPublished.release();
+                        }})
+                .accepted);
+    const SessionReceiveResult existing = worker.receive(1'000);
+    QCOMPARE(existing.status, SessionStatus::MessageReady);
+    QCOMPARE(existing.message->requestId(),
+             QStringLiteral("existing-long-route"));
+    QVERIFY(existingPublished.tryAcquire(1, 1'000));
+
+    QVERIFY(worker.sendRequest(
+        QStringLiteral("wakeup-blocker"), QStringLiteral("storage"),
+        QStringLiteral("get"), QJsonObject{}, 1'000));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    const auto blockingResponse = ProtocolMessage::successResponse(
+        QStringLiteral("wakeup-blocker"),
+        QJsonObject{{QStringLiteral("content"), QString(512 * 1024, u'x')}});
+    QVERIFY(blockingResponse.has_value());
+    QVERIFY(host.submitSend(*blockingResponse).accepted);
+    QVERIFY(host.submitRouteLoad(
+                    QStringLiteral("wakeup-route"), QStringLiteral("/orders"),
+                    25)
+                .accepted);
+
+    auto drainWorker = std::async(std::launch::async, [&worker] {
+        QTest::qSleep(75);
+        const SessionReceiveResult blocking = worker.receive(2'000);
+        const SessionReceiveResult routed = worker.receive(2'000);
+        return std::pair{blocking, routed};
+    });
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const SessionReceiveResult expired = host.receive(1'000);
+    const qint64 expiryElapsedMs = elapsed.elapsed();
+
+    QCOMPARE(expired.status, SessionStatus::TimedOut);
+    QCOMPARE(expired.errorCode,
+             QStringLiteral("ipc.session.request_timeout"));
+    QVERIFY2(expiryElapsedMs < 500,
+             qPrintable(QStringLiteral(
+                            "published request deadline was enforced after %1 ms")
+                            .arg(expiryElapsedMs)));
+    const auto drained = drainWorker.get();
+    QCOMPARE(drained.first.status, SessionStatus::MessageReady);
+    QCOMPARE(drained.first.message->requestId(),
+             QStringLiteral("wakeup-blocker"));
+    QCOMPARE(drained.second.status, SessionStatus::MessageReady);
+    QCOMPARE(drained.second.message->requestId(),
+             QStringLiteral("wakeup-route"));
+#endif
+}
+
+void IpcSessionTest::cancelledRoutePublicationReleasesItsReservation()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    IpcSession host(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("cancelled-route"),
+                          QStringLiteral("com.qbrowser.cancelled-route")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("cancelled-route"))));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    QVERIFY(worker.sendRequest(
+        QStringLiteral("blocking-cancel"), QStringLiteral("storage"),
+        QStringLiteral("get"), QJsonObject{}, 1'000));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    const auto blockingResponse = ProtocolMessage::successResponse(
+        QStringLiteral("blocking-cancel"),
+        QJsonObject{{QStringLiteral("content"), QString(512 * 1024, u'x')}});
+    QVERIFY(blockingResponse.has_value());
+    QVERIFY(host.submitSend(*blockingResponse).accepted);
+
+    QSemaphore completed;
+    std::atomic<PipeIoStatus> completionStatus{PipeIoStatus::Failed};
+    IpcSendSubmission cancelled = host.submitRouteLoad(
+        QStringLiteral("reusable-route"), QStringLiteral("/first"), 5'000,
+        IpcSendWork{
+            [] { return false; },
+            [&](const PipeWriteResult &result) {
+                completionStatus.store(result.status,
+                                       std::memory_order_release);
+                completed.release();
+            }});
+    QVERIFY(cancelled.accepted);
+    QCOMPARE(host.pendingRequestCount(), qsizetype(1));
+
+    QCOMPARE(worker.receive(2'000).status, SessionStatus::MessageReady);
+    QVERIFY(completed.tryAcquire(1, 1'000));
+    QCOMPARE(completionStatus.load(std::memory_order_acquire),
+             PipeIoStatus::Cancelled);
+    QCOMPARE(host.pendingRequestCount(), qsizetype(0));
+    QVERIFY(!host.isClosed());
+
+    IpcSendSubmission reused = host.submitRouteLoad(
+        QStringLiteral("reusable-route"), QStringLiteral("/second"), 5'000);
+    QVERIFY2(reused.accepted, qPrintable(reused.errorCode));
+    host.close();
+#endif
+}
+
+void IpcSessionTest::asynchronousCompletionCanDestroyItsSession()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    QVERIFY(pair.isValid());
+    auto host = std::make_unique<IpcSession>(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("destroying-completion"),
+                          QStringLiteral("com.qbrowser.destroying-completion")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("destroying-completion"))));
+    QCOMPARE(host->receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    QSemaphore completed;
+    std::atomic<int> completionCalls{0};
+    IpcSendSubmission submission = host->submitSend(
+        ProtocolMessage::heartbeat(),
+        IpcSendWork{
+            {},
+            [&](const PipeWriteResult &result) {
+                QCOMPARE(result.status, PipeIoStatus::Ok);
+                ++completionCalls;
+                host.reset();
+                completed.release();
+            }});
+    QVERIFY(submission.accepted);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+    QVERIFY(completed.tryAcquire(1, 1'000));
+    QCOMPARE(completionCalls.load(), 1);
+    QVERIFY(host == nullptr);
 #endif
 }
 

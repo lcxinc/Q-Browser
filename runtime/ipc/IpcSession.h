@@ -10,6 +10,9 @@
 #include <QSet>
 
 #include <functional>
+#include <memory>
+
+struct IpcPendingRequestState;
 
 enum class IpcRole {
     Host,
@@ -98,8 +101,9 @@ private:
     SessionReceiveResult receiveImpl(int timeoutMs, bool closeOnCallerTimeout);
     void deliverQueuedPageMetadata();
     SessionReceiveResult fail(SessionStatus status, const QString &code);
-    bool pendingRequestExpired() const;
-    std::optional<qint64> nearestPendingDeadline() const;
+    bool pendingRequestExpired();
+    std::optional<qint64> nearestPendingDeadline(
+        bool &publicationPending) const;
     bool sendTracked(const QString &requestId,
                      const std::optional<ProtocolMessage> &message,
                      int timeoutMs);
@@ -112,15 +116,23 @@ private:
     [[nodiscard]] IpcSendSubmission submitInternal(
         const ProtocolMessage &message,
         IpcSendWork work,
-        bool allowTrackedMessage);
+        bool allowTrackedMessage,
+        std::function<void(const PipeWriteResult &)> terminalObserver = {},
+        std::function<void()> rejectionObserver = {});
     void noteAcceptedSend(const ProtocolMessage &message);
+    [[nodiscard]] std::shared_ptr<IpcPendingRequestState>
+    reservePendingRequest(const QString &requestId);
+    void removePendingRequest(
+        const QString &requestId,
+        const std::shared_ptr<IpcPendingRequestState> &expected);
+    void pruneTerminalPendingRequests();
 
     WinPipeTransport transport_;
     IpcRole role_;
     HostLaunchContext hostContext_;
     FrameCodec codec_;
     QQueue<QueuedMessage> receivedMessages_;
-    QHash<QString, qint64> pendingRequests_;
+    QHash<QString, std::shared_ptr<IpcPendingRequestState>> pendingRequests_;
     QSet<QString> receivedRequestIds_;
     QElapsedTimer clock_;
     bool authenticated_ = false;

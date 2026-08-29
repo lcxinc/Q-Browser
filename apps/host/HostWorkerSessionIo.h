@@ -10,6 +10,7 @@
 
 class QTimer;
 class QThread;
+struct HostWorkerSessionBindingState;
 
 class HostWorkerSessionIo final : public QObject
 {
@@ -21,6 +22,7 @@ public:
                         QThread *ownerThread,
                         std::optional<TabCapabilityAuthority>
                             capabilityAuthority = std::nullopt);
+    ~HostWorkerSessionIo() override;
 
     void start();
     void sendMessage(quint64 generation,
@@ -65,15 +67,27 @@ signals:
 private:
     void pollSession();
     void fail(const QString &errorCode);
+    void invalidateLiveBinding() noexcept;
+    void armCommandDeadline(quint64 commandId,
+                            PipeWriteCancellation cancellation);
+    [[nodiscard]] bool completeCommandSubmission(quint64 commandId);
 
+    static constexpr int sendTimeoutMs = 5000;
+    static constexpr int shutdownTimeoutMs = 5000;
     static constexpr int routeLoadTimeoutMs = 5000;
     static constexpr int maximumMessagesPerTurn = 8;
 
     std::unique_ptr<IpcSession> session_;
     QTimer *pollTimer_ = nullptr;
+    QTimer *sendDeadlineTimer_ = nullptr;
+    QTimer *shutdownDeadlineTimer_ = nullptr;
     quint64 generation_ = 0;
     QThread *ownerThread_ = nullptr;
     const std::optional<TabCapabilityAuthority> capabilityAuthority_;
+    std::shared_ptr<HostWorkerSessionBindingState> liveBinding_;
+    PipeWriteCancellation commandCancellation_;
+    PipeWriteCancellation shutdownCancellation_;
+    quint64 pendingCommandId_ = 0;
     bool awaitingGui_ = false;
     bool stopping_ = false;
     bool terminal_ = false;

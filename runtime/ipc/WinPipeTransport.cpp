@@ -609,7 +609,12 @@ bool WinPipeTransport::writeAll(const QByteArrayView bytes, const int timeoutMs)
         [&completion] { return completion->result.has_value(); });
     if (!finished) {
         lock.unlock();
-        (void)submission.cancellation.cancel();
+        if (!submission.cancellation.cancel()) {
+            // Once a frame has started, queue cancellation cannot safely
+            // truncate it. Close and join the writer before reporting the
+            // deadline so no bytes can appear after writeAll returns.
+            close();
+        }
         lastStatus_ = PipeIoStatus::TimedOut;
         return false;
     }

@@ -70,3 +70,19 @@ q_browser_add_qt_test(
 set_tests_properties(browser_capability_isolation
   PROPERTIES
     TIMEOUT 15)
+
+add_executable(tst_host_worker_session_io
+  tst_host_worker_session_io.cpp)
+
+target_link_libraries(tst_host_worker_session_io
+  PRIVATE
+    q_browser_host
+    Qt6::Test)
+
+q_browser_enable_strict_warnings(tst_host_worker_session_io)
+q_browser_add_qt_test(
+  NAME host_worker_session_io
+  TARGET tst_host_worker_session_io)
+set_tests_properties(host_worker_session_io
+  PROPERTIES
+    TIMEOUT 20)

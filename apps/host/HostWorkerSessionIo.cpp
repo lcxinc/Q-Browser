@@ -5,7 +5,23 @@
 #include <QThread>
 #include <QTimer>
 
+#include <atomic>
 #include <utility>
+
+struct HostWorkerSessionBindingState final
+{
+    HostWorkerSessionBindingState(
+        const quint64 boundGeneration,
+        std::optional<TabCapabilityAuthority> boundAuthority)
+        : generation(boundGeneration),
+          capabilityAuthority(std::move(boundAuthority))
+    {
+    }
+
+    const quint64 generation;
+    const std::optional<TabCapabilityAuthority> capabilityAuthority;
+    std::atomic_bool active{true};
+};
 
 HostWorkerSessionIo::HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
                                          const quint64 generation,
@@ -14,13 +30,40 @@ HostWorkerSessionIo::HostWorkerSessionIo(std::unique_ptr<IpcSession> session,
                                              capabilityAuthority)
     : session_(std::move(session))
     , pollTimer_(new QTimer(this))
+    , sendDeadlineTimer_(new QTimer(this))
+    , shutdownDeadlineTimer_(new QTimer(this))
     , generation_(generation)
     , ownerThread_(ownerThread)
     , capabilityAuthority_(std::move(capabilityAuthority))
+    , liveBinding_(std::make_shared<HostWorkerSessionBindingState>(
+          generation_, capabilityAuthority_))
 {
     pollTimer_->setInterval(2);
     connect(pollTimer_, &QTimer::timeout, this,
             &HostWorkerSessionIo::pollSession);
+    sendDeadlineTimer_->setSingleShot(true);
+    connect(sendDeadlineTimer_, &QTimer::timeout, this, [this] {
+        if (terminal_ || pendingCommandId_ == 0) return;
+        pendingCommandId_ = 0;
+        PipeWriteCancellation cancellation = commandCancellation_;
+        commandCancellation_ = {};
+        (void)cancellation.cancel();
+        fail(QStringLiteral("host.worker_session.send_timeout"));
+    });
+    shutdownDeadlineTimer_->setSingleShot(true);
+    connect(shutdownDeadlineTimer_, &QTimer::timeout, this, [this] {
+        if (terminal_ || !stopping_) return;
+        PipeWriteCancellation cancellation = shutdownCancellation_;
+        shutdownCancellation_ = {};
+        (void)cancellation.cancel();
+        fail(QStringLiteral("host.worker_session.shutdown_timeout"));
+    });
+}
+
+HostWorkerSessionIo::~HostWorkerSessionIo()
+{
+    invalidateLiveBinding();
+    if (session_ != nullptr) session_->close();
 }
 
 void HostWorkerSessionIo::start()
@@ -66,12 +109,24 @@ void HostWorkerSessionIo::sendMessage(const quint64 generation,
     if (capabilitySend) {
         const TabCapabilityAuthority immutableAuthority =
             *capabilityAuthority;
-        const TabCapabilityAuthority boundAuthority = *capabilityAuthority_;
+        const quint64 immutableGeneration = generation;
+        const std::shared_ptr<HostWorkerSessionBindingState> liveBinding =
+            liveBinding_;
         work.publicationGate =
-            [immutableAuthority, boundAuthority,
+            [immutableAuthority, immutableGeneration, liveBinding,
              use = std::move(capabilityUse)] {
-                return immutableAuthority == boundAuthority && use != nullptr
-                    && use->publishIfStillAdmitted([] { return true; });
+                return liveBinding != nullptr && use != nullptr
+                    && use->publishIfStillAdmitted(
+                        [immutableAuthority, immutableGeneration,
+                         liveBinding] {
+                            return liveBinding->active.load(
+                                       std::memory_order_acquire)
+                                && liveBinding->generation
+                                    == immutableGeneration
+                                && liveBinding->capabilityAuthority.has_value()
+                                && *liveBinding->capabilityAuthority
+                                    == immutableAuthority;
+                        });
             };
     }
     work.completion = [this, generation, commandId, capabilitySend](
@@ -79,6 +134,7 @@ void HostWorkerSessionIo::sendMessage(const quint64 generation,
         (void)QMetaObject::invokeMethod(
             this,
             [this, generation, commandId, capabilitySend, result] {
+                if (!completeCommandSubmission(commandId)) return;
                 if (generation != generation_ || terminal_) return;
                 if (result.status == PipeIoStatus::Ok) {
                     emit commandFinished(generation, commandId, true, true,
@@ -111,7 +167,9 @@ void HostWorkerSessionIo::sendMessage(const quint64 generation,
         fail(errorCode.isEmpty()
                  ? QStringLiteral("host.worker_session.send_failed")
                  : errorCode);
+        return;
     }
+    armCommandDeadline(commandId, submission.cancellation);
 }
 
 void HostWorkerSessionIo::resumePolling(const quint64 generation)
@@ -129,11 +187,13 @@ void HostWorkerSessionIo::resumePolling(const quint64 generation)
 void HostWorkerSessionIo::beginShutdown(const quint64 generation,
                                         const QString &reason)
 {
-    if (generation != generation_ || terminal_ || session_ == nullptr) {
+    if (generation != generation_ || terminal_ || stopping_
+        || session_ == nullptr) {
         return;
     }
     stopping_ = true;
     awaitingGui_ = false;
+    invalidateLiveBinding();
     const auto message = ProtocolMessage::shutdown(reason);
     if (!message.has_value()) {
         fail(QStringLiteral("host.worker_session.shutdown_send_failed"));
@@ -149,8 +209,11 @@ void HostWorkerSessionIo::beginShutdown(const quint64 generation,
                     [this, generation, result] {
                         if (generation != generation_ || terminal_
                             || result.status == PipeIoStatus::Ok) {
+                            if (generation == generation_)
+                                shutdownCancellation_ = {};
                             return;
                         }
+                        shutdownCancellation_ = {};
                         fail(result.errorCode.isEmpty()
                                  ? QStringLiteral(
                                        "host.worker_session.shutdown_send_failed")
@@ -164,6 +227,8 @@ void HostWorkerSessionIo::beginShutdown(const quint64 generation,
                  : session_->lastErrorCode());
         return;
     }
+    shutdownCancellation_ = submission.cancellation;
+    shutdownDeadlineTimer_->start(shutdownTimeoutMs);
     pollTimer_->start();
 }
 
@@ -172,7 +237,13 @@ void HostWorkerSessionIo::abort(const quint64 generation)
     if (generation != generation_) return;
     if (!terminal_) {
         terminal_ = true;
+        invalidateLiveBinding();
         pollTimer_->stop();
+        sendDeadlineTimer_->stop();
+        shutdownDeadlineTimer_->stop();
+        pendingCommandId_ = 0;
+        commandCancellation_ = {};
+        shutdownCancellation_ = {};
         if (session_ != nullptr) session_->close();
     }
     QThread *const ioThread = QThread::currentThread();
@@ -237,7 +308,13 @@ void HostWorkerSessionIo::pollSession()
                 return;
             }
             terminal_ = true;
+            invalidateLiveBinding();
             pollTimer_->stop();
+            sendDeadlineTimer_->stop();
+            shutdownDeadlineTimer_->stop();
+            pendingCommandId_ = 0;
+            commandCancellation_ = {};
+            shutdownCancellation_ = {};
             session_->close();
             emit shutdownFinished(generation_);
             return;
@@ -272,11 +349,47 @@ void HostWorkerSessionIo::fail(const QString &errorCode)
         return;
     }
     terminal_ = true;
+    invalidateLiveBinding();
     pollTimer_->stop();
+    sendDeadlineTimer_->stop();
+    shutdownDeadlineTimer_->stop();
+    pendingCommandId_ = 0;
+    commandCancellation_ = {};
+    shutdownCancellation_ = {};
     if (session_ != nullptr) {
         session_->close();
     }
     emit sessionFailed(generation_, errorCode.isEmpty()
                                         ? QStringLiteral("host.worker_session.failed")
                                         : errorCode);
+}
+
+void HostWorkerSessionIo::invalidateLiveBinding() noexcept
+{
+    if (liveBinding_ != nullptr) {
+        liveBinding_->active.store(false, std::memory_order_release);
+    }
+}
+
+void HostWorkerSessionIo::armCommandDeadline(
+    const quint64 commandId, PipeWriteCancellation cancellation)
+{
+    if (terminal_) return;
+    if (pendingCommandId_ != 0) {
+        (void)cancellation.cancel();
+        fail(QStringLiteral("host.worker_session.concurrent_send"));
+        return;
+    }
+    pendingCommandId_ = commandId;
+    commandCancellation_ = std::move(cancellation);
+    sendDeadlineTimer_->start(sendTimeoutMs);
+}
+
+bool HostWorkerSessionIo::completeCommandSubmission(const quint64 commandId)
+{
+    if (pendingCommandId_ != commandId) return false;
+    pendingCommandId_ = 0;
+    commandCancellation_ = {};
+    sendDeadlineTimer_->stop();
+    return true;
 }
