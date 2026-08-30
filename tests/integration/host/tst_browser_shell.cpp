@@ -1,4 +1,5 @@
 #include "BrowserChrome.h"
+#include "BrowserSessionStore.h"
 #include "BrowserTabModel.h"
 #include "MainWindow.h"
 #include "NavigationBar.h"
@@ -29,6 +30,7 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 namespace {
 
@@ -214,6 +216,30 @@ class BrowserShellTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void deferredSessionShellStartsHiddenEmptyAndResourceFree();
+    void loadedSessionAppliesAtomicallyWithoutSaveAndStartsOnlyActive();
+    void missingSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
+    void corruptSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
+    void ioFailureSessionCreatesExactlyOneInMemoryNewTab();
+    void loadedSessionWithoutSnapshotFallsBackToOneInMemoryNewTab();
+    void invalidResolverResultFallsBackOnceWithoutSavingUnknownState();
+    void throwingResolverFallsBackWithoutEscapingOrSaving();
+    void resolverAndShellKindMismatchFallsBackWithoutLaunchingOrSaving();
+    void reentrantResolverCannotInterruptAtomicSessionApply();
+    void loadedUntrustedDescriptorBecomesResourceFreeTrustedError();
+    void loadedActiveNewTabCreatesZeroWorkerAndWebPages();
+    void loadedActiveAppStartsExactlyOnceAfterQueuedActivation();
+    void persistenceNeededUsesOneSingleShotTimerAndCoalescesOneSnapshotSave();
+    void normalShutdownStopsDebounceAndPerformsOneFinalSave();
+    void explicitFinalFlushFreezesOnceAndNeverRestartsDebounce();
+    void emptySaveCallbackLeavesPersistenceDisabled();
+    void throwingFinalSaveCannotEscapeOrBlockShutdown();
+    void throwingDebouncedSaveIsContainedBeforeOneFinalAttempt();
+    void reentrantDebouncedSaveCannotStartNestedFinalFlush();
+    void reentrantFinalSaveCannotReportSuccessOrShutdownDuringSave();
+    void failedFinalSaveReturnsFalseButShutdownStillCleansResources();
+    void freezeBeforeApplyIsTerminalAndRejectsLateSessionState();
+    void immediateShellRejectsLateSessionApplicationWithoutChangingModel();
     void startupHasOneTrustedHostTabWithoutWorkerOrWebPage();
     void tabCommandsUseStableIdsAndReplaceTheLastClosedTab();
     void tabMutationsRejectDirectReentrantCommands();
@@ -235,6 +261,1019 @@ private slots:
     void rendererFailureAtPageLimitReleasesSlotBeforeReload();
     void windowShutdownBeforeQueuedRendererCleanupCancelsIt();
 };
+
+void BrowserShellTest::deferredSessionShellStartsHiddenEmptyAndResourceFree()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+
+    QVERIFY(!window.isVisible());
+    QCOMPARE(window.tabModel()->count(), 0);
+    QCOMPARE(window.tabModel()->activeIndex(), -1);
+    QVERIFY(window.tabModel()->activeId().isEmpty());
+    QCOMPARE(window.surfaceStack()->count(), 0);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QVERIFY(window.findChildren<QWebEngineView *>().isEmpty());
+    QCOMPARE(window.workerSurface(), nullptr);
+    QCOMPARE(window.webSurface(), nullptr);
+}
+
+void BrowserShellTest::loadedSessionAppliesAtomicallyWithoutSaveAndStartsOnlyActive()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    BrowserTabModel *const model = window.tabModel();
+    QSignalSpy persistenceSpy(model, &BrowserTabModel::persistenceNeeded);
+    int saveCount = 0;
+
+    const QVector<BrowserTabSnapshot> rawTabs{
+        {QStringLiteral("11111111111111111111111111111111"),
+         BrowserTabKind::Host, QStringLiteral("Orders"),
+         QStringLiteral("app://pilot/orders"),
+         {QStringLiteral("qbrowser://newtab"),
+          QStringLiteral("app://pilot/orders")}, 1},
+        {QStringLiteral("22222222222222222222222222222222"),
+         BrowserTabKind::Host, QStringLiteral("Alpha"),
+         QStringLiteral("app://pilot/web/alpha"),
+         {QStringLiteral("qbrowser://newtab"),
+          QStringLiteral("app://pilot/web/alpha")}, 1},
+        {QStringLiteral("33333333333333333333333333333333"),
+         BrowserTabKind::Web, QStringLiteral("New tab"),
+         QStringLiteral("qbrowser://newtab"),
+         {QStringLiteral("qbrowser://newtab")}, 0},
+    };
+    const QRect persistedGeometry(120, 80, 900, 650);
+    const BrowserSessionLoadResult loaded{
+        BrowserSessionLoadStatus::Loaded,
+        BrowserWindowSnapshot{
+            persistedGeometry, rawTabs.at(1).id, rawTabs},
+        {}};
+    const RestoredAddressResolver resolver = [](const BrowserAddress &address)
+        -> std::optional<BrowserTabKind> {
+        if (address.kind() == BrowserAddressKind::NewTab) {
+            return BrowserTabKind::Host;
+        }
+        if (address.kind() != BrowserAddressKind::App) return std::nullopt;
+        if (address.appPath() == QStringLiteral("/orders")) {
+            return BrowserTabKind::App;
+        }
+        if (address.appPath() == QStringLiteral("/web/alpha")) {
+            return BrowserTabKind::Web;
+        }
+        return std::nullopt;
+    };
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        loaded, resolver, QRect(0, 0, 1920, 1080),
+        {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    QCOMPARE(window.geometry(), persistedGeometry);
+    QCOMPARE(model->count(), 3);
+    QCOMPARE(model->activeId(), rawTabs.at(1).id);
+    QCOMPARE(model->activeIndex(), 1);
+    QCOMPARE(model->snapshotAt(0).id, rawTabs.at(0).id);
+    QCOMPARE(model->snapshotAt(0).kind, BrowserTabKind::App);
+    QCOMPARE(model->snapshotAt(0).history, rawTabs.at(0).history);
+    QCOMPARE(model->snapshotAt(0).historyIndex, 1);
+    QCOMPARE(model->snapshotAt(1).id, rawTabs.at(1).id);
+    QCOMPARE(model->snapshotAt(1).kind, BrowserTabKind::Web);
+    QCOMPARE(model->snapshotAt(1).history, rawTabs.at(1).history);
+    QCOMPARE(model->snapshotAt(1).historyIndex, 1);
+    QCOMPARE(model->snapshotAt(2).id, rawTabs.at(2).id);
+    QCOMPARE(model->snapshotAt(2).kind, BrowserTabKind::Host);
+
+    TabController *const app = window.tabController(rawTabs.at(0).id);
+    TabController *const activeWeb = window.tabController(rawTabs.at(1).id);
+    TabController *const host = window.tabController(rawTabs.at(2).id);
+    QVERIFY(app != nullptr);
+    QVERIFY(activeWeb != nullptr);
+    QVERIFY(host != nullptr);
+    QCOMPARE(app->lifecycle(), BrowserTabLifecycle::Dormant);
+    QCOMPARE(app->hostSurface(), nullptr);
+    QCOMPARE(app->webSurface(), nullptr);
+    QCOMPARE(app->workerSurface(), nullptr);
+    QVERIFY(activeWeb->lifecycle() != BrowserTabLifecycle::Dormant);
+    QVERIFY(activeWeb->webSurface() != nullptr);
+    QCOMPARE(host->lifecycle(), BrowserTabLifecycle::Dormant);
+    QCOMPARE(host->hostSurface(), nullptr);
+    QCOMPARE(host->webSurface(), nullptr);
+    QCOMPARE(host->workerSurface(), nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(1));
+    QCOMPARE(window.surfaceStack()->count(), 1);
+    QCOMPARE(persistenceSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::missingSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    BrowserTabModel *const model = window.tabModel();
+    QSignalSpy persistenceSpy(model, &BrowserTabModel::persistenceNeeded);
+    int saveCount = 0;
+    bool resolverCalled = false;
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}},
+        [&](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+            resolverCalled = true;
+            return std::nullopt;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    QCOMPARE(model->count(), 1);
+    QCOMPARE(model->activeIndex(), 0);
+    const BrowserTabSnapshot clean = model->snapshotAt(0);
+    QVERIFY(!clean.id.isEmpty());
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.title, QStringLiteral("New tab"));
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(clean.history,
+             QStringList({QStringLiteral("qbrowser://newtab")}));
+    QCOMPARE(clean.historyIndex, 0);
+    TabController *const controller = window.tabController(clean.id);
+    QVERIFY(controller != nullptr);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::Active);
+    QVERIFY(controller->hostSurface() != nullptr);
+    QCOMPARE(controller->webSurface(), nullptr);
+    QCOMPARE(controller->workerSurface(), nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(window.surfaceStack()->count(), 1);
+    QVERIFY(!resolverCalled);
+    QCOMPARE(persistenceSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::corruptSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QSignalSpy persistenceSpy(
+        window.tabModel(), &BrowserTabModel::persistenceNeeded);
+    int saveCount = 0;
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Corrupt, std::nullopt,
+         QStringLiteral("host.session.corrupt")},
+        {}, QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QCOMPARE(window.tabModel()->activeId(), clean.id);
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.title, QStringLiteral("New tab"));
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(clean.history,
+             QStringList({QStringLiteral("qbrowser://newtab")}));
+    QCOMPARE(clean.historyIndex, 0);
+    QVERIFY(window.tabController(clean.id)->hostSurface() != nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(persistenceSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.tabModel()->setTitle(
+        clean.id, QStringLiteral("Recovered clean session")));
+    QTRY_COMPARE_WITH_TIMEOUT(saveCount, 1, 2'000);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 2);
+}
+
+void BrowserShellTest::ioFailureSessionCreatesExactlyOneInMemoryNewTab()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QSignalSpy persistenceSpy(
+        window.tabModel(), &BrowserTabModel::persistenceNeeded);
+    int saveCount = 0;
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::IoFailure, std::nullopt,
+         QStringLiteral("host.session.io_failed")},
+        {}, QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QCOMPARE(window.tabModel()->activeId(), clean.id);
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.title, QStringLiteral("New tab"));
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(clean.history,
+             QStringList({QStringLiteral("qbrowser://newtab")}));
+    QCOMPARE(clean.historyIndex, 0);
+    QVERIFY(window.tabController(clean.id)->hostSurface() != nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(persistenceSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.tabModel()->setTitle(
+        clean.id, QStringLiteral("Memory only")));
+    QTimer *const debounce = window.findChild<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QVERIFY(debounce != nullptr);
+    QVERIFY(!debounce->isActive());
+    QTest::qWait(350);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QVERIFY(window.shutdown());
+    QCOMPARE(saveCount, 0);
+}
+
+void BrowserShellTest::loadedSessionWithoutSnapshotFallsBackToOneInMemoryNewTab()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Loaded, std::nullopt, {}},
+        {}, QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QCOMPARE(window.tabModel()->activeId(), clean.id);
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(clean.history,
+             QStringList({QStringLiteral("qbrowser://newtab")}));
+    QCOMPARE(clean.historyIndex, 0);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.tabModel()->setTitle(
+        clean.id, QStringLiteral("Validation fallback")));
+    QTest::qWait(350);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 0);
+}
+
+void BrowserShellTest::invalidResolverResultFallsBackOnceWithoutSavingUnknownState()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    const BrowserSessionLoadResult loaded{
+        BrowserSessionLoadStatus::Loaded,
+        BrowserWindowSnapshot{
+            QRect(10, 20, 800, 600),
+            QStringLiteral("11111111111111111111111111111111"),
+            {{QStringLiteral("11111111111111111111111111111111"),
+              BrowserTabKind::App, QStringLiteral("Orders"),
+              QStringLiteral("app://pilot/orders"),
+              {QStringLiteral("app://pilot/orders")}, 0}}},
+        {}};
+    const auto save = [&](const BrowserWindowSnapshot &) {
+        ++saveCount;
+        return BrowserSessionSaveResult{
+            BrowserSessionSaveStatus::Saved, {}};
+    };
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        loaded,
+        [](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+            return static_cast<BrowserTabKind>(99);
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)}, save));
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QVERIFY(clean.id
+            != QStringLiteral("11111111111111111111111111111111"));
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QVERIFY(!window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)}, save));
+    QCOMPARE(window.tabModel()->count(), 1);
+    QCOMPARE(window.tabModel()->activeId(), clean.id);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.tabModel()->setTitle(
+        clean.id, QStringLiteral("Still memory only")));
+    QTest::qWait(350);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 0);
+}
+
+void BrowserShellTest::throwingResolverFallsBackWithoutEscapingOrSaving()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    const QString stableId =
+        QStringLiteral("11111111111111111111111111111111");
+    const BrowserSessionLoadResult loaded{
+        BrowserSessionLoadStatus::Loaded,
+        BrowserWindowSnapshot{
+            QRect(10, 20, 800, 600), stableId,
+            {{stableId, BrowserTabKind::App, QStringLiteral("Orders"),
+              QStringLiteral("app://pilot/orders"),
+              {QStringLiteral("app://pilot/orders")}, 0}}},
+        {}};
+    bool escaped = false;
+    bool applied = false;
+    try {
+        applied = window.applyBrowserSessionLoadResult(
+            loaded,
+            [](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+                throw std::runtime_error("resolver failed");
+            },
+            QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+            [&](const BrowserWindowSnapshot &) {
+                ++saveCount;
+                return BrowserSessionSaveResult{
+                    BrowserSessionSaveStatus::Saved, {}};
+            });
+    } catch (...) {
+        escaped = true;
+    }
+
+    QVERIFY(!escaped);
+    QVERIFY(applied);
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QVERIFY(clean.id != stableId);
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 0);
+}
+
+void BrowserShellTest::resolverAndShellKindMismatchFallsBackWithoutLaunchingOrSaving()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    window.setPackageRuntimeEnabled(true);
+    QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+    int saveCount = 0;
+    const QString restoredId =
+        QStringLiteral("11111111111111111111111111111111");
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Loaded,
+         BrowserWindowSnapshot{
+             QRect(10, 20, 800, 600), restoredId,
+             {{restoredId, BrowserTabKind::App, QStringLiteral("Orders"),
+               QStringLiteral("app://pilot/orders"),
+               {QStringLiteral("app://pilot/orders")}, 0}}},
+         {}},
+        [](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+            return BrowserTabKind::Web;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCoreApplication::processEvents();
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    const BrowserTabSnapshot clean = window.tabModel()->snapshotAt(0);
+    QVERIFY(clean.id != restoredId);
+    QCOMPARE(clean.kind, BrowserTabKind::Host);
+    QCOMPARE(clean.address, QStringLiteral("qbrowser://newtab"));
+    QCOMPARE(launchSpy.count(), 0);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 0);
+}
+
+void BrowserShellTest::reentrantResolverCannotInterruptAtomicSessionApply()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    bool nestedApplyResult = true;
+    bool resolverFreezeResult = true;
+    bool resolverShutdownResult = true;
+    bool insertedFreezeResult = true;
+    bool insertedShutdownResult = true;
+    const QString restoredId =
+        QStringLiteral("11111111111111111111111111111111");
+    connect(window.tabModel(), &BrowserTabModel::tabInserted, &window,
+            [&](int, const QString &id) {
+                if (id != restoredId) return;
+                insertedFreezeResult = window.freezeBrowserSessionAndFlush();
+                insertedShutdownResult = window.shutdown();
+            });
+
+    const bool outerApplyResult = window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Loaded,
+         BrowserWindowSnapshot{
+             QRect(10, 20, 800, 600), restoredId,
+             {{restoredId, BrowserTabKind::Host, QStringLiteral("Orders"),
+               QStringLiteral("app://pilot/orders"),
+               {QStringLiteral("app://pilot/orders")}, 0}}},
+         {}},
+        [&](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+            nestedApplyResult = window.applyBrowserSessionLoadResult(
+                {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+                QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)}, {});
+            resolverFreezeResult = window.freezeBrowserSessionAndFlush();
+            resolverShutdownResult = window.shutdown();
+            return BrowserTabKind::App;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        });
+
+    QVERIFY(!nestedApplyResult);
+    QVERIFY(outerApplyResult);
+    QVERIFY(!resolverFreezeResult);
+    QVERIFY(!resolverShutdownResult);
+    QVERIFY(!insertedFreezeResult);
+    QVERIFY(!insertedShutdownResult);
+    QCOMPARE(window.tabModel()->count(), 1);
+    QCOMPARE(window.tabModel()->activeId(), restoredId);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::loadedUntrustedDescriptorBecomesResourceFreeTrustedError()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    window.setPackageRuntimeEnabled(true);
+    QSignalSpy launchSpy(
+        &window, &MainWindow::appLaunchRequested);
+    int saveCount = 0;
+    const QString stableId =
+        QStringLiteral("11111111111111111111111111111111");
+    const BrowserSessionLoadResult loaded{
+        BrowserSessionLoadStatus::Loaded,
+        BrowserWindowSnapshot{
+            QRect(10, 20, 800, 600), stableId,
+            {{stableId, BrowserTabKind::App, QStringLiteral("Orders"),
+              QStringLiteral("app://pilot/orders"),
+              {QStringLiteral("app://pilot/orders")}, 0}}},
+        {}};
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        loaded,
+        [](const BrowserAddress &) -> std::optional<BrowserTabKind> {
+            return std::nullopt;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCoreApplication::processEvents();
+
+    QCOMPARE(window.tabModel()->count(), 1);
+    QCOMPARE(window.tabModel()->activeId(), stableId);
+    QCOMPARE(window.tabModel()->snapshotAt(0).kind,
+             BrowserTabKind::TrustedError);
+    TabController *const controller = window.tabController(stableId);
+    QVERIFY(controller != nullptr);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::TrustedError);
+    QCOMPARE(controller->surfaceKind(), HostSurfaceKind::TrustedError);
+    QCOMPARE(controller->hostSurface(), nullptr);
+    QCOMPARE(controller->webSurface(), nullptr);
+    QCOMPARE(controller->workerSurface(), nullptr);
+    QVERIFY(!controller->trustedErrorText().isEmpty());
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(launchSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::loadedActiveNewTabCreatesZeroWorkerAndWebPages()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+    int saveCount = 0;
+    const QString stableId =
+        QStringLiteral("11111111111111111111111111111111");
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Loaded,
+         BrowserWindowSnapshot{
+             QRect(10, 20, 800, 600), stableId,
+             {{stableId, BrowserTabKind::Web, QStringLiteral("New tab"),
+               QStringLiteral("qbrowser://newtab"),
+               {QStringLiteral("qbrowser://newtab")}, 0}}},
+         {}},
+        [](const BrowserAddress &address)
+            -> std::optional<BrowserTabKind> {
+            return address.kind() == BrowserAddressKind::NewTab
+                ? std::optional<BrowserTabKind>(BrowserTabKind::Host)
+                : std::nullopt;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCoreApplication::processEvents();
+
+    TabController *const controller = window.tabController(stableId);
+    QVERIFY(controller != nullptr);
+    QCOMPARE(window.tabModel()->snapshotAt(0).kind, BrowserTabKind::Host);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::Active);
+    QVERIFY(controller->hostSurface() != nullptr);
+    QCOMPARE(controller->webSurface(), nullptr);
+    QCOMPARE(controller->workerSurface(), nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QVERIFY(window.findChildren<QWebEngineView *>().isEmpty());
+    QCOMPARE(launchSpy.count(), 0);
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::loadedActiveAppStartsExactlyOnceAfterQueuedActivation()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    window.setPackageRuntimeEnabled(true);
+    QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+    const QString activeId =
+        QStringLiteral("11111111111111111111111111111111");
+    const QString siblingId =
+        QStringLiteral("22222222222222222222222222222222");
+    const BrowserSessionLoadResult loaded{
+        BrowserSessionLoadStatus::Loaded,
+        BrowserWindowSnapshot{
+            QRect(10, 20, 800, 600), activeId,
+            {{activeId, BrowserTabKind::Host, QStringLiteral("Orders"),
+              QStringLiteral("app://pilot/orders"),
+              {QStringLiteral("app://pilot/orders")}, 0},
+             {siblingId, BrowserTabKind::Host, QStringLiteral("Alpha"),
+              QStringLiteral("app://pilot/web/alpha"),
+              {QStringLiteral("app://pilot/web/alpha")}, 0}}},
+        {}};
+
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        loaded,
+        [](const BrowserAddress &address)
+            -> std::optional<BrowserTabKind> {
+            if (address.appPath() == QStringLiteral("/orders")) {
+                return BrowserTabKind::App;
+            }
+            if (address.appPath() == QStringLiteral("/web/alpha")) {
+                return BrowserTabKind::Web;
+            }
+            return std::nullopt;
+        },
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [](const BrowserWindowSnapshot &) {
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCoreApplication::processEvents();
+
+    QCOMPARE(launchSpy.count(), 1);
+    QCOMPARE(launchSpy.constFirst().at(0).toString(), activeId);
+    TabController *const active = window.tabController(activeId);
+    TabController *const sibling = window.tabController(siblingId);
+    QVERIFY(active != nullptr);
+    QVERIFY(sibling != nullptr);
+    QCOMPARE(active->lifecycle(), BrowserTabLifecycle::Loading);
+    QCOMPARE(active->hostSurface(), nullptr);
+    QCOMPARE(active->webSurface(), nullptr);
+    QCOMPARE(active->workerSurface(), nullptr);
+    QCOMPARE(sibling->lifecycle(), BrowserTabLifecycle::Dormant);
+    QCOMPARE(sibling->hostSurface(), nullptr);
+    QCOMPARE(sibling->webSurface(), nullptr);
+    QCOMPARE(sibling->workerSurface(), nullptr);
+    QCOMPARE(window.webSessionProfile()->registeredPageCount(), qsizetype(0));
+    QCOMPARE(window.surfaceStack()->count(), 0);
+}
+
+void BrowserShellTest::persistenceNeededUsesOneSingleShotTimerAndCoalescesOneSnapshotSave()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QVector<BrowserWindowSnapshot> savedSnapshots;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &snapshot) {
+            savedSnapshots.append(snapshot);
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+
+    const QList<QTimer *> timers = window.findChildren<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QCOMPARE(timers.size(), 1);
+    QVERIFY(timers.constFirst()->isSingleShot());
+    const QString activeId = window.tabModel()->activeId();
+    QVERIFY(window.tabModel()->setTitle(activeId, QStringLiteral("First")));
+    QVERIFY(window.tabModel()->setTitle(activeId, QStringLiteral("Second")));
+    QVERIFY(window.tabModel()->setTitle(activeId, QStringLiteral("Final")));
+
+    QTRY_COMPARE_WITH_TIMEOUT(savedSnapshots.size(), 1, 2'000);
+    QTest::qWait(350);
+    QCOMPARE(savedSnapshots.size(), 1);
+    const BrowserWindowSnapshot saved = savedSnapshots.constFirst();
+    QCOMPARE(saved.geometry, window.geometry());
+    QCOMPARE(saved.activeTabId, window.tabModel()->activeId());
+    QCOMPARE(saved.tabs, window.tabModel()->snapshots());
+    QCOMPARE(saved.tabs.constFirst().title, QStringLiteral("Final"));
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(savedSnapshots.size(), 2);
+}
+
+void BrowserShellTest::normalShutdownStopsDebounceAndPerformsOneFinalSave()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QVector<BrowserWindowSnapshot> savedSnapshots;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &snapshot) {
+            savedSnapshots.append(snapshot);
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    const QString activeId = window.tabModel()->activeId();
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("Frozen at shutdown")));
+    QTimer *const debounce = window.findChild<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QVERIFY(debounce != nullptr);
+    QVERIFY(debounce->isActive());
+
+    const QRect expectedGeometry = window.geometry();
+    const QString expectedActiveId = window.tabModel()->activeId();
+    const QVector<BrowserTabSnapshot> expectedTabs =
+        window.tabModel()->snapshots();
+    QVERIFY(window.shutdown());
+
+    QCOMPARE(savedSnapshots.size(), 1);
+    QCOMPARE(savedSnapshots.constFirst().geometry, expectedGeometry);
+    QCOMPARE(savedSnapshots.constFirst().activeTabId, expectedActiveId);
+    QCOMPARE(savedSnapshots.constFirst().tabs, expectedTabs);
+    QVERIFY(!debounce->isActive());
+    QTest::qWait(350);
+    QCOMPARE(savedSnapshots.size(), 1);
+}
+
+void BrowserShellTest::explicitFinalFlushFreezesOnceAndNeverRestartsDebounce()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QVector<BrowserWindowSnapshot> savedSnapshots;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &snapshot) {
+            savedSnapshots.append(snapshot);
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    const QString activeId = window.tabModel()->activeId();
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("Frozen title")));
+    QTimer *const debounce = window.findChild<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QVERIFY(debounce != nullptr);
+    QVERIFY(debounce->isActive());
+
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(savedSnapshots.size(), 1);
+    QVERIFY(!debounce->isActive());
+    QCOMPARE(savedSnapshots.constFirst().tabs.constFirst().title,
+             QStringLiteral("Frozen title"));
+
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("Changed after freeze")));
+    QVERIFY(!debounce->isActive());
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(savedSnapshots.size(), 1);
+    QTest::qWait(350);
+    QCOMPARE(savedSnapshots.size(), 1);
+    QVERIFY(window.shutdown());
+    QCOMPARE(savedSnapshots.size(), 1);
+}
+
+void BrowserShellTest::emptySaveCallbackLeavesPersistenceDisabled()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)}, {}));
+    const QString activeId = window.tabModel()->activeId();
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("No persistence authority")));
+    QTimer *const debounce = window.findChild<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QVERIFY(debounce != nullptr);
+    QVERIFY(!debounce->isActive());
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QVERIFY(!debounce->isActive());
+    QVERIFY(window.shutdown());
+}
+
+void BrowserShellTest::throwingFinalSaveCannotEscapeOrBlockShutdown()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &)
+            -> BrowserSessionSaveResult {
+            ++saveCount;
+            throw std::runtime_error("save failed");
+        }));
+    const QString activeId = window.tabModel()->activeId();
+    bool escaped = false;
+    bool flushResult = true;
+    try {
+        flushResult = window.freezeBrowserSessionAndFlush();
+    } catch (...) {
+        escaped = true;
+    }
+
+    QVERIFY(!escaped);
+    QVERIFY(!flushResult);
+    QCOMPARE(saveCount, 1);
+    QVERIFY(window.shutdown());
+    QVERIFY(window.isShutdownComplete());
+    QCOMPARE(window.tabController(activeId), nullptr);
+    QCOMPARE(window.webSessionProfile(), nullptr);
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::throwingDebouncedSaveIsContainedBeforeOneFinalAttempt()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &)
+            -> BrowserSessionSaveResult {
+            ++saveCount;
+            throw std::runtime_error("save failed");
+        }));
+    QVERIFY(window.tabModel()->setTitle(
+        window.tabModel()->activeId(), QStringLiteral("Schedule save")));
+
+    QTRY_COMPARE_WITH_TIMEOUT(saveCount, 1, 2'000);
+    QTimer *const debounce = window.findChild<QTimer *>(
+        QStringLiteral("browser-session-save-debounce"),
+        Qt::FindDirectChildrenOnly);
+    QVERIFY(debounce != nullptr);
+    QVERIFY(!debounce->isActive());
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 2);
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 2);
+    QVERIFY(window.shutdown());
+    QCOMPARE(saveCount, 2);
+}
+
+void BrowserShellTest::reentrantDebouncedSaveCannotStartNestedFinalFlush()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    bool nestedFreezeResult = true;
+    bool nestedShutdownResult = true;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            if (saveCount == 1) {
+                nestedFreezeResult = window.freezeBrowserSessionAndFlush();
+                nestedShutdownResult = window.shutdown();
+            }
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    const QString activeId = window.tabModel()->activeId();
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("First debounced save")));
+
+    QTRY_COMPARE_WITH_TIMEOUT(saveCount, 1, 2'000);
+    QVERIFY(!nestedFreezeResult);
+    QVERIFY(!nestedShutdownResult);
+    QVERIFY(window.isRunning());
+    QVERIFY(window.tabModel()->setTitle(
+        activeId, QStringLiteral("Second debounced save")));
+    QTRY_COMPARE_WITH_TIMEOUT(saveCount, 2, 2'000);
+
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 3);
+    QVERIFY(window.shutdown());
+    QCOMPARE(saveCount, 3);
+}
+
+void BrowserShellTest::reentrantFinalSaveCannotReportSuccessOrShutdownDuringSave()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    bool nestedFreezeResult = true;
+    bool nestedShutdownResult = true;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            nestedFreezeResult = window.freezeBrowserSessionAndFlush();
+            nestedShutdownResult = window.shutdown();
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::IoFailure,
+                QStringLiteral("host.session.save_failed")};
+        }));
+
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+    QVERIFY(!nestedFreezeResult);
+    QVERIFY(!nestedShutdownResult);
+    QVERIFY(window.isRunning());
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+    QVERIFY(window.shutdown());
+    QVERIFY(window.isShutdownComplete());
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::failedFinalSaveReturnsFalseButShutdownStillCleansResources()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+    QVERIFY(window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::IoFailure,
+                QStringLiteral("host.session.save_failed")};
+        }));
+    const QString activeId = window.tabModel()->activeId();
+
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+    QVERIFY(!window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 1);
+    QVERIFY(window.shutdown());
+    QVERIFY(window.isShutdownComplete());
+    QCOMPARE(window.tabController(activeId), nullptr);
+    QCOMPARE(window.webSessionProfile(), nullptr);
+    QCOMPARE(saveCount, 1);
+}
+
+void BrowserShellTest::freezeBeforeApplyIsTerminalAndRejectsLateSessionState()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(
+        browserRoutes(server), server.origin(),
+        MainWindowInitialState::DeferredSession);
+    int saveCount = 0;
+
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QVERIFY(!window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCOMPARE(window.tabModel()->count(), 0);
+    QVERIFY(window.tabModel()->activeId().isEmpty());
+    QVERIFY(window.freezeBrowserSessionAndFlush());
+    QCOMPARE(saveCount, 0);
+    QVERIFY(window.shutdown());
+}
+
+void BrowserShellTest::immediateShellRejectsLateSessionApplicationWithoutChangingModel()
+{
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(browserRoutes(server), server.origin());
+    const QVector<BrowserTabSnapshot> before = window.tabModel()->snapshots();
+    const QString activeBefore = window.tabModel()->activeId();
+    int saveCount = 0;
+
+    QVERIFY(!window.applyBrowserSessionLoadResult(
+        {BrowserSessionLoadStatus::Missing, std::nullopt, {}}, {},
+        QRect(0, 0, 1920, 1080), {QRect(0, 0, 1920, 1080)},
+        [&](const BrowserWindowSnapshot &) {
+            ++saveCount;
+            return BrowserSessionSaveResult{
+                BrowserSessionSaveStatus::Saved, {}};
+        }));
+    QCOMPARE(window.tabModel()->snapshots(), before);
+    QCOMPARE(window.tabModel()->activeId(), activeBefore);
+    QCOMPARE(window.tabModel()->count(), 1);
+    QCOMPARE(saveCount, 0);
+}
 
 void BrowserShellTest::startupHasOneTrustedHostTabWithoutWorkerOrWebPage()
 {

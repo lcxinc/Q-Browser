@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BrowserSessionStore.h"
 #include "BrowserTabModel.h"
 #include "BrowserCommand.h"
 #include "RouteRegistry.h"
@@ -11,14 +12,25 @@
 #include <QVariantMap>
 
 #include <memory>
+#include <functional>
 #include <optional>
 
 class BrowserChrome;
 class NavigationBar;
 class QStackedWidget;
+class QTimer;
 class WebSessionProfile;
 class WebSurface;
 class WorkerSurface;
+
+enum class MainWindowInitialState
+{
+    ImmediateNewTab,
+    DeferredSession,
+};
+
+using BrowserSessionSaveCallback =
+    std::function<BrowserSessionSaveResult(const BrowserWindowSnapshot &)>;
 
 class MainWindow final : public QMainWindow
 {
@@ -29,9 +41,20 @@ public:
                const QUrl &mockOrigin,
                WorkerSurface *workerSurface = nullptr,
                QWidget *parent = nullptr);
+    MainWindow(RouteRegistry routeRegistry,
+               const QUrl &mockOrigin,
+               MainWindowInitialState initialState,
+               QWidget *parent = nullptr);
     ~MainWindow() override;
 
     [[nodiscard]] bool navigate(QStringView input);
+    [[nodiscard]] bool applyBrowserSessionLoadResult(
+        const BrowserSessionLoadResult &loadResult,
+        const RestoredAddressResolver &resolver,
+        const QRect &primaryAvailableGeometry,
+        const QList<QRect> &availableScreenGeometries,
+        BrowserSessionSaveCallback saveCallback);
+    [[nodiscard]] bool freezeBrowserSessionAndFlush();
     void setPackageRuntimeEnabled(bool enabled) noexcept;
     [[nodiscard]] bool shutdown();
     [[nodiscard]] bool navigateFromWorker(const QString &packageId,
@@ -94,6 +117,12 @@ signals:
     void legacyWorkerRetirementRequested(const QString &tabId);
 
 private:
+    MainWindow(RouteRegistry routeRegistry,
+               const QUrl &mockOrigin,
+               WorkerSurface *workerSurface,
+               QWidget *parent,
+               MainWindowInitialState initialState);
+
     enum class LifecycleState
     {
         Running,
@@ -131,6 +160,9 @@ private:
                           bool retireWebSurface = false);
     void publishCommittedTabChange(const QString &stableTabId);
     void emitPersistenceAfterTransition();
+    [[nodiscard]] BrowserWindowSnapshot browserSessionSnapshot() const;
+    [[nodiscard]] bool performBrowserSessionSave(
+        const BrowserWindowSnapshot &snapshot) noexcept;
 
     void createController(const QString &stableTabId);
     void removeController(const QString &stableTabId);
@@ -161,5 +193,13 @@ private:
     int resourceMutationDepth_ = 0;
     bool shutdownInProgress_ = false;
     bool packageRuntimeEnabled_ = false;
+    BrowserSessionSaveCallback browserSessionSave_;
+    QTimer *browserSessionSaveTimer_ = nullptr;
+    std::optional<BrowserWindowSnapshot> frozenBrowserSessionSnapshot_;
+    bool browserSessionApplied_ = false;
+    bool browserSessionApplyInProgress_ = false;
+    bool browserSessionFrozen_ = false;
+    bool browserSessionFinalSaveSucceeded_ = true;
+    bool browserSessionSaveInProgress_ = false;
     LifecycleState lifecycleState_ = LifecycleState::Running;
 };

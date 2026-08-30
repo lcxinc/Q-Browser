@@ -768,7 +768,7 @@ BrowserSessionSaveResult BrowserSessionStore::save(
 
 BrowserSessionResolveResult BrowserSessionStore::validateAndResolve(
     const BrowserWindowSnapshot &raw,
-    const RestoredAddressResolver &resolver) const
+    const RestoredAddressResolver &resolver)
 {
     std::optional<BrowserWindowSnapshot> resolved = normalizedSnapshot(raw, true);
     if (!resolved.has_value() || !resolver) {

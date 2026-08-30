@@ -94,9 +94,9 @@ public:
     [[nodiscard]] BrowserSessionLoadResult load();
     [[nodiscard]] BrowserSessionSaveResult save(
         const BrowserWindowSnapshot &snapshot);
-    [[nodiscard]] BrowserSessionResolveResult validateAndResolve(
+    [[nodiscard]] static BrowserSessionResolveResult validateAndResolve(
         const BrowserWindowSnapshot &raw,
-        const RestoredAddressResolver &resolver) const;
+        const RestoredAddressResolver &resolver);
 
 private:
     std::shared_ptr<const HostOwnedStateDirectory> stateDirectory_;

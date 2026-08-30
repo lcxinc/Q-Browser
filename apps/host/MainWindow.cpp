@@ -3,6 +3,7 @@
 #include "AppTabRuntimeController.h"
 #include "BrowserAddress.h"
 #include "BrowserChrome.h"
+#include "BrowserWindowGeometry.h"
 #include "NavigationBar.h"
 #include "WebSessionProfile.h"
 #include "WebSurface.h"
@@ -14,11 +15,14 @@
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTabBar>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <utility>
 
 namespace {
+
+constexpr int BrowserSessionSaveDebounceMilliseconds = 200;
 
 QVariantMap variantParameters(const QHash<QString, QString> &parameters)
 {
@@ -36,6 +40,25 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
                        const QUrl &mockOrigin,
                        WorkerSurface *workerSurface,
                        QWidget *parent)
+    : MainWindow(std::move(routeRegistry), mockOrigin, workerSurface, parent,
+                 MainWindowInitialState::ImmediateNewTab)
+{
+}
+
+MainWindow::MainWindow(RouteRegistry routeRegistry,
+                       const QUrl &mockOrigin,
+                       const MainWindowInitialState initialState,
+                       QWidget *parent)
+    : MainWindow(std::move(routeRegistry), mockOrigin, nullptr, parent,
+                 initialState)
+{
+}
+
+MainWindow::MainWindow(RouteRegistry routeRegistry,
+                       const QUrl &mockOrigin,
+                       WorkerSurface *workerSurface,
+                       QWidget *parent,
+                       const MainWindowInitialState initialState)
     : QMainWindow(parent)
     , routes_(std::move(routeRegistry))
     , mockOrigin_(mockOrigin)
@@ -55,6 +78,27 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     layout->addWidget(browserChrome_);
     layout->addWidget(surfaceStack_, 1);
     setCentralWidget(central);
+
+    browserSessionSaveTimer_ = new QTimer(this);
+    browserSessionSaveTimer_->setObjectName(
+        QStringLiteral("browser-session-save-debounce"));
+    browserSessionSaveTimer_->setSingleShot(true);
+    browserSessionSaveTimer_->setInterval(
+        BrowserSessionSaveDebounceMilliseconds);
+    connect(browserSessionSaveTimer_, &QTimer::timeout, this, [this] {
+        if (!isRunning() || !browserSessionApplied_
+            || browserSessionFrozen_ || !browserSessionSave_) {
+            return;
+        }
+        (void)performBrowserSessionSave(browserSessionSnapshot());
+    });
+    connect(tabModel_.get(), &BrowserTabModel::persistenceNeeded, this,
+            [this] {
+                if (isRunning() && browserSessionApplied_
+                    && !browserSessionFrozen_ && browserSessionSave_) {
+                    browserSessionSaveTimer_->start();
+                }
+            });
 
     connect(tabModel_.get(), &BrowserTabModel::tabInserted, this,
             [this](int, const QString &id) {
@@ -119,10 +163,12 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
             this, [this] { (void)shutdown(); });
 
-    const QString initialId = tabModel_->createTab(
-        BrowserTabKind::Host, QStringLiteral("New tab"),
-        QStringLiteral("qbrowser://newtab"));
-    if (!initialId.isEmpty()) activateStableTab(initialId);
+    if (initialState == MainWindowInitialState::ImmediateNewTab) {
+        const QString initialId = tabModel_->createTab(
+            BrowserTabKind::Host, QStringLiteral("New tab"),
+            QStringLiteral("qbrowser://newtab"));
+        if (!initialId.isEmpty()) activateStableTab(initialId);
+    }
     synchronizeChrome();
     if (workerSurface != nullptr) {
         (void)attachWorkerSurface(
@@ -141,6 +187,7 @@ bool MainWindow::shutdown()
     if (shutdownInProgress_ || tabMutationInProgress()) return false;
     QScopedValueRollback<bool> shutdownTransaction(shutdownInProgress_, true);
     if (lifecycleState_ == LifecycleState::Running) {
+        (void)freezeBrowserSessionAndFlush();
         lifecycleState_ = LifecycleState::Closing;
         hide();
         const QList<TabController *> retiringControllers = controllers_.values();
@@ -179,6 +226,112 @@ bool MainWindow::shutdown()
 bool MainWindow::navigate(const QStringView input)
 {
     return navigateTab(activeStableId(), input);
+}
+
+bool MainWindow::applyBrowserSessionLoadResult(
+    const BrowserSessionLoadResult &loadResult,
+    const RestoredAddressResolver &resolver,
+    const QRect &primaryAvailableGeometry,
+    const QList<QRect> &availableScreenGeometries,
+    BrowserSessionSaveCallback saveCallback)
+{
+    if (!isRunning() || browserSessionApplied_ || browserSessionApplyInProgress_
+        || browserSessionFrozen_ || tabModel_ == nullptr
+        || !tabModel_->isEmpty()) {
+        return false;
+    }
+    QScopedValueRollback<bool> applyTransaction(
+        browserSessionApplyInProgress_, true);
+    const auto applyCleanSession = [&](const bool enableSaving) {
+        QString cleanId;
+        {
+            const QSignalBlocker blockModelSignals(tabModel_.get());
+            cleanId = tabModel_->createTab(
+                BrowserTabKind::Host, QStringLiteral("New tab"),
+                QStringLiteral("qbrowser://newtab"));
+        }
+        if (cleanId.isEmpty()) return false;
+        createController(cleanId);
+        setGeometry(restoreBrowserWindowGeometry(
+            {}, primaryAvailableGeometry, availableScreenGeometries));
+        if (enableSaving) browserSessionSave_ = std::move(saveCallback);
+        browserSessionApplied_ = true;
+        activateStableTab(cleanId);
+        synchronizeChrome();
+        return true;
+    };
+    if (loadResult.status == BrowserSessionLoadStatus::Missing
+        || loadResult.status == BrowserSessionLoadStatus::Corrupt
+        || loadResult.status == BrowserSessionLoadStatus::IoFailure) {
+        return applyCleanSession(
+            loadResult.status != BrowserSessionLoadStatus::IoFailure);
+    }
+    if (loadResult.status != BrowserSessionLoadStatus::Loaded
+        || !loadResult.snapshot.has_value()) return applyCleanSession(false);
+    BrowserSessionResolveResult resolved;
+    bool resolverThrew = false;
+    try {
+        resolved = BrowserSessionStore::validateAndResolve(
+            *loadResult.snapshot, resolver);
+    } catch (...) {
+        resolverThrew = true;
+    }
+    if (!isRunning() || browserSessionApplied_ || browserSessionFrozen_
+        || tabModel_ == nullptr || !tabModel_->isEmpty()) {
+        return false;
+    }
+    if (resolverThrew) return applyCleanSession(false);
+    if (!resolved.snapshot.has_value()) return applyCleanSession(false);
+    for (const BrowserTabSnapshot &tab : resolved.snapshot->tabs) {
+        if (tab.kind == BrowserTabKind::TrustedError) continue;
+        const std::optional<ResolvedNavigation> shellResolution =
+            resolveAddress(tab.address);
+        if (!shellResolution.has_value()
+            || shellResolution->kind != tab.kind) {
+            return applyCleanSession(false);
+        }
+    }
+    const int activeIndex = [&resolved] {
+        for (int index = 0; index < resolved.snapshot->tabs.size(); ++index) {
+            if (resolved.snapshot->tabs.at(index).id
+                == resolved.snapshot->activeTabId) {
+                return index;
+            }
+        }
+        return -1;
+    }();
+    if (activeIndex < 0
+        || !tabModel_->replaceFromValidatedSnapshot(
+            resolved.snapshot->tabs, activeIndex)) {
+        return applyCleanSession(false);
+    }
+
+    setGeometry(restoreBrowserWindowGeometry(
+        resolved.snapshot->geometry, primaryAvailableGeometry,
+        availableScreenGeometries));
+    browserSessionSave_ = std::move(saveCallback);
+    browserSessionApplied_ = true;
+    activateStableTab(resolved.snapshot->activeTabId);
+    synchronizeChrome();
+    return true;
+}
+
+bool MainWindow::freezeBrowserSessionAndFlush()
+{
+    if (browserSessionApplyInProgress_ || browserSessionSaveInProgress_) {
+        return false;
+    }
+    if (browserSessionFrozen_) return browserSessionFinalSaveSucceeded_;
+    browserSessionFrozen_ = true;
+    if (browserSessionSaveTimer_ != nullptr) {
+        browserSessionSaveTimer_->stop();
+    }
+    frozenBrowserSessionSnapshot_ = browserSessionSnapshot();
+    if (!browserSessionApplied_ || !browserSessionSave_) return true;
+
+    browserSessionFinalSaveSucceeded_ = performBrowserSessionSave(
+        *frozenBrowserSessionSnapshot_);
+    return browserSessionFinalSaveSucceeded_;
 }
 
 void MainWindow::setPackageRuntimeEnabled(const bool enabled) noexcept
@@ -666,9 +819,20 @@ bool MainWindow::startCurrentDescriptor(const QString &stableTabId,
 {
     const int index = tabModel_->indexOfId(stableTabId);
     if (index < 0) return false;
+    const BrowserTabSnapshot descriptor = tabModel_->snapshotAt(index);
+    if (descriptor.kind == BrowserTabKind::TrustedError) {
+        TabController *const controller = tabController(stableTabId);
+        if (controller == nullptr) return false;
+        const quint64 navigationIncarnation = controller->beginNavigation();
+        if (navigationIncarnation == 0) return false;
+        controller->showTrustedErrorForNavigation(
+            navigationIncarnation,
+            QStringLiteral("The restored content is no longer available."));
+        return true;
+    }
     QString error;
     const std::optional<ResolvedNavigation> resolved = resolveAddress(
-        tabModel_->snapshotAt(index).address, &error);
+        descriptor.address, &error);
     if (!resolved.has_value()) {
         showTrustedError(stableTabId, error);
         return false;
@@ -708,6 +872,27 @@ void MainWindow::emitPersistenceAfterTransition()
     const bool published = QMetaObject::invokeMethod(
         tabModel_.get(), "persistenceNeeded", Qt::DirectConnection);
     Q_ASSERT(published);
+}
+
+BrowserWindowSnapshot MainWindow::browserSessionSnapshot() const
+{
+    return {geometry(), activeStableId(),
+            tabModel_ != nullptr ? tabModel_->snapshots()
+                                 : QVector<BrowserTabSnapshot>{}};
+}
+
+bool MainWindow::performBrowserSessionSave(
+    const BrowserWindowSnapshot &snapshot) noexcept
+{
+    if (!browserSessionSave_ || browserSessionSaveInProgress_) return false;
+    QScopedValueRollback<bool> saveTransaction(
+        browserSessionSaveInProgress_, true);
+    try {
+        return browserSessionSave_(snapshot).status
+            == BrowserSessionSaveStatus::Saved;
+    } catch (...) {
+        return false;
+    }
 }
 
 void MainWindow::createController(const QString &stableTabId)
@@ -1057,7 +1242,8 @@ BrowserTabSnapshot MainWindow::activeSnapshot() const
 
 bool MainWindow::tabMutationInProgress() const noexcept
 {
-    return navigationInProgress_ || resourceMutationDepth_ > 0;
+    return navigationInProgress_ || resourceMutationDepth_ > 0
+        || browserSessionApplyInProgress_ || browserSessionSaveInProgress_;
 }
 
 int MainWindow::numberedTabIndex(const BrowserCommand command) noexcept
