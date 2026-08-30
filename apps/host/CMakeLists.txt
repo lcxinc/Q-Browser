@@ -13,6 +13,8 @@ add_library(q_browser_host STATIC
   BrowserSessionStore.h
   BrowserTabModel.cpp
   BrowserTabModel.h
+  BrowserWindowGeometry.cpp
+  BrowserWindowGeometry.h
   HostApplication.cpp
   HostApplication.h
   HostCapabilityRuntime.cpp

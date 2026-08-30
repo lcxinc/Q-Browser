@@ -34,6 +34,16 @@ target_link_libraries(tst_browser_tab_model
 q_browser_enable_strict_warnings(tst_browser_tab_model)
 q_browser_add_qt_test(NAME browser_tab_model TARGET tst_browser_tab_model)
 
+add_executable(tst_browser_window_geometry tst_browser_window_geometry.cpp)
+target_link_libraries(tst_browser_window_geometry
+  PRIVATE
+    q_browser_host
+    Qt6::Test)
+q_browser_enable_strict_warnings(tst_browser_window_geometry)
+q_browser_add_qt_test(
+  NAME browser_window_geometry
+  TARGET tst_browser_window_geometry)
+
 add_executable(tst_browser_session_store tst_browser_session_store.cpp)
 target_link_libraries(tst_browser_session_store
   PRIVATE
