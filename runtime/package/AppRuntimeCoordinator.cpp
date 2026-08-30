@@ -54,6 +54,52 @@ qint64 boundedDeadline(const qint64 nowMs, const qint64 timeoutMs) noexcept
 
 } // namespace
 
+VerifiedCurrentPackage::VerifiedCurrentPackage(
+    QString appId,
+    QString version,
+    QString versionDirectory,
+    QString packageDirectory,
+    QByteArray digestHex,
+    const qint64 activationGenerationAtIssue)
+    : appId_(std::move(appId))
+    , version_(std::move(version))
+    , versionDirectory_(std::move(versionDirectory))
+    , packageDirectory_(std::move(packageDirectory))
+    , digestHex_(std::move(digestHex))
+    , activationGenerationAtIssue_(activationGenerationAtIssue)
+{
+}
+
+const QString &VerifiedCurrentPackage::appId() const noexcept
+{
+    return appId_;
+}
+
+const QString &VerifiedCurrentPackage::version() const noexcept
+{
+    return version_;
+}
+
+const QString &VerifiedCurrentPackage::versionDirectory() const noexcept
+{
+    return versionDirectory_;
+}
+
+const QString &VerifiedCurrentPackage::packageDirectory() const noexcept
+{
+    return packageDirectory_;
+}
+
+const QByteArray &VerifiedCurrentPackage::digestHex() const noexcept
+{
+    return digestHex_;
+}
+
+qint64 VerifiedCurrentPackage::activationGenerationAtIssue() const noexcept
+{
+    return activationGenerationAtIssue_;
+}
+
 AppRuntimeCoordinator::TabState::TabState(
     TabLaunchAuthority value,
     const WorkerSupervisionPolicy policy)
@@ -200,6 +246,20 @@ AppRuntimeCoordinator::descriptorFromResult(
     return descriptor;
 }
 
+AppRuntimeResult AppRuntimeCoordinator::verifiedStartupResult(
+    const VersionDescriptor &descriptor)
+{
+    AppRuntimeResult result;
+    result.verifiedCurrent = VerifiedCurrentPackage{
+        descriptor.lease.appId,
+        descriptor.lease.version,
+        descriptor.lease.versionDirectory,
+        descriptor.lease.packageDirectory,
+        descriptor.lease.digestHex,
+        descriptor.lease.activationGenerationAtIssue};
+    return result;
+}
+
 quint64 AppRuntimeCoordinator::issueLeaseEpoch() noexcept
 {
     const quint64 issued = nextLeaseAuthorityEpoch_;
@@ -260,7 +320,7 @@ AppRuntimeResult AppRuntimeCoordinator::installAndActivate(
     candidate_ = descriptor;
     candidatePromoted_ = false;
     rollbackStarted_ = false;
-    return {};
+    return verifiedStartupResult(*descriptor);
 }
 
 AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
@@ -281,8 +341,11 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
     }
     const InstallResult verified = installer_.reverifyInstalledVersion(
         appId_, *binding);
-    auto current = descriptorFromResult(verified, *binding);
-    if (!current.has_value()
+    auto nextCurrent = descriptorFromResult(verified, *binding);
+    std::optional<VersionDescriptor> nextLkg;
+    bool nextCandidatePromoted = false;
+    bool recoveredLastKnownGood = false;
+    if (!nextCurrent.has_value()
         && !state.state.lastKnownGood.isEmpty()
         && state.state.lastKnownGood != state.state.current) {
         const InstallResult lkgVerified = installer_.verifyInstalled(
@@ -303,39 +366,50 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
                     || !recovered.activationBinding.has_value()) {
                     return rejectedResult(QStringLiteral("lkg_recovery_failed"));
                 }
-                current = descriptorFromResult(lkgVerified,
-                                               *recovered.activationBinding);
+                nextCurrent = descriptorFromResult(
+                    lkgVerified, *recovered.activationBinding);
+                if (nextCurrent.has_value()) {
+                    nextLkg = nextCurrent;
+                    nextCandidatePromoted = true;
+                    recoveredLastKnownGood = true;
+                }
             }
         }
     }
-    if (!current.has_value()) {
+    if (!nextCurrent.has_value()) {
         return rejectedResult(QStringLiteral("installed_content_invalid"));
     }
-    current_ = current;
-    candidate_ = current;
-    candidatePromoted_ = state.state.lastKnownGood == state.state.current;
 
-    if (!state.state.lastKnownGood.isEmpty()
-        && state.state.lastKnownGood != state.state.current) {
-        const InstallResult lkgVerified = installer_.verifyInstalled(
-            appId_, state.state.lastKnownGood);
-        const QString directory = state.state.lastKnownGood;
-        const qsizetype separator = directory.lastIndexOf(QLatin1Char('-'));
-        if (!lkgVerified.succeeded() || separator <= 0) {
-            return rejectedResult(QStringLiteral("lkg_unavailable"));
+    if (!recoveredLastKnownGood) {
+        nextCandidatePromoted =
+            state.state.lastKnownGood == state.state.current;
+        if (!state.state.lastKnownGood.isEmpty()
+            && state.state.lastKnownGood != state.state.current) {
+            const InstallResult lkgVerified = installer_.verifyInstalled(
+                appId_, state.state.lastKnownGood);
+            const QString directory = state.state.lastKnownGood;
+            const qsizetype separator = directory.lastIndexOf(QLatin1Char('-'));
+            if (!lkgVerified.succeeded() || separator <= 0) {
+                return rejectedResult(QStringLiteral("lkg_unavailable"));
+            }
+            const ActivationBinding lkgBinding{
+                directory,
+                directory.sliced(separator + 1).toLatin1(),
+                state.state.generation};
+            nextLkg = descriptorFromResult(lkgVerified, lkgBinding);
+            if (!nextLkg.has_value()) {
+                return rejectedResult(QStringLiteral("lkg_unavailable"));
+            }
+        } else if (nextCandidatePromoted) {
+            nextLkg = nextCurrent;
         }
-        const ActivationBinding lkgBinding{
-            directory,
-            directory.sliced(separator + 1).toLatin1(),
-            state.state.generation};
-        lkg_ = descriptorFromResult(lkgVerified, lkgBinding);
-        if (!lkg_.has_value()) {
-            return rejectedResult(QStringLiteral("lkg_unavailable"));
-        }
-    } else if (candidatePromoted_) {
-        lkg_ = current;
     }
-    return {};
+
+    current_ = nextCurrent;
+    candidate_ = nextCurrent;
+    lkg_ = nextLkg;
+    candidatePromoted_ = nextCandidatePromoted;
+    return verifiedStartupResult(*nextCurrent);
 }
 
 AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(

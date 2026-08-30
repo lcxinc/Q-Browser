@@ -66,6 +66,37 @@ struct AppRuntimeAction final
     std::optional<AuthorityDrainBatch> drain;
 };
 
+class VerifiedCurrentPackage final
+{
+public:
+    [[nodiscard]] const QString &appId() const noexcept;
+    [[nodiscard]] const QString &version() const noexcept;
+    [[nodiscard]] const QString &versionDirectory() const noexcept;
+    [[nodiscard]] const QString &packageDirectory() const noexcept;
+    [[nodiscard]] const QByteArray &digestHex() const noexcept;
+    [[nodiscard]] qint64 activationGenerationAtIssue() const noexcept;
+
+    friend bool operator==(const VerifiedCurrentPackage &,
+                           const VerifiedCurrentPackage &) = default;
+
+private:
+    friend class AppRuntimeCoordinator;
+
+    VerifiedCurrentPackage(QString appId,
+                           QString version,
+                           QString versionDirectory,
+                           QString packageDirectory,
+                           QByteArray digestHex,
+                           qint64 activationGenerationAtIssue);
+
+    QString appId_;
+    QString version_;
+    QString versionDirectory_;
+    QString packageDirectory_;
+    QByteArray digestHex_;
+    qint64 activationGenerationAtIssue_ = 0;
+};
+
 enum class AppRuntimeResultCode
 {
     Applied,
@@ -80,6 +111,7 @@ struct AppRuntimeResult final
     QString stableError;
     QVector<AppRuntimeAction> actions;
     quint32 nativeError = 0;
+    std::optional<VerifiedCurrentPackage> verifiedCurrent;
 };
 
 class AppRuntimeCoordinator final
@@ -203,6 +235,8 @@ private:
     [[nodiscard]] static std::optional<VersionDescriptor> descriptorFromResult(
         const InstallResult &result,
         const ActivationBinding &binding);
+    [[nodiscard]] static AppRuntimeResult verifiedStartupResult(
+        const VersionDescriptor &descriptor);
     [[nodiscard]] TabState *findTab(const TabLaunchAuthority &tab) const;
     [[nodiscard]] TabState *findTab(const FullAttemptKey &key) const;
     [[nodiscard]] AppRuntimeResult staleResult() const;

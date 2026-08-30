@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <memory>
+#include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -73,6 +75,52 @@ const AppRuntimeAction &onlyAction(const AppRuntimeResult &result,
     return *found;
 }
 
+bool tamperInstalledEntryPoint(const QString &packageDirectory)
+{
+    const QString entryPath = QDir(packageDirectory).filePath(
+        QStringLiteral("qml/Main.qml"));
+#ifdef Q_OS_WIN
+    if (SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(
+                reinterpret_cast<LPCWSTR>(entryPath.utf16())),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const auto *const nativePath = reinterpret_cast<LPCWSTR>(
+        entryPath.utf16());
+    const DWORD attributes = GetFileAttributesW(nativePath);
+    if (attributes == INVALID_FILE_ATTRIBUTES
+        || ((attributes & FILE_ATTRIBUTE_READONLY) != 0U
+            && SetFileAttributesW(nativePath,
+                                  attributes & ~FILE_ATTRIBUTE_READONLY)
+                   == FALSE)) {
+        return false;
+    }
+#endif
+    if (!QFile::setPermissions(entryPath,
+                               QFileDevice::ReadOwner
+                                   | QFileDevice::WriteOwner)) {
+        return false;
+    }
+    QFile entry(entryPath);
+    return entry.open(QIODevice::WriteOnly | QIODevice::Truncate)
+        && entry.write("tampered") == qint64(8);
+}
+
+template <typename T>
+concept ExposesLeaseAuthorityEpoch = requires(const T &value) {
+    value.leaseAuthorityEpoch;
+};
+
+static_assert(std::is_copy_constructible_v<VerifiedCurrentPackage>);
+static_assert(!std::is_aggregate_v<VerifiedCurrentPackage>);
+static_assert(!std::is_default_constructible_v<VerifiedCurrentPackage>);
+static_assert(!std::is_convertible_v<VerifiedCurrentPackage,
+                                     VerifiedPackageLease>);
+static_assert(!ExposesLeaseAuthorityEpoch<VerifiedCurrentPackage>);
+
 } // namespace
 
 class AppRuntimeCoordinatorTest final : public QObject
@@ -94,6 +142,12 @@ private slots:
     void lateCandidateEventsAreIgnored();
     void rollbackDoesNotAffectAnotherApp();
     void activeNewTabWithInstallPackageStartsZeroWorkers();
+    void installReturnsCopiedVerifiedCurrentWithoutWorkerAuthority();
+    void offlineStartupReturnsCopiedVerifiedCurrentWithoutWorkerAuthority();
+    void rejectedOfflineStartupCannotIssueAuthority();
+    void recoveredLkgIsPromotedWithRecoveredGeneration();
+    void rejectedStartupReturnsNoVerifiedCurrent();
+    void installingUpdatePreservesPinnedTabAndReturnsNewVerifiedCurrent();
     void userReloadUsesCurrentCandidateWhileCrashRestartUsesPinnedLease();
     void drainTimeoutIsFailedClosedAndNeverRecovers();
     void shutdownRetiresEveryTabAndRejectsNewEvents();
@@ -457,6 +511,227 @@ void AppRuntimeCoordinatorTest::activeNewTabWithInstallPackageStartsZeroWorkers(
         h.package("one", "1.0.0"), 0);
     QVERIFY(installed.code == AppRuntimeResultCode::Applied);
     QCOMPARE(installed.actions.size(), 0);
+}
+
+void AppRuntimeCoordinatorTest::installReturnsCopiedVerifiedCurrentWithoutWorkerAuthority()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    const AppRuntimeResult installed = h.coordinator->installAndActivate(
+        h.package("one", "1.0.0"), 0);
+    QCOMPARE(installed.code, AppRuntimeResultCode::Applied);
+    QCOMPARE(installed.actions.size(), 0);
+    QVERIFY(installed.verifiedCurrent.has_value());
+
+    const PackageStoreResult resolved = h.store->resolveCurrent(
+        QStringLiteral("company.pilot"));
+    const ActivationStateResult state = h.store->activationState(
+        QStringLiteral("company.pilot"));
+    QVERIFY(resolved.succeeded());
+    QVERIFY(state.hasValue());
+    const qsizetype digestSeparator = state.state.current.lastIndexOf(
+        QLatin1Char('-'));
+    QVERIFY(digestSeparator > 0);
+    const VerifiedCurrentPackage copied = *installed.verifiedCurrent;
+    QCOMPARE(copied.appId(), QStringLiteral("company.pilot"));
+    QCOMPARE(copied.version(), QStringLiteral("1.0.0"));
+    QCOMPARE(copied.packageDirectory(), resolved.path);
+    QCOMPARE(copied.versionDirectory(), state.state.current);
+    QCOMPARE(copied.digestHex(),
+             state.state.current.sliced(digestSeparator + 1).toLatin1());
+    QCOMPARE(copied.activationGenerationAtIssue(),
+             state.state.generation);
+    QVERIFY(copied.activationGenerationAtIssue() > 0);
+
+    const AppRuntimeResult updated = h.coordinator->installAndActivate(
+        h.package("two", "1.1.0"), 1);
+    QVERIFY(updated.verifiedCurrent.has_value());
+    QCOMPARE(copied.version(), QStringLiteral("1.0.0"));
+    QVERIFY(copied.packageDirectory()
+            != updated.verifiedCurrent->packageDirectory());
+
+    const AppRuntimeResult explicitLaunch = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("explicit")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 2);
+    QVERIFY(!explicitLaunch.verifiedCurrent.has_value());
+    (void)onlyAction(explicitLaunch, AppRuntimeActionKind::Launch);
+}
+
+void AppRuntimeCoordinatorTest::offlineStartupReturnsCopiedVerifiedCurrentWithoutWorkerAuthority()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    const AppRuntimeResult installed = h.coordinator->installAndActivate(
+        h.package("one", "1.0.0"), 0);
+    QVERIFY(installed.verifiedCurrent.has_value());
+
+    AppRuntimeCoordinator cold(QStringLiteral("company.pilot"), *h.store,
+                               *h.installer,
+                               WorkerSupervisionPolicy{100, 1'000},
+                               h.clock.source());
+    const AppRuntimeResult started = cold.startOffline(1);
+    QCOMPARE(started.code, AppRuntimeResultCode::Applied);
+    QCOMPARE(started.actions.size(), 0);
+    QVERIFY(started.verifiedCurrent.has_value());
+    QCOMPARE(*started.verifiedCurrent, *installed.verifiedCurrent);
+}
+
+void AppRuntimeCoordinatorTest::rejectedOfflineStartupCannotIssueAuthority()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    const AppRuntimeResult stable = h.coordinator->installAndActivate(
+        h.package("stable", "1.0.0"), 0);
+    QVERIFY(stable.verifiedCurrent.has_value());
+    const AppRuntimeResult stableLaunch = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("stable")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 1);
+    const AppRuntimeAction &stableAction = onlyAction(
+        stableLaunch, AppRuntimeActionKind::Launch);
+    const FullAttemptKey stableKey = fullKey(stableAction);
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(
+                 stableKey, stableAction.launch->lease, 1)
+                 .code,
+             AppRuntimeResultCode::Applied);
+    QCOMPARE(h.coordinator->heartbeat(stableKey, 90).code,
+             AppRuntimeResultCode::Applied);
+    QCOMPARE(h.coordinator->heartbeat(stableKey, 101).code,
+             AppRuntimeResultCode::Applied);
+    QVERIFY(h.coordinator->installAndActivate(
+                h.package("candidate", "1.1.0"), 102)
+                .verifiedCurrent.has_value());
+    QVERIFY(tamperInstalledEntryPoint(stable.verifiedCurrent
+                                          ->packageDirectory()));
+
+    AppRuntimeCoordinator cold(QStringLiteral("company.pilot"), *h.store,
+                               *h.installer,
+                               WorkerSupervisionPolicy{100, 1'000},
+                               h.clock.source());
+    const AppRuntimeResult rejected = cold.startOffline(103);
+    QCOMPARE(rejected.code, AppRuntimeResultCode::Rejected);
+    QCOMPARE(rejected.actions.size(), 0);
+    QVERIFY(!rejected.verifiedCurrent.has_value());
+
+    const AppRuntimeResult launchAfterRejection = cold.requestTabLaunch(
+        tab(QStringLiteral("must-not-launch")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 104);
+    QCOMPARE(launchAfterRejection.code, AppRuntimeResultCode::Rejected);
+    QCOMPARE(launchAfterRejection.actions.size(), 0);
+}
+
+void AppRuntimeCoordinatorTest::recoveredLkgIsPromotedWithRecoveredGeneration()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    const AppRuntimeResult stable = h.coordinator->installAndActivate(
+        h.package("stable", "1.0.0"), 0);
+    QVERIFY(stable.verifiedCurrent.has_value());
+    const AppRuntimeResult stableLaunch = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("stable")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 1);
+    const AppRuntimeAction &stableAction = onlyAction(
+        stableLaunch, AppRuntimeActionKind::Launch);
+    const FullAttemptKey stableKey = fullKey(stableAction);
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(
+                 stableKey, stableAction.launch->lease, 1)
+                 .code,
+             AppRuntimeResultCode::Applied);
+    QCOMPARE(h.coordinator->heartbeat(stableKey, 90).code,
+             AppRuntimeResultCode::Applied);
+    QCOMPARE(h.coordinator->heartbeat(stableKey, 101).code,
+             AppRuntimeResultCode::Applied);
+    const AppRuntimeResult candidate = h.coordinator->installAndActivate(
+        h.package("candidate", "1.1.0"), 102);
+    QVERIFY(candidate.verifiedCurrent.has_value());
+    QVERIFY(tamperInstalledEntryPoint(candidate.verifiedCurrent
+                                          ->packageDirectory()));
+
+    AppRuntimeCoordinator cold(QStringLiteral("company.pilot"), *h.store,
+                               *h.installer,
+                               WorkerSupervisionPolicy{100, 1'000},
+                               h.clock.source());
+    const AppRuntimeResult recovered = cold.startOffline(103);
+    QCOMPARE(recovered.code, AppRuntimeResultCode::Applied);
+    QCOMPARE(recovered.actions.size(), 0);
+    QVERIFY(recovered.verifiedCurrent.has_value());
+    QCOMPARE(recovered.verifiedCurrent->version(), QStringLiteral("1.0.0"));
+    QCOMPARE(recovered.verifiedCurrent->packageDirectory(),
+             stable.verifiedCurrent->packageDirectory());
+    const ActivationState recoveredState = h.store->activationState(
+        QStringLiteral("company.pilot")).state;
+    QCOMPARE(recoveredState.current, recoveredState.lastKnownGood);
+    QCOMPARE(recovered.verifiedCurrent->versionDirectory(),
+             recoveredState.current);
+    QCOMPARE(recovered.verifiedCurrent->activationGenerationAtIssue(),
+             recoveredState.generation);
+
+    const AppRuntimeResult launched = cold.requestTabLaunch(
+        tab(QStringLiteral("recovered")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 104);
+    const AppRuntimeAction &launchAction = onlyAction(
+        launched, AppRuntimeActionKind::Launch);
+    const AppRuntimeResult restarted = cold.workerExited(
+        fullKey(launchAction), WorkerExitReason::Crashed, 105);
+    const AppRuntimeAction &restartAction = onlyAction(
+        restarted, AppRuntimeActionKind::Launch);
+    const AppRuntimeResult crashLoop = cold.workerExited(
+        fullKey(restartAction), WorkerExitReason::Crashed, 106);
+    QVERIFY(std::ranges::any_of(crashLoop.actions, [](const auto &action) {
+        return action.kind == AppRuntimeActionKind::TrustedCrash;
+    }));
+    QVERIFY(std::ranges::none_of(crashLoop.actions, [](const auto &action) {
+        return action.kind == AppRuntimeActionKind::AwaitAuthorityDrain;
+    }));
+    QCOMPARE(h.store->activationState(QStringLiteral("company.pilot"))
+                 .state.generation,
+             recoveredState.generation);
+    (void)onlyAction(cold.requestTabLaunch(
+                         tab(QStringLiteral("still-available")),
+                         QStringLiteral("/"),
+                         TabLaunchIntent::ActivateCurrent, 107),
+                     AppRuntimeActionKind::Launch);
+}
+
+void AppRuntimeCoordinatorTest::rejectedStartupReturnsNoVerifiedCurrent()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    const AppRuntimeResult rejectedInstall =
+        h.coordinator->installAndActivate({}, 0);
+    QCOMPARE(rejectedInstall.code, AppRuntimeResultCode::Rejected);
+    QCOMPARE(rejectedInstall.actions.size(), 0);
+    QVERIFY(!rejectedInstall.verifiedCurrent.has_value());
+
+    const AppRuntimeResult rejectedOffline = h.coordinator->startOffline(1);
+    QCOMPARE(rejectedOffline.code, AppRuntimeResultCode::Rejected);
+    QCOMPARE(rejectedOffline.actions.size(), 0);
+    QVERIFY(!rejectedOffline.verifiedCurrent.has_value());
+}
+
+void AppRuntimeCoordinatorTest::installingUpdatePreservesPinnedTabAndReturnsNewVerifiedCurrent()
+{
+    CoordinatorHarness h;
+    QVERIFY(h.keys.hasValue());
+    QVERIFY(h.coordinator->installAndActivate(h.package("one", "1.0.0"), 0)
+                .verifiedCurrent.has_value());
+    const AppRuntimeResult pinned = h.coordinator->requestTabLaunch(
+        tab(QStringLiteral("pinned")), QStringLiteral("/"),
+        TabLaunchIntent::ActivateCurrent, 1);
+    const AppRuntimeAction &pinnedLaunch = onlyAction(
+        pinned, AppRuntimeActionKind::Launch);
+    const VerifiedPackageLease pinnedLease = pinnedLaunch.launch->lease;
+
+    const AppRuntimeResult updated = h.coordinator->installAndActivate(
+        h.package("two", "1.1.0"), 2);
+    QCOMPARE(updated.code, AppRuntimeResultCode::Applied);
+    QCOMPARE(updated.actions.size(), 0);
+    QVERIFY(updated.verifiedCurrent.has_value());
+    QCOMPARE(updated.verifiedCurrent->version(), QStringLiteral("1.1.0"));
+    QCOMPARE(pinnedLaunch.launch->lease, pinnedLease);
+    QCOMPARE(h.coordinator->admitAuthenticatedWorker(
+                 *pinnedLaunch.launch, 3)
+                 .code,
+             AppRuntimeResultCode::Applied);
 }
 
 void AppRuntimeCoordinatorTest::userReloadUsesCurrentCandidateWhileCrashRestartUsesPinnedLease()
