@@ -110,8 +110,8 @@ describe("release acceptance script", () => {
       "utf8",
     );
     const business = await releaseFunction("Invoke-DeployedPilotBusinessAcceptance");
-    expect(script).toContain(
-      "if (!FocusWorker(worker)) return false;\n      Input down = new Input(); down.type = InputMouse;",
+    expect(script).toMatch(
+      /if \(!FocusWorker\(worker\)\) return false;\r?\n      Input down = new Input\(\); down\.type = InputMouse;/u,
     );
     expect(business).toContain("$fileCancelAttempt -lt 2");
   });
