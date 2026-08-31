@@ -143,6 +143,8 @@ public:
         const QString &route,
         TabLaunchIntent intent,
         qint64 nowMs);
+    [[nodiscard]] AppRuntimeResult cancelPendingLaunch(
+        const WorkerLaunchRequest &request);
 
     // This is the plan-level compatibility entry point. New Host code should
     // pass the complete WorkerLaunchRequest overload below.
@@ -160,6 +162,9 @@ public:
     [[nodiscard]] AppRuntimeResult heartbeat(
         const FullAttemptKey &key,
         qint64 receivedMonotonicMs);
+    void recordRouteLoadAcknowledged(const WorkerLaunchRequest &request,
+                                     const QString &routeTemplate,
+                                     qsizetype pendingRouteLoads) const;
     [[nodiscard]] AppRuntimeResult checkHealth(qint64 nowMs);
     [[nodiscard]] AppRuntimeResult workerExited(
         const FullAttemptKey &key,
@@ -188,6 +193,8 @@ public:
     [[nodiscard]] AppRuntimeResult closeTab(const TabLaunchAuthority &tab,
                                             qint64 nowMs = -1);
     [[nodiscard]] AppRuntimeResult beginShutdown(qint64 nowMs = -1);
+    [[nodiscard]] UpdateLifecycleShutdownResult
+    beginHostShutdownCleanup() noexcept;
 
 private:
     struct VersionDescriptor final
@@ -244,6 +251,10 @@ private:
     [[nodiscard]] AppRuntimeResult failedClosedResult(
         const QString &error,
         quint32 nativeError = 0) const;
+    [[nodiscard]] AppRuntimeResult immutableCleanupFailureResult() const;
+    [[nodiscard]] bool settleTemporaryVerification(
+        InstallResult &result) noexcept;
+    [[nodiscard]] bool retryPendingImmutableCleanup() noexcept;
     [[nodiscard]] AppRuntimeAction makeTabAction(
         AppRuntimeActionKind kind,
         const TabLaunchAuthority &tab) const;
@@ -301,6 +312,9 @@ private:
              AuthorityLess>
         tabs_;
     std::optional<PendingDrain> pendingDrain_;
+    std::shared_ptr<const ImmutablePackageGuard> pendingImmutableCleanup_;
+    QString pendingImmutableCleanupError_;
+    quint32 pendingImmutableCleanupNativeError_ = 0;
     quint64 nextLeaseAuthorityEpoch_ = 1;
     quint64 nextDrainId_ = 1;
     bool candidatePromoted_ = false;

@@ -13,15 +13,6 @@
 #include <limits>
 #include <utility>
 
-namespace {
-
-QString attemptKey(const WorkerAttemptKey &key)
-{
-    return QStringLiteral("%1/%2").arg(key.activation.value).arg(key.attempt.value);
-}
-
-}
-
 AppTabRuntimeController::AppTabRuntimeController(
     QString tabId,
     TabController *const tabController,
@@ -133,8 +124,25 @@ AppTabRuntimeController::AppTabRuntimeController(
                     || !currentRequest_.has_value()) {
                     return;
                 }
-                emit failed(*currentRequest_, errorCode, generation);
-                stopCurrent(QStringLiteral("host.worker_session.failed"));
+                const WorkerLaunchRequest failedRequest = *currentRequest_;
+                const QPointer<AppTabRuntimeController> self(this);
+                emit failed(failedRequest, errorCode, generation);
+                if (!self || !self->currentRequest_.has_value()
+                    || !hasSameWorkerLaunchAuthority(
+                           *self->currentRequest_, failedRequest)
+                    || self->sessionController_ == nullptr
+                    || self->sessionController_->generation() != generation
+                    || self->sessionController_->state()
+                           != HostWorkerSessionState::Failed
+                    || (generation != self->activeGeneration_
+                        && (!self->pendingAttach_.has_value()
+                            || generation
+                                   != self->pendingAttach_
+                                          ->expectedGeneration))) {
+                    return;
+                }
+                self->stopCurrent(
+                    QStringLiteral("host.worker_session.failed"));
             },
             Qt::DirectConnection);
 
@@ -163,78 +171,100 @@ AppTabRuntimeController::AppTabRuntimeController(
         [guard] {
             if (guard) guard->stopCurrent(QStringLiteral("host.worker.relaunch"));
         },
-        [guard](const WorkerAttemptKey key, const bool expected) {
-            if (!guard) return;
-            const auto request = guard->requestForAttempt(key);
-            if (!request.has_value()) return;
-            emit guard->workerExited(*request, expected);
-            if (guard->currentRequest_.has_value()
-                && guard->currentRequest_->attempt == key) {
-                guard->stopCurrent(QStringLiteral("host.worker.exited"));
-            }
-        },
-        [guard](const WorkerAttemptKey key, const QString &error,
-                const quint32 nativeError) {
-            if (!guard) return;
-            const auto request = guard->requestForAttempt(key);
-            if (request.has_value()) {
-                emit guard->workerFailed(*request, error, nativeError);
-                if (guard->currentRequest_.has_value()
-                    && guard->currentRequest_->attempt == key) {
-                    guard->stopCurrent(QStringLiteral("host.worker.failed"));
-                }
-            }
-        },
+        [](WorkerAttemptKey, bool) {},
+        [](WorkerAttemptKey, const QString &, quint32) {},
         this);
     accepting_ = launcher_->isAccepting();
 
-    connect(launcher_.get(), &InstalledPackageWorkerLauncher::ready, this,
-            [this](const QString &, const QString &, const QString &,
-                   const quint64 activation, const quint64 attempt,
+    connect(launcher_.get(),
+            &InstalledPackageWorkerLauncher::readyForRequest, this,
+            [this](const WorkerLaunchRequest &request,
                    const quint32 processId) {
-                const WorkerAttemptKey key{WorkerActivationId{activation},
-                                           WorkerAttemptId{attempt}};
                 if (pendingAttach_.has_value()
-                    && pendingAttach_->request.attempt == key) {
+                    && hasSameWorkerLaunchAuthority(
+                        pendingAttach_->request, request)) {
                     return;
                 }
-                const auto request = requestForAttempt(key);
-                if (request.has_value()) emit ready(*request, processId);
+                const WorkerLaunchRequest projectedRequest =
+                    currentRequest_.has_value()
+                        && hasSameWorkerLaunchAuthority(*currentRequest_, request)
+                    ? *currentRequest_ : request;
+                emit ready(projectedRequest, processId);
             },
             Qt::DirectConnection);
     connect(launcher_.get(),
-            &InstalledPackageWorkerLauncher::unexpectedExit, this,
-            [this](const quint64 activation, const quint64 attempt) {
-                const auto request = requestForAttempt(
-                    WorkerAttemptKey{WorkerActivationId{activation},
-                                     WorkerAttemptId{attempt}});
-                if (request.has_value() && currentRequest_.has_value()
-                    && currentRequest_->attempt == request->attempt) {
-                    stopCurrent(QStringLiteral("host.worker.unexpected_exit"));
+            &InstalledPackageWorkerLauncher::workerExitedForRequest, this,
+            [this](const WorkerLaunchRequest &request, const bool expected) {
+                QPointer<AppTabRuntimeController> self(this);
+                emit self->workerExited(request, expected);
+                if (!self) return;
+                if (self->currentRequest_.has_value()
+                    && hasSameWorkerLaunchAuthority(*self->currentRequest_,
+                                                    request)) {
+                    self->stopCurrent(
+                        expected ? QStringLiteral("host.worker.expected_exit")
+                                 : QStringLiteral(
+                                       "host.worker.unexpected_exit"));
                 }
             },
             Qt::DirectConnection);
     connect(launcher_.get(),
-            &InstalledPackageWorkerLauncher::retirementCompleted, this,
-            [this](const quint64 activation, const quint64 attempt,
-                   const bool) {
-                const auto request = requestForAttempt(
-                    WorkerAttemptKey{WorkerActivationId{activation},
-                                     WorkerAttemptId{attempt}});
-                if (!request.has_value()) return;
-                const WorkerAttemptKey key = request->attempt;
+            &InstalledPackageWorkerLauncher::launchFailedForRequest, this,
+            [this](const WorkerLaunchRequest &request, const QString &error,
+                   const quint32 nativeError) {
+                QPointer<AppTabRuntimeController> self(this);
+                emit self->workerFailed(request, error, nativeError);
+                if (!self) return;
+                if (self->currentRequest_.has_value()
+                    && hasSameWorkerLaunchAuthority(*self->currentRequest_,
+                                                    request)) {
+                    self->stopCurrent(QStringLiteral("host.worker.failed"));
+                }
+            },
+            Qt::DirectConnection);
+    connect(launcher_.get(),
+            &InstalledPackageWorkerLauncher::terminalFailure, this,
+            [this](const QString &error, const quint32 nativeError) {
+                accepting_ = false;
+                expectedLaunchTarget_.reset();
+                currentRequest_.reset();
+                activeGeneration_ = 0;
+                const QString stableTabId = tabId_;
+                const QPointer<AppTabRuntimeController> self(this);
+                stopCurrent(error);
+                if (self) {
+                    emit self->launcherTerminalFailure(
+                        stableTabId, error, nativeError);
+                }
+            },
+            Qt::DirectConnection);
+    connect(launcher_.get(),
+            &InstalledPackageWorkerLauncher::retirementCompletedForRequest,
+            this,
+            [this](const WorkerLaunchRequest &request, const bool) {
                 if (currentRequest_.has_value()
-                    && currentRequest_->attempt == key) {
+                    && hasSameWorkerLaunchAuthority(*currentRequest_,
+                                                    request)) {
                     currentRequest_.reset();
                     activeGeneration_ = 0;
                 }
+                if (expectedLaunchTarget_.has_value()
+                    && hasSameWorkerLaunchAuthority(
+                        expectedLaunchTarget_->request, request)) {
+                    expectedLaunchTarget_.reset();
+                }
                 if (pendingAttach_.has_value()
-                    && pendingAttach_->request.attempt == key) {
+                    && hasSameWorkerLaunchAuthority(
+                        pendingAttach_->request, request)) {
                     clearPendingAttach();
                 }
-                if (closing_ && !retiredEmitted_) {
+                if (closing_ && !retiredEmitted_
+                    && !currentRequest_.has_value()
+                    && !pendingAttach_.has_value()
+                    && (launcher_ == nullptr
+                        || !launcher_->hasPendingActivity())) {
                     retiredEmitted_ = true;
-                    emit retired(tabId_, request->runtimeIncarnation);
+                    emit retired(tabId_, runtimeIncarnation_);
                 }
             },
             Qt::DirectConnection);
@@ -291,27 +321,83 @@ HostCapabilityRuntime *AppTabRuntimeController::capabilityRuntime() const noexce
     return capabilityRuntime_.get();
 }
 
-bool AppTabRuntimeController::requestLaunch(const WorkerLaunchRequest &request)
+bool AppTabRuntimeController::requestLaunch(
+    const WorkerLaunchRequest &request,
+    const quint64 expectedNavigationIncarnation,
+    const QString &originalCanonicalAddress)
 {
     if (!isAccepting() || request.tabId != tabId_
-        || request.runtimeIncarnation == 0 || launcher_ == nullptr) {
+        || request.runtimeIncarnation == 0 || launcher_ == nullptr
+        || expectedNavigationIncarnation == 0
+        || originalCanonicalAddress.isEmpty() || mainWindow_.isNull()
+        || !mainWindow_->isAppLaunchTargetCurrent(
+            tabId_, expectedNavigationIncarnation, request.lease.appId,
+            request.route, originalCanonicalAddress)) {
         return false;
     }
-    rememberRequest(request);
     currentRequest_ = request;
+    expectedLaunchTarget_ = ExpectedLaunchTarget{
+        request, expectedNavigationIncarnation, originalCanonicalAddress};
     runtimeIncarnation_ = request.runtimeIncarnation;
-    const bool launched = launcher_->requestLaunch(request);
-    if (!launched && currentRequest_.has_value()
-        && currentRequest_->attempt == request.attempt
-        && !launcher_->hasPendingActivity(request.attempt)
-        && !launcher_->hasPendingActivity()) {
-        currentRequest_.reset();
-        if (closing_ && !retiredEmitted_) {
-            retiredEmitted_ = true;
-            emit retired(tabId_, runtimeIncarnation_);
+    InstalledPackageWorkerLauncher *const launcher = launcher_.get();
+    const QPointer<AppTabRuntimeController> self(this);
+    const bool launched = launcher->requestLaunch(request);
+    if (!self) return launched;
+    if (!launched && self->launcher_.get() == launcher
+        && self->currentRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*self->currentRequest_, request)
+        && !launcher->hasPendingActivity(request)
+        && !launcher->hasPendingActivity()) {
+        self->currentRequest_.reset();
+        if (self->expectedLaunchTarget_.has_value()
+            && hasSameWorkerLaunchAuthority(
+                self->expectedLaunchTarget_->request, request)) {
+            self->expectedLaunchTarget_.reset();
+        }
+        if (self->closing_ && !self->retiredEmitted_) {
+            self->retiredEmitted_ = true;
+            emit self->retired(self->tabId_, self->runtimeIncarnation_);
         }
     }
     return launched;
+}
+
+bool AppTabRuntimeController::retargetPendingLaunch(
+    const quint64 runtimeIncarnation,
+    const quint64 expectedNavigationIncarnation,
+    const QString &route,
+    const QString &originalCanonicalAddress)
+{
+    if (!isAccepting() || runtimeIncarnation == 0
+        || expectedNavigationIncarnation == 0 || route.isEmpty()
+        || originalCanonicalAddress.isEmpty() || mainWindow_.isNull()
+        || !currentRequest_.has_value()
+        || currentRequest_->runtimeIncarnation != runtimeIncarnation
+        || !expectedLaunchTarget_.has_value()
+        || !hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, *currentRequest_)) {
+        return false;
+    }
+    WorkerLaunchRequest updatedRequest = *currentRequest_;
+    updatedRequest.route = route;
+    if (!mainWindow_->isAppLaunchTargetCurrent(
+            tabId_, expectedNavigationIncarnation,
+            updatedRequest.lease.appId, route, originalCanonicalAddress)) {
+        return false;
+    }
+    currentRequest_ = updatedRequest;
+    expectedLaunchTarget_ = ExpectedLaunchTarget{
+        updatedRequest, expectedNavigationIncarnation,
+        originalCanonicalAddress};
+    if (pendingAttach_.has_value()
+        && hasSameWorkerLaunchAuthority(
+            pendingAttach_->request, updatedRequest)) {
+        pendingAttach_->request = updatedRequest;
+        pendingAttach_->expectedNavigationIncarnation =
+            expectedNavigationIncarnation;
+        pendingAttach_->originalCanonicalAddress = originalCanonicalAddress;
+    }
+    return true;
 }
 
 bool AppTabRuntimeController::requestRouteLoad(const QString &route)
@@ -322,11 +408,63 @@ bool AppTabRuntimeController::requestRouteLoad(const QString &route)
     return queued;
 }
 
+bool AppTabRuntimeController::cancelLaunchIfCurrent(
+    const WorkerLaunchRequest &request, const QString &reason)
+{
+    if (reason.isEmpty() || !currentRequest_.has_value()
+        || !hasSameWorkerLaunchAuthority(*currentRequest_, request)) {
+        return false;
+    }
+    InstalledPackageWorkerLauncher *const launcher = launcher_.get();
+    if (launcher != nullptr) (void)launcher->cancelLaunch(request);
+    const QPointer<AppTabRuntimeController> self(this);
+    stopCurrent(reason);
+    if (!self) return true;
+    if (self->currentRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*self->currentRequest_, request)) {
+        self->currentRequest_.reset();
+        self->activeGeneration_ = 0;
+    }
+    if (self->expectedLaunchTarget_.has_value()
+        && hasSameWorkerLaunchAuthority(
+            self->expectedLaunchTarget_->request, request)) {
+        self->expectedLaunchTarget_.reset();
+    }
+    return true;
+}
+
 bool AppTabRuntimeController::sendVisibilityChanged(const bool active)
 {
     return sessionController_ != nullptr
         && sessionController_->sendVisibilityChanged(active);
 }
+
+#ifdef Q_BROWSER_HOST_TESTING
+void AppTabRuntimeController::deferNextAttachForTesting() noexcept
+{
+    deferNextAttachForTesting_ = true;
+}
+
+bool AppTabRuntimeController::hasPendingAttachForTesting() const noexcept
+{
+    return pendingAttach_.has_value();
+}
+
+bool AppTabRuntimeController::resumePendingAttachForTesting()
+{
+    if (!pendingAttach_.has_value()) return false;
+    holdPendingAttachForTesting_ = false;
+    completePendingAttach(
+        sessionController_ != nullptr ? sessionController_->generation() : 0);
+    return true;
+}
+
+void AppTabRuntimeController::setAfterPendingSessionAttachHookForTesting(
+    std::function<void()> hook)
+{
+    afterPendingSessionAttachHookForTesting_ = std::move(hook);
+}
+#endif
 
 void AppTabRuntimeController::failClosed(const QString &reason)
 {
@@ -359,14 +497,9 @@ void AppTabRuntimeController::failClosed(const QString &reason)
 
 void AppTabRuntimeController::stop(const QString &reason)
 {
-    if (launcher_ == nullptr) return;
-    if (capabilityRuntime_ != nullptr) capabilityRuntime_->invalidate();
-    if (sessionController_ != nullptr
-        && sessionController_->state() == HostWorkerSessionState::Running) {
-        (void)sessionController_->shutdown(
-            reason.isEmpty() ? QStringLiteral("host.worker.stop") : reason);
-    }
-    launcher_->stopCurrent();
+    Q_UNUSED(reason);
+    const QPointer<InstalledPackageWorkerLauncher> launcher(launcher_.get());
+    if (launcher) launcher->stopCurrent();
 }
 
 void AppTabRuntimeController::close(const QString &reason)
@@ -374,27 +507,18 @@ void AppTabRuntimeController::close(const QString &reason)
     if (closing_) return;
     closing_ = true;
     accepting_ = false;
-    clearPendingAttach();
-    if (capabilityRuntime_ != nullptr) capabilityRuntime_->invalidate();
-    if (launcher_ != nullptr) {
-        if (sessionController_ != nullptr
-            && sessionController_->state() == HostWorkerSessionState::Running) {
-            (void)sessionController_->shutdown(
-                reason.isEmpty() ? QStringLiteral("host.worker.close") : reason);
-        }
-        launcher_->cancel();
-        if (processLifetime_ == nullptr && !currentRequest_.has_value()
-            && !launcher_->hasPendingActivity()
-            && !retiredEmitted_) {
-            retiredEmitted_ = true;
-            emit retired(tabId_, runtimeIncarnation_);
-        }
-    } else {
-        stopCurrent(reason);
-        if (!retiredEmitted_) {
-            retiredEmitted_ = true;
-            emit retired(tabId_, runtimeIncarnation_);
-        }
+    expectedLaunchTarget_.reset();
+    const QPointer<AppTabRuntimeController> self(this);
+    const QPointer<InstalledPackageWorkerLauncher> launcher(launcher_.get());
+    if (launcher) launcher->cancel();
+    else stopCurrent(reason);
+    if (!self) return;
+    self->currentRequest_.reset();
+    self->activeGeneration_ = 0;
+    if ((launcher.isNull() || !launcher->hasPendingActivity())
+        && self->processLifetime_ == nullptr && !self->retiredEmitted_) {
+        self->retiredEmitted_ = true;
+        emit self->retired(self->tabId_, self->runtimeIncarnation_);
     }
 }
 
@@ -414,18 +538,28 @@ AppTabRuntimeController::realizeAttach(
         || request.admission == nullptr || request.lease.appId.isEmpty()) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
-    if (currentRequest_.has_value() && currentRequest_->attempt != request.attempt) {
+    if (!expectedLaunchTarget_.has_value()
+        || !currentRequest_.has_value()
+        || !hasSameWorkerLaunchAuthority(*currentRequest_, request)
+        || !hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, request)
+        || !isExpectedLaunchTarget(
+            request, expectedLaunchTarget_->navigationIncarnation,
+            expectedLaunchTarget_->canonicalAddress)) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
+    const ExpectedLaunchTarget target = *expectedLaunchTarget_;
     PendingAttach pending;
-    pending.request = request;
+    pending.request = target.request;
+    pending.expectedNavigationIncarnation = target.navigationIncarnation;
+    pending.originalCanonicalAddress = target.canonicalAddress;
     pending.session = transaction.takeSession();
     pending.surface = transaction.takeSurface();
     pending.process = transaction.takeProcess();
     if (pending.session == nullptr || pending.surface == nullptr
         || pending.process == nullptr || !pending.session->isAuthenticated()
         || pending.session->isClosed()
-        || pending.session->appIdentity() != request.lease.appId) {
+        || pending.session->appIdentity() != target.request.lease.appId) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
     if (sessionController_->generation() == std::numeric_limits<quint64>::max()) {
@@ -437,21 +571,21 @@ AppTabRuntimeController::realizeAttach(
     const quint64 expectedGeneration = sessionController_->generation() + 1;
     pending.expectedGeneration = expectedGeneration;
     const TabCapabilityAuthority authority{
-        request.tabId,
-        request.runtimeIncarnation,
-        request.lease.appId,
+        target.request.tabId,
+        target.request.runtimeIncarnation,
+        target.request.lease.appId,
         pending.process->processId(),
         workerWindowId,
         expectedGeneration,
-        request.lease.leaseAuthorityEpoch};
+        target.request.lease.leaseAuthorityEpoch};
     if (!authority.isValid()) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
 
     QString capabilityError;
     auto capability = HostCapabilityRuntime::create(
-        authority, request.admission, gestureRouter_.data(),
-        request.lease.permissions, mockOrigin_, storageDirectory_, hostWindowId_,
+        authority, target.request.admission, gestureRouter_.data(),
+        target.request.lease.permissions, mockOrigin_, storageDirectory_, hostWindowId_,
         &capabilityError, fileDialogCoordinator_);
     // The production factory needs the configured storage directory. A
     // controller constructed by HostApplication supplies it through the
@@ -483,7 +617,13 @@ AppTabRuntimeController::realizeAttach(
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
 
-    if (!pending.capability->isWorkerInitializationComplete()
+    bool forceDeferredAttach = false;
+#ifdef Q_BROWSER_HOST_TESTING
+    forceDeferredAttach = std::exchange(deferNextAttachForTesting_, false);
+    if (forceDeferredAttach) holdPendingAttachForTesting_ = true;
+#endif
+    if (forceDeferredAttach
+        || !pending.capability->isWorkerInitializationComplete()
         || !sessionController_->canAttachImmediately()) {
         if (pendingAttach_.has_value()) {
             return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
@@ -497,6 +637,9 @@ AppTabRuntimeController::realizeAttach(
             [this, pendingRuntime](const bool, const QString &) {
                 if (pendingAttach_.has_value()
                     && pendingAttach_->capability.get() == pendingRuntime) {
+#ifdef Q_BROWSER_HOST_TESTING
+                    if (holdPendingAttachForTesting_) return;
+#endif
                     completePendingAttach(
                         sessionController_ != nullptr
                             ? sessionController_->generation()
@@ -523,6 +666,15 @@ AppTabRuntimeController::realizeAttach(
         HostCapabilityRuntime::retire(std::move(pending.capability));
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
+    if (expectedLaunchTarget_.has_value()
+        && hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, pending.request)) {
+        pending.request = expectedLaunchTarget_->request;
+        pending.expectedNavigationIncarnation =
+            expectedLaunchTarget_->navigationIncarnation;
+        pending.originalCanonicalAddress =
+            expectedLaunchTarget_->canonicalAddress;
+    }
     if (!completeAttach(std::move(pending), expectedGeneration)) {
         return InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure;
     }
@@ -542,6 +694,16 @@ void AppTabRuntimeController::completePendingAttach(
     }
     if (pendingAttach_->capability == nullptr) {
         clearPendingAttach();
+        return;
+    }
+    if (!isExpectedLaunchTarget(
+            pendingAttach_->request,
+            pendingAttach_->expectedNavigationIncarnation,
+            pendingAttach_->originalCanonicalAddress)) {
+        const WorkerLaunchRequest staleRequest = pendingAttach_->request;
+        clearPendingAttach();
+        (void)cancelLaunchIfCurrent(
+            staleRequest, QStringLiteral("host.worker.launch_target_stale"));
         return;
     }
     if (!pendingAttach_->capability->isWorkerInitializationComplete()) {
@@ -565,33 +727,113 @@ void AppTabRuntimeController::completePendingAttach(
     const quint32 processId = pending.process != nullptr
         ? pending.process->processId() : 0;
     const quint64 expectedGeneration = pending.expectedGeneration;
-    if (sessionController_->generation() == std::numeric_limits<quint64>::max()
-        || !sessionController_->attach(std::move(pending.session),
-                                       pending.capability.get())
-        || sessionController_->state() != HostWorkerSessionState::Running
-        || sessionController_->generation() != expectedGeneration) {
+    const QPointer<AppTabRuntimeController> sessionAttachGuard(this);
+    const QPointer<HostWorkerSessionController> sessionGuard(
+        sessionController_.get());
+    bool attachAccepted = false;
+    if (sessionGuard
+        && sessionGuard->generation()
+            != std::numeric_limits<quint64>::max()) {
+        attachAccepted = sessionGuard->attach(
+            std::move(pending.session), pending.capability.get());
+    }
+    if (!sessionAttachGuard || !sessionGuard) {
         if (pending.process != nullptr) {
             pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
         }
         HostCapabilityRuntime::retire(std::move(pending.capability));
-        if (currentRequest_.has_value()
-            && currentRequest_->attempt == request.attempt) {
-            emit workerFailed(currentRequest_.value(),
-                              QStringLiteral("host.launch.attach_failed"), 0);
-            stopCurrent(QStringLiteral("host.worker.reattach_failed"));
+        return;
+    }
+    if (!attachAccepted
+        || sessionGuard->state() != HostWorkerSessionState::Running
+        || sessionGuard->generation() != expectedGeneration) {
+        if (pending.process != nullptr) {
+            pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        }
+        HostCapabilityRuntime::retire(std::move(pending.capability));
+        if (sessionAttachGuard->currentRequest_.has_value()
+            && hasSameWorkerLaunchAuthority(
+                *sessionAttachGuard->currentRequest_, request)) {
+            const WorkerLaunchRequest failedRequest =
+                *sessionAttachGuard->currentRequest_;
+            const quint64 observedSessionGeneration =
+                sessionGuard->generation();
+            const quint64 observedActiveGeneration =
+                sessionAttachGuard->activeGeneration_;
+            emit sessionAttachGuard->workerFailed(
+                failedRequest, QStringLiteral("host.launch.attach_failed"), 0);
+            const QPointer<AppTabRuntimeController> self(sessionAttachGuard);
+            if (self && self->currentRequest_.has_value()
+                && hasSameWorkerLaunchAuthority(
+                    *self->currentRequest_, failedRequest)
+                && self->sessionController_ != nullptr
+                && self->sessionController_->generation()
+                       == observedSessionGeneration
+                && self->activeGeneration_ == observedActiveGeneration
+                && !self->pendingAttach_.has_value()
+                && observedSessionGeneration <= expectedGeneration) {
+                self->stopCurrent(
+                    QStringLiteral("host.worker.reattach_failed"));
+            }
         }
         return;
     }
-    if (!completeAttach(std::move(pending), expectedGeneration)) {
-        if (currentRequest_.has_value()
-            && currentRequest_->attempt == request.attempt) {
-            emit workerFailed(currentRequest_.value(),
-                              QStringLiteral("host.launch.attach_failed"), 0);
+#ifdef Q_BROWSER_HOST_TESTING
+    std::function<void()> afterSessionAttach = std::move(
+        sessionAttachGuard->afterPendingSessionAttachHookForTesting_);
+    sessionAttachGuard->afterPendingSessionAttachHookForTesting_ = {};
+    if (afterSessionAttach) afterSessionAttach();
+    if (!sessionAttachGuard) {
+        if (pending.process != nullptr) {
+            pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
         }
-        stopCurrent(QStringLiteral("host.worker.reattach_failed"));
+        HostCapabilityRuntime::retire(std::move(pending.capability));
         return;
     }
-    emit ready(request, processId);
+#endif
+    if (expectedLaunchTarget_.has_value()
+        && hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, pending.request)) {
+        pending.request = expectedLaunchTarget_->request;
+        pending.expectedNavigationIncarnation =
+            expectedLaunchTarget_->navigationIncarnation;
+        pending.originalCanonicalAddress =
+            expectedLaunchTarget_->canonicalAddress;
+    }
+    const QPointer<AppTabRuntimeController> attachGuard(this);
+    const bool attached = completeAttach(
+        std::move(pending), expectedGeneration);
+    if (!attachGuard) return;
+    if (!attached) {
+        if (attachGuard->currentRequest_.has_value()
+            && hasSameWorkerLaunchAuthority(
+                *attachGuard->currentRequest_, request)) {
+            const WorkerLaunchRequest failedRequest =
+                *attachGuard->currentRequest_;
+            const quint64 observedSessionGeneration =
+                attachGuard->sessionController_->generation();
+            const quint64 observedActiveGeneration =
+                attachGuard->activeGeneration_;
+            emit attachGuard->workerFailed(
+                failedRequest, QStringLiteral("host.launch.attach_failed"), 0);
+            const QPointer<AppTabRuntimeController> self(attachGuard);
+            if (!self || !self->currentRequest_.has_value()
+                || !hasSameWorkerLaunchAuthority(
+                    *self->currentRequest_, failedRequest)
+                || self->sessionController_ == nullptr
+                || self->sessionController_->generation()
+                       != observedSessionGeneration
+                || self->activeGeneration_ != observedActiveGeneration
+                || self->pendingAttach_.has_value()
+                || observedSessionGeneration != expectedGeneration) {
+                return;
+            }
+            self->stopCurrent(
+                QStringLiteral("host.worker.reattach_failed"));
+        }
+        return;
+    }
+    if (attachGuard) emit attachGuard->ready(request, processId);
 }
 
 bool AppTabRuntimeController::completeAttach(PendingAttach pending,
@@ -617,6 +859,9 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         || !pending.capability->isWorkerReady()
         || sessionController_ == nullptr || tabController_.isNull()
         || mainWindow_.isNull()
+        || !isExpectedLaunchTarget(
+            pending.request, pending.expectedNavigationIncarnation,
+            pending.originalCanonicalAddress)
         || sessionController_->state() != HostWorkerSessionState::Running
         || sessionController_->generation() != expectedGeneration) {
         return rollback();
@@ -642,8 +887,26 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
             && !transportGate_->load(std::memory_order_acquire)) {
             return rollback();
         }
-        if (!mainWindow_->attachWorkerSurface(tabId_,
-                                              std::move(pending.surface))) {
+        const QPointer<AppTabRuntimeController> self(this);
+        const QPointer<MainWindow> windowGuard(mainWindow_);
+        const bool surfaceAttached = windowGuard
+            && windowGuard->attachAppWorkerSurfaceIfCurrent(
+                tabId_, pending.expectedNavigationIncarnation,
+                pending.request.lease.appId, pending.request.route,
+                pending.originalCanonicalAddress,
+                std::move(pending.surface));
+        if (!self) {
+            if (pending.process != nullptr) {
+                pending.process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+            }
+            HostCapabilityRuntime::retire(std::move(pending.capability));
+            return false;
+        }
+        if (!surfaceAttached) return rollback();
+        if (!self->isExpectedLaunchTarget(
+                pending.request, pending.expectedNavigationIncarnation,
+                pending.originalCanonicalAddress)) {
+            if (windowGuard) windowGuard->detachWorkerSurface(tabId_);
             return rollback();
         }
     }
@@ -663,12 +926,14 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
         stopCurrent(QStringLiteral("host.worker.attach_gate_closed"));
         return false;
     }
-    const quint64 navigationIncarnation = tabController_->incarnation();
-    if (!tabController_->bindAppWorkerSurface(
-            pending.request.lease.appId, navigationIncarnation)
-        || !sessionController_->requestRouteLoad(pending.request.route)) {
+    if (!sessionController_->requestRouteLoad(pending.request.route)) {
         stopCurrent(QStringLiteral("host.worker.attach_route_failed"));
         return false;
+    }
+    if (expectedLaunchTarget_.has_value()
+        && hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, pending.request)) {
+        expectedLaunchTarget_.reset();
     }
     if (sessionController_->state() == HostWorkerSessionState::Running
         && sessionController_->generation() == activeGeneration_) {
@@ -677,6 +942,25 @@ bool AppTabRuntimeController::completeAttach(PendingAttach pending,
             && tabController_->surfaceKind() == HostSurfaceKind::Worker);
     }
     return true;
+}
+
+bool AppTabRuntimeController::isExpectedLaunchTarget(
+    const WorkerLaunchRequest &request,
+    const quint64 expectedNavigationIncarnation,
+    const QString &originalCanonicalAddress) const
+{
+    return expectedLaunchTarget_.has_value() && !mainWindow_.isNull()
+        && expectedLaunchTarget_->navigationIncarnation
+            == expectedNavigationIncarnation
+        && expectedLaunchTarget_->canonicalAddress
+            == originalCanonicalAddress
+        && hasSameWorkerLaunchAuthority(
+            expectedLaunchTarget_->request, request)
+        && mainWindow_->isAppLaunchTargetCurrent(
+            tabId_, expectedNavigationIncarnation,
+            expectedLaunchTarget_->request.lease.appId,
+            expectedLaunchTarget_->request.route,
+            originalCanonicalAddress);
 }
 
 void AppTabRuntimeController::clearPendingAttach() noexcept
@@ -691,40 +975,35 @@ void AppTabRuntimeController::clearPendingAttach() noexcept
 
 void AppTabRuntimeController::stopCurrent(const QString &reason)
 {
-    clearPendingAttach();
-    if (sessionController_ != nullptr
-        && sessionController_->state() == HostWorkerSessionState::Running) {
-        (void)sessionController_->shutdown(
+    const bool launcherOwnsClosingRetirement = closing_ && launcher_ != nullptr;
+    std::optional<PendingAttach> pending = std::move(pendingAttach_);
+    pendingAttach_.reset();
+    std::shared_ptr<HostCapabilityRuntime> capability =
+        std::exchange(capabilityRuntime_, {});
+    std::shared_ptr<SandboxProcess> process =
+        std::exchange(processLifetime_, {});
+    std::function<void()> stopProcess = std::exchange(stopProcess_, {});
+    const QPointer<HostWorkerSessionController> session(
+        sessionController_.get());
+    const QPointer<MainWindow> window(mainWindow_);
+    const QString stableTabId = tabId_;
+    activeGeneration_ = 0;
+
+    if (pending.has_value()) {
+        if (pending->process != nullptr) {
+            pending->process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        }
+        HostCapabilityRuntime::retire(std::move(pending->capability));
+    }
+    if (session && capability != nullptr) {
+        session->unbindCapabilityRuntime(capability->authority());
+    }
+    if (session && session->state() == HostWorkerSessionState::Running) {
+        (void)session->shutdown(
             reason.isEmpty() ? QStringLiteral("host.worker.stop") : reason);
     }
-    if (sessionController_ != nullptr && capabilityRuntime_ != nullptr) {
-        sessionController_->unbindCapabilityRuntime(
-            capabilityRuntime_->authority());
-    }
-    HostCapabilityRuntime::retire(std::exchange(capabilityRuntime_, {}));
-    if (mainWindow_ != nullptr) mainWindow_->detachWorkerSurface(tabId_);
-    if (stopProcess_) stopProcess_();
-    stopProcess_ = {};
-    processLifetime_.reset();
-    activeGeneration_ = 0;
-}
-
-void AppTabRuntimeController::rememberRequest(const WorkerLaunchRequest &request)
-{
-    requestHistory_.insert(attemptKey(request.attempt), request);
-    constexpr int maximumRememberedRequests = 128;
-    while (requestHistory_.size() > maximumRememberedRequests) {
-        requestHistory_.erase(requestHistory_.begin());
-    }
-}
-
-std::optional<WorkerLaunchRequest> AppTabRuntimeController::requestForAttempt(
-    const WorkerAttemptKey &key) const
-{
-    const auto found = requestHistory_.constFind(attemptKey(key));
-    if (found != requestHistory_.cend()) return *found;
-    if (currentRequest_.has_value() && currentRequest_->attempt == key) {
-        return currentRequest_;
-    }
-    return std::nullopt;
+    HostCapabilityRuntime::retire(std::move(capability));
+    if (window && !closing_) window->detachWorkerSurface(stableTabId);
+    if (stopProcess && !launcherOwnsClosingRetirement) stopProcess();
+    Q_UNUSED(process);
 }

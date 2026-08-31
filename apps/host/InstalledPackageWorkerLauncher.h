@@ -93,7 +93,11 @@ public:
 
     [[nodiscard]] bool requestLaunch(const WorkerLaunchRequest &request);
     [[nodiscard]] bool hasPendingActivity(const WorkerAttemptKey &key) const noexcept;
+    [[nodiscard]] bool hasPendingActivity(
+        const WorkerLaunchRequest &request) const noexcept;
     [[nodiscard]] bool hasPendingActivity() const noexcept;
+    [[nodiscard]] bool cancelLaunch(
+        const WorkerLaunchRequest &request) noexcept;
     void stopCurrent();
     void cancel() noexcept;
     [[nodiscard]] bool isAccepting() const noexcept;
@@ -112,6 +116,16 @@ signals:
     void retirementCompleted(quint64 activation,
                              quint64 attempt,
                              bool succeeded);
+    void readyForRequest(const WorkerLaunchRequest &request,
+                         quint32 processId);
+    void workerExitedForRequest(const WorkerLaunchRequest &request,
+                                bool expected);
+    void launchFailedForRequest(const WorkerLaunchRequest &request,
+                                const QString &stableError,
+                                quint32 nativeError);
+    void retirementCompletedForRequest(const WorkerLaunchRequest &request,
+                                       bool succeeded);
+    void terminalFailure(const QString &stableError, quint32 nativeError);
 
 private:
     struct LaunchRetirementContext;
@@ -129,9 +143,17 @@ private:
         std::shared_ptr<LaunchRetirementContext> context,
         bool succeeded,
         const QString &stableError);
-    void fail(WorkerAttemptKey key,
+    void fail(const WorkerLaunchRequest &request,
               const QString &stableError,
               quint32 nativeError = 0);
+    void failLegacy(WorkerAttemptKey key,
+                    const QString &stableError,
+                    quint32 nativeError = 0);
+    [[nodiscard]] bool publishFatalRetirement(
+        const WorkerLaunchRequest &request,
+        const QString &stableError,
+        quint32 nativeError,
+        bool publishTerminal);
 
     SandboxTrustBoundary boundary_;
     QString workerExecutable_;
@@ -145,8 +167,8 @@ private:
     FailureCallback failed_;
     std::shared_ptr<SandboxProcess> currentProcess_;
     std::shared_ptr<LaunchRetirementContext> currentRetirement_;
-    std::optional<WorkerAttemptKey> currentKey_;
-    std::optional<WorkerAttemptKey> expectedStop_;
+    std::optional<WorkerLaunchRequest> currentRequest_;
+    std::optional<WorkerLaunchRequest> expectedStop_;
     std::optional<WorkerLaunchRequest> pendingRequest_;
     std::unordered_map<quint64, std::shared_ptr<LaunchRetirementContext>> inflight_;
     std::vector<std::shared_ptr<LaunchRetirementContext>> fatalCleanup_;

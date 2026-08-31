@@ -11,6 +11,19 @@
 
 namespace {
 
+constexpr int ipcWriteTimeoutMs = 5'000;
+constexpr int defaultCapabilityResponseTimeoutMs = 5'000;
+constexpr int interactiveFileResponseTimeoutMs = 5 * 60'000;
+
+int capabilityResponseTimeout(const QString &capability,
+                              const QString &operation) noexcept
+{
+    return capability == QStringLiteral("file")
+            && operation == QStringLiteral("open")
+        ? interactiveFileResponseTimeoutMs
+        : defaultCapabilityResponseTimeoutMs;
+}
+
 std::optional<QString> singleValue(const QStringList &arguments, const QString &name)
 {
     const qsizetype index = arguments.indexOf(name);
@@ -175,7 +188,10 @@ bool WorkerApplication::flushPendingCapabilities()
                                    request->capability,
                                    request->operation,
                                    request->payload,
-                                   5000)) {
+                                   ipcWriteTimeoutMs,
+                                   capabilityResponseTimeout(
+                                       request->capability,
+                                       request->operation))) {
             pendingCapabilities_.clear();
             return false;
         }
@@ -255,7 +271,9 @@ void WorkerApplication::sendCapabilityRequest(const QString &requestId,
         return;
     }
     if (state_ != State::Ready
-        || !session_->sendRequest(requestId, capability, operation, payload, 5000)) {
+        || !session_->sendRequest(
+            requestId, capability, operation, payload, ipcWriteTimeoutMs,
+            capabilityResponseTimeout(capability, operation))) {
         failClosed();
     }
 }

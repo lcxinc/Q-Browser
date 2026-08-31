@@ -126,17 +126,18 @@ private:
     void destroyHostSurface();
     void destroyTrustedErrorSurface();
     void destroyWebSurface();
+    void discardWorkerSurfaceWithoutFallback();
 
     QString tabId_;
-    BrowserTabModel *model_ = nullptr;
-    QStackedWidget *surfaceStack_ = nullptr;
-    WebSessionProfile *webSessionProfile_ = nullptr;
-    NewTabPage *hostSurface_ = nullptr;
-    WebSurface *webSurface_ = nullptr;
-    WorkerSurface *workerSurface_ = nullptr;
-    QWidget *trustedErrorSurface_ = nullptr;
-    QLabel *trustedErrorLabel_ = nullptr;
-    QWidget *currentSurface_ = nullptr;
+    QPointer<BrowserTabModel> model_;
+    QPointer<QStackedWidget> surfaceStack_;
+    QPointer<WebSessionProfile> webSessionProfile_;
+    QPointer<NewTabPage> hostSurface_;
+    QPointer<WebSurface> webSurface_;
+    QPointer<WorkerSurface> workerSurface_;
+    QPointer<QWidget> trustedErrorSurface_;
+    QPointer<QLabel> trustedErrorLabel_;
+    QPointer<QWidget> currentSurface_;
     QUrl webEntry_;
     QPointer<WebSurface> failedWebSurface_;
     QString workerPackageId_;

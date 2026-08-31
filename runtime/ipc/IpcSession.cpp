@@ -295,16 +295,28 @@ bool IpcSession::sendRequest(const QString &requestId,
                             const QJsonObject &payload,
                             const int timeoutMs)
 {
+    return sendRequest(requestId, capability, operation, payload,
+                       timeoutMs, timeoutMs);
+}
+
+bool IpcSession::sendRequest(const QString &requestId,
+                            const QString &capability,
+                            const QString &operation,
+                            const QJsonObject &payload,
+                            const int writeTimeoutMs,
+                            const int responseTimeoutMs)
+{
     return sendTracked(requestId,
                        ProtocolMessage::request(requestId, capability, operation, payload),
-                       timeoutMs);
+                       writeTimeoutMs, responseTimeoutMs);
 }
 
 bool IpcSession::sendRouteLoad(const QString &requestId,
                                const QString &route,
                                const int timeoutMs)
 {
-    return sendTracked(requestId, ProtocolMessage::routeLoad(requestId, route), timeoutMs);
+    return sendTracked(requestId, ProtocolMessage::routeLoad(requestId, route),
+                       timeoutMs, timeoutMs);
 }
 
 IpcSendSubmission IpcSession::submitRouteLoad(const QString &requestId,
@@ -356,7 +368,7 @@ bool IpcSession::sendNavigationRequest(const QString &requestId,
 {
     return sendTracked(requestId,
                        ProtocolMessage::navigationRequest(requestId, route),
-                       timeoutMs);
+                       timeoutMs, timeoutMs);
 }
 
 bool IpcSession::sendVisibilityChanged(const bool active, const int timeoutMs)
@@ -691,9 +703,14 @@ std::optional<qint64> IpcSession::nearestPendingDeadline(
 
 bool IpcSession::sendTracked(const QString &requestId,
                              const std::optional<ProtocolMessage> &message,
-                             const int timeoutMs)
+                             const int writeTimeoutMs,
+                             const int responseTimeoutMs)
 {
     if (closed_) {
+        return false;
+    }
+    if (writeTimeoutMs < 0 || responseTimeoutMs < 0) {
+        lastErrorCode_ = QStringLiteral("ipc.session.invalid_timeout");
         return false;
     }
     const std::shared_ptr<IpcPendingRequestState> reservation =
@@ -704,12 +721,12 @@ bool IpcSession::sendTracked(const QString &requestId,
         lastErrorCode_ = QStringLiteral("ipc.protocol.invalid_payload");
         return false;
     }
-    if (!sendInternal(*message, timeoutMs, true)) {
+    if (!sendInternal(*message, writeTimeoutMs, true)) {
         removePendingRequest(requestId, reservation);
         return false;
     }
     reservation->deadlineMonotonicMs.store(
-        steadyMonotonicMs() + timeoutMs, std::memory_order_relaxed);
+        steadyMonotonicMs() + responseTimeoutMs, std::memory_order_relaxed);
     reservation->phase.store(IpcPendingRequestState::Phase::Published,
                              std::memory_order_release);
     return true;

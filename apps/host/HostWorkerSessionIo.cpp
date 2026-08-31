@@ -274,6 +274,10 @@ void HostWorkerSessionIo::pollSession()
         }
         if (received.status != SessionStatus::MessageReady
             || !received.message.has_value()) {
+            if (stopping_ && received.status == SessionStatus::PeerClosed) {
+                finishShutdown();
+                return;
+            }
             fail(received.errorCode.isEmpty()
                      ? QStringLiteral("host.worker_session.receive_failed")
                      : received.errorCode);
@@ -307,16 +311,7 @@ void HostWorkerSessionIo::pollSession()
                 fail(QStringLiteral("host.worker_session.peer_shutdown"));
                 return;
             }
-            terminal_ = true;
-            invalidateLiveBinding();
-            pollTimer_->stop();
-            sendDeadlineTimer_->stop();
-            shutdownDeadlineTimer_->stop();
-            pendingCommandId_ = 0;
-            commandCancellation_ = {};
-            shutdownCancellation_ = {};
-            session_->close();
-            emit shutdownFinished(generation_);
+            finishShutdown();
             return;
         case ProtocolType::Heartbeat:
             emit heartbeatObserved(generation_);
@@ -341,6 +336,21 @@ void HostWorkerSessionIo::pollSession()
             return;
         }
     }
+}
+
+void HostWorkerSessionIo::finishShutdown()
+{
+    if (terminal_ || !stopping_) return;
+    terminal_ = true;
+    invalidateLiveBinding();
+    pollTimer_->stop();
+    sendDeadlineTimer_->stop();
+    shutdownDeadlineTimer_->stop();
+    pendingCommandId_ = 0;
+    commandCancellation_ = {};
+    shutdownCancellation_ = {};
+    if (session_ != nullptr) session_->close();
+    emit shutdownFinished(generation_);
 }
 
 void HostWorkerSessionIo::fail(const QString &errorCode)

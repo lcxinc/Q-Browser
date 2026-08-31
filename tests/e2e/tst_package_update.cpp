@@ -17,6 +17,8 @@ void PackageUpdateE2eTest::signedUpdateActivatesAndTamperNeverExecutes()
     const QString update = environment.createPackage(QStringLiteral("1.1.0"));
     QVERIFY(!update.isEmpty());
     QVERIFY(environment.install(update));
+    QVERIFY(environment.waitForVerified(QStringLiteral("1.1.0")));
+    QVERIFY(environment.reloadActiveTab());
     QVERIFY(environment.waitForReady(QStringLiteral("1.1.0")));
     QVERIFY(environment.waitForHealthyVersion(QStringLiteral("1.1.0")));
     const QString expectedCurrent = environment.currentVersionDirectory();

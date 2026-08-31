@@ -53,6 +53,7 @@ class HostWorkerSessionIoTest final : public QObject
 private slots:
     void blockedSendFailsOnItsIoDeadline();
     void silentShutdownPeerFailsOnItsIoDeadline();
+    void peerCloseDuringShutdownCompletes();
     void retiredBindingRejectsQueuedCapabilityPublication();
 };
 
@@ -110,6 +111,29 @@ void HostWorkerSessionIoTest::silentShutdownPeerFailsOnItsIoDeadline()
     QCOMPARE(failed.at(0).at(1).toString(),
              QStringLiteral("host.worker_session.shutdown_timeout"));
     sessions->worker->close();
+}
+
+void HostWorkerSessionIoTest::peerCloseDuringShutdownCompletes()
+{
+    auto sessions = authenticatedSessions(
+        QStringLiteral("com.qbrowser.peer-close-shutdown"));
+    QVERIFY(sessions.has_value());
+    HostWorkerSessionIo io(std::move(sessions->host), 74,
+                           QThread::currentThread());
+    QSignalSpy failed(&io, &HostWorkerSessionIo::sessionFailed);
+    QSignalSpy finished(&io, &HostWorkerSessionIo::shutdownFinished);
+    QVERIFY(failed.isValid());
+    QVERIFY(finished.isValid());
+    io.start();
+    io.beginShutdown(74, QStringLiteral("test.peer_close"));
+
+    const SessionReceiveResult shutdown = sessions->worker->receive(2'000);
+    QCOMPARE(shutdown.status, SessionStatus::MessageReady);
+    QCOMPARE(shutdown.message->type(), ProtocolType::Shutdown);
+    sessions->worker->close();
+    QVERIFY(waitForSignal(finished, 2'000));
+    QCOMPARE(finished.count(), 1);
+    QCOMPARE(failed.count(), 0);
 }
 
 void HostWorkerSessionIoTest::retiredBindingRejectsQueuedCapabilityPublication()

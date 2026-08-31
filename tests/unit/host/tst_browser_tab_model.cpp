@@ -1,12 +1,14 @@
 #include "BrowserTabModel.h"
 
 #include <QRegularExpression>
+#include <QPointer>
 #include <QScopedValueRollback>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTest>
 
 #include <optional>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -114,6 +116,7 @@ private slots:
     void restoreToEmptyIsInactiveAndNoOpRestoreIsSilent();
     void restoreRejectsNestedMutations();
     void restoreOwnsItsInputBeforeEmittingSignals();
+    void restoreSignalCanDestroyModel();
     void validatedRestoreIsAtomicDormantAndNonPersistent();
 };
 
@@ -1770,6 +1773,31 @@ void BrowserTabModelTest::restoreOwnsItsInputBeforeEmittingSignals()
     QCOMPARE(inserted.at(0).at(1).toString(), expected.at(0).id);
     QCOMPARE(inserted.at(1).at(0).toInt(), 1);
     QCOMPARE(inserted.at(1).at(1).toString(), expected.at(1).id);
+}
+
+void BrowserTabModelTest::restoreSignalCanDestroyModel()
+{
+    auto model = std::make_unique<BrowserTabModel>();
+    QPointer<BrowserTabModel> guard(model.get());
+    const QVector<BrowserTabSnapshot> restored{
+        restoredTab(231, BrowserTabKind::Host, QStringLiteral("First"),
+                    {QStringLiteral("qbrowser://newtab")}, 0),
+        restoredTab(232, BrowserTabKind::Host, QStringLiteral("Second"),
+                    {QStringLiteral("qbrowser://newtab")}, 0),
+    };
+    bool destroyed = false;
+    connect(model.get(), &BrowserTabModel::tabInserted, this,
+            [&](int, const QString &) {
+                if (destroyed) return;
+                destroyed = true;
+                model.reset();
+            },
+            Qt::DirectConnection);
+
+    const bool applied = model->replaceFromValidatedSnapshot(restored, 0);
+    QVERIFY(!applied);
+    QVERIFY(destroyed);
+    QVERIFY(guard.isNull());
 }
 
 void BrowserTabModelTest::validatedRestoreIsAtomicDormantAndNonPersistent()

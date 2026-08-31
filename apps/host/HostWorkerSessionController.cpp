@@ -127,7 +127,7 @@ bool HostWorkerSessionController::attach(
         pendingCapabilityBinding_ = std::move(capabilityBinding);
         cleanupFinalState_ = HostWorkerSessionState::Detached;
         state_ = HostWorkerSessionState::ShuttingDown;
-        pendingRouteLoads_.clear();
+        clearPendingRouteLoads();
         outbound_.clear();
         activeCommand_.reset();
         activeCapabilityRequestId_.clear();
@@ -202,7 +202,7 @@ bool HostWorkerSessionController::startSession(
             return false;
         }
     }
-    pendingRouteLoads_.clear();
+    clearPendingRouteLoads();
     outbound_.clear();
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
@@ -273,7 +273,7 @@ bool HostWorkerSessionController::startSession(
             [this](const quint64 generation) {
                 if (generation != generation_
                     || state_ != HostWorkerSessionState::ShuttingDown) return;
-                pendingRouteLoads_.clear();
+                clearPendingRouteLoads();
                 outbound_.clear();
                 activeCommand_.reset();
                 appIdentity_.clear();
@@ -310,7 +310,7 @@ bool HostWorkerSessionController::shutdown(const QString &reason)
     outbound_.clear();
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
-    pendingRouteLoads_.clear();
+    clearPendingRouteLoads();
     invalidateCapabilityBinding();
     const quint64 generation = generation_;
     HostWorkerSessionIo *const io = io_;
@@ -435,9 +435,33 @@ void HostWorkerSessionController::handleRouteLoadResponse(
         return;
     }
     pendingRouteLoads_.erase(iterator);
-    emit routeLoadAcknowledged(route, generation);
-    if (generation == generation_ && state_ == HostWorkerSessionState::Running)
-        resumeIoPolling();
+    if (requestId == latestRouteLoadRequestId_) {
+        latestRouteLoadAcknowledged_ = true;
+    }
+    if (pendingRouteLoads_.isEmpty()) {
+        if (!latestRouteLoadAcknowledged_
+            || latestRouteLoadRequestId_.isEmpty()
+            || latestRouteLoadRoute_.isEmpty()) {
+            failClosed(QStringLiteral(
+                "host.worker_session.route_load_completion_mismatch"));
+            return;
+        }
+        const QString latestRoute = latestRouteLoadRoute_;
+        latestRouteLoadRequestId_.clear();
+        latestRouteLoadRoute_.clear();
+        latestRouteLoadAcknowledged_ = false;
+        const QPointer<HostWorkerSessionController> self(this);
+        emit routeLoadAcknowledged(latestRoute, generation);
+        HostWorkerSessionController *const controller = self.data();
+        if (controller == nullptr
+            || generation != controller->generation_
+            || controller->state_ != HostWorkerSessionState::Running) {
+            return;
+        }
+        controller->resumeIoPolling();
+        return;
+    }
+    resumeIoPolling();
 }
 
 void HostWorkerSessionController::handleCapabilityRequest(
@@ -448,53 +472,66 @@ void HostWorkerSessionController::handleCapabilityRequest(
 {
     if (generation != generation_ || state_ != HostWorkerSessionState::Running)
         return;
+    const QPointer<HostWorkerSessionController> self(this);
     emit capabilityRequestObserved(capability, operation, payload.toVariantMap(),
                                    generation);
-    if (!activeCapabilityRequestId_.isEmpty()) {
-        if (capabilityRuntime_ == nullptr || !capabilityAuthority_.has_value()
-            || requestAuthority != *capabilityAuthority_
-            || capabilityRuntime_->authority() != *capabilityAuthority_) {
-            failClosed(QStringLiteral(
+    HostWorkerSessionController *const controller = self.data();
+    if (controller == nullptr || generation != controller->generation_
+        || controller->state_ != HostWorkerSessionState::Running) {
+        return;
+    }
+    if (!controller->activeCapabilityRequestId_.isEmpty()) {
+        if (controller->capabilityRuntime_ == nullptr
+            || !controller->capabilityAuthority_.has_value()
+            || requestAuthority != *controller->capabilityAuthority_
+            || controller->capabilityRuntime_->authority()
+                   != *controller->capabilityAuthority_) {
+            controller->failClosed(QStringLiteral(
                 "host.worker_session.capability_authority_mismatch"));
             return;
         }
-        auto use = capabilityRuntime_->acquireResponseUse(
+        auto use = controller->capabilityRuntime_->acquireResponseUse(
             requestAuthority, generation);
         if (use == nullptr
-            || !queueCapabilityResponse(
+            || !controller->queueCapabilityResponse(
                 requestAuthority, std::move(use), generation, requestId,
                 BrokerResult::failure(
                     QStringLiteral("capability.busy"),
                     QStringLiteral("A capability request is already active.")),
                 false)) {
-            failClosed(QStringLiteral("host.worker_session.response_queue_failed"));
+            if (self) {
+                controller->failClosed(QStringLiteral(
+                    "host.worker_session.response_queue_failed"));
+            }
         }
         return;
     }
-    activeCapabilityRequestId_ = requestId;
-    if (capabilityRuntime_ == nullptr || !capabilityAuthority_.has_value()) {
+    controller->activeCapabilityRequestId_ = requestId;
+    if (controller->capabilityRuntime_ == nullptr
+        || !controller->capabilityAuthority_.has_value()) {
         if (requestAuthority.isValid()) {
-            activeCapabilityRequestId_.clear();
-            failClosed(QStringLiteral(
+            controller->activeCapabilityRequestId_.clear();
+            controller->failClosed(QStringLiteral(
                 "host.worker_session.capability_authority_mismatch"));
             return;
         }
-        (void)queueCapabilityResponse(
+        (void)controller->queueCapabilityResponse(
             std::nullopt, nullptr, generation, requestId,
             BrokerResult::failure(QStringLiteral("capability.denied"),
                                   QStringLiteral("Capability is not permitted.")),
             true);
         return;
     }
-    if (requestAuthority != *capabilityAuthority_
-        || capabilityRuntime_->authority() != *capabilityAuthority_) {
-        activeCapabilityRequestId_.clear();
-        failClosed(
+    if (requestAuthority != *controller->capabilityAuthority_
+        || controller->capabilityRuntime_->authority()
+               != *controller->capabilityAuthority_) {
+        controller->activeCapabilityRequestId_.clear();
+        controller->failClosed(
             QStringLiteral("host.worker_session.capability_authority_mismatch"));
         return;
     }
-    capabilityRuntime_->dispatch(generation, requestId, capability, operation,
-                                 payload);
+    controller->capabilityRuntime_->dispatch(
+        generation, requestId, capability, operation, payload);
 }
 
 bool HostWorkerSessionController::submitCapabilityCompletion(
@@ -604,7 +641,16 @@ void HostWorkerSessionController::handleCommandFinished(
     if (published && !completedCapability.isEmpty()
         && completedCapability == activeCapabilityRequestId_) {
         activeCapabilityRequestId_.clear();
+        const QPointer<HostWorkerSessionController> self(this);
         emit capabilityResponseSent(completedCapability, generation);
+        HostWorkerSessionController *const controller = self.data();
+        if (controller == nullptr || generation != controller->generation_
+            || controller->state_ != HostWorkerSessionState::Running) {
+            return;
+        }
+        controller->pumpOutbound();
+        if (resume) controller->resumeIoPolling();
+        return;
     } else if (!published && !completedCapability.isEmpty()
                && completedCapability == activeCapabilityRequestId_) {
         activeCapabilityRequestId_.clear();
@@ -637,6 +683,9 @@ bool HostWorkerSessionController::enqueueRouteLoad(const QString &route)
     const auto message = ProtocolMessage::routeLoad(requestId, route);
     if (!message.has_value()) return false;
     pendingRouteLoads_.insert(requestId, route);
+    latestRouteLoadRequestId_ = requestId;
+    latestRouteLoadRoute_ = route;
+    latestRouteLoadAcknowledged_ = false;
     OutboundCommand command;
     command.id = ++nextCommandId_;
     command.message = *message;
@@ -645,6 +694,14 @@ bool HostWorkerSessionController::enqueueRouteLoad(const QString &route)
     outbound_.enqueue(std::move(command));
     pumpOutbound();
     return true;
+}
+
+void HostWorkerSessionController::clearPendingRouteLoads() noexcept
+{
+    pendingRouteLoads_.clear();
+    latestRouteLoadRequestId_.clear();
+    latestRouteLoadRoute_.clear();
+    latestRouteLoadAcknowledged_ = false;
 }
 
 void HostWorkerSessionController::pumpOutbound()
@@ -680,7 +737,7 @@ void HostWorkerSessionController::failClosed(const QString &errorCode)
     state_ = HostWorkerSessionState::Failed;
     lastErrorCode_ = errorCode.isEmpty() ? QStringLiteral("host.worker_session.failed")
                                          : errorCode;
-    pendingRouteLoads_.clear();
+    clearPendingRouteLoads();
     outbound_.clear();
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();
@@ -751,7 +808,7 @@ void HostWorkerSessionController::handleIoThreadFinished(
         delete completedIo;
     }
     delete oldThread;
-    pendingRouteLoads_.clear();
+    clearPendingRouteLoads();
     outbound_.clear();
     activeCommand_.reset();
     activeCapabilityRequestId_.clear();

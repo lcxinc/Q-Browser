@@ -27,6 +27,9 @@ public:
     [[nodiscard]] QString createTamperedPackage(const QString &version);
     [[nodiscard]] bool start(const QString &version = QStringLiteral("1.0.0"));
     [[nodiscard]] bool install(const QString &packagePath);
+    [[nodiscard]] bool reloadActiveTab();
+    [[nodiscard]] bool waitForVerified(const QString &version,
+                                       int timeoutMs = 30'000);
     [[nodiscard]] bool waitForReady(const QString &version, int timeoutMs = 60'000);
     [[nodiscard]] bool waitForHealthyVersion(const QString &version,
                                              int timeoutMs = 10'000);
@@ -63,6 +66,7 @@ private:
     QStringList mockRequests_;
     QString error_;
     std::unique_ptr<HostApplication> host_;
+    QStringList verifiedVersions_;
     QStringList readyVersions_;
     int failureCount_ = 0;
     int tamperCanaryCount_ = 0;

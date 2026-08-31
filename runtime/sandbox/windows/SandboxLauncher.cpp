@@ -618,6 +618,10 @@ void SandboxProcess::requestTerminateNoWait(const DWORD exitCode) noexcept
     std::lock_guard lock(mutex_);
     if (validHandle(process_)
         && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) {
+#ifdef Q_BROWSER_SANDBOX_TESTING
+        const auto &hooks = qbrowser_sandbox_testing::sandboxProcessTestHooks();
+        if (hooks.beforeTerminate) hooks.beforeTerminate(processId_);
+#endif
         (void)TerminateProcess(process_, exitCode);
     }
 }

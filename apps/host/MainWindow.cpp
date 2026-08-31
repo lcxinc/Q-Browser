@@ -11,6 +11,7 @@
 
 #include <QCoreApplication>
 #include <QPointer>
+#include <QScopeGuard>
 #include <QScopedValueRollback>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -240,8 +241,13 @@ bool MainWindow::applyBrowserSessionLoadResult(
         || !tabModel_->isEmpty()) {
         return false;
     }
-    QScopedValueRollback<bool> applyTransaction(
-        browserSessionApplyInProgress_, true);
+    browserSessionApplyInProgress_ = true;
+    QPointer<MainWindow> applyLifetimeGuard(this);
+    const auto finishApplyTransaction = qScopeGuard([applyLifetimeGuard] {
+        if (applyLifetimeGuard) {
+            applyLifetimeGuard->browserSessionApplyInProgress_ = false;
+        }
+    });
     const auto applyCleanSession = [&](const bool enableSaving) {
         QString cleanId;
         {
@@ -254,9 +260,11 @@ bool MainWindow::applyBrowserSessionLoadResult(
         createController(cleanId);
         setGeometry(restoreBrowserWindowGeometry(
             {}, primaryAvailableGeometry, availableScreenGeometries));
+        if (!applyLifetimeGuard) return false;
         if (enableSaving) browserSessionSave_ = std::move(saveCallback);
         browserSessionApplied_ = true;
         activateStableTab(cleanId);
+        if (!applyLifetimeGuard) return false;
         synchronizeChrome();
         return true;
     };
@@ -276,6 +284,7 @@ bool MainWindow::applyBrowserSessionLoadResult(
     } catch (...) {
         resolverThrew = true;
     }
+    if (!applyLifetimeGuard) return false;
     if (!isRunning() || browserSessionApplied_ || browserSessionFrozen_
         || tabModel_ == nullptr || !tabModel_->isEmpty()) {
         return false;
@@ -300,18 +309,23 @@ bool MainWindow::applyBrowserSessionLoadResult(
         }
         return -1;
     }();
-    if (activeIndex < 0
-        || !tabModel_->replaceFromValidatedSnapshot(
-            resolved.snapshot->tabs, activeIndex)) {
+    if (activeIndex < 0) {
         return applyCleanSession(false);
     }
+    BrowserTabModel *const model = tabModel_.get();
+    const bool replaced = model->replaceFromValidatedSnapshot(
+        resolved.snapshot->tabs, activeIndex);
+    if (!applyLifetimeGuard) return false;
+    if (!replaced) return applyCleanSession(false);
 
     setGeometry(restoreBrowserWindowGeometry(
         resolved.snapshot->geometry, primaryAvailableGeometry,
         availableScreenGeometries));
+    if (!applyLifetimeGuard) return false;
     browserSessionSave_ = std::move(saveCallback);
     browserSessionApplied_ = true;
     activateStableTab(resolved.snapshot->activeTabId);
+    if (!applyLifetimeGuard) return false;
     synchronizeChrome();
     return true;
 }
@@ -457,20 +471,139 @@ bool MainWindow::attachWorkerSurface(const QString &stableId,
     return true;
 }
 
+bool MainWindow::attachAppWorkerSurfaceIfCurrent(
+    const QString &stableId,
+    const quint64 expectedNavigationIncarnation,
+    const QString &packageId,
+    const QString &route,
+    const QString &originalCanonicalAddress,
+    std::unique_ptr<WorkerSurface> surface)
+{
+    TabController *const controller = tabController(stableId);
+    if (!isRunning() || tabMutationInProgress() || stableId.isEmpty()
+        || expectedNavigationIncarnation == 0 || packageId.isEmpty()
+        || route.isEmpty() || originalCanonicalAddress.isEmpty()
+        || surface == nullptr || controller == nullptr
+        || controller->workerSurface() != nullptr) {
+        return false;
+    }
+    const QPointer<MainWindow> windowGuard(this);
+    const QPointer<TabController> controllerGuard(controller);
+    const auto targetIsCurrent = [windowGuard, stableId,
+                                  expectedNavigationIncarnation, packageId,
+                                  route, originalCanonicalAddress] {
+        return windowGuard
+            && windowGuard->isAppLaunchTargetCurrent(
+                stableId, expectedNavigationIncarnation, packageId, route,
+                originalCanonicalAddress);
+    };
+    const auto isHiddenLoadingTarget = [targetIsCurrent, controllerGuard] {
+        return targetIsCurrent() && controllerGuard
+            && (controllerGuard->lifecycle()
+                    == BrowserTabLifecycle::Starting
+                || controllerGuard->lifecycle()
+                    == BrowserTabLifecycle::Loading)
+            && controllerGuard->surfaceKind() == HostSurfaceKind::Worker
+            && controllerGuard->currentSurface() == nullptr;
+    };
+    if (!isHiddenLoadingTarget()
+        || controllerGuard->workerSurface() != nullptr) {
+        return false;
+    }
+
+    navigationInProgress_ = true;
+    const auto transaction = qScopeGuard([windowGuard] {
+        if (windowGuard) windowGuard->navigationInProgress_ = false;
+    });
+    if (!controllerGuard->attachLegacyWorkerSurface(std::move(surface))) {
+        return false;
+    }
+    if (!windowGuard || !controllerGuard || !isHiddenLoadingTarget()
+        || controllerGuard->workerSurface() == nullptr) {
+        if (controllerGuard) {
+            controllerGuard->discardWorkerSurfaceWithoutFallback();
+        }
+        return false;
+    }
+    if (!controllerGuard->bindAppWorkerSurface(
+            packageId, expectedNavigationIncarnation)) {
+        if (controllerGuard) {
+            controllerGuard->discardWorkerSurfaceWithoutFallback();
+        }
+        return false;
+    }
+    if (!windowGuard || !controllerGuard || !targetIsCurrent()
+        || (controllerGuard->lifecycle() != BrowserTabLifecycle::Active
+            && controllerGuard->lifecycle()
+                != BrowserTabLifecycle::Background)
+        || controllerGuard->surfaceKind() != HostSurfaceKind::Worker
+        || controllerGuard->workerSurface() == nullptr
+        || controllerGuard->currentSurface()
+            != controllerGuard->workerSurface()) {
+        if (controllerGuard) {
+            controllerGuard->discardWorkerSurfaceWithoutFallback();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool MainWindow::isAppLaunchTargetCurrent(
+    const QString &stableId,
+    const quint64 expectedNavigationIncarnation,
+    const QString &packageId,
+    const QString &route,
+    const QString &originalCanonicalAddress) const
+{
+    const TabController *const controller = tabController(stableId);
+    if (!isRunning() || tabModel_ == nullptr || stableId.isEmpty()
+        || expectedNavigationIncarnation == 0 || packageId.isEmpty()
+        || route.isEmpty() || originalCanonicalAddress.isEmpty()
+        || controller == nullptr
+        || controller->incarnation() != expectedNavigationIncarnation
+        || controller->lifecycle() == BrowserTabLifecycle::Closing
+        || controller->lifecycle() == BrowserTabLifecycle::Retired
+        || controller->workerPackageId() != packageId) {
+        return false;
+    }
+    const int index = tabModel_->indexOfId(stableId);
+    if (index < 0) return false;
+    const BrowserTabSnapshot snapshot = tabModel_->snapshotAt(index);
+    const BrowserAddress parsed = BrowserAddress::parse(
+        snapshot.address, QStringLiteral("pilot"));
+    if (snapshot.kind != BrowserTabKind::App || !parsed.isValid()
+        || parsed.kind() != BrowserAddressKind::App
+        || parsed.canonical() != snapshot.address
+        || snapshot.address != originalCanonicalAddress
+        || parsed.appPath() != route) {
+        return false;
+    }
+    const RouteMatch matched = routes_.match(route);
+    return matched.isValid() && matched.record.engine == Engine::QmlWorker
+        && matched.record.packageId == packageId;
+}
+
 void MainWindow::detachWorkerSurface()
 {
     if (legacyWorkerOwnerId_.isEmpty()) return;
     const QString stableId = legacyWorkerOwnerId_;
+    const QPointer<MainWindow> self(this);
     detachWorkerSurface(stableId);
-    legacyWorkerOwnerId_.clear();
+    if (self && self->legacyWorkerOwnerId_ == stableId) {
+        self->legacyWorkerOwnerId_.clear();
+    }
 }
 
 void MainWindow::detachWorkerSurface(const QString &stableId)
 {
     if (stableId.isEmpty()) return;
-    QScopedValueRollback<bool> transaction(navigationInProgress_, true);
-    TabController *const controller = tabController(stableId);
-    if (controller != nullptr) controller->detachLegacyWorkerSurface();
+    navigationInProgress_ = true;
+    const QPointer<MainWindow> self(this);
+    const auto transaction = qScopeGuard([self] {
+        if (self) self->navigationInProgress_ = false;
+    });
+    const QPointer<TabController> controller(tabController(stableId));
+    if (controller) controller->detachLegacyWorkerSurface();
 }
 
 bool MainWindow::isRunning() const noexcept
@@ -639,7 +772,11 @@ bool MainWindow::navigateTab(const QString &stableTabId,
         || controller == nullptr) {
         return false;
     }
-    QScopedValueRollback<bool> transaction(navigationInProgress_, true);
+    navigationInProgress_ = true;
+    const QPointer<MainWindow> windowGuard(this);
+    const auto transaction = qScopeGuard([windowGuard] {
+        if (windowGuard) windowGuard->navigationInProgress_ = false;
+    });
     QString error;
     const std::optional<ResolvedNavigation> resolved = resolveAddress(input, &error);
     if (!resolved.has_value()) {
@@ -651,6 +788,15 @@ bool MainWindow::navigateTab(const QString &stableTabId,
     const int index = tabModel_->indexOfId(stableTabId);
     if (index < 0) return false;
     const BrowserTabSnapshot before = tabModel_->snapshotAt(index);
+    const QPointer<TabController> controllerGuard(controller);
+    const bool abandoningApp = before.kind == BrowserTabKind::App
+        && resolved->kind != BrowserTabKind::App;
+    std::optional<WorkerLaunchRequest> abandonedAppRequest;
+    if (abandoningApp && controller->appRuntimeController() != nullptr
+        && controller->appRuntimeController()->currentRequest().has_value()) {
+        abandonedAppRequest =
+            *controller->appRuntimeController()->currentRequest();
+    }
     bool committed = false;
     quint64 navigationIncarnation = 0;
     {
@@ -673,14 +819,33 @@ bool MainWindow::navigateTab(const QString &stableTabId,
     if (committedIndex < 0) return false;
     const BrowserTabSnapshot after = tabModel_->snapshotAt(committedIndex);
     const bool modelChanged = before != after;
+    const QPointer<AppTabRuntimeController> abandonedRuntime =
+        abandoningApp
+        ? controller->appRuntimeController() : nullptr;
     if (modelChanged) publishCommittedTabChange(stableTabId);
-
-    const bool started = startResolved(
+    if (!windowGuard || !controllerGuard) return false;
+    const bool started = windowGuard->startResolved(
         stableTabId, *resolved, navigationIncarnation);
-    if (activeStableId() == stableTabId && before.address != after.address) {
-        emit currentUrlChanged(after.address);
+    if (abandoningApp) {
+        if (abandonedRuntime && abandonedAppRequest.has_value()) {
+            (void)abandonedRuntime->cancelLaunchIfCurrent(
+                *abandonedAppRequest,
+                QStringLiteral("host.app.navigation_abandoned"));
+        }
+        if (!windowGuard) return started;
+        emit windowGuard->appStopRequested(
+            stableTabId, navigationIncarnation,
+            abandonedAppRequest.has_value()
+                ? abandonedAppRequest->runtimeIncarnation : 0);
+        if (!windowGuard) return started;
     }
-    if (modelChanged) emitPersistenceAfterTransition();
+    if (!windowGuard || !controllerGuard) return started;
+    if (windowGuard->activeStableId() == stableTabId
+        && before.address != after.address) {
+        emit windowGuard->currentUrlChanged(after.address);
+    }
+    if (!windowGuard) return started;
+    if (modelChanged) windowGuard->emitPersistenceAfterTransition();
     return started;
 }
 
@@ -696,7 +861,11 @@ bool MainWindow::traverseHistory(const QString &stableTabId,
     const int targetIndex = before.historyIndex + (forward ? 1 : -1);
     if (targetIndex < 0 || targetIndex >= before.history.size()) return false;
 
-    QScopedValueRollback<bool> transaction(navigationInProgress_, true);
+    navigationInProgress_ = true;
+    const QPointer<MainWindow> windowGuard(this);
+    const auto transaction = qScopeGuard([windowGuard] {
+        if (windowGuard) windowGuard->navigationInProgress_ = false;
+    });
     QString error;
     const std::optional<ResolvedNavigation> resolved = resolveAddress(
         before.history.at(targetIndex), &error);
@@ -710,6 +879,15 @@ bool MainWindow::traverseHistory(const QString &stableTabId,
     quint64 navigationIncarnation = 0;
     TabController *const controller = tabController(stableTabId);
     if (controller == nullptr) return false;
+    const QPointer<TabController> controllerGuard(controller);
+    const bool abandoningApp = before.kind == BrowserTabKind::App
+        && resolved->kind != BrowserTabKind::App;
+    std::optional<WorkerLaunchRequest> abandonedAppRequest;
+    if (abandoningApp && controller->appRuntimeController() != nullptr
+        && controller->appRuntimeController()->currentRequest().has_value()) {
+        abandonedAppRequest =
+            *controller->appRuntimeController()->currentRequest();
+    }
     {
         const QSignalBlocker blockModelSignals(tabModel_.get());
         committed = forward
@@ -727,13 +905,32 @@ bool MainWindow::traverseHistory(const QString &stableTabId,
     if (!committed) return false;
     Q_ASSERT(navigationIncarnation != 0);
     if (navigationIncarnation == 0) return false;
+    const QPointer<AppTabRuntimeController> abandonedRuntime =
+        abandoningApp
+        ? controller->appRuntimeController() : nullptr;
     publishCommittedTabChange(stableTabId);
-    (void)startResolved(
+    if (!windowGuard || !controllerGuard) return false;
+    const bool started = windowGuard->startResolved(
         stableTabId, *resolved, navigationIncarnation);
-    if (activeStableId() == stableTabId) {
-        emit currentUrlChanged(resolved->canonicalAddress);
+    if (abandoningApp) {
+        if (abandonedRuntime && abandonedAppRequest.has_value()) {
+            (void)abandonedRuntime->cancelLaunchIfCurrent(
+                *abandonedAppRequest,
+                QStringLiteral("host.app.navigation_abandoned"));
+        }
+        if (!windowGuard) return started;
+        emit windowGuard->appStopRequested(
+            stableTabId, navigationIncarnation,
+            abandonedAppRequest.has_value()
+                ? abandonedAppRequest->runtimeIncarnation : 0);
+        if (!windowGuard) return started;
     }
-    emitPersistenceAfterTransition();
+    if (!windowGuard || !controllerGuard) return started;
+    if (windowGuard->activeStableId() == stableTabId) {
+        emit windowGuard->currentUrlChanged(resolved->canonicalAddress);
+    }
+    if (!windowGuard) return started;
+    windowGuard->emitPersistenceAfterTransition();
     return true;
 }
 
@@ -998,15 +1195,21 @@ void MainWindow::activateStableTab(const QString &stableTabId)
         || activeStableId() != stableTabId) {
         return;
     }
-    QScopedValueRollback<bool> transaction(navigationInProgress_, true);
+    navigationInProgress_ = true;
+    QPointer<MainWindow> lifetimeGuard(this);
+    const auto finishNavigation = qScopeGuard([lifetimeGuard] {
+        if (lifetimeGuard) lifetimeGuard->navigationInProgress_ = false;
+    });
     if (!visibleTabId_.isEmpty() && visibleTabId_ != stableTabId) {
         TabController *const oldController = tabController(visibleTabId_);
         if (oldController != nullptr) oldController->setActive(false);
+        if (!lifetimeGuard) return;
     }
     visibleTabId_ = stableTabId;
     TabController *const controller = tabController(stableTabId);
     if (controller == nullptr) return;
     controller->setActive(true);
+    if (!lifetimeGuard) return;
     if (controller->lifecycle() == BrowserTabLifecycle::Dormant) {
         (void)startCurrentDescriptor(stableTabId);
     }

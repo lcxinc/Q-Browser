@@ -2,6 +2,8 @@
 
 #include "Archive.h"
 #include "AppContainerProfile.h"
+#include "BrowserChrome.h"
+#include "BrowserSessionStore.h"
 #include "ContentDigest.h"
 #include "HostOwnedFileAuthority.h"
 #include "HostRuntimeConfig.h"
@@ -254,7 +256,8 @@ bool TestEnvironment::shutdown()
     shutdown_ = true;
     const quint32 workerProcessId = currentWorkerProcessId_;
     if (host_ != nullptr && host_->mainWindow() != nullptr) {
-        if (!host_->mainWindow()->shutdown()) {
+        MainWindow *const window = host_->mainWindow();
+        if (!waitUntil([window] { return window->shutdown(); }, 5'000)) {
             cleanupError_ = QStringLiteral("WebEngine renderer cleanup failed");
         }
     }
@@ -536,7 +539,28 @@ bool TestEnvironment::start(const QString &version)
         error_ = parsed.stableError;
         return false;
     }
+    const QString initialTabId = QStringLiteral(
+        "11111111111111111111111111111111");
+    const QString initialAddress = QStringLiteral("app://pilot/dashboard");
+    const BrowserSessionSaveResult initialSession =
+        BrowserSessionStore(parsed.value->browserStateAuthority()).save(
+            BrowserWindowSnapshot{
+                QRect(100, 100, 1100, 720), initialTabId,
+                {{initialTabId, BrowserTabKind::App, QStringLiteral("Pilot"),
+                  initialAddress, {initialAddress}, 0}}});
+    if (initialSession.status != BrowserSessionSaveStatus::Saved) {
+        error_ = initialSession.stableError.isEmpty()
+            ? QStringLiteral("initial browser session could not be saved")
+            : initialSession.stableError;
+        return false;
+    }
     host_ = std::make_unique<HostApplication>(std::move(*parsed.value));
+    QObject::connect(host_.get(), &HostApplication::packageActivationVerified,
+                     host_.get(),
+                     [this](quint64, const QString &, const QString &version,
+                            const QByteArray &) {
+                         verifiedVersions_.push_back(version);
+                     });
     QObject::connect(host_.get(), &HostApplication::packageWorkerReady,
                      host_.get(), [this](const QString &, const QString &readyVersion,
                                          const QString &, quint64, quint64, quint32 pid) {
@@ -561,9 +585,16 @@ bool TestEnvironment::start(const QString &version)
         error_ = QStringLiteral("production Host did not start");
         return false;
     }
-    HostWorkerSessionController *controller = host_->workerSessionController();
-    if (controller == nullptr) {
-        error_ = QStringLiteral("production Host session controller is unavailable");
+    HostWorkerSessionController *controller = nullptr;
+    const bool controllerPublished = waitUntil([&] {
+        controller = host_->workerSessionController();
+        return controller != nullptr || !error_.isEmpty();
+    }, 10'000);
+    if (!controllerPublished || controller == nullptr) {
+        if (error_.isEmpty()) {
+            error_ = QStringLiteral(
+                "production Host session controller is unavailable");
+        }
         return false;
     }
     QObject::connect(controller, &HostWorkerSessionController::heartbeatObserved,
@@ -599,6 +630,24 @@ bool TestEnvironment::start(const QString &version)
 bool TestEnvironment::install(const QString &packagePath)
 {
     return host_ && host_->requestPackageInstall(packagePath);
+}
+
+bool TestEnvironment::reloadActiveTab()
+{
+    if (!host_ || host_->mainWindow() == nullptr
+        || host_->mainWindow()->browserChrome() == nullptr) {
+        return false;
+    }
+    host_->mainWindow()->browserChrome()->dispatchCommand(
+        BrowserCommand::Reload);
+    return true;
+}
+
+bool TestEnvironment::waitForVerified(const QString &version,
+                                      const int timeoutMs)
+{
+    return waitUntil([&] { return verifiedVersions_.contains(version); },
+                     timeoutMs);
 }
 
 bool TestEnvironment::waitForReady(const QString &version, const int timeoutMs)

@@ -53,7 +53,9 @@ void HostRoutesE2eTest::productionHostNavigatesTenPilotRoutes()
     }
     QCOMPARE(window->historyCount(), routes.size() + 1);
     QCOMPARE(window->historyIndex(), routes.size());
-    QVERIFY(environment.host()->hasWorkerContext());
+    // The final route is WebEngine-backed. The tab-keyed app runtime must be
+    // retired instead of leaving a hidden package worker attached to the tab.
+    QVERIFY(!environment.host()->hasWorkerContext());
     QVERIFY2(environment.shutdown(), qPrintable(environment.error()));
 }
 

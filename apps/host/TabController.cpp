@@ -138,7 +138,7 @@ bool TabController::startHost(const quint64 navigationIncarnation)
     connectHostSignals();
     currentSurface_ = hostSurface_;
     surfaceKind_ = HostSurfaceKind::Host;
-    if (appRuntimeController_ == nullptr) workerPackageId_.clear();
+    workerPackageId_.clear();
     updateVisibility();
     transitionTo(active_ ? BrowserTabLifecycle::Active
                          : BrowserTabLifecycle::Background);
@@ -165,7 +165,7 @@ bool TabController::startWeb(const QUrl &physicalEntry,
     (void)model_->setLoadState(tabId_, false, 0);
     destroyTrustedErrorSurface();
     destroyHostSurface();
-    if (appRuntimeController_ == nullptr) workerPackageId_.clear();
+    workerPackageId_.clear();
 
     if (webSurface_ != nullptr && webEntry_ != physicalEntry) {
         destroyWebSurface();
@@ -352,18 +352,46 @@ void TabController::detachLegacyWorkerSurface()
 {
     if (workerSurface_ == nullptr) return;
     const bool wasCurrent = currentSurface_ == workerSurface_;
-    surfaceStack_->removeWidget(workerSurface_);
-    delete workerSurface_;
-    workerSurface_ = nullptr;
+    const QPointer<TabController> self(this);
+    const QPointer<QStackedWidget> stack(surfaceStack_);
+    const QPointer<WorkerSurface> surface(workerSurface_);
+    workerSurface_.clear();
     workerPackageId_.clear();
     if (wasCurrent) {
         currentSurface_ = nullptr;
-        if (!retired_ && lifecycle_ != BrowserTabLifecycle::Closing) {
-            enterTrustedError(
-                QStringLiteral("The package worker is unavailable."),
-                false, true);
-        }
     }
+    if (stack && surface) stack->removeWidget(surface);
+    if (!self) return;
+    if (surface) {
+        surface->hide();
+        surface->deleteLater();
+    }
+    if (!self) return;
+    if (wasCurrent && !self->retired_
+        && self->lifecycle_ != BrowserTabLifecycle::Closing) {
+        self->enterTrustedError(
+            QStringLiteral("The package worker is unavailable."),
+            false, true);
+    }
+}
+
+void TabController::discardWorkerSurfaceWithoutFallback()
+{
+    if (workerSurface_ == nullptr) return;
+    const bool wasCurrent = currentSurface_ == workerSurface_;
+    const QPointer<TabController> self(this);
+    const QPointer<QStackedWidget> stack(surfaceStack_);
+    const QPointer<WorkerSurface> surface(workerSurface_);
+    workerSurface_.clear();
+    workerPackageId_.clear();
+    if (wasCurrent) {
+        currentSurface_ = nullptr;
+        surfaceKind_ = HostSurfaceKind::TrustedError;
+    }
+    if (stack && surface) stack->removeWidget(surface);
+    if (!self) return;
+    if (surface) delete surface.data();
+    if (self && wasCurrent) self->updateVisibility();
 }
 
 bool TabController::beginClosing()
@@ -372,30 +400,40 @@ bool TabController::beginClosing()
     if (lifecycle_ == BrowserTabLifecycle::Closing) return true;
     advanceIncarnation();
     active_ = false;
+    const QPointer<TabController> self(this);
     if (appRuntimeController_ != nullptr) {
         appRuntimeController_->close(QStringLiteral("host.tab.closing"));
     }
-    transitionTo(BrowserTabLifecycle::Closing);
-    updateVisibility();
+    if (!self) return false;
+    self->transitionTo(BrowserTabLifecycle::Closing);
+    if (!self) return false;
+    self->updateVisibility();
     return true;
 }
 
 bool TabController::retire()
 {
     if (retired_) return true;
+    const QPointer<TabController> self(this);
     if (!beginClosing()) return false;
-    destroyTrustedErrorSurface();
-    destroyHostSurface();
-    destroyWebSurface();
-    if (workerSurface_ != nullptr) {
-        surfaceStack_->removeWidget(workerSurface_);
-        delete workerSurface_;
-        workerSurface_ = nullptr;
-    }
-    currentSurface_ = nullptr;
-    workerPackageId_.clear();
-    retired_ = true;
-    transitionTo(BrowserTabLifecycle::Retired);
+    if (!self) return false;
+    self->destroyTrustedErrorSurface();
+    if (!self) return false;
+    self->destroyHostSurface();
+    if (!self) return false;
+    self->destroyWebSurface();
+    if (!self) return false;
+    const QPointer<QStackedWidget> stack(self->surfaceStack_);
+    const QPointer<WorkerSurface> surface(self->workerSurface_);
+    self->workerSurface_.clear();
+    self->currentSurface_ = nullptr;
+    self->workerPackageId_.clear();
+    self->retired_ = true;
+    if (stack && surface) stack->removeWidget(surface);
+    if (!self) return false;
+    if (surface) delete surface.data();
+    if (!self) return false;
+    self->transitionTo(BrowserTabLifecycle::Retired);
     return true;
 }
 
@@ -650,31 +688,37 @@ void TabController::destroyHostSurface()
 {
     if (hostSurface_ == nullptr) return;
     if (currentSurface_ == hostSurface_) currentSurface_ = nullptr;
-    surfaceStack_->removeWidget(hostSurface_);
-    delete hostSurface_;
-    hostSurface_ = nullptr;
+    const QPointer<QStackedWidget> stack(surfaceStack_);
+    const QPointer<NewTabPage> surface(hostSurface_);
+    hostSurface_.clear();
+    if (stack && surface) stack->removeWidget(surface);
+    if (surface) delete surface.data();
 }
 
 void TabController::destroyTrustedErrorSurface()
 {
     if (trustedErrorSurface_ == nullptr) return;
     if (currentSurface_ == trustedErrorSurface_) currentSurface_ = nullptr;
-    surfaceStack_->removeWidget(trustedErrorSurface_);
-    delete trustedErrorSurface_;
-    trustedErrorSurface_ = nullptr;
-    trustedErrorLabel_ = nullptr;
+    const QPointer<QStackedWidget> stack(surfaceStack_);
+    const QPointer<QWidget> surface(trustedErrorSurface_);
+    trustedErrorSurface_.clear();
+    trustedErrorLabel_.clear();
+    if (stack && surface) stack->removeWidget(surface);
+    if (surface) delete surface.data();
 }
 
 void TabController::destroyWebSurface()
 {
     if (webSurface_ == nullptr) return;
+    const QPointer<QStackedWidget> stack(surfaceStack_);
+    const QPointer<WebSurface> surface(webSurface_);
     failedWebSurface_.clear();
     if (currentSurface_ == webSurface_) currentSurface_ = nullptr;
-    disconnect(webSurface_, nullptr, this, nullptr);
-    webSurface_->setTabActive(false);
-    surfaceStack_->removeWidget(webSurface_);
-    (void)webSurface_->shutdown();
-    delete webSurface_;
-    webSurface_ = nullptr;
+    webSurface_.clear();
     webEntry_ = {};
+    if (surface) disconnect(surface, nullptr, this, nullptr);
+    if (surface) surface->setTabActive(false);
+    if (stack && surface) stack->removeWidget(surface);
+    if (surface) (void)surface->shutdown();
+    if (surface) delete surface.data();
 }

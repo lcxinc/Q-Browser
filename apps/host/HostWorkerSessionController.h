@@ -128,6 +128,7 @@ private:
         const BrokerResult &result,
         bool completesActiveRequest);
     void invalidateCapabilityBinding() noexcept;
+    void clearPendingRouteLoads() noexcept;
     void requestIoStop();
     void handleIoThreadFinished(QPointer<HostWorkerSessionIo> oldIo,
                                 QThread *oldThread,
@@ -147,6 +148,9 @@ private:
     std::optional<OutboundCommand> activeCommand_;
     QString activeCapabilityRequestId_;
     QHash<QString, QString> pendingRouteLoads_;
+    QString latestRouteLoadRequestId_;
+    QString latestRouteLoadRoute_;
+    bool latestRouteLoadAcknowledged_ = false;
     HostWorkerSessionState state_ = HostWorkerSessionState::Detached;
     HostWorkerSessionState cleanupFinalState_ = HostWorkerSessionState::Detached;
     QString lastErrorCode_;

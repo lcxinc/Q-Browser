@@ -23,6 +23,7 @@ struct SandboxProcessTestHooks final
 {
     bool forceCloseWaitTimeout = false;
     bool forceCreateProcessFailure = false;
+    std::function<void(quint32)> beforeTerminate;
     std::function<bool(const QString &)> failAclRestore;
     std::function<void(const QString &)> beforeAclGrant;
 };

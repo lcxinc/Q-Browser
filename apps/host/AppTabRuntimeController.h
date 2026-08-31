@@ -5,7 +5,6 @@
 #include "WorkerLaunchRequest.h"
 
 #include <QObject>
-#include <QHash>
 #include <QPointer>
 #include <QUrl>
 
@@ -65,9 +64,27 @@ public:
     [[nodiscard]] InstalledPackageWorkerLauncher *launcher() const noexcept;
     [[nodiscard]] HostCapabilityRuntime *capabilityRuntime() const noexcept;
 
-    [[nodiscard]] bool requestLaunch(const WorkerLaunchRequest &request);
+    [[nodiscard]] bool requestLaunch(
+        const WorkerLaunchRequest &request,
+        quint64 expectedNavigationIncarnation,
+        const QString &originalCanonicalAddress);
+    [[nodiscard]] bool retargetPendingLaunch(
+        quint64 runtimeIncarnation,
+        quint64 expectedNavigationIncarnation,
+        const QString &route,
+        const QString &originalCanonicalAddress);
+    [[nodiscard]] bool cancelLaunchIfCurrent(
+        const WorkerLaunchRequest &request,
+        const QString &reason = QStringLiteral("host.worker.launch_stale"));
     [[nodiscard]] bool requestRouteLoad(const QString &route);
     [[nodiscard]] bool sendVisibilityChanged(bool active);
+#ifdef Q_BROWSER_HOST_TESTING
+    void deferNextAttachForTesting() noexcept;
+    [[nodiscard]] bool hasPendingAttachForTesting() const noexcept;
+    [[nodiscard]] bool resumePendingAttachForTesting();
+    void setAfterPendingSessionAttachHookForTesting(
+        std::function<void()> hook);
+#endif
     void failClosed(const QString &reason =
                         QStringLiteral("host.runtime.critical_event_dropped"));
     void stop(const QString &reason = QStringLiteral("host.worker.stop"));
@@ -96,12 +113,24 @@ signals:
     void failed(const WorkerLaunchRequest &request,
                 const QString &errorCode,
                 quint64 sessionGeneration);
+    void launcherTerminalFailure(const QString &tabId,
+                                 const QString &stableError,
+                                 quint32 nativeError);
     void retired(const QString &tabId, quint64 runtimeIncarnation);
 
 private:
+    struct ExpectedLaunchTarget final
+    {
+        WorkerLaunchRequest request;
+        quint64 navigationIncarnation = 0;
+        QString canonicalAddress;
+    };
+
     struct PendingAttach final
     {
         WorkerLaunchRequest request;
+        quint64 expectedNavigationIncarnation = 0;
+        QString originalCanonicalAddress;
         std::unique_ptr<IpcSession> session;
         std::unique_ptr<WorkerSurface> surface;
         std::shared_ptr<SandboxProcess> process;
@@ -115,11 +144,12 @@ private:
     void completePendingAttach(quint64 detachedGeneration);
     [[nodiscard]] bool completeAttach(PendingAttach pending,
                                       quint64 expectedGeneration);
+    [[nodiscard]] bool isExpectedLaunchTarget(
+        const WorkerLaunchRequest &request,
+        quint64 expectedNavigationIncarnation,
+        const QString &originalCanonicalAddress) const;
     void clearPendingAttach() noexcept;
     void stopCurrent(const QString &reason);
-    void rememberRequest(const WorkerLaunchRequest &request);
-    [[nodiscard]] std::optional<WorkerLaunchRequest> requestForAttempt(
-        const WorkerAttemptKey &key) const;
 
     QString tabId_;
     QPointer<TabController> tabController_;
@@ -139,10 +169,15 @@ private:
     std::shared_ptr<std::mutex> transportGateMutex_;
     std::optional<PendingAttach> pendingAttach_;
     std::optional<WorkerLaunchRequest> currentRequest_;
-    QHash<QString, WorkerLaunchRequest> requestHistory_;
+    std::optional<ExpectedLaunchTarget> expectedLaunchTarget_;
     quint64 runtimeIncarnation_ = 0;
     quint64 activeGeneration_ = 0;
     bool accepting_ = true;
     bool closing_ = false;
     bool retiredEmitted_ = false;
+#ifdef Q_BROWSER_HOST_TESTING
+    bool deferNextAttachForTesting_ = false;
+    bool holdPendingAttachForTesting_ = false;
+    std::function<void()> afterPendingSessionAttachHookForTesting_;
+#endif
 };

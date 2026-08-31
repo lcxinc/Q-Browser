@@ -1,5 +1,10 @@
+#include "AppTabRuntimeController.h"
+#include "BrowserTabModel.h"
+#include "HostCapabilityRuntime.h"
+#include "HostGestureRouter.h"
 #include "HostWorkerSessionController.h"
 #include "MainWindow.h"
+#include "TabController.h"
 #include "TestEnvironment.h"
 #include "WorkerSurface.h"
 
@@ -456,10 +461,12 @@ bool waitForDarkPixels(const HWND worker, const QRect &region, const int minimum
 {
     return waitUntil([&] {
         const QImage image = captureWorker(worker);
-        if (image.isNull() || !image.rect().contains(region)) return false;
+        if (image.isNull()) return false;
+        const QRect visibleRegion = image.rect().intersected(region);
+        if (visibleRegion.isEmpty()) return false;
         int dark = 0;
-        for (int y = region.top(); y <= region.bottom(); ++y) {
-            for (int x = region.left(); x <= region.right(); ++x) {
+        for (int y = visibleRegion.top(); y <= visibleRegion.bottom(); ++y) {
+            for (int x = visibleRegion.left(); x <= visibleRegion.right(); ++x) {
                 const QRgb pixel = image.pixel(x, y);
                 if (qRed(pixel) < 100 && qGreen(pixel) < 100
                     && qBlue(pixel) < 100) ++dark;
@@ -657,9 +664,11 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     QVERIFY(waitForCapabilityIdle(controller));
     // Route acknowledgement and broker completion can precede the QML model
     // consuming the response. Wait for the enabled "processing" destination.
-    QVERIFY(waitForDarkPixels(worker, QRect(340, 610, 95, 48), 30));
+    const int orderControlTop = captureWorker(worker).height() - 67;
+    QVERIFY(orderControlTop >= 0);
+    QVERIFY(waitForDarkPixels(worker, QRect(340, orderControlTop, 95, 48), 30));
     const int orderMutationFrom = requests.count();
-    QVERIFY(clickWorker(worker, 383, 634));
+    QVERIFY(clickWorker(worker, 383, orderControlTop + 21));
     const int orderMutation = waitForCapability(
         requests, orderMutationFrom, QStringLiteral("network"),
         QStringLiteral("request"), [](const QVariantMap &payload) {
@@ -692,7 +701,9 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     const int customerAck = acknowledgements.count();
     QVERIFY(clickWorker(worker, 650, 170));
     recordStage("customers-selected");
-    QVERIFY(clickWorker(worker, 900, 634));
+    const int customerActionY = captureWorker(worker).height() - 44;
+    QVERIFY(customerActionY >= 0);
+    QVERIFY(clickWorker(worker, 900, customerActionY));
     recordStage("customers-open");
     QVERIFY(waitUntil([&] {
         return acknowledgements.count() == customerAck + 1
@@ -725,6 +736,8 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     const QString update = environment.createPackage(QStringLiteral("1.0.1"));
     QVERIFY(!update.isEmpty());
     QVERIFY(environment.install(update));
+    QVERIFY(environment.waitForVerified(QStringLiteral("1.0.1")));
+    QVERIFY(environment.reloadActiveTab());
     QVERIFY(environment.waitForReady(QStringLiteral("1.0.1")));
     worker = workerWindow(window);
     QVERIFY(worker != nullptr);
@@ -816,6 +829,8 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     const int undeclaredFrom = requests.count();
     QVERIFY(environment.install(undeclared));
     recordStage("undeclared-installed");
+    QVERIFY(environment.waitForVerified(QStringLiteral("1.0.2")));
+    QVERIFY(environment.reloadActiveTab());
     QVERIFY(environment.waitForReady(QStringLiteral("1.0.2")));
     recordStage("undeclared-ready");
     QVERIFY(navigateAndWait(window, controller, acknowledgements,
@@ -876,6 +891,21 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     QVERIFY(gestureRendered);
     recordStage("gesture-rendered");
     QVERIFY(focusWorker(window, worker));
+    TabController *const activeTab = window->tabController(
+        window->tabModel()->activeId());
+    QVERIFY(activeTab != nullptr);
+    AppTabRuntimeController *const activeRuntime =
+        activeTab->appRuntimeController();
+    QVERIFY(activeRuntime != nullptr);
+    HostCapabilityRuntime *const activeCapability =
+        activeRuntime->capabilityRuntime();
+    HostGestureRouter *const gestureRouter =
+        environment.host()->gestureRouterForTesting();
+    QVERIFY(activeCapability != nullptr);
+    QVERIFY(gestureRouter != nullptr);
+    QVERIFY(waitUntil([&] {
+        return gestureRouter->isActiveBinding(activeCapability->authority());
+    }, 1'000));
     recordStage("gesture-focused");
     const int gestureFrom = requests.count();
     const int gestureQueuedFrom = responsesQueued.count();

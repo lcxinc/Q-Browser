@@ -7,9 +7,11 @@
 
 #include <QString>
 
+#include <array>
 #include <functional>
 #include <optional>
 
+class AppRuntimeCoordinator;
 class EventRecorder;
 class PackageStore;
 
@@ -89,13 +91,17 @@ public:
 
     [[nodiscard]] ImmutablePackageGuardCloseResult close() noexcept;
     [[nodiscard]] bool isPending() const noexcept;
+    void append(UpdateLifecycleShutdownCleanup cleanup) noexcept;
 
 private:
+    friend class AppRuntimeCoordinator;
     friend class UpdateLifecycleCoordinator;
     explicit UpdateLifecycleShutdownCleanup(
         std::shared_ptr<const ImmutablePackageGuard> guard) noexcept;
 
-    std::shared_ptr<const ImmutablePackageGuard> guard_;
+    // A host owns the app and legacy update coordinators, so shutdown merges at
+    // most one pending guard from each while keeping this noexcept path allocation-free.
+    std::array<std::shared_ptr<const ImmutablePackageGuard>, 2> guards_{};
 };
 
 struct UpdateLifecycleShutdownResult final

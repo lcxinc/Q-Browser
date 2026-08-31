@@ -69,6 +69,12 @@ public:
                      const QString &operation,
                      const QJsonObject &payload,
                      int timeoutMs);
+    bool sendRequest(const QString &requestId,
+                     const QString &capability,
+                     const QString &operation,
+                     const QJsonObject &payload,
+                     int writeTimeoutMs,
+                     int responseTimeoutMs);
     bool sendRouteLoad(const QString &requestId, const QString &route, int timeoutMs);
     [[nodiscard]] IpcSendSubmission submitRouteLoad(
         const QString &requestId,
@@ -106,7 +112,8 @@ private:
         bool &publicationPending) const;
     bool sendTracked(const QString &requestId,
                      const std::optional<ProtocolMessage> &message,
-                     int timeoutMs);
+                     int writeTimeoutMs,
+                     int responseTimeoutMs);
     bool sendInternal(const ProtocolMessage &message,
                       int timeoutMs,
                       bool allowTrackedMessage);

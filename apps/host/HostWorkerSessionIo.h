@@ -66,6 +66,7 @@ signals:
 
 private:
     void pollSession();
+    void finishShutdown();
     void fail(const QString &errorCode);
     void invalidateLiveBinding() noexcept;
     void armCommandDeadline(quint64 commandId,

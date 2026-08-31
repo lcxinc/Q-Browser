@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <new>
 #include <semaphore>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -414,6 +415,7 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
     std::atomic_bool launching{true};
     std::atomic_bool retirementSubmitted{false};
     std::atomic_bool attached{false};
+    std::atomic_bool canceled{false};
     std::atomic_bool fatalCleanupObserved{false};
     std::atomic_bool observationFailed{false};
     std::atomic_bool terminationRequested{false};
@@ -505,63 +507,67 @@ struct InstalledPackageWorkerLauncher::LaunchRetirementContext final
             ownedTempDirectory = tempDirectory;
         }
         QString error;
+        const auto rememberFirstError = [&error](const QString &stableError,
+                                                  const QString &fallback) {
+            if (error.isEmpty()) {
+                error = stableError.isEmpty() ? fallback : stableError;
+            }
+        };
+        bool retiringExecutionClosed = retiringProcess == nullptr;
         if (retiringProcess != nullptr) {
             retiringProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
             const auto executionClosed = retiringProcess->closeExecution();
             if (!executionClosed.value.has_value()) {
-                error = executionClosed.errorCode.isEmpty()
-                    ? QStringLiteral("host.launch.process_cleanup_failed")
-                    : executionClosed.errorCode;
+                rememberFirstError(
+                    executionClosed.errorCode,
+                    QStringLiteral("host.launch.process_cleanup_failed"));
+            } else {
+                retiringExecutionClosed = true;
             }
         }
-        if (!error.isEmpty()) return {false, error};
         if (failedLaunchCleanupOwner != nullptr) {
             const auto failedLaunchClosed = failedLaunchCleanupOwner->close();
             if (!failedLaunchClosed.value.has_value()) {
-                error = failedLaunchClosed.errorCode.isEmpty()
-                    ? QStringLiteral("host.launch.sandbox_cleanup_failed")
-                    : failedLaunchClosed.errorCode;
+                rememberFirstError(
+                    failedLaunchClosed.errorCode,
+                    QStringLiteral("host.launch.sandbox_cleanup_failed"));
+            } else {
+                std::lock_guard lock(resourceMutex);
+                failedLaunchCleanup.reset();
             }
         }
-        if (!error.isEmpty()) return {false, error};
-        {
-            std::lock_guard lock(resourceMutex);
-            failedLaunchCleanup.reset();
-        }
-        if (ownedImmutableGuard != nullptr) {
+        const bool packageCleanupSafe = retiringProcess == nullptr
+            || retiringExecutionClosed;
+        if (packageCleanupSafe && ownedImmutableGuard != nullptr) {
             const ImmutablePackageGuardCloseResult immutableClosed =
                 ownedImmutableGuard->close();
             if (!immutableClosed.value.has_value()) {
-                error = immutableClosed.errorCode.isEmpty()
-                    ? QStringLiteral("host.launch.package_cleanup_failed")
-                    : immutableClosed.errorCode;
+                rememberFirstError(
+                    immutableClosed.errorCode,
+                    QStringLiteral("host.launch.package_cleanup_failed"));
+            } else {
+                std::lock_guard lock(resourceMutex);
+                immutableGuard.reset();
             }
         }
-        if (!error.isEmpty()) return {false, error};
-        {
-            std::lock_guard lock(resourceMutex);
-            immutableGuard.reset();
-        }
-        ownedImmutableGuard.reset();
-        if (preparedCleanupOwner != nullptr) {
+        if (packageCleanupSafe) ownedImmutableGuard.reset();
+        if (packageCleanupSafe && preparedCleanupOwner != nullptr) {
             const auto preparedClosed = preparedCleanupOwner->close();
             if (!preparedClosed.value.has_value()) {
-                error = preparedClosed.errorCode.isEmpty()
-                    ? QStringLiteral("host.launch.sandbox_cleanup_failed")
-                    : preparedClosed.errorCode;
+                rememberFirstError(
+                    preparedClosed.errorCode,
+                    QStringLiteral("host.launch.sandbox_cleanup_failed"));
+            } else {
+                std::lock_guard lock(resourceMutex);
+                preparedCleanup.reset();
             }
         }
-        if (!error.isEmpty()) return {false, error};
-        {
-            std::lock_guard lock(resourceMutex);
-            preparedCleanup.reset();
-        }
-        if (retiringProcess != nullptr) {
+        if (retiringProcess != nullptr && retiringExecutionClosed) {
             const auto grantsClosed = retiringProcess->close();
             if (!grantsClosed.value.has_value()) {
-                error = grantsClosed.errorCode.isEmpty()
-                    ? QStringLiteral("host.launch.process_cleanup_failed")
-                    : grantsClosed.errorCode;
+                rememberFirstError(
+                    grantsClosed.errorCode,
+                    QStringLiteral("host.launch.process_cleanup_failed"));
             }
         }
         if (error.isEmpty() && ownedTempTree != nullptr
@@ -690,27 +696,25 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                .compare(QDir::cleanPath(request.lease.packageDirectory),
                          Qt::CaseInsensitive)
             != 0) {
-        fail(request.attempt, QStringLiteral("host.launch.package_path_invalid"));
+        fail(request, QStringLiteral("host.launch.package_path_invalid"));
         return false;
     }
     if (!isStableEntryPoint(canonicalPackage, request.lease.entryPoint)) {
-        fail(request.attempt, QStringLiteral("host.launch.entry_point_invalid"));
+        fail(request, QStringLiteral("host.launch.entry_point_invalid"));
         return false;
     }
     if (currentProcess_ != nullptr || !inflight_.empty()) {
         pendingRequest_ = request;
+        const QPointer<InstalledPackageWorkerLauncher> self(this);
         stopCurrent();
-        for (const auto &[unused, context] : inflight_) {
-            Q_UNUSED(unused);
-            context->requestTerminateNoWait();
-        }
+        if (!self) return true;
         return true;
     }
     ++serial_;
     const quint64 launchSerial = serial_;
     const auto ownedTemp = createOwnedWorkerTemp(sandboxTempRoot_);
     if (!ownedTemp.has_value()) {
-        fail(request.attempt, QStringLiteral("host.launch.temp_unavailable"));
+        fail(request, QStringLiteral("host.launch.temp_unavailable"));
         return false;
     }
     auto context = std::make_shared<LaunchRetirementContext>();
@@ -746,11 +750,18 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
         QStringLiteral("--qbrowser-heartbeat-ms"), QStringLiteral("50"),
     };
     launchRequest.resourceLimits = {1, 512ULL * 1024ULL * 1024ULL};
+#ifdef Q_BROWSER_HOST_TESTING
+    const auto beforePrepareHooks = qbrowser_host_testing::
+        installedPackageWorkerLauncherTestHooks();
+    if (beforePrepareHooks.beforeSandboxPrepare) {
+        beforePrepareHooks.beforeSandboxPrepare(request);
+    }
+#endif
     auto configured = boundary_.makeLaunchConfig(launchRequest);
     if (!configured.value.has_value()) {
         context->launchFinished();
         context->retireAsync();
-        fail(request.attempt, configured.errorCode.isEmpty()
+        fail(request, configured.errorCode.isEmpty()
                               ? QStringLiteral("host.launch.trust_rejected")
                               : configured.errorCode);
         return false;
@@ -823,8 +834,9 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
             payload->context = context;
             WinPipePair pair = WinPipeTransport::createHostPair();
             if (!pair.isValid()) {
-                if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.attempt] {
-                    if (guard) guard->fail(key, QStringLiteral("host.launch.pipe_failed"));
+                if (guard) QMetaObject::invokeMethod(guard, [guard, request] {
+                    if (guard) guard->fail(
+                        request, QStringLiteral("host.launch.pipe_failed"));
                 }, Qt::QueuedConnection);
                 return;
             }
@@ -835,8 +847,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     ? QStringLiteral("host.launch.sandbox_prepare_failed")
                     : prepared.errorCode;
                 if (guard) QMetaObject::invokeMethod(
-                    guard, [guard, key = request.attempt, error] {
-                        if (guard) guard->fail(key, error);
+                    guard, [guard, request, error] {
+                        if (guard) guard->fail(request, error);
                     }, Qt::QueuedConnection);
                 return;
             }
@@ -847,7 +859,18 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 beforeValidationHooks.beforeBindingValidation(request);
             }
 #endif
+#ifdef Q_BROWSER_HOST_TESTING
+            WorkerLaunchRequest validationRequest = request;
+            const auto validationMutationHooks =
+                qbrowser_host_testing::installedPackageWorkerLauncherTestHooks();
+            if (validationMutationHooks.mutateBindingValidationRequest) {
+                validationMutationHooks.mutateBindingValidationRequest(
+                    validationRequest);
+            }
+            InstallResult prelaunch = validateBinding(validationRequest, {});
+#else
             InstallResult prelaunch = validateBinding(request, {});
+#endif
             if (!matchesValidatedLease(request, prelaunch)) {
                 recordLauncherValidationFailure("prelaunch", request,
                                                 prelaunch);
@@ -867,8 +890,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 const quint32 nativeError = immutableCleanupFailed
                     ? prelaunch.nativeError : 0U;
                 if (guard) QMetaObject::invokeMethod(
-                    guard, [guard, key = request.attempt, error, nativeError] {
-                        if (guard) guard->fail(key, error, nativeError);
+                    guard, [guard, request, error, nativeError] {
+                        if (guard) guard->fail(request, error, nativeError);
                     }, Qt::QueuedConnection);
                 return;
             }
@@ -895,8 +918,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 const QString error = launched.errorCode.isEmpty()
                     ? QStringLiteral("host.launch.process_failed")
                     : launched.errorCode;
-                if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.attempt, error] {
-                    if (guard) guard->fail(key, error);
+                if (guard) QMetaObject::invokeMethod(guard, [guard, request, error] {
+                    if (guard) guard->fail(request, error);
                 }, Qt::QueuedConnection);
                 return;
             }
@@ -921,9 +944,9 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                     }
                     context->requestTerminateNoWait();
                     if (guard) QMetaObject::invokeMethod(
-                        guard, [guard, key = request.attempt] {
+                        guard, [guard, request] {
                             if (guard) guard->fail(
-                                key,
+                                request,
                                 QStringLiteral("host.launch.process_failed"));
                         }, Qt::QueuedConnection);
                     return;
@@ -939,8 +962,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                         context->immutableGuard = immutableGuard;
                     }
                     if (guard) QMetaObject::invokeMethod(
-                        guard, [guard, key = request.attempt, error] {
-                            if (guard) guard->fail(key, error);
+                        guard, [guard, request, error] {
+                            if (guard) guard->fail(request, error);
                         }, Qt::QueuedConnection);
                     return;
                 }
@@ -979,8 +1002,8 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 const QString error = ready.stableError.isEmpty()
                     ? QStringLiteral("host.launch.handshake_failed")
                     : ready.stableError;
-                if (guard) QMetaObject::invokeMethod(guard, [guard, key = request.attempt, error] {
-                    if (guard) guard->fail(key, error);
+                if (guard) QMetaObject::invokeMethod(guard, [guard, request, error] {
+                    if (guard) guard->fail(request, error);
                 }, Qt::QueuedConnection);
                 return;
             }
@@ -990,9 +1013,10 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
                 recordLauncherValidationFailure("posthandshake", request,
                                                 admitted);
                 if (guard) QMetaObject::invokeMethod(
-                    guard, [guard, key = request.attempt] {
+                    guard, [guard, request] {
                         if (guard) guard->fail(
-                            key, QStringLiteral("host.launch.stale_activation"));
+                            request,
+                            QStringLiteral("host.launch.stale_activation"));
                     }, Qt::QueuedConnection);
                 return;
             }
@@ -1033,7 +1057,7 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
         }
 #endif
         context->retireAsync();
-        fail(request.attempt,
+        fail(request,
              QStringLiteral("host.launch.launch_thread_unavailable"));
         return false;
     }
@@ -1043,7 +1067,9 @@ bool InstalledPackageWorkerLauncher::requestLaunch(
 bool InstalledPackageWorkerLauncher::hasPendingActivity(
     const WorkerAttemptKey &key) const noexcept
 {
-    if (currentKey_.has_value() && *currentKey_ == key) return true;
+    if (currentRequest_.has_value() && currentRequest_->attempt == key) {
+        return true;
+    }
     if (pendingRequest_.has_value() && pendingRequest_->attempt == key) {
         return true;
     }
@@ -1060,11 +1086,85 @@ bool InstalledPackageWorkerLauncher::hasPendingActivity(
     return false;
 }
 
+bool InstalledPackageWorkerLauncher::hasPendingActivity(
+    const WorkerLaunchRequest &request) const noexcept
+{
+    if (currentRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*currentRequest_, request)) {
+        return true;
+    }
+    if (pendingRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*pendingRequest_, request)) {
+        return true;
+    }
+    if (currentRetirement_ != nullptr
+        && hasSameWorkerLaunchAuthority(currentRetirement_->request,
+                                        request)) {
+        return true;
+    }
+    for (const auto &[unused, context] : inflight_) {
+        Q_UNUSED(unused);
+        if (context != nullptr
+            && hasSameWorkerLaunchAuthority(context->request, request)) {
+            return true;
+        }
+    }
+    for (const std::shared_ptr<LaunchRetirementContext> &context :
+         fatalCleanup_) {
+        if (context != nullptr
+            && hasSameWorkerLaunchAuthority(context->request, request)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool InstalledPackageWorkerLauncher::hasPendingActivity() const noexcept
 {
-    return currentKey_.has_value() || currentProcess_ != nullptr
+    return currentRequest_.has_value() || currentProcess_ != nullptr
         || currentRetirement_ != nullptr || pendingRequest_.has_value()
         || !inflight_.empty() || !fatalCleanup_.empty();
+}
+
+bool InstalledPackageWorkerLauncher::cancelLaunch(
+    const WorkerLaunchRequest &request) noexcept
+{
+    bool canceled = false;
+    std::vector<std::shared_ptr<LaunchRetirementContext>> matchingInflight;
+    if (pendingRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*pendingRequest_, request)) {
+        pendingRequest_.reset();
+        canceled = true;
+    }
+    if (currentRequest_.has_value()
+        && hasSameWorkerLaunchAuthority(*currentRequest_, request)) {
+        expectedStop_ = *currentRequest_;
+        if (currentRetirement_ != nullptr) {
+            currentRetirement_->canceled.store(true,
+                                                std::memory_order_release);
+            currentRetirement_->requestTerminateNoWait();
+        }
+        if (currentProcess_ != nullptr) {
+            currentProcess_->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+        }
+        canceled = true;
+    }
+    for (const auto &[unused, context] : inflight_) {
+        Q_UNUSED(unused);
+        if (context == nullptr
+            || !hasSameWorkerLaunchAuthority(context->request, request)) {
+            continue;
+        }
+        matchingInflight.push_back(context);
+    }
+    for (const std::shared_ptr<LaunchRetirementContext> &context :
+         matchingInflight) {
+        context->canceled.store(true, std::memory_order_release);
+        context->requestTerminateNoWait();
+        context->retireAsync();
+        canceled = true;
+    }
+    return canceled;
 }
 
 void InstalledPackageWorkerLauncher::requestAdmission(
@@ -1072,7 +1172,11 @@ void InstalledPackageWorkerLauncher::requestAdmission(
     std::shared_ptr<ReadyPayload> payload)
 {
     if (!accepting_ || serial != serial_ || payload == nullptr
-        || payload->context == nullptr) {
+        || payload->context == nullptr
+        || payload->context->canceled.load(std::memory_order_acquire)) {
+        if (payload != nullptr && payload->context != nullptr) {
+            payload->context->retireAsync();
+        }
         return;
     }
     auto *const timeout = new QTimer(this);
@@ -1126,13 +1230,25 @@ void InstalledPackageWorkerLauncher::completeLaunch(
         payload->admissionTimer->deleteLater();
         payload->admissionTimer = nullptr;
     }
+    if (context != nullptr
+        && context->canceled.load(std::memory_order_acquire)) {
+        context->retireAsync();
+        return;
+    }
     if (!admission.accepted) {
         if (context != nullptr) context->retireAsync();
         if (admission.ignoredStale) return;
-        fail(context != nullptr ? context->request.attempt : WorkerAttemptKey{},
-             admission.stableError.isEmpty()
-                 ? QStringLiteral("host.launch.admission_rejected")
-                 : admission.stableError);
+        if (context != nullptr) {
+            fail(context->request,
+                 admission.stableError.isEmpty()
+                     ? QStringLiteral("host.launch.admission_rejected")
+                     : admission.stableError);
+        } else {
+            failLegacy(
+                {}, admission.stableError.isEmpty()
+                        ? QStringLiteral("host.launch.admission_rejected")
+                        : admission.stableError);
+        }
         return;
     }
     if (!accepting_ || serial != serial_ || payload == nullptr
@@ -1144,7 +1260,7 @@ void InstalledPackageWorkerLauncher::completeLaunch(
         || *admission.authority != context->request) {
         if (context != nullptr) context->retireAsync();
         if (context != nullptr && accepting_ && serial == serial_) {
-            fail(context->request.attempt,
+            fail(context->request,
                  QStringLiteral("host.launch.admission_authority_mismatch"));
         }
         return;
@@ -1160,7 +1276,7 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     if (!observerHandle.has_value()) {
         context->observationFailed.store(true, std::memory_order_release);
         context->retireAsync();
-        fail(context->request.attempt,
+        fail(context->request,
              QStringLiteral("host.launch.process_observer_failed"));
         return;
     }
@@ -1197,7 +1313,8 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     std::optional<CommittedAttachTransaction> committed;
     const bool published = prepared != nullptr && use.has_value()
         && use->publishIfStillAdmitted([&] {
-               if (!payload->revalidatedAuthority.has_value()
+               if (context->canceled.load(std::memory_order_acquire)
+                   || !payload->revalidatedAuthority.has_value()
                    || !admission.authority.has_value()
                    || *payload->revalidatedAuthority != context->request
                    || *admission.authority != context->request
@@ -1225,18 +1342,36 @@ void InstalledPackageWorkerLauncher::completeLaunch(
                 attachHooks.afterAttachPublicationBeforeRealization(
                     context->request, true);
             }
+            if (attachHooks.beforeCommittedAttachRealization) {
+                attachHooks.beforeCommittedAttachRealization(
+                    context->request);
+            }
+            if (attachHooks.throwAttachRealization) {
+                throw std::runtime_error(
+                    "injected committed attach realization failure");
+            }
 #endif
+            if (!self
+                || context->canceled.load(std::memory_order_acquire)) {
+                use.reset();
+                context->retireAsync();
+                return;
+            }
             attachResult = (*attachCallback)(std::move(*committed));
         } catch (...) {
             attachThrew = true;
         }
     }
     use.reset();
+    if (context->canceled.load(std::memory_order_acquire)) {
+        context->retireAsync();
+        return;
+    }
     if (!published || attachResult != AttachResult::Attached) {
         context->retireAsync();
         if (self) {
             self->fail(
-                context->request.attempt,
+                context->request,
                 surfaceCreated && !authorityCommitted && !attachThrew
                     ? QStringLiteral("host.launch.admission_revoked")
                     : QStringLiteral("host.launch.attach_failed"));
@@ -1252,7 +1387,7 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     self->inflight_.erase(serial);
     self->currentProcess_ = context->process;
     self->currentRetirement_ = context;
-    self->currentKey_ = context->request.attempt;
+    self->currentRequest_ = context->request;
     self->expectedStop_.reset();
     const QString readyAppId = context->request.lease.appId;
     const QString readyVersion = context->request.lease.version;
@@ -1260,6 +1395,8 @@ void InstalledPackageWorkerLauncher::completeLaunch(
     const quint64 readyActivation = context->request.attempt.activation.value;
     const quint64 readyAttempt = context->request.attempt.attempt.value;
     const quint32 readyProcessId = context->process->processId();
+    emit self->readyForRequest(context->request, readyProcessId);
+    if (!self) return;
     emit self->ready(readyAppId, readyVersion, readyDirectory,
                      readyActivation, readyAttempt, readyProcessId);
 }
@@ -1315,7 +1452,7 @@ InstalledPackageWorkerLauncher::observeProcess(
         context->observationFailed.store(true, std::memory_order_release);
         context->requestTerminateNoWait();
         context->retireAsync();
-        fail(context->request.attempt,
+        fail(context->request,
              QStringLiteral("host.launch.observer_thread_unavailable"));
         return {};
     }
@@ -1328,11 +1465,21 @@ void InstalledPackageWorkerLauncher::handleRetirement(
     const QString &stableError)
 {
     if (context == nullptr) return;
+    QPointer<InstalledPackageWorkerLauncher> self(this);
+    const auto publishRetirement = [&self, &context](const bool completed) {
+        if (!self) return false;
+        emit self->retirementCompletedForRequest(context->request, completed);
+        if (!self) return false;
+        emit self->retirementCompleted(
+            context->request.attempt.activation.value,
+            context->request.attempt.attempt.value, completed);
+        return !self.isNull();
+    };
     inflight_.erase(context->serial);
     if (!succeeded) {
-        emit retirementCompleted(context->request.attempt.activation.value,
-                                 context->request.attempt.attempt.value,
-                                 false);
+        const bool terminalTransition = accepting_;
+        const QString terminalError = stableError.isEmpty()
+            ? QStringLiteral("host.launch.cleanup_failed") : stableError;
         context->fatalCleanupObserved.store(true, std::memory_order_release);
         accepting_ = false;
         pendingRequest_.reset();
@@ -1341,12 +1488,10 @@ void InstalledPackageWorkerLauncher::handleRetirement(
         if (currentRetirement_ == context) {
             currentRetirement_.reset();
             currentProcess_.reset();
-            currentKey_.reset();
+            currentRequest_.reset();
         }
-        fail(context->request.attempt,
-             stableError.isEmpty()
-                 ? QStringLiteral("host.launch.cleanup_failed")
-                 : stableError);
+        (void)publishFatalRetirement(context->request, terminalError, 0,
+                                     terminalTransition);
         return;
     }
     fatalCleanup_.erase(
@@ -1354,23 +1499,25 @@ void InstalledPackageWorkerLauncher::handleRetirement(
         fatalCleanup_.end());
     const bool wasAttached = context->attached.load(std::memory_order_acquire);
     const WorkerAttemptKey key = context->request.attempt;
-    const bool expected = expectedStop_.has_value() && *expectedStop_ == key;
+    const bool expected = expectedStop_.has_value()
+        && hasSameWorkerLaunchAuthority(*expectedStop_, context->request);
     const bool staleSerial = context->serial != serial_;
     if (currentRetirement_ == context) {
         currentRetirement_.reset();
         currentProcess_.reset();
-        currentKey_.reset();
+        currentRequest_.reset();
     }
     if (wasAttached
         && !context->fatalCleanupObserved.load(std::memory_order_acquire)) {
         if (context->observationFailed.load(std::memory_order_acquire)) {
+            const bool terminalTransition = accepting_;
             accepting_ = false;
             pendingRequest_.reset();
             expectedStop_.reset();
-            emit retirementCompleted(key.activation.value,
-                                     key.attempt.value,
-                                     false);
-            fail(key, QStringLiteral("host.launch.process_observer_failed"));
+            (void)publishFatalRetirement(
+                context->request,
+                QStringLiteral("host.launch.process_observer_failed"), 0,
+                terminalTransition);
             return;
         }
     }
@@ -1381,15 +1528,15 @@ void InstalledPackageWorkerLauncher::handleRetirement(
         && !context->observationFailed.load(std::memory_order_acquire);
     if (notifyExit) exitCallback = exited_;
     expectedStop_.reset();
-    std::optional<WorkerLaunchRequest> pending;
-    if (accepting_ && inflight_.empty() && currentProcess_ == nullptr
-        && pendingRequest_.has_value()) {
-        pending = std::move(pendingRequest_);
-        pendingRequest_.reset();
-    }
-
-    QPointer<InstalledPackageWorkerLauncher> self(this);
     if (notifyExit) {
+        const quint64 notificationSerial = serial_;
+        emit self->workerExitedForRequest(context->request,
+                                          expected || staleSerial);
+        if (!self) return;
+        if (self->serial_ != notificationSerial) {
+            (void)publishRetirement(true);
+            return;
+        }
         if (!expected) {
             QFile standardError;
             if (qEnvironmentVariableIsSet(
@@ -1416,7 +1563,21 @@ void InstalledPackageWorkerLauncher::handleRetirement(
             }
 #endif
         }
-        if (exitCallback) exitCallback(key, expected || staleSerial);
+        if (exitCallback) {
+#ifdef Q_BROWSER_HOST_TESTING
+            const auto callbackHooks = qbrowser_host_testing::
+                installedPackageWorkerLauncherTestHooks();
+            if (callbackHooks.duringExitCallbackBeforeLifecycleEnqueue) {
+                callbackHooks.duringExitCallbackBeforeLifecycleEnqueue();
+                if (!self) return;
+                if (self->serial_ != notificationSerial) {
+                    (void)publishRetirement(true);
+                    return;
+                }
+            }
+#endif
+            exitCallback(key, expected || staleSerial);
+        }
         if (!self) return;
 #ifdef Q_BROWSER_HOST_TESTING
         const auto exitHooks = qbrowser_host_testing::
@@ -1427,25 +1588,38 @@ void InstalledPackageWorkerLauncher::handleRetirement(
         }
 #endif
     }
+    if (!publishRetirement(true) || !self) return;
+    std::optional<WorkerLaunchRequest> pending;
+    if (self->accepting_ && self->inflight_.empty()
+        && self->currentProcess_ == nullptr
+        && self->pendingRequest_.has_value()) {
+        pending = std::move(self->pendingRequest_);
+        self->pendingRequest_.reset();
+    }
     if (pending.has_value() && self) {
         (void)self->requestLaunch(*pending);
     }
-    emit retirementCompleted(key.activation.value, key.attempt.value, true);
 }
 
 void InstalledPackageWorkerLauncher::stopCurrent()
 {
-    if (currentKey_.has_value() && currentProcess_ != nullptr
+    if (currentRequest_.has_value() && currentProcess_ != nullptr
         && currentProcess_->isRunning()) {
-        expectedStop_ = currentKey_;
+        expectedStop_ = currentRequest_;
     }
-    if (stop_) stop_();
-    if (currentProcess_ != nullptr)
-        currentProcess_->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    const StopCallback stop = stop_;
+    const std::shared_ptr<SandboxProcess> currentProcess = currentProcess_;
+    std::vector<std::shared_ptr<LaunchRetirementContext>> inflight;
+    inflight.reserve(inflight_.size());
     for (const auto &[unused, context] : inflight_) {
         Q_UNUSED(unused);
-        context->requestTerminateNoWait();
+        if (context != nullptr) inflight.push_back(context);
     }
+    if (stop) stop();
+    if (currentProcess != nullptr)
+        currentProcess->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    for (const std::shared_ptr<LaunchRetirementContext> &context : inflight)
+        context->requestTerminateNoWait();
 }
 
 void InstalledPackageWorkerLauncher::cancel() noexcept
@@ -1453,12 +1627,23 @@ void InstalledPackageWorkerLauncher::cancel() noexcept
     accepting_ = false;
     ++serial_;
     pendingRequest_.reset();
-    stopCurrent();
-    if (currentRetirement_ != nullptr) currentRetirement_->retireAsync();
+    if (currentRequest_.has_value() && currentProcess_ != nullptr
+        && currentProcess_->isRunning()) {
+        expectedStop_ = currentRequest_;
+    }
+    const StopCallback stop = stop_;
+    const std::shared_ptr<LaunchRetirementContext> currentRetirement =
+        currentRetirement_;
+    std::vector<std::shared_ptr<LaunchRetirementContext>> inflight;
+    inflight.reserve(inflight_.size());
     for (const auto &[unused, context] : inflight_) {
         Q_UNUSED(unused);
-        context->retireAsync();
+        if (context != nullptr) inflight.push_back(context);
     }
+    if (stop) stop();
+    if (currentRetirement != nullptr) currentRetirement->retireAsync();
+    for (const std::shared_ptr<LaunchRetirementContext> &context : inflight)
+        context->retireAsync();
 }
 
 bool InstalledPackageWorkerLauncher::isAccepting() const noexcept
@@ -1474,12 +1659,49 @@ bool InstalledPackageWorkerLauncher::retryFatalCleanupForTesting()
 #endif
 
 void InstalledPackageWorkerLauncher::fail(
+    const WorkerLaunchRequest &request,
+    const QString &stableError,
+    const quint32 nativeError)
+{
+    const QString publishedError = stableError.isEmpty()
+        ? QStringLiteral("host.launch.failed") : stableError;
+    QPointer<InstalledPackageWorkerLauncher> self(this);
+    emit launchFailedForRequest(request, publishedError, nativeError);
+    if (!self) return;
+    failLegacy(request.attempt, publishedError, nativeError);
+}
+
+void InstalledPackageWorkerLauncher::failLegacy(
     const WorkerAttemptKey key,
     const QString &stableError,
     const quint32 nativeError)
 {
     if (failed_) failed_(key, stableError.isEmpty()
-                                   ? QStringLiteral("host.launch.failed")
-                                   : stableError,
+                                  ? QStringLiteral("host.launch.failed")
+                                  : stableError,
                          nativeError);
+}
+
+bool InstalledPackageWorkerLauncher::publishFatalRetirement(
+    const WorkerLaunchRequest &request,
+    const QString &stableError,
+    const quint32 nativeError,
+    const bool publishTerminal)
+{
+    const QString publishedError = stableError.isEmpty()
+        ? QStringLiteral("host.launch.cleanup_failed") : stableError;
+    QPointer<InstalledPackageWorkerLauncher> self(this);
+    emit retirementCompletedForRequest(request, false);
+    if (!self) return false;
+    emit launchFailedForRequest(request, publishedError, nativeError);
+    if (!self) return false;
+    if (publishTerminal) {
+        emit terminalFailure(publishedError, nativeError);
+        if (!self) return false;
+    }
+    emit retirementCompleted(request.attempt.activation.value,
+                             request.attempt.attempt.value, false);
+    if (!self) return false;
+    failLegacy(request.attempt, publishedError, nativeError);
+    return !self.isNull();
 }

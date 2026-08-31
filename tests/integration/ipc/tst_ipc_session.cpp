@@ -166,6 +166,7 @@ private slots:
     void correlatesRouteLoadAcknowledgement();
     void correlatesWorkerNavigationAndRejectsReplay();
     void rejectsUnknownProtocolAndDuplicateInboundRequests();
+    void requestWriteAndResponseDeadlinesAreIndependent();
     void expiresPendingRequests();
     void reportsTimeoutPeerCloseAndHeartbeat();
     void pageMetadataRequiresWorkerReadyAndIsOneWay();
@@ -1451,6 +1452,44 @@ void IpcSessionTest::expiresPendingRequests()
     QCOMPARE(worker.receive(1000).status, SessionStatus::TimedOut);
     QCOMPARE(worker.lastErrorCode(), QStringLiteral("ipc.session.request_timeout"));
     QVERIFY(elapsed.elapsed() < 250);
+#endif
+}
+
+void IpcSessionTest::requestWriteAndResponseDeadlinesAreIndependent()
+{
+#ifndef Q_OS_WIN
+    QSKIP("Windows anonymous pipe contract");
+#else
+    WinPipePair pair = WinPipeTransport::createHostPair();
+    IpcSession host(
+        pair.takeHost(), IpcRole::Host,
+        HostLaunchContext{QStringLiteral("independent-deadlines"),
+                          QStringLiteral("trusted")});
+    IpcSession worker(
+        WinPipeTransport::adoptWorkerEnds(pair.takeWorkerEnds()),
+        IpcRole::Worker);
+    QVERIFY(worker.send(*ProtocolMessage::handshake(
+        QStringLiteral("independent-deadlines"))));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QCOMPARE(worker.receive(1'000).status, SessionStatus::MessageReady);
+
+    QVERIFY(worker.sendRequest(
+        QStringLiteral("interactive"), QStringLiteral("file"),
+        QStringLiteral("open"), QJsonObject{}, 25, 500));
+    QCOMPARE(host.receive(1'000).status, SessionStatus::MessageReady);
+    QTest::qWait(75);
+    QCOMPARE(worker.poll(0).status, SessionStatus::TimedOut);
+    QVERIFY(!worker.isClosed());
+
+    const auto response = ProtocolMessage::successResponse(
+        QStringLiteral("interactive"),
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("note.txt")}});
+    QVERIFY(response.has_value());
+    QVERIFY(host.send(*response));
+    const SessionReceiveResult received = worker.receive(1'000);
+    QCOMPARE(received.status, SessionStatus::MessageReady);
+    QCOMPARE(received.message->requestId(), QStringLiteral("interactive"));
+    QCOMPARE(worker.pendingRequestCount(), qsizetype(0));
 #endif
 }
 

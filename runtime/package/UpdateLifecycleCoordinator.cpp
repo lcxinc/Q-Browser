@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QDateTime>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <utility>
@@ -23,21 +24,49 @@ UpdateLifecycleResult lifecycleFailure(const UpdateLifecycleError error,
 
 UpdateLifecycleShutdownCleanup::UpdateLifecycleShutdownCleanup(
     std::shared_ptr<const ImmutablePackageGuard> guard) noexcept
-    : guard_(std::move(guard))
 {
+    guards_.front() = std::move(guard);
 }
 
 ImmutablePackageGuardCloseResult UpdateLifecycleShutdownCleanup::close() noexcept
 {
-    if (guard_ == nullptr) return {true, {}, 0U};
-    ImmutablePackageGuardCloseResult result = guard_->close();
-    if (result.value.has_value()) guard_.reset();
-    return result;
+    QString firstError;
+    quint32 firstNativeError = 0;
+    for (qsizetype index = static_cast<qsizetype>(guards_.size());
+         index > 0; --index) {
+        auto &guard = guards_[static_cast<std::size_t>(index - 1)];
+        if (guard == nullptr) continue;
+        const ImmutablePackageGuardCloseResult closed = guard->close();
+        if (closed.value.has_value()) {
+            guard.reset();
+        } else if (firstError.isEmpty()) {
+            firstError = closed.errorCode.isEmpty()
+                ? QStringLiteral("package.immutable_restore_failed")
+                : closed.errorCode;
+            firstNativeError = closed.nativeError;
+        }
+    }
+    return firstError.isEmpty()
+        ? ImmutablePackageGuardCloseResult{true, {}, 0U}
+        : ImmutablePackageGuardCloseResult{
+              std::nullopt, firstError, firstNativeError};
 }
 
 bool UpdateLifecycleShutdownCleanup::isPending() const noexcept
 {
-    return guard_ != nullptr;
+    return guards_.front() != nullptr || guards_.back() != nullptr;
+}
+
+void UpdateLifecycleShutdownCleanup::append(
+    UpdateLifecycleShutdownCleanup cleanup) noexcept
+{
+    for (auto &source : cleanup.guards_) {
+        if (source == nullptr) continue;
+        auto target = std::find(guards_.begin(), guards_.end(), nullptr);
+        Q_ASSERT(target != guards_.end());
+        if (target == guards_.end()) return;
+        *target = std::move(source);
+    }
 }
 
 LifecycleClock LifecycleClock::system()

@@ -211,6 +211,49 @@ AppRuntimeResult AppRuntimeCoordinator::failedClosedResult(
     return result;
 }
 
+AppRuntimeResult AppRuntimeCoordinator::immutableCleanupFailureResult() const
+{
+    return failedClosedResult(
+        pendingImmutableCleanupError_.isEmpty()
+            ? QStringLiteral("package.immutable_restore_failed")
+            : pendingImmutableCleanupError_,
+        pendingImmutableCleanupNativeError_);
+}
+
+bool AppRuntimeCoordinator::settleTemporaryVerification(
+    InstallResult &result) noexcept
+{
+    if (result.immutableGuard == nullptr) return true;
+    if (result.succeeded()) {
+        result = closeImmutablePackageGuard(std::move(result));
+    }
+    if (result.immutableGuard == nullptr) return true;
+    pendingImmutableCleanup_ = std::move(result.immutableGuard);
+    pendingImmutableCleanupError_ = result.stableError.isEmpty()
+        ? QStringLiteral("package.immutable_restore_failed")
+        : result.stableError;
+    pendingImmutableCleanupNativeError_ = result.nativeError;
+    return false;
+}
+
+bool AppRuntimeCoordinator::retryPendingImmutableCleanup() noexcept
+{
+    if (pendingImmutableCleanup_ == nullptr) return true;
+    const ImmutablePackageGuardCloseResult closed =
+        pendingImmutableCleanup_->close();
+    if (!closed.value.has_value()) {
+        pendingImmutableCleanupError_ = closed.errorCode.isEmpty()
+            ? QStringLiteral("package.immutable_restore_failed")
+            : closed.errorCode;
+        pendingImmutableCleanupNativeError_ = closed.nativeError;
+        return false;
+    }
+    pendingImmutableCleanup_.reset();
+    pendingImmutableCleanupError_.clear();
+    pendingImmutableCleanupNativeError_ = 0;
+    return true;
+}
+
 AppRuntimeAction AppRuntimeCoordinator::makeTabAction(
     const AppRuntimeActionKind kind,
     const TabLaunchAuthority &tab) const
@@ -282,6 +325,10 @@ AppRuntimeResult AppRuntimeCoordinator::installAndActivate(
 {
     Q_UNUSED(nowMs);
     if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (!retryPendingImmutableCleanup()) {
+        failedClosed_ = true;
+        return immutableCleanupFailureResult();
+    }
     if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
     if (pendingDrain_.has_value()) {
         return pendingDrain_->timedOut || pendingDrain_->terminalFailure
@@ -297,21 +344,30 @@ AppRuntimeResult AppRuntimeCoordinator::installAndActivate(
     if (before.hasValue() && !before.state.current.isEmpty()) {
         const auto beforeBinding = store_.bindingForState(before.state);
         if (beforeBinding.has_value()) {
-            const InstallResult verified = installer_.verifyInstalled(
+            InstallResult verified = installer_.verifyInstalled(
                 appId_, before.state.current);
             previousCurrent = descriptorFromResult(verified, *beforeBinding);
+            if (!settleTemporaryVerification(verified)) {
+                failedClosed_ = true;
+                return immutableCleanupFailureResult();
+            }
         }
     }
 
-    const InstallResult installed = installer_.install(packagePath);
+    InstallResult installed = installer_.install(packagePath);
+    const auto descriptor = installed.activationBinding.has_value()
+        ? descriptorFromResult(installed, *installed.activationBinding)
+        : std::nullopt;
+    if (!settleTemporaryVerification(installed)) {
+        failedClosed_ = true;
+        return immutableCleanupFailureResult();
+    }
     if (!installed.succeeded() || !installed.activationBinding.has_value()
         || installed.appId != appId_) {
         return rejectedResult(installed.stableError.isEmpty()
                                   ? QStringLiteral("package_install_rejected")
                                   : installed.stableError);
     }
-    const auto descriptor = descriptorFromResult(
-        installed, *installed.activationBinding);
     if (!descriptor.has_value()) {
         return rejectedResult(QStringLiteral("package_descriptor_invalid"));
     }
@@ -327,6 +383,10 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
 {
     Q_UNUSED(nowMs);
     if (shuttingDown_) return rejectedResult(QStringLiteral("shutdown"));
+    if (!retryPendingImmutableCleanup()) {
+        failedClosed_ = true;
+        return immutableCleanupFailureResult();
+    }
     if (failedClosed_) return failedClosedResult(QStringLiteral("app_failed_closed"));
     if (pendingDrain_.has_value()) {
         return rejectedResult(QStringLiteral("authority_drain_pending"));
@@ -339,40 +399,49 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
     if (!binding.has_value()) {
         return rejectedResult(QStringLiteral("state_invalid"));
     }
-    const InstallResult verified = installer_.reverifyInstalledVersion(
+    InstallResult verified = installer_.reverifyInstalledVersion(
         appId_, *binding);
     auto nextCurrent = descriptorFromResult(verified, *binding);
+    if (!settleTemporaryVerification(verified)) {
+        failedClosed_ = true;
+        return immutableCleanupFailureResult();
+    }
     std::optional<VersionDescriptor> nextLkg;
     bool nextCandidatePromoted = false;
     bool recoveredLastKnownGood = false;
     if (!nextCurrent.has_value()
         && !state.state.lastKnownGood.isEmpty()
         && state.state.lastKnownGood != state.state.current) {
-        const InstallResult lkgVerified = installer_.verifyInstalled(
+        InstallResult lkgVerified = installer_.verifyInstalled(
             appId_, state.state.lastKnownGood);
         const qsizetype separator = state.state.lastKnownGood.lastIndexOf(
             QLatin1Char('-'));
+        std::optional<VersionDescriptor> lkgCandidate;
+        ActivationBinding lkgBinding;
         if (lkgVerified.succeeded() && separator > 0) {
-            const ActivationBinding lkgBinding{
+            lkgBinding = ActivationBinding{
                 state.state.lastKnownGood,
                 state.state.lastKnownGood.sliced(separator + 1).toLatin1(),
                 state.state.generation};
-            if (const auto lkgCandidate = descriptorFromResult(
-                    lkgVerified, lkgBinding);
-                lkgCandidate.has_value()) {
-                const PackageStoreResult recovered =
-                    store_.recoverLastKnownGood(appId_, *binding);
-                if (!recovered.succeeded()
-                    || !recovered.activationBinding.has_value()) {
-                    return rejectedResult(QStringLiteral("lkg_recovery_failed"));
-                }
-                nextCurrent = descriptorFromResult(
-                    lkgVerified, *recovered.activationBinding);
-                if (nextCurrent.has_value()) {
-                    nextLkg = nextCurrent;
-                    nextCandidatePromoted = true;
-                    recoveredLastKnownGood = true;
-                }
+            lkgCandidate = descriptorFromResult(lkgVerified, lkgBinding);
+        }
+        if (!settleTemporaryVerification(lkgVerified)) {
+            failedClosed_ = true;
+            return immutableCleanupFailureResult();
+        }
+        if (lkgCandidate.has_value()) {
+            const PackageStoreResult recovered =
+                store_.recoverLastKnownGood(appId_, *binding);
+            if (!recovered.succeeded()
+                || !recovered.activationBinding.has_value()) {
+                return rejectedResult(QStringLiteral("lkg_recovery_failed"));
+            }
+            nextCurrent = descriptorFromResult(
+                lkgVerified, *recovered.activationBinding);
+            if (nextCurrent.has_value()) {
+                nextLkg = nextCurrent;
+                nextCandidatePromoted = true;
+                recoveredLastKnownGood = true;
             }
         }
     }
@@ -385,7 +454,7 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
             state.state.lastKnownGood == state.state.current;
         if (!state.state.lastKnownGood.isEmpty()
             && state.state.lastKnownGood != state.state.current) {
-            const InstallResult lkgVerified = installer_.verifyInstalled(
+            InstallResult lkgVerified = installer_.verifyInstalled(
                 appId_, state.state.lastKnownGood);
             const QString directory = state.state.lastKnownGood;
             const qsizetype separator = directory.lastIndexOf(QLatin1Char('-'));
@@ -397,6 +466,10 @@ AppRuntimeResult AppRuntimeCoordinator::startOffline(const qint64 nowMs)
                 directory.sliced(separator + 1).toLatin1(),
                 state.state.generation};
             nextLkg = descriptorFromResult(lkgVerified, lkgBinding);
+            if (!settleTemporaryVerification(lkgVerified)) {
+                failedClosed_ = true;
+                return immutableCleanupFailureResult();
+            }
             if (!nextLkg.has_value()) {
                 return rejectedResult(QStringLiteral("lkg_unavailable"));
             }
@@ -454,6 +527,15 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
     }
 
     TabState *existing = findTab(tab);
+    if (intent == TabLaunchIntent::ActivateCurrent && existing != nullptr
+        && existing->hasRequest && existing->admitted && !existing->revoked
+        && !existing->retired && !existing->failedClosed) {
+        // Route changes and ordinary activation never retarget a live tab to
+        // a newly installed current package.  Its admitted lease remains
+        // pinned until an explicit ReloadCurrent request.
+        existing->request.route = route;
+        return replacement;
+    }
     const VersionDescriptor *descriptor = nullptr;
     std::optional<VersionDescriptor> pinned;
     PackageRevalidationMode mode = PackageRevalidationMode::PinnedLease;
@@ -475,18 +557,6 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
     } else {
         return rejectedResult(QStringLiteral("current_unavailable"));
     }
-    if (intent == TabLaunchIntent::ActivateCurrent && existing != nullptr
-        && existing->hasRequest && existing->admitted && !existing->revoked
-        && !existing->retired && !existing->failedClosed
-        && sameLeaseIdentity(existing->pinnedLease, descriptor->lease)
-        && existing->pinnedLease.activationGenerationAtIssue
-               == descriptor->lease.activationGenerationAtIssue) {
-        // A healthy worker already owns this tab/runtime authority.  A user
-        // route change updates the authority's restart route without creating
-        // a second process; the GUI dispatches the corresponding RouteLoad.
-        existing->request.route = route;
-        return replacement;
-    }
     AppRuntimeResult launched = launchForTab(tab, route, *descriptor, mode,
                                              false, now);
     replacement.actions += launched.actions;
@@ -496,6 +566,27 @@ AppRuntimeResult AppRuntimeCoordinator::requestTabLaunch(
         replacement.nativeError = launched.nativeError;
     }
     return replacement;
+}
+
+AppRuntimeResult AppRuntimeCoordinator::cancelPendingLaunch(
+    const WorkerLaunchRequest &request)
+{
+    const TabLaunchAuthority authority{request.tabId,
+                                       request.runtimeIncarnation};
+    if (!validAuthority(authority)) {
+        return rejectedResult(QStringLiteral("invalid_launch_request"));
+    }
+    const auto found = tabs_.find(authority);
+    if (found == tabs_.end()) return staleResult();
+    TabState &state = *found->second;
+    if (!state.hasRequest || state.admitted || state.revoked || state.retired
+        || state.failedClosed
+        || !hasSameWorkerLaunchAuthority(state.request, request)) {
+        return staleResult();
+    }
+    revokeSilently(state);
+    tabs_.erase(found);
+    return {};
 }
 
 AppRuntimeResult AppRuntimeCoordinator::launchForTab(
@@ -764,6 +855,39 @@ AppRuntimeResult AppRuntimeCoordinator::heartbeat(
     return {};
 }
 
+void AppRuntimeCoordinator::recordRouteLoadAcknowledged(
+    const WorkerLaunchRequest &request,
+    const QString &routeTemplate,
+    const qsizetype pendingRouteLoads) const
+{
+    static const QStringList allowedTemplates{
+        QStringLiteral("/login"), QStringLiteral("/dashboard"),
+        QStringLiteral("/orders"), QStringLiteral("/orders/:id"),
+        QStringLiteral("/orders/:id/edit"), QStringLiteral("/customers"),
+        QStringLiteral("/customers/:id"), QStringLiteral("/files"),
+        QStringLiteral("/settings")};
+    const FullAttemptKey key{{request.tabId, request.runtimeIncarnation},
+                             request.attempt,
+                             request.lease.leaseAuthorityEpoch};
+    const TabState *const state = findTab(key);
+    if (recorder_ == nullptr || state == nullptr || !state->admitted
+        || !state->hasRequest
+        || !hasSameWorkerLaunchAuthority(state->request, request)
+        || state->request.route != request.route
+        || pendingRouteLoads != 0
+        || !allowedTemplates.contains(routeTemplate)
+        || state->pinnedLease != request.lease
+        || state->pinnedLease.version.isEmpty()) {
+        return;
+    }
+    const SafeEventResult event = SafeEvent::create(
+        clock_.utcNowMilliseconds(), appId_, state->pinnedLease.version,
+        SafeEventPhase::Worker, SafeEventCode::Completed, 0, routeTemplate,
+        {{SafeMetric::QueueDepth,
+          static_cast<double>(pendingRouteLoads)}});
+    if (event.hasValue()) (void)recorder_->record(event.value());
+}
+
 AppRuntimeResult AppRuntimeCoordinator::promoteCandidate(const qint64 nowMs)
 {
     if (candidatePromoted_ || !candidate_.has_value()) return {};
@@ -852,8 +976,9 @@ AppRuntimeResult AppRuntimeCoordinator::workerExited(
 {
     TabState *state = findTab(key);
     if (state == nullptr) return staleResult();
+    const qint64 observedNow = resolveNow(nowMs);
     const WorkerSupervisionAction action = state->supervisor->workerExited(
-        key.attempt, reason, nowMs);
+        key.attempt, reason, observedNow);
     if (action == WorkerSupervisionAction::IgnoredStaleAttempt
         || action == WorkerSupervisionAction::IgnoredDuplicateFailure) {
         return staleResult();
@@ -864,12 +989,12 @@ AppRuntimeResult AppRuntimeCoordinator::workerExited(
         return {};
     }
     if (action == WorkerSupervisionAction::Restart) {
-        return restartTab(*state, nowMs);
+        return restartTab(*state, observedNow);
     }
     if (action == WorkerSupervisionAction::CrashLoopRollback
         || action == WorkerSupervisionAction::StartupRollback) {
         if (currentCandidateTab(*state)) {
-            return beginCandidateRollback(nowMs);
+            return beginCandidateRollback(observedNow);
         }
         return failClosedTab(*state, QStringLiteral("worker_crash_loop"), true);
     }
@@ -908,9 +1033,18 @@ AppRuntimeResult AppRuntimeCoordinator::workerCleanupFailed(
 {
     Q_UNUSED(nowMs);
     TabState *state = findTab(key);
+    if (state == nullptr) {
+        // Cleanup completes after process observation and may therefore race
+        // with a restart that has already advanced the attempt and lease
+        // epoch. The cleanup authority is Host-owned; an exact tab/runtime
+        // match must still fail closed instead of treating an unresolved
+        // sandbox retirement as a harmless stale worker event.
+        state = findTab(key.tab);
+    }
     if (state == nullptr) return staleResult();
     revokeSilently(*state);
     state->failedClosed = true;
+    failedClosed_ = true;
     AppRuntimeResult result = failedClosedResult(
         stableError.isEmpty() ? QStringLiteral("worker_cleanup_failed")
                               : stableError,
@@ -984,21 +1118,31 @@ AppRuntimeResult AppRuntimeCoordinator::beginCandidateRollback(
         if (drainConsumer_) drainConsumer_(pending.batch);
         return result;
     }
-    const InstallResult recovered = installer_.verifyInstalled(
+    InstallResult recovered = installer_.verifyInstalled(
         appId_, QFileInfo(rolled.path).fileName());
     const auto recoveredDescriptor = descriptorFromResult(
         recovered, *rolled.activationBinding);
-    if (!recoveredDescriptor.has_value()) {
+    const bool recoveredCleanupSettled =
+        settleTemporaryVerification(recovered);
+    if (!recoveredDescriptor.has_value() || !recoveredCleanupSettled) {
         for (const TabLaunchAuthority &tab : pending.affected) {
             tabs_.at(tab)->failedClosed = true;
         }
         pending.terminalFailure = true;
-        pending.failureError = QStringLiteral("lkg_unavailable");
+        if (recoveredCleanupSettled) {
+            pending.failureError = QStringLiteral("lkg_unavailable");
+        } else {
+            pending.failureError = pendingImmutableCleanupError_.isEmpty()
+                ? QStringLiteral("package.immutable_restore_failed")
+                : pendingImmutableCleanupError_;
+        }
         pendingDrain_ = pending;
         rollbackStarted_ = true;
         failedClosed_ = true;
         AppRuntimeResult result = failedClosedResult(
-            pending.failureError);
+            pending.failureError,
+            recoveredCleanupSettled ? 0U
+                                    : pendingImmutableCleanupNativeError_);
         for (const TabLaunchAuthority &tab : pending.affected) {
             result.actions.push_back(makeTabAction(AppRuntimeActionKind::Revoke,
                                                     tab));
@@ -1198,6 +1342,24 @@ AppRuntimeResult AppRuntimeCoordinator::beginShutdown(const qint64 nowMs)
             state->retired = true;
         }
     }
+    return result;
+}
+
+UpdateLifecycleShutdownResult
+AppRuntimeCoordinator::beginHostShutdownCleanup() noexcept
+{
+    if (retryPendingImmutableCleanup()) return {};
+
+    UpdateLifecycleShutdownResult result;
+    result.stableError = pendingImmutableCleanupError_.isEmpty()
+        ? QStringLiteral("package.immutable_restore_failed")
+        : pendingImmutableCleanupError_;
+    result.nativeError = pendingImmutableCleanupNativeError_;
+    result.cleanupOwner.emplace(
+        UpdateLifecycleShutdownCleanup(
+            std::move(pendingImmutableCleanup_)));
+    pendingImmutableCleanupError_.clear();
+    pendingImmutableCleanupNativeError_ = 0;
     return result;
 }
 

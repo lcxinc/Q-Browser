@@ -1,4 +1,5 @@
 #include "HostApplication.h"
+#include "BrowserSessionStore.h"
 #include "BrowserChrome.h"
 #include "BrowserCommand.h"
 #include "HostCapabilityRuntime.h"
@@ -8,6 +9,9 @@
 #include "NavigationBar.h"
 #include "HostWorkerSessionController.h"
 #include "HostWorkerSessionTestHooks.h"
+#include "InstalledPackageWorkerLauncherTestHooks.h"
+#include "PackageInstaller.h"
+#include "PackageStore.h"
 #include "ProtocolMessage.h"
 #include "RouteRegistry.h"
 #include "SignatureVerifier.h"
@@ -15,6 +19,7 @@
 #include "WorkerSurface.h"
 #include "WorkerTestEnvironment.h"
 #include "WorkerRetirementManager.h"
+#include "../update/UpdateTestSupport.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
@@ -36,6 +41,7 @@
 #include <QTimer>
 #include <QTemporaryDir>
 #include <QToolButton>
+#include <QUuid>
 #include <QWebEnginePage>
 
 #ifdef Q_OS_WIN
@@ -46,6 +52,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <semaphore>
 #include <stdexcept>
@@ -205,6 +212,138 @@ private:
     QTcpServer server_;
     QList<QByteArray> requests_;
 };
+
+class ShowEventCounter final : public QObject
+{
+public:
+    [[nodiscard]] int count() const noexcept { return count_; }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched != nullptr && event != nullptr
+            && event->type() == QEvent::Show) {
+            ++count_;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    int count_ = 0;
+};
+
+HostRuntimeConfigResult packageHostConfig(
+    const QUrl &mockOrigin,
+    const WorkerTestEnvironment &environment,
+    QTemporaryDir &authority,
+    QTemporaryDir &hostFixture,
+    const QByteArray &publicKeyPem,
+    const QString &installPackage,
+    QString *const browserStateOut = nullptr)
+{
+    const auto failure = [](const QString &detail) {
+        return HostRuntimeConfigResult{
+            std::nullopt, HostRuntimeConfigError::UnsafePath,
+            QStringLiteral("host.test.package_fixture.") + detail};
+    };
+    if (!authority.isValid() || !hostFixture.isValid()
+        || !environment.isValid() || publicKeyPem.isEmpty()) {
+        return failure(QStringLiteral("invalid_input"));
+    }
+    const QString store = authority.filePath(QStringLiteral("store"));
+    const QString sandbox = authority.filePath(QStringLiteral("sandbox"));
+    const QString telemetry = authority.filePath(QStringLiteral("telemetry"));
+    const QString storage = authority.filePath(QStringLiteral("storage"));
+    const QString deployment = hostFixture.filePath(
+        QStringLiteral("deployment"));
+    const QString browserState = hostFixture.filePath(
+        QStringLiteral("browser-state"));
+    const QString runtime = QDir(deployment).filePath(
+        QStringLiteral("runtime"));
+    const QString hostDirectory = QDir(deployment).filePath(
+        QStringLiteral("host"));
+    const QString trustDirectory = QDir(deployment).filePath(
+        QStringLiteral("trust"));
+    const QString packagesDirectory = QDir(deployment).filePath(
+        QStringLiteral("packages"));
+    if (!QDir().mkpath(store) || !QDir().mkpath(sandbox)
+        || !QDir().mkpath(telemetry) || !QDir().mkpath(storage)
+        || !QDir().mkpath(browserState) || !QDir().mkpath(hostDirectory)
+        || !QDir().mkpath(trustDirectory)
+        || !QDir().mkpath(packagesDirectory)
+        || !copyPlainTree(environment.runtimeRoot(), runtime)) {
+        return failure(QStringLiteral("directory_setup"));
+    }
+    const QString workerRelative = QDir(environment.runtimeRoot())
+        .relativeFilePath(environment.workerExecutable());
+    if (workerRelative == QStringLiteral("..")
+        || workerRelative.startsWith(QStringLiteral("../"))
+        || workerRelative.startsWith(QStringLiteral("..\\"))) {
+        return failure(QStringLiteral("worker_outside_runtime"));
+    }
+    const QString stagedWorker = QDir(runtime).filePath(workerRelative);
+    const QString sourceHost = currentExecutablePath();
+    const QString stagedHost = QDir(hostDirectory).filePath(
+        QFileInfo(sourceHost).fileName());
+    const QString publicKey = QDir(trustDirectory).filePath(
+        QStringLiteral("trusted.pem"));
+    QString stagedPackage;
+    if (!installPackage.isEmpty()) {
+        stagedPackage = QDir(packagesDirectory).filePath(
+            QFileInfo(installPackage).fileName());
+    }
+    QFile keyFile(publicKey);
+    if (!QFileInfo(stagedWorker).isFile() || sourceHost.isEmpty()
+        || !QFile::copy(sourceHost, stagedHost)
+        || !keyFile.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+        || keyFile.write(publicKeyPem) != publicKeyPem.size()) {
+        return failure(QStringLiteral("immutable_copy"));
+    }
+    keyFile.close();
+    if (!stagedPackage.isEmpty()
+        && !QFile::copy(installPackage, stagedPackage)) {
+        return failure(QStringLiteral("package_copy"));
+    }
+#ifdef Q_OS_WIN
+    QStringList protectedPaths{
+        deployment, browserState, runtime,
+        QFileInfo(stagedWorker).absolutePath(), stagedWorker,
+        hostDirectory, stagedHost, trustDirectory, publicKey,
+        packagesDirectory};
+    if (!stagedPackage.isEmpty()) protectedPaths.push_back(stagedPackage);
+    for (const QString &path : protectedPaths) {
+        if (!protectPath(path, QFileInfo(path).isDir())) {
+            return failure(QStringLiteral("protection"));
+        }
+    }
+#endif
+    QStringList arguments{
+        QStringLiteral("--package-mode"),
+        QStringLiteral("--mock-origin=")
+            + mockOrigin.toString(QUrl::FullyEncoded),
+        QStringLiteral("--app-id=") + environment.appId(),
+        QStringLiteral("--trusted-public-key=") + publicKey,
+        QStringLiteral("--package-store=") + store,
+        QStringLiteral("--sandbox-temp=") + sandbox,
+        QStringLiteral("--runtime-root=") + runtime,
+        QStringLiteral("--worker-executable=") + stagedWorker,
+        QStringLiteral("--telemetry-directory=") + telemetry,
+        QStringLiteral("--storage-directory=") + storage,
+        QStringLiteral("--deployment-root=") + deployment,
+        QStringLiteral("--browser-state-directory=") + browserState,
+    };
+    if (!stagedPackage.isEmpty()) {
+        arguments.push_back(QStringLiteral("--install-package=")
+                            + stagedPackage);
+    }
+    HostRuntimeParseContext context;
+    context.currentHostExecutable = HostOwnedFileAuthority::open(stagedHost);
+    if (!context.currentHostExecutable) {
+        return failure(QStringLiteral("host_authority"));
+    }
+    if (browserStateOut != nullptr) *browserStateOut = browserState;
+    return HostRuntimeConfig::fromArguments(arguments, context);
+}
 
 RouteRegistry routes(const QUrl &helpUrl,
                      const QString &workerPackageId = QStringLiteral("com.qbrowser.pilot"))
@@ -412,11 +551,13 @@ private slots:
     void routeRegistryAloneSelectsOneActiveSurfaceAndStableHistory();
     void tabKeyedWorkerSurfacesStayIndependent();
     void packageNavigationPublishesTabLaunchRequest();
+    void packageStartupStaysHiddenAndDropsStaleReply();
+    void restoredUntrustedAppDescriptorsStayResourceFree();
     void legacyWorkerAdapterRejectsASecondAppTab();
     void legacyWorkerDetachDuringRouteStartWinsTransition();
     void workerNavigationIsSameAppAndHistoryAware();
     void hostApplicationOwnsAttachableWorkerSessionController();
-    void hostApplicationBindsWorkerContextLifecycle();
+    void verifiedPackageHostRejectsLegacyWorkerContext();
     void failedWorkerContextAttachmentConsumesSurfaceExactlyOnce();
     void hostWorkerRoutesAreTrackedWithoutDuplicateWorkerNavigation();
     void stalledWorkerReaderNeverBlocksTheGuiThread();
@@ -430,9 +571,11 @@ private slots:
     void pageMetadataUsesOnlyCurrentGenerationAndResanitizes();
     void preinstalledPageMetadataHandlerIsClearedBeforeIoTransfer();
     void sameAppSessionsRouteOnlyTheirOwnTab();
+    void outOfOrderRouteResponsesPublishLatestOnly();
     void backgroundWorkerNavigationUpdatesOnlyOwningHistory();
     void retiredSessionRejectsLateTabNavigation();
     void sessionDetachedMarksSafeRebindPoint();
+    void peerCloseDuringRequestedShutdownDetachesAndCanReattach();
     void pageMetadataFromOneSessionUpdatesOnlyOwningTab();
     void navigationCallbackExceptionFailsClosedWithoutAffectingSibling();
     void navigationCallbackMayDestroyOwningController();
@@ -674,6 +817,69 @@ void UnifiedNavigationTest::sameAppSessionsRouteOnlyTheirOwnTab()
     QVERIFY(second->worker->send(*secondShutdownAck, 1000));
     QTRY_COMPARE_WITH_TIMEOUT(secondController->state(),
                               HostWorkerSessionState::Detached, 3000);
+}
+
+void UnifiedNavigationTest::outOfOrderRouteResponsesPublishLatestOnly()
+{
+    HostWorkerSessionController controller(
+        [](const QString &, const QString &) { return true; });
+    auto sessions = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(sessions.has_value());
+    QVERIFY(controller.attach(std::move(sessions->host)));
+    QSignalSpy acknowledged(
+        &controller, &HostWorkerSessionController::routeLoadAcknowledged);
+    QVERIFY(acknowledged.isValid());
+
+    const auto receiveWithEvents = [&](const int timeoutMs) {
+        QElapsedTimer timer;
+        timer.start();
+        SessionReceiveResult result;
+        do {
+            result = sessions->worker->poll(0);
+            if (result.status != SessionStatus::TimedOut) return result;
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(5);
+        } while (timer.elapsed() < timeoutMs);
+        return result;
+    };
+
+    QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders")));
+    QVERIFY(controller.requestRouteLoad(QStringLiteral("/orders/42")));
+    const SessionReceiveResult first = receiveWithEvents(3000);
+    const SessionReceiveResult second = receiveWithEvents(3000);
+    QCOMPARE(first.status, SessionStatus::MessageReady);
+    QCOMPARE(second.status, SessionStatus::MessageReady);
+    QCOMPARE(first.message->type(), ProtocolType::RouteLoad);
+    QCOMPARE(second.message->type(), ProtocolType::RouteLoad);
+    QCOMPARE(first.message->payload().value(QStringLiteral("route")).toString(),
+             QStringLiteral("/orders"));
+    QCOMPARE(second.message->payload().value(QStringLiteral("route")).toString(),
+             QStringLiteral("/orders/42"));
+
+    const auto secondResponse = ProtocolMessage::successResponse(
+        second.message->requestId(),
+        QJsonObject{{QStringLiteral("route"), QStringLiteral("/orders/42")}});
+    QVERIFY(secondResponse.has_value());
+    QVERIFY(sessions->worker->send(*secondResponse, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.pendingRouteLoadCount(), qsizetype(1),
+                              3000);
+    QCOMPARE(acknowledged.count(), 0);
+
+    const auto firstResponse = ProtocolMessage::successResponse(
+        first.message->requestId(),
+        QJsonObject{{QStringLiteral("route"), QStringLiteral("/orders")}});
+    QVERIFY(firstResponse.has_value());
+    QVERIFY(sessions->worker->send(*firstResponse, 1000));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.pendingRouteLoadCount(), qsizetype(0),
+                              3000);
+    QTRY_COMPARE_WITH_TIMEOUT(acknowledged.count(), 1, 3000);
+    QCOMPARE(acknowledged.first().at(0).toString(),
+             QStringLiteral("/orders/42"));
+    QCOMPARE(acknowledged.first().at(1).toULongLong(),
+             controller.generation());
+
+    sessions->worker->close();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
 }
 
 void UnifiedNavigationTest::backgroundWorkerNavigationUpdatesOnlyOwningHistory()
@@ -1319,6 +1525,7 @@ void UnifiedNavigationTest::packageNavigationPublishesTabLaunchRequest()
     MainWindow window(routes(server.helpUrl()), server.origin());
     window.setPackageRuntimeEnabled(true);
     QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+    QSignalSpy reloadSpy(&window, &MainWindow::appReloadRequested);
 
     const QString tabId = window.tabModel()->activeId();
     QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
@@ -1329,7 +1536,208 @@ void UnifiedNavigationTest::packageNavigationPublishesTabLaunchRequest()
              QStringLiteral("com.qbrowser.pilot"));
     QCOMPARE(launchSpy.at(0).at(3).toString(), QStringLiteral("/orders"));
     QVERIFY(window.workerSurface(tabId) == nullptr);
+    window.browserChrome()->dispatchCommand(BrowserCommand::Reload);
+    QCOMPARE(reloadSpy.count(), 1);
+    QCOMPARE(reloadSpy.at(0).at(0).toString(), tabId);
+    QCOMPARE(reloadSpy.at(0).at(2).toString(),
+             QStringLiteral("com.qbrowser.pilot"));
+    QCOMPARE(reloadSpy.at(0).at(3).toString(), QStringLiteral("/orders"));
+    QCOMPARE(launchSpy.count(), 1);
     window.close();
+}
+
+void UnifiedNavigationTest::packageStartupStaysHiddenAndDropsStaleReply()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir packages;
+    QTemporaryDir authority;
+    QTemporaryDir hostFixture;
+    QVERIFY(packages.isValid());
+    QVERIFY(authority.isValid());
+    QVERIFY(hostFixture.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString packageA = updateSignedPackage(
+        packages, QStringLiteral("startup-a"), QStringLiteral("1.0.0"),
+        keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    const QString packageB = updateSignedPackage(
+        packages, QStringLiteral("startup-b"), QStringLiteral("1.1.0"),
+        keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!packageA.isEmpty());
+    QVERIFY(!packageB.isEmpty());
+    HostRuntimeConfigResult parsed = packageHostConfig(
+        server.origin(), environment, authority, hostFixture,
+        keys.value().publicKeyPem, packageA);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+
+    const qsizetype launchThreadsBefore = qbrowser_host_testing::
+        installedPackageWorkerActiveLaunchThreads();
+    HostApplication host(std::move(*parsed.value));
+    QSignalSpy held(&host,
+                    &HostApplication::packageStartupReplyHeldForTesting);
+    QSignalSpy verified(&host, &HostApplication::packageActivationVerified);
+    QSignalSpy ready(&host, &HostApplication::packageWorkerReadyForTab);
+    QSignalSpy intents(&host,
+                       &HostApplication::appLaunchIntentQueuedForTesting);
+    QVERIFY(held.isValid());
+    host.holdNextPackageStartupReplyForTesting();
+    QVERIFY(host.start());
+    QTRY_COMPARE_WITH_TIMEOUT(held.count(), 1, 30'000);
+    const quint64 tokenA = held.first().first().toULongLong();
+    QVERIFY(tokenA != 0);
+    QVERIFY(host.mainWindow() != nullptr);
+    ShowEventCounter shows;
+    host.mainWindow()->installEventFilter(&shows);
+    QVERIFY(!host.mainWindow()->isVisible());
+    QVERIFY(host.mainWindow()->tabModel()->isEmpty());
+    QVERIFY(host.workerSessionController() == nullptr);
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(intents.count(), 0);
+    QCOMPARE(verified.count(), 0);
+    QCOMPARE(qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads(),
+             launchThreadsBefore);
+    QVERIFY(host.start());
+    QVERIFY(!host.mainWindow()->isVisible());
+    QVERIFY(host.mainWindow()->tabModel()->isEmpty());
+
+    QSignalSpy persistence(host.mainWindow()->tabModel(),
+                           &BrowserTabModel::persistenceNeeded);
+    host.holdNextPackageStartupReplyForTesting();
+    const quint64 tokenB = host.supersedePackageStartupForTesting(packageB);
+    QVERIFY(tokenB != 0);
+    QVERIFY(tokenB != tokenA);
+    QTRY_COMPARE_WITH_TIMEOUT(held.count(), 2, 30'000);
+    QCOMPARE(held.last().first().toULongLong(), tokenB);
+    QVERIFY(!host.mainWindow()->isVisible());
+    QVERIFY(host.mainWindow()->tabModel()->isEmpty());
+
+    QVERIFY(host.deliverHeldPackageStartupReplyForTesting(tokenB));
+    QTRY_COMPARE_WITH_TIMEOUT(verified.count(), 1, 30'000);
+    QCOMPARE(verified.first().at(0).toULongLong(), tokenB);
+    QCOMPARE(verified.first().at(1).toString(), environment.appId());
+    QCOMPARE(verified.first().at(2).toString(), QStringLiteral("1.1.0"));
+    QVERIFY(host.mainWindow()->isVisible());
+    QCOMPARE(shows.count(), 1);
+    QCOMPARE(host.mainWindow()->tabModel()->count(), 1);
+    const QVector<BrowserTabSnapshot> appliedTabs =
+        host.mainWindow()->tabModel()->snapshots();
+    const int persistenceBeforeStale = persistence.count();
+    QVERIFY(host.deliverHeldPackageStartupReplyForTesting(tokenA));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    QCOMPARE(verified.count(), 1);
+    QCOMPARE(host.mainWindow()->tabModel()->snapshots(), appliedTabs);
+    QCOMPARE(persistence.count(), persistenceBeforeStale);
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(intents.count(), 0);
+    QCOMPARE(qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads(),
+             launchThreadsBefore);
+    QCOMPARE(shows.count(), 1);
+    QVERIFY(!host.deliverHeldPackageStartupReplyForTesting(tokenA));
+    QVERIFY(!host.deliverHeldPackageStartupReplyForTesting(
+        std::numeric_limits<quint64>::max()));
+
+    QVERIFY(host.requestOfflineStart());
+    QTRY_COMPARE_WITH_TIMEOUT(verified.count(), 2, 30'000);
+    QCOMPARE(verified.last().at(2).toString(), QStringLiteral("1.1.0"));
+    QCOMPARE(ready.count(), 0);
+}
+
+void UnifiedNavigationTest::restoredUntrustedAppDescriptorsStayResourceFree()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    WorkerTestEnvironment environment;
+    QVERIFY2(environment.isValid(), qPrintable(environment.error()));
+    UpdateTemporaryDir packages;
+    QTemporaryDir authority;
+    QTemporaryDir hostFixture;
+    QVERIFY(packages.isValid());
+    QVERIFY(authority.isValid());
+    QVERIFY(hostFixture.isValid());
+    const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
+    QVERIFY(keys.hasValue());
+    const QString package = updateSignedPackage(
+        packages, QStringLiteral("restore-authority"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    HostRuntimeConfigResult parsed = packageHostConfig(
+        server.origin(), environment, authority, hostFixture,
+        keys.value().publicKeyPem, package);
+    QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
+    QVERIFY(parsed.value->browserStateAuthority());
+    BrowserSessionStore store(parsed.value->browserStateAuthority());
+    const QVector<BrowserTabSnapshot> rawTabs{
+        {QStringLiteral("11111111111111111111111111111111"),
+         BrowserTabKind::App, QStringLiteral("Foreign authority"),
+         QStringLiteral("app://foreign/orders"),
+         {QStringLiteral("app://foreign/orders")}, 0},
+        {QStringLiteral("22222222222222222222222222222222"),
+         BrowserTabKind::App, QStringLiteral("Removed route"),
+         QStringLiteral("app://pilot/removed"),
+         {QStringLiteral("app://pilot/removed")}, 0},
+        {QStringLiteral("33333333333333333333333333333333"),
+         BrowserTabKind::App, QStringLiteral("Wrong package"),
+         QStringLiteral("app://pilot/orders"),
+         {QStringLiteral("app://pilot/orders")}, 0},
+    };
+    const BrowserSessionSaveResult saved = store.save(
+        BrowserWindowSnapshot{QRect(100, 100, 900, 700), rawTabs.first().id,
+                              rawTabs});
+    QCOMPARE(saved.status, BrowserSessionSaveStatus::Saved);
+
+    const qsizetype launchThreadsBefore = qbrowser_host_testing::
+        installedPackageWorkerActiveLaunchThreads();
+    HostApplication host(std::move(*parsed.value));
+    host.setRestoredRoutePackageIdForTesting(
+        QStringLiteral("com.qbrowser.foreign"));
+    QSignalSpy verified(&host, &HostApplication::packageActivationVerified);
+    QSignalSpy ready(&host, &HostApplication::packageWorkerReadyForTab);
+    QSignalSpy intents(&host,
+                       &HostApplication::appLaunchIntentQueuedForTesting);
+    QVERIFY(host.start());
+    QVERIFY(!host.mainWindow()->isVisible());
+    QVERIFY(host.mainWindow()->tabModel()->isEmpty());
+    QSignalSpy persistence(host.mainWindow()->tabModel(),
+                           &BrowserTabModel::persistenceNeeded);
+    QTRY_COMPARE_WITH_TIMEOUT(verified.count(), 1, 30'000);
+    QVERIFY(host.mainWindow()->isVisible());
+    QCOMPARE(host.mainWindow()->tabModel()->count(),
+             static_cast<int>(rawTabs.size()));
+    for (int index = 0; index < static_cast<int>(rawTabs.size()); ++index) {
+        const BrowserTabSnapshot restored =
+            host.mainWindow()->tabModel()->snapshotAt(index);
+        QCOMPARE(restored.id, rawTabs.at(index).id);
+        QCOMPARE(restored.kind, BrowserTabKind::TrustedError);
+        TabController *const controller = host.mainWindow()->tabController(
+            restored.id);
+        QVERIFY(controller != nullptr);
+        if (index == 0) {
+            QCOMPARE(controller->lifecycle(),
+                     BrowserTabLifecycle::TrustedError);
+            QCOMPARE(controller->surfaceKind(),
+                     HostSurfaceKind::TrustedError);
+            QVERIFY(controller->currentSurface() != nullptr);
+        } else {
+            QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::Dormant);
+            QVERIFY(controller->currentSurface() == nullptr);
+        }
+        QVERIFY(controller->appRuntimeController() == nullptr);
+    }
+    QCOMPARE(persistence.count(), 0);
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(intents.count(), 0);
+    QVERIFY(host.workerSessionController() == nullptr);
+    QCOMPARE(qbrowser_host_testing::installedPackageWorkerActiveLaunchThreads(),
+             launchThreadsBefore);
 }
 
 void UnifiedNavigationTest::legacyWorkerAdapterRejectsASecondAppTab()
@@ -1902,6 +2310,53 @@ void UnifiedNavigationTest::failedSessionCanReattachBeforeOldCallbacksDrain()
     QTRY_VERIFY_WITH_TIMEOUT(!controller.hasIoThread(), 6000);
 }
 
+void UnifiedNavigationTest::
+    peerCloseDuringRequestedShutdownDetachesAndCanReattach()
+{
+    HelpServer server;
+    QVERIFY(server.listen());
+    MainWindow window(routes(server.helpUrl()), server.origin());
+    HostWorkerSessionController controller(&window);
+    QSignalSpy failed(&controller, &HostWorkerSessionController::failed);
+    QSignalSpy detached(&controller,
+                        &HostWorkerSessionController::sessionDetached);
+    QVERIFY(failed.isValid());
+    QVERIFY(detached.isValid());
+
+    auto first = authenticatedSessions(QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(first.has_value());
+    QVERIFY(controller.attach(std::move(first->host)));
+    QVERIFY(controller.shutdown(QStringLiteral("reload.peer_close")));
+    const SessionReceiveResult shutdown = first->worker->receive(2'000);
+    QCOMPARE(shutdown.status, SessionStatus::MessageReady);
+    QCOMPARE(shutdown.message->type(), ProtocolType::Shutdown);
+    first->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(),
+                              HostWorkerSessionState::Detached, 6'000);
+    QCOMPARE(failed.count(), 0);
+    QCOMPARE(detached.count(), 1);
+    QVERIFY(controller.canAttachImmediately());
+
+    auto replacement = authenticatedSessions(
+        QStringLiteral("com.qbrowser.pilot"));
+    QVERIFY(replacement.has_value());
+    QVERIFY(controller.attach(std::move(replacement->host)));
+    QCOMPARE(controller.state(), HostWorkerSessionState::Running);
+    QVERIFY(controller.shutdown(QStringLiteral("reload.replacement")));
+    const SessionReceiveResult replacementShutdown =
+        replacement->worker->receive(2'000);
+    QCOMPARE(replacementShutdown.status, SessionStatus::MessageReady);
+    QCOMPARE(replacementShutdown.message->type(), ProtocolType::Shutdown);
+    const auto acknowledgement = ProtocolMessage::shutdown(
+        QStringLiteral("worker.ack"));
+    QVERIFY(acknowledgement.has_value());
+    QVERIFY(replacement->worker->send(*acknowledgement, 1'000));
+    replacement->worker->close();
+    QTRY_COMPARE_WITH_TIMEOUT(controller.state(),
+                              HostWorkerSessionState::Detached, 6'000);
+    QCOMPARE(failed.count(), 0);
+}
+
 void UnifiedNavigationTest::reattachAfterIoThreadFinishedBeforeGuiCleanup()
 {
     HelpServer server;
@@ -2044,7 +2499,7 @@ void UnifiedNavigationTest::hostApplicationOwnsAttachableWorkerSessionController
     application.mainWindow()->close();
 }
 
-void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
+void UnifiedNavigationTest::verifiedPackageHostRejectsLegacyWorkerContext()
 {
     HelpServer server;
     QVERIFY(server.listen());
@@ -2064,7 +2519,8 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
         surfaceReady.message->payload().value(QStringLiteral("windowHandle")).toString(),
         process->nativeProcessHandle(), WorkerAttemptId{104}));
     QVERIFY(surface != nullptr);
-    WorkerSurface *const surfacePointer = surface.get();
+    QSignalSpy surfaceDestroyed(surface.get(), &QObject::destroyed);
+    QVERIFY(surfaceDestroyed.isValid());
 
     QTemporaryDir authority;
     QTemporaryDir hostFixture;
@@ -2103,6 +2559,26 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     QVERIFY(QFile::copy(sourceHost, stagedHost));
     const SignatureKeyPairResult keys = SignatureVerifier::generateKeyPair();
     QVERIFY(keys.hasValue());
+    UpdateTemporaryDir packageTemporary;
+    QVERIFY(packageTemporary.isValid());
+    const QString package = updateSignedPackage(
+        packageTemporary, QStringLiteral("verified-manual-context"),
+        QStringLiteral("1.0.0"), keys.value().privateKeyPem, false,
+        QByteArrayLiteral("import QtQuick\nItem { width: 320; height: 200 }"),
+        environment.appId());
+    QVERIFY(!package.isEmpty());
+    PackageStore seededStore(store);
+    InstallPolicy policy;
+    policy.expectedAppId = environment.appId();
+    policy.runtimeVersion = QStringLiteral("1.2.0");
+    policy.allowedImports = {QStringLiteral("QtQuick"),
+                             QStringLiteral("QtQuick.Layouts"),
+                             QStringLiteral("Company.Design")};
+    policy.preflight = [](const Manifest &, const QString &) { return true; };
+    PackageInstaller seededInstaller(
+        seededStore, keys.value().publicKeyPem, std::move(policy));
+    const InstallResult seeded = seededInstaller.install(package);
+    QVERIFY2(seeded.succeeded(), qPrintable(seeded.stableError));
     const QString publicKey = QDir(trustDirectory).filePath(
         QStringLiteral("trusted.pem"));
     QFile keyFile(publicKey);
@@ -2139,7 +2615,13 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
     }, parseContext);
     QVERIFY2(parsed.value.has_value(), qPrintable(parsed.stableError));
     HostApplication application(std::move(*parsed.value));
+    QSignalSpy verified(&application,
+                        &HostApplication::packageActivationVerified);
+    QVERIFY(verified.isValid());
     QVERIFY(application.start());
+    QTRY_COMPARE_WITH_TIMEOUT(verified.count(), 1, 30'000);
+    QVERIFY(application.mainWindow()->isVisible());
+    QCOMPARE(application.workerSessionController(), nullptr);
     HostWorkerAttachContext context;
     context.session = std::make_unique<IpcSession>(std::move(launch->hostSession));
     context.surface = std::move(surface);
@@ -2163,21 +2645,19 @@ void UnifiedNavigationTest::hostApplicationBindsWorkerContextLifecycle()
         PackageRevalidationMode::CurrentActivation,
         false};
     context.processId = process->processId();
-    context.stopProcess = [process] { process->terminate(ERROR_PROCESS_ABORTED); };
+    int stopCalls = 0;
+    context.stopProcess = [process, &stopCalls] {
+        ++stopCalls;
+        process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
+    };
     QCOMPARE(application.attachWorkerContextForTesting(std::move(context)),
-             InstalledPackageWorkerLauncher::AttachResult::Attached);
-    QTRY_VERIFY_WITH_TIMEOUT(application.hasWorkerContext(), 5'000);
-    QCOMPARE(application.mainWindow()->workerSurface(), surfacePointer);
-    QCOMPARE(application.workerSessionController()->state(),
-             HostWorkerSessionState::Running);
-
-    QSignalSpy retirementRequested(
-        application.mainWindow(),
-        &MainWindow::legacyWorkerRetirementRequested);
-    QVERIFY(application.mainWindow()->shutdown());
-    QCOMPARE(retirementRequested.count(), 1);
+             InstalledPackageWorkerLauncher::AttachResult::ConsumedFailure);
+    QCOMPARE(surfaceDestroyed.count(), 1);
+    QCOMPARE(stopCalls, 0);
     QVERIFY(!application.hasWorkerContext());
     QCOMPARE(application.mainWindow()->workerSurface(), nullptr);
+    QCOMPARE(application.workerSessionController(), nullptr);
+    process->requestTerminateNoWait(ERROR_PROCESS_ABORTED);
     QVERIFY(process->waitForFinished(5000));
     const auto closed = process->close();
     QVERIFY2(closed.value.has_value(), qPrintable(closed.errorCode));

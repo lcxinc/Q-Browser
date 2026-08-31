@@ -67,6 +67,19 @@ public:
     [[nodiscard]] bool attachWorkerSurface(std::unique_ptr<WorkerSurface> surface);
     [[nodiscard]] bool attachWorkerSurface(const QString &tabId,
                                            std::unique_ptr<WorkerSurface> surface);
+    [[nodiscard]] bool attachAppWorkerSurfaceIfCurrent(
+        const QString &tabId,
+        quint64 expectedNavigationIncarnation,
+        const QString &packageId,
+        const QString &route,
+        const QString &originalCanonicalAddress,
+        std::unique_ptr<WorkerSurface> surface);
+    [[nodiscard]] bool isAppLaunchTargetCurrent(
+        const QString &tabId,
+        quint64 expectedNavigationIncarnation,
+        const QString &packageId,
+        const QString &route,
+        const QString &originalCanonicalAddress) const;
     [[nodiscard]] bool reserveLegacyWorkerOwner(const QString &tabId);
     void detachWorkerSurface();
     void detachWorkerSurface(const QString &tabId);

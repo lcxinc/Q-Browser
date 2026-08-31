@@ -38,6 +38,8 @@ void HostSurvivesWorkerCrashE2eTest::crashingCandidateRollsBackWithoutTerminatin
     QVERIFY(!crashing.isEmpty());
     QVERIFY(environment.install(crashing));
 
+    QVERIFY(environment.waitForVerified(QStringLiteral("1.1.0")));
+    QVERIFY(environment.reloadActiveTab());
     QVERIFY(environment.waitForReady(QStringLiteral("1.1.0")));
     QVERIFY(terminateWorker(environment.currentWorkerProcessId()));
     QElapsedTimer elapsed;

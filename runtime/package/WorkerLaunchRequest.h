@@ -29,3 +29,18 @@ struct WorkerLaunchRequest final
     friend bool operator==(const WorkerLaunchRequest &,
                            const WorkerLaunchRequest &) = default;
 };
+
+// Route is mutable after a Worker is attached.  Runtime ownership must instead
+// be compared using the immutable launch authority that admitted the attempt.
+[[nodiscard]] inline bool hasSameWorkerLaunchAuthority(
+    const WorkerLaunchRequest &left,
+    const WorkerLaunchRequest &right) noexcept
+{
+    return left.tabId == right.tabId
+        && left.runtimeIncarnation == right.runtimeIncarnation
+        && left.lease == right.lease
+        && left.admission == right.admission
+        && left.attempt == right.attempt
+        && left.revalidationMode == right.revalidationMode
+        && left.recovery == right.recovery;
+}

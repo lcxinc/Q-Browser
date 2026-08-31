@@ -1,6 +1,8 @@
 #include "BrowserTabModel.h"
 
 #include <QChar>
+#include <QPointer>
+#include <QScopeGuard>
 #include <QScopedValueRollback>
 #include <QSet>
 #include <QUuid>
@@ -424,7 +426,6 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     int activeIndex)
 {
     if (mutationInProgress_) return false;
-    QScopedValueRollback<bool> mutationGuard(mutationInProgress_, true);
 
     const QVector<BrowserTabSnapshot> ownedSnapshots = snapshots;
     const int restoredCount = static_cast<int>(ownedSnapshots.size());
@@ -461,6 +462,12 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     }
     if (alreadyRestored) return true;
 
+    mutationInProgress_ = true;
+    QPointer<BrowserTabModel> lifetimeGuard(this);
+    const auto finishMutation = qScopeGuard([lifetimeGuard] {
+        if (lifetimeGuard) lifetimeGuard->mutationInProgress_ = false;
+    });
+
     const int oldActive = activeIndex_;
     QVector<QString> oldIds;
     oldIds.reserve(tabs_.size());
@@ -480,14 +487,17 @@ bool BrowserTabModel::replaceFromValidatedSnapshot(
     for (int index = static_cast<int>(oldIds.size()) - 1; index >= 0; --index) {
         tabs_.removeAt(index);
         emit tabRemoved(index, oldIds.at(index));
+        if (!lifetimeGuard) return false;
     }
     for (int index = 0; index < restoredCount; ++index) {
         tabs_.append(std::move(restoredTabs[index]));
         emit tabInserted(index, restoredIds.at(index));
+        if (!lifetimeGuard) return false;
     }
     activeIndex_ = activeIndex;
     if (restoredCount > 0 || oldActive != -1) {
         emit activeTabChanged(oldActive, activeIndex_);
+        if (!lifetimeGuard) return false;
     }
     return true;
 }
