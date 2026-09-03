@@ -8,6 +8,7 @@
 
 #include <QHash>
 #include <QMainWindow>
+#include <QPointer>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -18,7 +19,9 @@
 class BrowserChrome;
 class NavigationBar;
 class QStackedWidget;
+class QShowEvent;
 class QTimer;
+class QWindow;
 class WebSessionProfile;
 class WebSurface;
 class WorkerSurface;
@@ -129,6 +132,9 @@ signals:
                           quint64 runtimeIncarnation);
     void legacyWorkerRetirementRequested(const QString &tabId);
 
+protected:
+    void showEvent(QShowEvent *event) override;
+
 private:
     MainWindow(RouteRegistry routeRegistry,
                const QUrl &mockOrigin,
@@ -186,6 +192,7 @@ private:
     void moveStableTab(const QString &stableTabId, int destinationIndex);
     void handleCommand(BrowserCommand command);
     void synchronizeChrome();
+    void synchronizeTitleBarSafeArea();
 
     [[nodiscard]] QString activeStableId() const;
     [[nodiscard]] BrowserTabSnapshot activeSnapshot() const;
@@ -197,6 +204,8 @@ private:
     std::unique_ptr<WebSessionProfile> webSessionProfile_;
     std::unique_ptr<BrowserTabModel> tabModel_;
     BrowserChrome *browserChrome_ = nullptr;
+    QPointer<QWindow> titleBarWindow_;
+    QMetaObject::Connection titleBarSafeAreaConnection_;
     QStackedWidget *surfaceStack_ = nullptr;
     QHash<QString, TabController *> controllers_;
     QHash<QString, TabController *> retiringControllers_;

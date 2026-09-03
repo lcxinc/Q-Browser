@@ -217,6 +217,7 @@ class BrowserShellTest final : public QObject
 
 private slots:
     void deferredSessionShellStartsHiddenEmptyAndResourceFree();
+    void mainWindowUsesExpandedNativeTitleArea();
     void loadedSessionAppliesAtomicallyWithoutSaveAndStartsOnlyActive();
     void missingSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
     void corruptSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
@@ -261,6 +262,42 @@ private slots:
     void rendererFailureAtPageLimitReleasesSlotBeforeReload();
     void windowShutdownBeforeQueuedRendererCleanupCancelsIt();
 };
+
+void BrowserShellTest::mainWindowUsesExpandedNativeTitleArea()
+{
+    MainWindow window(RouteRegistry{}, QUrl(QStringLiteral("http://127.0.0.1/")));
+    window.resize(900, 650);
+    window.show();
+    QTRY_VERIFY(window.isVisible());
+
+    const Qt::WindowFlags flags = window.windowFlags();
+    QVERIFY(flags.testFlag(Qt::ExpandedClientAreaHint));
+    QVERIFY(flags.testFlag(Qt::NoTitleBarBackgroundHint));
+    QVERIFY(!flags.testFlag(Qt::FramelessWindowHint));
+    QVERIFY(flags.testFlag(Qt::WindowMinMaxButtonsHint));
+    QVERIFY(flags.testFlag(Qt::WindowCloseButtonHint));
+
+    BrowserChrome *const chrome = window.browserChrome();
+    BrowserTabModel *const model = window.tabModel();
+    QVERIFY(chrome != nullptr);
+    QVERIFY(model != nullptr);
+    const int tabCount = model->count();
+    const QString activeId = model->activeId();
+
+    QVERIFY(!window.isMaximized());
+    QVERIFY(QMetaObject::invokeMethod(
+        chrome, "windowMaximizeRestoreRequested", Qt::DirectConnection));
+    QTRY_VERIFY(window.isMaximized());
+    QVERIFY(QMetaObject::invokeMethod(
+        chrome, "windowMaximizeRestoreRequested", Qt::DirectConnection));
+    QTRY_VERIFY(!window.isMaximized());
+
+    QVERIFY(QMetaObject::invokeMethod(
+        chrome, "windowMoveRequested", Qt::DirectConnection));
+    QCoreApplication::processEvents();
+    QCOMPARE(model->count(), tabCount);
+    QCOMPARE(model->activeId(), activeId);
+}
 
 void BrowserShellTest::deferredSessionShellStartsHiddenEmptyAndResourceFree()
 {

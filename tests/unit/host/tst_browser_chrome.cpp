@@ -10,6 +10,7 @@
 #include <QEventLoop>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLayout>
 #include <QMouseEvent>
 #include <QSet>
 #include <QSignalSpy>
@@ -278,6 +279,7 @@ class BrowserChromeTest final : public QObject
 private slots:
     void initTestCase();
     void tabRowUsesBrowserSizingAndOverflow();
+    void safeAreaInsetsReserveNativeCaptionControls();
     void tabOverflowKeepsNewTabAvailable();
     void emptyTitleAreaOwnsOnlyWindowGestures();
     void titleDragStartsAfterSystemThreshold();
@@ -370,6 +372,22 @@ void BrowserChromeTest::tabRowUsesBrowserSizingAndOverflow()
         QVERIFY(tabRect.width() >= 120);
         QVERIFY(tabRect.width() <= 240);
     }
+}
+
+void BrowserChromeTest::safeAreaInsetsReserveNativeCaptionControls()
+{
+    BrowserChrome chrome;
+    QWidget *const tabRow = chrome.findChild<QWidget *>(
+        QStringLiteral("browser-tab-row"));
+    QVERIFY(tabRow != nullptr);
+    QVERIFY(tabRow->layout() != nullptr);
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 3, 8, 3));
+
+    chrome.setTitleBarSafeAreaMargins(QMargins(3, 11, 37, 13));
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(11, 3, 45, 3));
+
+    chrome.setTitleBarSafeAreaMargins(QMargins(-1, -2, -3, -4));
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 3, 8, 3));
 }
 
 void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()

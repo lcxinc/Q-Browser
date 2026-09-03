@@ -14,10 +14,12 @@
 #include <QScopeGuard>
 #include <QScopedValueRollback>
 #include <QSignalBlocker>
+#include <QShowEvent>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWindow>
 
 #include <utility>
 
@@ -66,6 +68,8 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     , webSessionProfile_(std::make_unique<WebSessionProfile>(mockOrigin_))
     , tabModel_(std::make_unique<BrowserTabModel>())
 {
+    setWindowFlag(Qt::ExpandedClientAreaHint, true);
+    setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
     setObjectName(QStringLiteral("qbrowser-main-window"));
     setWindowTitle(QStringLiteral("Q-Browser"));
 
@@ -161,6 +165,18 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
             });
     connect(browserChrome_, &BrowserChrome::tabCloseRequested, this,
             [this](const QString &stableId) { closeStableTab(stableId); });
+    connect(browserChrome_, &BrowserChrome::windowMoveRequested, this,
+            [this] {
+                if (QWindow *const handle = windowHandle()) {
+                    (void)handle->startSystemMove();
+                }
+            });
+    connect(browserChrome_,
+            &BrowserChrome::windowMaximizeRestoreRequested,
+            this,
+            [this] {
+                isMaximized() ? showNormal() : showMaximized();
+            });
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
             this, [this] { (void)shutdown(); });
 
@@ -180,6 +196,34 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
 MainWindow::~MainWindow()
 {
     (void)shutdown();
+}
+
+void MainWindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+    synchronizeTitleBarSafeArea();
+}
+
+void MainWindow::synchronizeTitleBarSafeArea()
+{
+    QWindow *const currentWindow = windowHandle();
+    if (titleBarWindow_ != currentWindow) {
+        QObject::disconnect(titleBarSafeAreaConnection_);
+        titleBarSafeAreaConnection_ = {};
+        titleBarWindow_ = currentWindow;
+        if (currentWindow != nullptr) {
+            titleBarSafeAreaConnection_ = connect(
+                currentWindow, &QWindow::safeAreaMarginsChanged,
+                this, [this](const QMargins &) {
+                    synchronizeTitleBarSafeArea();
+                });
+        }
+    }
+    if (browserChrome_ != nullptr) {
+        browserChrome_->setTitleBarSafeAreaMargins(
+            currentWindow != nullptr ? currentWindow->safeAreaMargins()
+                                     : QMargins{});
+    }
 }
 
 bool MainWindow::shutdown()

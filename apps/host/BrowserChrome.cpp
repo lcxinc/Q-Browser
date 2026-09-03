@@ -20,6 +20,7 @@
 #include <QVariant>
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace
@@ -29,6 +30,18 @@ constexpr int BrowserTitleRowHeight = 42;
 constexpr int BrowserTabMinimumWidth = 120;
 constexpr int BrowserTabMaximumWidth = 240;
 constexpr int BrowserTabHeight = 36;
+constexpr int BrowserTitleHorizontalMargin = 8;
+constexpr int BrowserTitleVerticalMargin = 3;
+
+int titleMarginWithSafeInset(const int safeInset) noexcept
+{
+    if (safeInset <= 0) return BrowserTitleHorizontalMargin;
+    constexpr int maximumInset =
+        std::numeric_limits<int>::max() - BrowserTitleHorizontalMargin;
+    return safeInset >= maximumInset
+        ? std::numeric_limits<int>::max()
+        : BrowserTitleHorizontalMargin + safeInset;
+}
 
 class BrowserTabBar final : public QTabBar
 {
@@ -220,9 +233,11 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     tabRow->setAccessibleName(QStringLiteral("Tab strip"));
     tabRow->setAccessibleDescription(
         QStringLiteral("Open and arrange browser tabs"));
-    auto *tabLayout = new QHBoxLayout(tabRow);
-    tabLayout->setContentsMargins(8, 3, 8, 3);
-    tabLayout->setSpacing(4);
+    titleLayout_ = new QHBoxLayout(tabRow);
+    titleLayout_->setContentsMargins(
+        BrowserTitleHorizontalMargin, BrowserTitleVerticalMargin,
+        BrowserTitleHorizontalMargin, BrowserTitleVerticalMargin);
+    titleLayout_->setSpacing(4);
 
     tabBar_ = new BrowserTabBar(tabRow);
     tabBar_->setObjectName(QStringLiteral("browser-tab-bar"));
@@ -256,9 +271,9 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
                                   QSizePolicy::Preferred);
     titleDragArea_->installEventFilter(this);
 
-    tabLayout->addWidget(tabBar_);
-    tabLayout->addWidget(newTabButton_);
-    tabLayout->addWidget(titleDragArea_, 1);
+    titleLayout_->addWidget(tabBar_);
+    titleLayout_->addWidget(newTabButton_);
+    titleLayout_->addWidget(titleDragArea_, 1);
     layout->addWidget(tabRow);
 
     navigationBar_ = new NavigationBar(this);
@@ -357,6 +372,14 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
 
     updateActionAvailability(false, 0, false, false, false);
     navigationBar_->clearActivePresentation();
+}
+
+void BrowserChrome::setTitleBarSafeAreaMargins(const QMargins &margins)
+{
+    if (titleLayout_ == nullptr) return;
+    titleLayout_->setContentsMargins(
+        titleMarginWithSafeInset(margins.left()), BrowserTitleVerticalMargin,
+        titleMarginWithSafeInset(margins.right()), BrowserTitleVerticalMargin);
 }
 
 bool BrowserChrome::eventFilter(QObject *watched, QEvent *event)

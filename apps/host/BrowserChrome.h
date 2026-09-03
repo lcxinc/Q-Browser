@@ -11,6 +11,7 @@
 
 class QAction;
 class QEvent;
+class QHBoxLayout;
 class NavigationBar;
 class QTabBar;
 class QToolButton;
@@ -23,6 +24,7 @@ public:
     explicit BrowserChrome(QWidget *parent = nullptr);
 
     [[nodiscard]] bool synchronizeTabs(const BrowserTabModel &model);
+    void setTitleBarSafeAreaMargins(const QMargins &margins);
 
     [[nodiscard]] QTabBar *tabBar() const noexcept;
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
@@ -89,6 +91,7 @@ private:
     [[nodiscard]] int tabIndexForId(const QString &tabId) const noexcept;
 
     QTabBar *tabBar_ = nullptr;
+    QHBoxLayout *titleLayout_ = nullptr;
     QToolButton *newTabButton_ = nullptr;
     QWidget *titleDragArea_ = nullptr;
     NavigationBar *navigationBar_ = nullptr;
