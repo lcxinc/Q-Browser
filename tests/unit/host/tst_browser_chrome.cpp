@@ -2108,6 +2108,14 @@ void BrowserChromeTest::actionCapacityMatrixIsExact()
     QVERIFY(enabled(BrowserCommand::CloseTab));
     QVERIFY(enabled(BrowserCommand::NextTab));
 
+    QToolButton *const newTab = toolButton(
+        chrome, QStringLiteral("browser-new-tab"));
+    QVERIFY(newTab != nullptr);
+    QVERIFY(!newTab->isEnabled());
+    QCOMPARE(newTab->text(), QStringLiteral("+"));
+    QCOMPARE(newTab->toolTip(), QStringLiteral("New tab"));
+    QCOMPARE(newTab->accessibleName(), QStringLiteral("New tab"));
+
     QSignalSpy commands(&chrome, &BrowserChrome::commandRequested);
     chrome.dispatchCommand(*browserCommandForKeyCombination(
         QKeyCombination(Qt::ControlModifier, Qt::Key_T)));
@@ -2115,6 +2123,15 @@ void BrowserChromeTest::actionCapacityMatrixIsExact()
         QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier,
                         Qt::Key_T)));
     QCOMPARE(commands.count(), 0);
+
+    tabs.removeLast();
+    presentations.removeLast();
+    QVERIFY(synchronizeChrome(chrome, tabs, presentations, tabs.first().id));
+    QVERIFY(enabled(BrowserCommand::NewTab));
+    QVERIFY(newTab->isEnabled());
+    QCOMPARE(newTab->text(), QStringLiteral("+"));
+    QCOMPARE(newTab->toolTip(), QStringLiteral("New tab"));
+    QCOMPARE(newTab->accessibleName(), QStringLiteral("New tab"));
 }
 
 void BrowserChromeTest::accessibleTreeHasNoDuplicateReloadStopActions()

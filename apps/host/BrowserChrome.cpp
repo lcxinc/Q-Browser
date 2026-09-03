@@ -280,13 +280,22 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     layout->addWidget(navigationBar_);
 
     createActions();
-    newTabButton_->setDefaultAction(actionForCommand(BrowserCommand::NewTab));
+    QAction *const newTabAction = actionForCommand(BrowserCommand::NewTab);
+    newTabButton_->setDefaultAction(newTabAction);
     newTabButton_->setObjectName(QStringLiteral("browser-new-tab"));
     newTabButton_->setAccessibleName(QStringLiteral("New tab"));
     newTabButton_->setAccessibleDescription(QStringLiteral("Open a new tab"));
     newTabButton_->setText(QStringLiteral("+"));
     newTabButton_->setToolTip(QStringLiteral("New tab"));
     newTabButton_->setFocusPolicy(Qt::StrongFocus);
+    connect(newTabAction, &QAction::changed, newTabButton_,
+            [button = newTabButton_] {
+                button->setAccessibleName(QStringLiteral("New tab"));
+                button->setAccessibleDescription(
+                    QStringLiteral("Open a new tab"));
+                button->setText(QStringLiteral("+"));
+                button->setToolTip(QStringLiteral("New tab"));
+            });
     navigationBar_->setReloadStopActions(
         actionForCommand(BrowserCommand::Reload),
         actionForCommand(BrowserCommand::Stop));
