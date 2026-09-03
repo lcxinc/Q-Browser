@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Place the existing Q-Browser tab strip in the native Windows title area with browser-like sizing and styling while retaining native caption controls, resize, snapping, tab behavior, and accessibility.
+**Goal:** Place the existing Q-Browser tab strip in the Windows title area with browser-like sizing and styling while retaining Qt's Windows caption controls, native resize and snapping, tab behavior, and accessibility.
 
-**Architecture:** `MainWindow` enables Qt 6.11's expanded client area and forwards native safe-area margins to `BrowserChrome`. `BrowserChrome` owns a compact browser tab row plus a dedicated empty drag region; it emits window-move and maximize/restore requests without changing the existing tab model or command flow.
+**Architecture:** `MainWindow` enables Qt 6.11's expanded client area, hides the Qt title text/icon with `CustomizeWindowHint`, and derives a right content inset from the Windows top safe inset for Qt's three caption buttons. `BrowserChrome` owns a compact browser tab row plus a dedicated empty drag region; it emits window-move and maximize/restore requests without changing the existing tab model or command flow.
 
 **Tech Stack:** C++20, Qt 6.11 Core/Gui/Widgets/Test, CMake 3.30, CTest, Windows desktop window management
 
@@ -151,7 +151,8 @@ Add `emptyTitleAreaOwnsOnlyWindowGestures()` to `BrowserChromeTest`. Find
 QVERIFY(dragArea != nullptr);
 QCOMPARE(dragArea->focusPolicy(), Qt::NoFocus);
 QTest::mousePress(dragArea, Qt::LeftButton);
-QCOMPARE(moveRequests.count(), 1);
+QCOMPARE(moveRequests.count(), 0);
+// A held-button move at QApplication::startDragDistance() emits exactly once.
 QTest::mouseDClick(dragArea, Qt::LeftButton);
 QCOMPARE(maximizeRequests.count(), 1);
 ```
@@ -188,9 +189,11 @@ size policy, no focus, and no mouse-transparent attribute. Install
 QTabBar | New Tab | expanding drag area | native safe-area inset
 ```
 
-In `eventFilter`, consume only left-button `MouseButtonPress` and
-`MouseButtonDblClick` events from `titleDragArea_`, emitting the matching signal.
-Forward every other object/event to `QWidget::eventFilter`.
+In `eventFilter`, record a left-button `MouseButtonPress`, emit one move request
+only when a held-button move reaches `QApplication::startDragDistance()`, and
+reset on release. Consume `MouseButtonDblClick` by clearing the pending move and
+emitting only the maximize/restore signal. Forward every other object/event to
+`QWidget::eventFilter`.
 
 **Step 4: Run focused GREEN verification**
 
@@ -223,16 +226,16 @@ git commit -m "feat: add browser title drag area"
 Add `safeAreaInsetsReserveNativeCaptionControls()` to `BrowserChromeTest`.
 Call a new production method with `QMargins(3, 11, 37, 13)`, inspect the title
 row layout, and require the base horizontal margin plus safe left/right inset
-while keeping the 4-pixel vertical margins:
+while keeping the 3-pixel vertical margins:
 
 ```cpp
 chrome.setTitleBarSafeAreaMargins(QMargins(3, 11, 37, 13));
 const QMargins applied = tabRow->layout()->contentsMargins();
-QCOMPARE(applied, QMargins(11, 4, 45, 4));
+QCOMPARE(applied, QMargins(11, 3, 45, 3));
 ```
 
 Repeat with negative margins and require clamping to the base
-`QMargins(8, 4, 8, 4)`.
+`QMargins(8, 3, 8, 3)`.
 
 **Step 2: Add a failing MainWindow chrome test**
 
@@ -243,6 +246,8 @@ and show a `MainWindow`, then assert:
 QVERIFY(window.windowFlags().testFlag(Qt::ExpandedClientAreaHint));
 QVERIFY(window.windowFlags().testFlag(Qt::NoTitleBarBackgroundHint));
 QVERIFY(!window.windowFlags().testFlag(Qt::FramelessWindowHint));
+QVERIFY(window.windowFlags().testFlag(Qt::CustomizeWindowHint));
+QVERIFY(!window.windowFlags().testFlag(Qt::WindowTitleHint));
 QVERIFY(window.windowFlags().testFlag(Qt::WindowMinMaxButtonsHint));
 QVERIFY(window.windowFlags().testFlag(Qt::WindowCloseButtonHint));
 ```
@@ -271,26 +276,33 @@ void setTitleBarSafeAreaMargins(const QMargins &margins);
 
 Store the title-row `QHBoxLayout *` as a private member. Clamp only left and
 right margins to nonnegative values and apply them on top of the base
-`QMargins(8, 4, 8, 4)`. Ignore top and bottom safe-area values because the row
+`QMargins(8, 3, 8, 3)`. Ignore top and bottom safe-area values because the row
 itself occupies the extended title area.
 
 **Step 5: Enable and synchronize the expanded area in MainWindow**
 
-Before creating the central widget, enable:
+Before creating the central widget, construct an explicit flag set that enables:
 
 ```cpp
-setWindowFlag(Qt::ExpandedClientAreaHint, true);
-setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
+Qt::ExpandedClientAreaHint | Qt::NoTitleBarBackgroundHint
+    | Qt::CustomizeWindowHint | Qt::WindowSystemMenuHint
+    | Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint
+    | Qt::WindowCloseButtonHint
 ```
 
-Keep the standard minimize/maximize/close flags and do not enable
-`Qt::FramelessWindowHint`.
+Clear `Qt::WindowTitleHint` so Qt does not draw a duplicate title/icon. Keep the
+standard minimize/maximize/close flags and do not enable
+`Qt::FramelessWindowHint`; apply the complete pre-handle flag set with
+`overrideWindowFlags()` so QWidget does not restore `WindowTitleHint`.
 
 Add a private `synchronizeTitleBarSafeArea()` method and a stored
 `QMetaObject::Connection`. Override `showEvent(QShowEvent *)`, call the base
 implementation, obtain `windowHandle()`, reconnect only when necessary, and
-forward `QWindow::safeAreaMargins()` to `BrowserChrome`. Refresh on
-`safeAreaMarginsChanged`.
+read `QWindow::safeAreaMargins()`, and refresh on `safeAreaMarginsChanged`. On
+Windows, Qt 6.11 reports the title-bar height in the top inset rather than a
+horizontal caption-button inset. Reserve the larger of the reported right inset
+and three button widths, where each button width is 1.5 times the top inset,
+then forward the derived content insets to `BrowserChrome`.
 
 Connect `windowMoveRequested` to `windowHandle()->startSystemMove()`. Connect
 `windowMaximizeRestoreRequested` to `showNormal()` when maximized and
@@ -314,7 +326,11 @@ git commit -m "feat: integrate tabs with native title area"
 
 **Files:**
 
-- Modify only if test evidence identifies a defect in files already in scope.
+- Modify production files only if test evidence identifies a defect in the
+  already scoped feature implementation.
+- Modify `tests/e2e/tst_pilot_capabilities.cpp` if the new chrome height exposes
+  fixed-pixel interaction assumptions; derive centered controls from the actual
+  Worker surface dimensions and retain explicit bounds/color/focus assertions.
 - Update: `docs/verification/mvp-acceptance-report.md` only if final Release
   evidence is regenerated.
 
@@ -335,7 +351,7 @@ Launch the Debug Host through the existing accepted development runtime
 configuration. Verify at 100% and the available non-100% DPI scale:
 
 - no separate title-bar band appears;
-- native caption controls remain visible and clickable;
+- Qt's Windows caption controls remain visible and clickable;
 - tabs and New Tab do not overlap caption controls;
 - empty strip space moves the window and double-click toggles maximize;
 - tab drag still reorders instead of moving the window;
@@ -353,7 +369,8 @@ to the repository.
 & 'C:\Program Files\nodejs\npm.cmd' test --prefix tools
 ```
 
-Expected: all Qt/C++ and all 172 tools tests pass with zero failures.
+Expected: the current 55-test Qt/C++ inventory and all 172 tools tests pass with
+zero failures.
 
 **Step 4: Check the Release host inventory**
 

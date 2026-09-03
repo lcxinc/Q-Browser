@@ -9,6 +9,43 @@ read-only verification completed on 2026-08-23 from 10:40 through 10:56 China
 Standard Time (UTC+08:00, Asia/Shanghai). The report-only commit is
 intentionally not part of the audited executable input.
 
+## Browser-style title-area follow-up (2026-09-04)
+
+The browser-style title-area change was automatically verified from source
+commit `fef635b` in the isolated worktree
+`L:\project\Q-Browser\.worktrees\browser-style-frameless-tabs`. This follow-up
+does not replace the immutable Task 0–18 deployment evidence below and does not
+claim that the separate manual Windows visual/interaction smoke test was run.
+
+| Check | Fresh result |
+|---|---|
+| Focused Debug build | `tst_browser_chrome`, `tst_browser_shell`, and `qbrowser-host` built successfully; 9.846 s |
+| Focused Debug CTest | `browser_chrome` and `browser_shell`: 2/2 passed, 0 failed; 35.26 s |
+| Complete Debug build | Passed; 273.894 s. The changed pilot E2E target was rebuilt again after its test-only coordinate fix. |
+| Complete Debug CTest | 55/55 passed, 0 failed; 609.49 s |
+| Node/Vitest | 9/9 files and 172/172 tests passed; Vitest 42.38 s, complete command 44.281 s |
+| Release product configure | Independent `build/release-browser-tabs-product` configured with `BUILD_TESTING=OFF`; 15.262 s |
+| Release Host build | `qbrowser-host.exe` built successfully; 55.566 s; artifact size 1,858,048 bytes |
+| Release test inventory | `ctest -C Release -N` reported `Total Tests: 0` |
+
+The first complete Debug CTest run retained one real RED:
+`e2e_pilot_capabilities` sampled a centered login control at a fixed y-coordinate
+from the previous 1100x647 Worker surface. The 42-pixel title row changed the
+observed Worker surface to 1106x606, so the old sample hit the background. Commit
+`fef635b` derives the login and centered clipboard-control points from the actual
+surface center, verifies that every point is in bounds, and retains the color,
+focus, real-input, and capability-response assertions. The focused E2E then
+passed 1/1 in 33.20 s before the passing full-suite rerun.
+
+The tools worktree initially had no installed dependencies, so the first command
+stopped at `tsc` not found. `npm ci --prefix tools` installed the exact lockfile
+set (54 packages, 0 reported vulnerabilities). The first post-install Vitest
+process then exited before listing tests with Windows fast-fail `0xC0000409`, the
+same environmental diagnostic already retained later in this report; an
+independent complete rerun produced the 172/172 passing result above. Release
+configure also repeated the already-known optional Vulkan-header and private
+`Qt6TaskTree` / `Qt6QmlAssetDownloaderPrivate` diagnostics.
+
 ## Audited environment and immutable outputs
 
 | Item | Observed value |
