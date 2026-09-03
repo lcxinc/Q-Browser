@@ -10,6 +10,7 @@
 #include "WorkerSurface.h"
 
 #include <QCoreApplication>
+#include <QDebug>
 #include <QPointer>
 #include <QScopeGuard>
 #include <QScopedValueRollback>
@@ -21,11 +22,25 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#include <limits>
 #include <utility>
 
 namespace {
 
 constexpr int BrowserSessionSaveDebounceMilliseconds = 200;
+
+#ifdef Q_OS_WIN
+int windowsCaptionControlsInset(const int titleBarHeight) noexcept
+{
+    if (titleBarHeight <= 0) return 0;
+    const qint64 captionButtonWidth =
+        (static_cast<qint64>(titleBarHeight) * 3) / 2;
+    const qint64 captionControlsWidth = captionButtonWidth * 3;
+    return static_cast<int>(qMin(
+        captionControlsWidth,
+        static_cast<qint64>(std::numeric_limits<int>::max())));
+}
+#endif
 
 QVariantMap variantParameters(const QHash<QString, QString> &parameters)
 {
@@ -68,8 +83,20 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     , webSessionProfile_(std::make_unique<WebSessionProfile>(mockOrigin_))
     , tabModel_(std::make_unique<BrowserTabModel>())
 {
-    setWindowFlag(Qt::ExpandedClientAreaHint, true);
-    setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
+    Qt::WindowFlags titleAreaFlags = windowFlags();
+    titleAreaFlags |= Qt::ExpandedClientAreaHint
+        | Qt::NoTitleBarBackgroundHint
+        | Qt::CustomizeWindowHint
+        | Qt::WindowSystemMenuHint
+        | Qt::WindowMinimizeButtonHint
+        | Qt::WindowMaximizeButtonHint
+        | Qt::WindowCloseButtonHint;
+    titleAreaFlags &= ~Qt::WindowTitleHint;
+    titleAreaFlags &= ~Qt::FramelessWindowHint;
+    // QWidget's normal flag adjustment restores WindowTitleHint when caption
+    // buttons are requested. No native handle exists yet, so preserve this
+    // complete, explicit flag set for the QWindow that will be created.
+    overrideWindowFlags(titleAreaFlags);
     setObjectName(QStringLiteral("qbrowser-main-window"));
     setWindowTitle(QStringLiteral("Q-Browser"));
 
@@ -168,7 +195,13 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     connect(browserChrome_, &BrowserChrome::windowMoveRequested, this,
             [this] {
                 if (QWindow *const handle = windowHandle()) {
-                    (void)handle->startSystemMove();
+                    if (!handle->startSystemMove()) {
+                        qWarning("Q-Browser could not start the native system "
+                                 "window move.");
+                    }
+                } else {
+                    qWarning("Q-Browser cannot start a native system window "
+                             "move without a window handle.");
                 }
             });
     connect(browserChrome_,
@@ -220,9 +253,21 @@ void MainWindow::synchronizeTitleBarSafeArea()
         }
     }
     if (browserChrome_ != nullptr) {
-        browserChrome_->setTitleBarSafeAreaMargins(
-            currentWindow != nullptr ? currentWindow->safeAreaMargins()
-                                     : QMargins{});
+        QMargins contentInsets = currentWindow != nullptr
+            ? currentWindow->safeAreaMargins() : QMargins{};
+#ifdef Q_OS_WIN
+        if (windowFlags().testFlag(Qt::ExpandedClientAreaHint)) {
+            // Qt 6.11's Windows platform plugin exposes the title-bar height
+            // as a logical top safe inset and draws three child caption
+            // buttons, each 1.5 times that height. Match that observable
+            // qwindowswindow.cpp geometry without DPR scaling; these are Qt
+            // child controls, not DWMWA_CAPTION_BUTTON_BOUNDS.
+            contentInsets.setRight(qMax(
+                contentInsets.right(),
+                windowsCaptionControlsInset(contentInsets.top())));
+        }
+#endif
+        browserChrome_->setTitleBarSafeAreaMargins(contentInsets);
     }
 }
 

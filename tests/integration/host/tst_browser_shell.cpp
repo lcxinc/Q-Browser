@@ -16,6 +16,7 @@
 #include <QHostAddress>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLayout>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QStackedWidget>
@@ -27,6 +28,7 @@
 #include <QWebEnginePage>
 #include <QWebEngineProfile>
 #include <QWebEngineView>
+#include <QWindow>
 
 #include <memory>
 #include <optional>
@@ -270,11 +272,42 @@ void BrowserShellTest::mainWindowUsesExpandedNativeTitleArea()
     window.show();
     QTRY_VERIFY(window.isVisible());
 
+#ifdef Q_OS_WIN
+    QWindow *const nativeWindow = window.windowHandle();
+    QVERIFY(nativeWindow != nullptr);
+    QTRY_VERIFY(nativeWindow->safeAreaMargins().top() > 0);
+    const int titleBarHeight = nativeWindow->safeAreaMargins().top();
+    const int captionButtonWidth = static_cast<int>(titleBarHeight * 1.5);
+    const int captionControlsWidth = 3 * captionButtonWidth;
+    QVERIFY(captionControlsWidth > 0);
+
+    QWidget *const tabRow = window.findChild<QWidget *>(
+        QStringLiteral("browser-tab-row"));
+    QVERIFY(tabRow != nullptr);
+    QVERIFY(tabRow->layout() != nullptr);
+    const QRect rowContentRect = tabRow->layout()->contentsRect();
+    const QRect windowContentRect(tabRow->mapTo(&window,
+                                                 rowContentRect.topLeft()),
+                                  rowContentRect.size());
+    const QRect captionControlsRect(window.width() - captionControlsWidth,
+                                    0,
+                                    captionControlsWidth,
+                                    titleBarHeight);
+    QVERIFY2(windowContentRect.right() < captionControlsRect.left(),
+             qPrintable(QStringLiteral("contentRight=%1 captionLeft=%2")
+                            .arg(windowContentRect.right())
+                            .arg(captionControlsRect.left())));
+#endif
+
     const Qt::WindowFlags flags = window.windowFlags();
     QVERIFY(flags.testFlag(Qt::ExpandedClientAreaHint));
     QVERIFY(flags.testFlag(Qt::NoTitleBarBackgroundHint));
     QVERIFY(!flags.testFlag(Qt::FramelessWindowHint));
-    QVERIFY(flags.testFlag(Qt::WindowMinMaxButtonsHint));
+    QVERIFY(flags.testFlag(Qt::CustomizeWindowHint));
+    QVERIFY(!flags.testFlag(Qt::WindowTitleHint));
+    QVERIFY(flags.testFlag(Qt::WindowSystemMenuHint));
+    QVERIFY(flags.testFlag(Qt::WindowMinimizeButtonHint));
+    QVERIFY(flags.testFlag(Qt::WindowMaximizeButtonHint));
     QVERIFY(flags.testFlag(Qt::WindowCloseButtonHint));
 
     BrowserChrome *const chrome = window.browserChrome();

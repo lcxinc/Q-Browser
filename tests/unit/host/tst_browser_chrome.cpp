@@ -279,7 +279,7 @@ class BrowserChromeTest final : public QObject
 private slots:
     void initTestCase();
     void tabRowUsesBrowserSizingAndOverflow();
-    void safeAreaInsetsReserveNativeCaptionControls();
+    void titleBarContentInsetsAdjustRowMargins();
     void tabOverflowKeepsNewTabAvailable();
     void emptyTitleAreaOwnsOnlyWindowGestures();
     void titleDragStartsAfterSystemThreshold();
@@ -374,7 +374,7 @@ void BrowserChromeTest::tabRowUsesBrowserSizingAndOverflow()
     }
 }
 
-void BrowserChromeTest::safeAreaInsetsReserveNativeCaptionControls()
+void BrowserChromeTest::titleBarContentInsetsAdjustRowMargins()
 {
     BrowserChrome chrome;
     QWidget *const tabRow = chrome.findChild<QWidget *>(
