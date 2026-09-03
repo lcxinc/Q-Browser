@@ -3,12 +3,14 @@
 #include "BrowserCommand.h"
 #include "BrowserTabModel.h"
 
+#include <QPoint>
 #include <QVector>
 #include <QWidget>
 
 #include <optional>
 
 class QAction;
+class QEvent;
 class NavigationBar;
 class QTabBar;
 class QToolButton;
@@ -35,6 +37,11 @@ signals:
     void tabActivationRequested(const QString &tabId);
     void tabMoveRequested(const QString &tabId, int from, int to);
     void tabCloseRequested(const QString &tabId);
+    void windowMoveRequested();
+    void windowMaximizeRestoreRequested();
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     struct CommandAction final
@@ -83,9 +90,11 @@ private:
 
     QTabBar *tabBar_ = nullptr;
     QToolButton *newTabButton_ = nullptr;
+    QWidget *titleDragArea_ = nullptr;
     NavigationBar *navigationBar_ = nullptr;
     QVector<CommandAction> commandActions_;
     QString selectedTabId_;
+    std::optional<QPoint> titleDragOrigin_;
     bool synchronizationInProgress_ = false;
     bool terminalSynchronizationPhase_ = false;
     std::optional<PresentationBatch> pendingBatch_;

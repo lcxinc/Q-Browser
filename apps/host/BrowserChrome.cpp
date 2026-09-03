@@ -3,9 +3,12 @@
 #include "NavigationBar.h"
 
 #include <QAction>
+#include <QApplication>
+#include <QEvent>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QScopedValueRollback>
 #include <QSet>
 #include <QSignalBlocker>
@@ -244,8 +247,18 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     newTabButton_->setToolTip(QStringLiteral("Open a new tab"));
     newTabButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
 
-    tabLayout->addWidget(tabBar_, 1);
+    titleDragArea_ = new QWidget(tabRow);
+    titleDragArea_->setObjectName(
+        QStringLiteral("browser-title-drag-area"));
+    titleDragArea_->setFocusPolicy(Qt::NoFocus);
+    titleDragArea_->setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    titleDragArea_->setSizePolicy(QSizePolicy::Expanding,
+                                  QSizePolicy::Preferred);
+    titleDragArea_->installEventFilter(this);
+
+    tabLayout->addWidget(tabBar_);
     tabLayout->addWidget(newTabButton_);
+    tabLayout->addWidget(titleDragArea_, 1);
     layout->addWidget(tabRow);
 
     navigationBar_ = new NavigationBar(this);
@@ -344,6 +357,46 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
 
     updateActionAvailability(false, 0, false, false, false);
     navigationBar_->clearActivePresentation();
+}
+
+bool BrowserChrome::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == titleDragArea_) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            const auto *const mouseEvent = static_cast<QMouseEvent *>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                titleDragOrigin_ = mouseEvent->position().toPoint();
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseMove) {
+            const auto *const mouseEvent = static_cast<QMouseEvent *>(event);
+            if (titleDragOrigin_.has_value()
+                && mouseEvent->buttons().testFlag(Qt::LeftButton)) {
+                const int distance =
+                    (mouseEvent->position().toPoint() - *titleDragOrigin_)
+                        .manhattanLength();
+                if (distance >= QApplication::startDragDistance()) {
+                    titleDragOrigin_.reset();
+                    emit windowMoveRequested();
+                }
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            const auto *const mouseEvent = static_cast<QMouseEvent *>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                titleDragOrigin_.reset();
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonDblClick) {
+            const auto *const mouseEvent = static_cast<QMouseEvent *>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                titleDragOrigin_.reset();
+                emit windowMaximizeRestoreRequested();
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 bool BrowserChrome::synchronizeTabs(const BrowserTabModel &model)

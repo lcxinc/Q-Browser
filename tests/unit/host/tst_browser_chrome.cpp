@@ -4,11 +4,13 @@
 
 #include <QAccessible>
 #include <QAction>
+#include <QApplication>
 #include <QCoreApplication>
 #include <QEvent>
 #include <QEventLoop>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTabBar>
@@ -277,6 +279,8 @@ private slots:
     void initTestCase();
     void tabRowUsesBrowserSizingAndOverflow();
     void tabOverflowKeepsNewTabAvailable();
+    void emptyTitleAreaOwnsOnlyWindowGestures();
+    void titleDragStartsAfterSystemThreshold();
     void stableIdsSurviveInsertMoveCloseAndDriveViewRequests();
     void modelToViewSynchronizationBlocksAllViewRequests();
     void navigationPresentationAndAddressEventsAreExplicit();
@@ -411,6 +415,120 @@ void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()
         }
     }
     QVERIFY(hasVisibleScrollButton);
+}
+
+void BrowserChromeTest::emptyTitleAreaOwnsOnlyWindowGestures()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot first = tab(
+        tabId(u'1'), BrowserTabKind::Host, QStringLiteral("First"),
+        {QStringLiteral("qbrowser://first")}, 0);
+    const BrowserTabSnapshot second = tab(
+        tabId(u'2'), BrowserTabKind::Web, QStringLiteral("Second"),
+        {QStringLiteral("app://pilot/web/second")}, 0);
+    QVERIFY(synchronizeChrome(
+        chrome,
+        {first, second},
+        {presentation(),
+         presentation(BrowserContentIdentity::RestrictedWeb)},
+        first.id));
+    chrome.resize(900, 160);
+    chrome.show();
+    QCoreApplication::processEvents();
+
+    QWidget *const dragArea = chrome.findChild<QWidget *>(
+        QStringLiteral("browser-title-drag-area"));
+    QTabBar *const tabBar = chrome.tabBar();
+    QToolButton *const newTab = toolButton(
+        chrome, QStringLiteral("browser-new-tab"));
+    QVERIFY(dragArea != nullptr);
+    QVERIFY(tabBar != nullptr);
+    QVERIFY(newTab != nullptr);
+    QVERIFY(dragArea->isVisible());
+    QVERIFY(dragArea->width() > 0);
+    QCOMPARE(dragArea->focusPolicy(), Qt::NoFocus);
+
+    QSignalSpy moveRequests(&chrome, &BrowserChrome::windowMoveRequested);
+    QSignalSpy maximizeRestoreRequests(
+        &chrome, &BrowserChrome::windowMaximizeRestoreRequested);
+    QSignalSpy activationRequests(
+        &chrome, &BrowserChrome::tabActivationRequested);
+
+    QTest::mouseClick(dragArea, Qt::LeftButton);
+    QTest::mouseDClick(dragArea, Qt::LeftButton);
+    QCOMPARE(moveRequests.count(), 0);
+    QCOMPARE(maximizeRestoreRequests.count(), 1);
+    QTest::mouseRelease(dragArea, Qt::LeftButton);
+
+    moveRequests.clear();
+    maximizeRestoreRequests.clear();
+    QTest::mouseClick(tabBar, Qt::LeftButton, Qt::NoModifier,
+                      tabBar->tabRect(1).center());
+    QCOMPARE(tabBar->currentIndex(), 1);
+    QCOMPARE(activationRequests.count(), 1);
+    QCOMPARE(activationRequests.takeFirst().at(0).toString(), second.id);
+    QCOMPARE(moveRequests.count(), 0);
+    QCOMPARE(maximizeRestoreRequests.count(), 0);
+
+    QTest::mouseClick(newTab, Qt::LeftButton);
+    QCOMPARE(moveRequests.count(), 0);
+    QCOMPARE(maximizeRestoreRequests.count(), 0);
+
+    QTest::mousePress(dragArea, Qt::RightButton);
+    QTest::mouseRelease(dragArea, Qt::RightButton);
+    QCOMPARE(moveRequests.count(), 0);
+    QCOMPARE(maximizeRestoreRequests.count(), 0);
+}
+
+void BrowserChromeTest::titleDragStartsAfterSystemThreshold()
+{
+    BrowserChrome chrome;
+    chrome.resize(900, 160);
+    chrome.show();
+    QCoreApplication::processEvents();
+
+    QWidget *const dragArea = chrome.findChild<QWidget *>(
+        QStringLiteral("browser-title-drag-area"));
+    QVERIFY(dragArea != nullptr);
+    QVERIFY(dragArea->isVisible());
+    const int threshold = QApplication::startDragDistance();
+    QVERIFY(threshold > 0);
+    QVERIFY(dragArea->width() > threshold + 20);
+
+    const QPoint origin(5, dragArea->height() / 2);
+    const QPoint belowThreshold(origin.x() + threshold - 1, origin.y());
+    const QPoint atThreshold(origin.x() + threshold, origin.y());
+    const QPoint beyondThreshold(origin.x() + threshold + 1, origin.y());
+    const QPoint farther(beyondThreshold.x() + 5, origin.y());
+    auto sendLeftMove = [&](const QPoint &position) {
+        QMouseEvent move(
+            QEvent::MouseMove,
+            QPointF(position),
+            QPointF(dragArea->mapToGlobal(position)),
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier);
+        QCoreApplication::sendEvent(dragArea, &move);
+    };
+
+    QSignalSpy moveRequests(&chrome, &BrowserChrome::windowMoveRequested);
+    QTest::mousePress(dragArea, Qt::LeftButton, Qt::NoModifier, origin);
+    QCOMPARE(moveRequests.count(), 0);
+    sendLeftMove(belowThreshold);
+    QCOMPARE(moveRequests.count(), 0);
+    sendLeftMove(atThreshold);
+    QCOMPARE(moveRequests.count(), 1);
+    sendLeftMove(beyondThreshold);
+    QCOMPARE(moveRequests.count(), 1);
+    sendLeftMove(farther);
+    QCOMPARE(moveRequests.count(), 1);
+    QTest::mouseRelease(dragArea, Qt::LeftButton, Qt::NoModifier, farther);
+
+    QTest::mousePress(dragArea, Qt::LeftButton, Qt::NoModifier, origin);
+    sendLeftMove(beyondThreshold);
+    QCOMPARE(moveRequests.count(), 2);
+    QTest::mouseRelease(
+        dragArea, Qt::LeftButton, Qt::NoModifier, beyondThreshold);
 }
 
 void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()
