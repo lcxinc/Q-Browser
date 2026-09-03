@@ -14,8 +14,9 @@ intentionally not part of the audited executable input.
 The browser-style title-area change was automatically verified from source
 commit `fef635b` in the isolated worktree
 `L:\project\Q-Browser\.worktrees\browser-style-frameless-tabs`. This follow-up
-does not replace the immutable Task 0–18 deployment evidence below and does not
-claim that the separate manual Windows visual/interaction smoke test was run.
+does not replace the immutable Task 0–18 deployment evidence below. The
+automated results and the subsequent Windows UI observations are reported
+separately.
 
 | Check | Fresh result |
 |---|---|
@@ -45,6 +46,38 @@ same environmental diagnostic already retained later in this report; an
 independent complete rerun produced the 172/172 passing result above. Release
 configure also repeated the already-known optional Vulkan-header and private
 `Qt6TaskTree` / `Qt6QmlAssetDownloaderPrivate` diagnostics.
+
+### Windows UI smoke observations
+
+Launching the Debug Host directly without the Qt binary directory on `PATH`
+first produced loader errors for the Debug Qt WebEngine Widgets/Core DLLs. The
+same executable started successfully after applying the Qt `PATH` environment
+used by CTest. This was a launch-environment diagnostic, not an observed product
+failure.
+
+With `QT_SCALE_FACTOR=1.0`, the captured window measured 1102x728 pixels. No
+separate title band was visible: tabs and the Windows caption buttons occupied
+the same top row. The New Tab `+` created a tab; dragging a tab did not move the
+window; double-clicking unused title-row space maximized and restored the window;
+and the maximize, restore, and close caption buttons completed their actions.
+Resizing from the native lower-right edge changed the window from 1102x728 to
+1002x652 pixels. With eight tabs open, the tab bar exposed both scroll buttons;
+the New Tab button and caption buttons remained separate, and a visible inactive
+tab could be activated.
+
+With `QT_SCALE_FACTOR=1.25`, the captured window measured 1377x908 pixels. The
+title area remained visually integrated, and the tabs, New Tab button, and
+caption buttons were clear and did not overlap. The close caption button also
+completed its action.
+
+The immediate `sky.drag` automation sequence did not make actual movement of the
+window through the unused title area, or drag-to-edge snap, reliably observable.
+Those two interactions therefore remain an automation limitation and are not
+recorded as manually passed. The exercised implementation path is bounded by the
+drag-threshold unit test and the Windows `startSystemMove()` return diagnostic;
+the separate maximize/restore, native-edge resize, and caption-button observations
+above provide supporting window-integration evidence. No smoke-test screenshot
+was added to the repository.
 
 ## Audited environment and immutable outputs
 
