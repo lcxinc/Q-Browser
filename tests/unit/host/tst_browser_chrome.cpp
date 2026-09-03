@@ -275,6 +275,8 @@ class BrowserChromeTest final : public QObject
 
 private slots:
     void initTestCase();
+    void tabRowUsesBrowserSizingAndOverflow();
+    void tabOverflowKeepsNewTabAvailable();
     void stableIdsSurviveInsertMoveCloseAndDriveViewRequests();
     void modelToViewSynchronizationBlocksAllViewRequests();
     void navigationPresentationAndAddressEventsAreExplicit();
@@ -304,6 +306,111 @@ private slots:
 void BrowserChromeTest::initTestCase()
 {
     qRegisterMetaType<BrowserCommand>();
+}
+
+void BrowserChromeTest::tabRowUsesBrowserSizingAndOverflow()
+{
+    BrowserChrome chrome;
+    const BrowserTabSnapshot shortTitle = tab(
+        tabId(u'1'), BrowserTabKind::Host, QStringLiteral("Short"),
+        {QStringLiteral("qbrowser://newtab")}, 0);
+    const BrowserTabSnapshot longTitle = tab(
+        tabId(u'2'), BrowserTabKind::Web,
+        QStringLiteral("A deliberately long browser tab title that must elide"),
+        {QStringLiteral("app://pilot/web/help")}, 0);
+    QVERIFY(synchronizeChrome(
+        chrome,
+        {shortTitle, longTitle},
+        {presentation(),
+         presentation(BrowserContentIdentity::RestrictedWeb)},
+        shortTitle.id));
+
+    chrome.resize(900, 160);
+    chrome.show();
+    QCoreApplication::processEvents();
+
+    QWidget *const tabRow = chrome.findChild<QWidget *>(
+        QStringLiteral("browser-tab-row"));
+    QVERIFY(tabRow != nullptr);
+    QCOMPARE(tabRow->height(), 42);
+
+    QTabBar *const tabBar = chrome.tabBar();
+    QVERIFY(tabBar != nullptr);
+    QVERIFY(tabBar->documentMode());
+    QVERIFY(tabBar->usesScrollButtons());
+    QVERIFY(!tabBar->drawBase());
+
+    QWidget *closeButton = tabBar->tabButton(0, QTabBar::RightSide);
+    if (closeButton == nullptr) {
+        closeButton = tabBar->tabButton(0, QTabBar::LeftSide);
+    }
+    QVERIFY(closeButton != nullptr);
+    QVERIFY(closeButton->isVisible());
+    QSignalSpy closeRequests(&chrome, &BrowserChrome::tabCloseRequested);
+    QTest::mouseClick(closeButton, Qt::LeftButton);
+    QCOMPARE(closeRequests.count(), 1);
+    QCOMPARE(closeRequests.takeFirst().at(0).toString(), shortTitle.id);
+
+    QToolButton *const newTab = toolButton(
+        chrome, QStringLiteral("browser-new-tab"));
+    QVERIFY(newTab != nullptr);
+    QVERIFY(newTab->isVisible());
+    QCOMPARE(newTab->text(), QStringLiteral("+"));
+    QCOMPARE(newTab->focusPolicy(), Qt::StrongFocus);
+    QVERIFY(!newTab->accessibleName().isEmpty());
+    QVERIFY(!newTab->accessibleDescription().isEmpty());
+
+    for (int index = 0; index < tabBar->count(); ++index) {
+        const QRect tabRect = tabBar->tabRect(index);
+        QVERIFY(tabBar->rect().contains(tabRect));
+        QVERIFY(tabRect.width() >= 120);
+        QVERIFY(tabRect.width() <= 240);
+    }
+}
+
+void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()
+{
+    BrowserChrome chrome;
+    QVector<BrowserTabSnapshot> tabs;
+    QVector<BrowserTabPresentation> presentations;
+    const int tabCount = BrowserTabModel::MaxOpenTabs - 1;
+    tabs.reserve(tabCount);
+    presentations.reserve(tabCount);
+    for (int index = 0; index < tabCount; ++index) {
+        const QString id = QString::number(index + 1, 16)
+            .rightJustified(32, QLatin1Char('0'));
+        tabs.append(tab(
+            id, BrowserTabKind::App,
+            QStringLiteral("Overflow tab with a long title %1").arg(index + 1),
+            {QStringLiteral("app://pilot/orders/%1").arg(index + 1)}, 0));
+        presentations.append(
+            presentation(BrowserContentIdentity::SignedApplication));
+    }
+    QVERIFY(synchronizeChrome(chrome, tabs, presentations, tabs.first().id));
+
+    chrome.resize(360, 160);
+    chrome.show();
+    QCoreApplication::processEvents();
+
+    QTabBar *const tabBar = chrome.tabBar();
+    QToolButton *const newTab = toolButton(
+        chrome, QStringLiteral("browser-new-tab"));
+    QVERIFY(tabBar != nullptr);
+    QVERIFY(newTab != nullptr);
+    QVERIFY(newTab->isVisible());
+    QVERIFY(newTab->isEnabled());
+
+    bool hasVisibleScrollButton = false;
+    const QList<QToolButton *> tabBarButtons =
+        tabBar->findChildren<QToolButton *>(QString(),
+                                            Qt::FindDirectChildrenOnly);
+    for (const QToolButton *const button : tabBarButtons) {
+        if (button->isVisible() && button->arrowType() != Qt::NoArrow) {
+            hasVisibleScrollButton = true;
+            break;
+        }
+    }
+    QVERIFY(hasVisibleScrollButton);
 }
 
 void BrowserChromeTest::stableIdsSurviveInsertMoveCloseAndDriveViewRequests()

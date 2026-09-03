@@ -9,17 +9,39 @@
 #include <QScopedValueRollback>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QStyle>
 #include <QTabBar>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
 
+#include <algorithm>
 #include <vector>
 
 namespace
 {
 constexpr int MaxSynchronizationPasses = BrowserTabModel::MaxOpenTabs;
+constexpr int BrowserTitleRowHeight = 42;
+constexpr int BrowserTabMinimumWidth = 120;
+constexpr int BrowserTabMaximumWidth = 240;
+constexpr int BrowserTabHeight = 36;
+
+class BrowserTabBar final : public QTabBar
+{
+public:
+    using QTabBar::QTabBar;
+
+protected:
+    QSize tabSizeHint(int index) const override
+    {
+        QSize size = QTabBar::tabSizeHint(index);
+        size.setWidth(std::clamp(size.width(), BrowserTabMinimumWidth,
+                                 BrowserTabMaximumWidth));
+        size.setHeight(BrowserTabHeight);
+        return size;
+    }
+};
 
 QString literalTabText(const QString &title)
 {
@@ -191,14 +213,15 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
 
     auto *tabRow = new QWidget(this);
     tabRow->setObjectName(QStringLiteral("browser-tab-row"));
+    tabRow->setFixedHeight(BrowserTitleRowHeight);
     tabRow->setAccessibleName(QStringLiteral("Tab strip"));
     tabRow->setAccessibleDescription(
         QStringLiteral("Open and arrange browser tabs"));
     auto *tabLayout = new QHBoxLayout(tabRow);
-    tabLayout->setContentsMargins(8, 4, 8, 4);
+    tabLayout->setContentsMargins(8, 3, 8, 3);
     tabLayout->setSpacing(4);
 
-    tabBar_ = new QTabBar(tabRow);
+    tabBar_ = new BrowserTabBar(tabRow);
     tabBar_->setObjectName(QStringLiteral("browser-tab-bar"));
     tabBar_->setAccessibleName(QStringLiteral("Browser tabs"));
     tabBar_->setAccessibleDescription(
@@ -208,6 +231,11 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     tabBar_->setExpanding(false);
     tabBar_->setElideMode(Qt::ElideRight);
     tabBar_->setSelectionBehaviorOnRemove(QTabBar::SelectPreviousTab);
+    tabBar_->setDocumentMode(true);
+    tabBar_->setDrawBase(false);
+    tabBar_->setUsesScrollButtons(true);
+    tabBar_->setIconSize(QSize(16, 16));
+    tabBar_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
     newTabButton_ = new QToolButton(tabRow);
     newTabButton_->setObjectName(QStringLiteral("browser-new-tab"));
@@ -228,9 +256,64 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     newTabButton_->setObjectName(QStringLiteral("browser-new-tab"));
     newTabButton_->setAccessibleName(QStringLiteral("New tab"));
     newTabButton_->setAccessibleDescription(QStringLiteral("Open a new tab"));
+    newTabButton_->setText(QStringLiteral("+"));
+    newTabButton_->setToolTip(QStringLiteral("New tab"));
+    newTabButton_->setFocusPolicy(Qt::StrongFocus);
     navigationBar_->setReloadStopActions(
         actionForCommand(BrowserCommand::Reload),
         actionForCommand(BrowserCommand::Stop));
+
+    setStyleSheet(QStringLiteral(R"(
+        QWidget#browser-chrome QWidget#browser-tab-row {
+            background: palette(base);
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar {
+            background: palette(base);
+        }
+        QWidget#browser-chrome QWidget#navigation-bar {
+            background: palette(base);
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar::tab {
+            background: palette(button);
+            color: palette(button-text);
+            border: 1px solid palette(mid);
+            border-bottom-color: palette(mid);
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            padding: 0 10px;
+            margin-right: 2px;
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar::tab:selected {
+            background: palette(base);
+            color: palette(text);
+            border-bottom-color: palette(base);
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar::tab:!selected:hover {
+            background: palette(light);
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar::close-button {
+            background: palette(button);
+            border: 1px solid palette(mid);
+            border-radius: 7px;
+        }
+        QWidget#browser-chrome QTabBar#browser-tab-bar::close-button:hover {
+            background: palette(midlight);
+        }
+        QWidget#browser-chrome QToolButton#browser-new-tab {
+            background: palette(base);
+            color: palette(window-text);
+            border: 1px solid palette(base);
+            border-radius: 8px;
+            padding: 4px 10px;
+        }
+        QWidget#browser-chrome QToolButton#browser-new-tab:hover {
+            background: palette(light);
+            border-color: palette(mid);
+        }
+        QWidget#browser-chrome QToolButton#browser-new-tab:focus {
+            border-color: palette(highlight);
+        }
+    )"));
 
     connect(tabBar_, &QTabBar::currentChanged, this, [this](int index) {
         if (index < 0) {
