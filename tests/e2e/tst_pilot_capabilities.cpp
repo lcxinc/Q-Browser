@@ -626,11 +626,21 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     QVERIFY(worker != nullptr);
     QVERIFY(activateHostWindow(GetAncestor(worker, GA_ROOT)));
     QVERIFY(focusWorker(window, worker));
-    QVERIFY(waitForBlueControl(worker, 550, 442));
+    const QImage loginSurface = captureWorker(worker);
+    QVERIFY(!loginSurface.isNull());
+    const QPoint loginCenter(loginSurface.width() / 2,
+                             loginSurface.height() / 2);
+    const QPoint loginEmailPoint = loginCenter + QPoint(0, -16);
+    const QPoint loginButtonPoint = loginCenter + QPoint(0, 119);
+    QVERIFY(loginSurface.rect().contains(loginEmailPoint));
+    QVERIFY(loginSurface.rect().contains(loginButtonPoint));
+    QVERIFY(waitForBlueControl(worker, loginButtonPoint.x(),
+                               loginButtonPoint.y()));
     (void)captureWorker(worker).save(
         QDir::temp().filePath(QStringLiteral("qbrowser-login-before.png")));
     recordStage("login-email");
-    QVERIFY(clickWorkerIdempotentFocus(window, worker, 550, 308));
+    QVERIFY(clickWorkerIdempotentFocus(window, worker, loginEmailPoint.x(),
+                                       loginEmailPoint.y()));
     QVERIFY(sendText(window, worker, QStringLiteral("pilot@example.com")));
     recordStage("login-password");
     QVERIFY(workerHasTrustedInputFocus(worker) || focusWorker(window, worker));
@@ -845,7 +855,13 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
                 + QByteArray::number(environment.currentWorkerProcessId()));
     (void)captureWorker(worker).save(
         QDir::temp().filePath(QStringLiteral("qbrowser-undeclared.png")));
-    const bool undeclaredRendered = waitForBlueControl(worker, 550, 360);
+    const QImage clipboardSurface = captureWorker(worker);
+    QVERIFY(!clipboardSurface.isNull());
+    const QPoint clipboardControlPoint(clipboardSurface.width() / 2,
+                                       clipboardSurface.height() / 2);
+    QVERIFY(clipboardSurface.rect().contains(clipboardControlPoint));
+    const bool undeclaredRendered = waitForBlueControl(
+        worker, clipboardControlPoint.x(), clipboardControlPoint.y());
     if (!undeclaredRendered) {
         const WorkerSurface *const currentSurface = window->workerSurface();
         recordStage(QByteArray("undeclared-render-failed-exits-")
@@ -882,7 +898,8 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     QGuiApplication::clipboard()->setText(QStringLiteral("gesture-canary"));
     (void)captureWorker(worker).save(
         QDir::temp().filePath(QStringLiteral("qbrowser-gesture.png")));
-    const bool gestureRendered = waitForBlueControl(worker, 550, 360);
+    const bool gestureRendered = waitForBlueControl(
+        worker, clipboardControlPoint.x(), clipboardControlPoint.y());
     if (!gestureRendered) {
         recordStage(QByteArray("gesture-render-failed-")
                     + environment.lastFailure().toLatin1() + QByteArray("-")
@@ -910,7 +927,8 @@ void PilotCapabilitiesE2eTest::productionPilotBusinessCapabilities()
     const int gestureFrom = requests.count();
     const int gestureQueuedFrom = responsesQueued.count();
     const int gestureSentFrom = responsesSent.count();
-    QVERIFY(clickWorker(worker, 550, 360));
+    QVERIFY(clickWorker(worker, clipboardControlPoint.x(),
+                        clipboardControlPoint.y()));
     recordStage("gesture-clicked");
     QVERIFY(waitForCapability(requests, gestureFrom, QStringLiteral("clipboard"),
                               QStringLiteral("read"), {}) >= 0);
