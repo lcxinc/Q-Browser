@@ -31,7 +31,8 @@ constexpr int BrowserTabMinimumWidth = 120;
 constexpr int BrowserTabMaximumWidth = 240;
 constexpr int BrowserTabHeight = 36;
 constexpr int BrowserTitleHorizontalMargin = 8;
-constexpr int BrowserTitleVerticalMargin = 3;
+constexpr int BrowserTitleTopMargin = BrowserTitleRowHeight - BrowserTabHeight;
+constexpr int BrowserTitleDragMinimumWidth = 48;
 
 int titleMarginWithSafeInset(const int safeInset) noexcept
 {
@@ -235,8 +236,8 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
         QStringLiteral("Open and arrange browser tabs"));
     titleLayout_ = new QHBoxLayout(tabRow);
     titleLayout_->setContentsMargins(
-        BrowserTitleHorizontalMargin, BrowserTitleVerticalMargin,
-        BrowserTitleHorizontalMargin, BrowserTitleVerticalMargin);
+        BrowserTitleHorizontalMargin, BrowserTitleTopMargin,
+        BrowserTitleHorizontalMargin, 0);
     titleLayout_->setSpacing(4);
 
     tabBar_ = new BrowserTabBar(tabRow);
@@ -261,6 +262,7 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     newTabButton_->setAccessibleDescription(QStringLiteral("Open a new tab"));
     newTabButton_->setToolTip(QStringLiteral("Open a new tab"));
     newTabButton_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    newTabButton_->setFixedSize(30, 30);
 
     titleDragArea_ = new QWidget(tabRow);
     titleDragArea_->setObjectName(
@@ -269,6 +271,7 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     titleDragArea_->setAttribute(Qt::WA_TransparentForMouseEvents, false);
     titleDragArea_->setSizePolicy(QSizePolicy::Expanding,
                                   QSizePolicy::Preferred);
+    titleDragArea_->setMinimumWidth(BrowserTitleDragMinimumWidth);
     titleDragArea_->installEventFilter(this);
 
     titleLayout_->addWidget(tabBar_);
@@ -302,55 +305,46 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
 
     setStyleSheet(QStringLiteral(R"(
         QWidget#browser-chrome QWidget#browser-tab-row {
-            background: palette(base);
+            background: palette(window);
         }
         QWidget#browser-chrome QTabBar#browser-tab-bar {
-            background: palette(base);
+            background: transparent;
         }
         QWidget#browser-chrome QWidget#navigation-bar {
             background: palette(base);
         }
         QWidget#browser-chrome QTabBar#browser-tab-bar::tab {
-            background: palette(button);
-            color: palette(button-text);
-            border: 1px solid palette(mid);
-            border-bottom-color: palette(mid);
-            border-top-left-radius: 8px;
-            border-top-right-radius: 8px;
-            padding: 0 10px;
+            background: transparent;
+            color: palette(window-text);
+            border: none;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            padding: 0 12px;
             margin-right: 2px;
         }
         QWidget#browser-chrome QTabBar#browser-tab-bar::tab:selected {
             background: palette(base);
             color: palette(text);
-            border-bottom-color: palette(base);
         }
         QWidget#browser-chrome QTabBar#browser-tab-bar::tab:!selected:hover {
-            background: palette(light);
-        }
-        QWidget#browser-chrome QTabBar#browser-tab-bar::close-button {
-            background: palette(button);
-            border: 1px solid palette(mid);
-            border-radius: 7px;
-        }
-        QWidget#browser-chrome QTabBar#browser-tab-bar::close-button:hover {
             background: palette(midlight);
         }
         QWidget#browser-chrome QToolButton#browser-new-tab {
-            background: palette(base);
+            background: transparent;
             color: palette(window-text);
-            border: 1px solid palette(base);
-            border-radius: 8px;
-            padding: 4px 10px;
+            border: 1px solid transparent;
+            border-radius: 9px;
+            font-size: 20px;
+            padding: 0;
         }
         QWidget#browser-chrome QToolButton#browser-new-tab:hover {
-            background: palette(light);
-            border-color: palette(mid);
+            background: palette(midlight);
         }
         QWidget#browser-chrome QToolButton#browser-new-tab:focus {
             border-color: palette(highlight);
         }
     )"));
+    qApp->installEventFilter(this);
 
     connect(tabBar_, &QTabBar::currentChanged, this, [this](int index) {
         if (index < 0) {
@@ -387,12 +381,19 @@ void BrowserChrome::setTitleBarSafeAreaMargins(const QMargins &margins)
 {
     if (titleLayout_ == nullptr) return;
     titleLayout_->setContentsMargins(
-        titleMarginWithSafeInset(margins.left()), BrowserTitleVerticalMargin,
-        titleMarginWithSafeInset(margins.right()), BrowserTitleVerticalMargin);
+        titleMarginWithSafeInset(margins.left()), BrowserTitleTopMargin,
+        titleMarginWithSafeInset(margins.right()), 0);
 }
 
 bool BrowserChrome::eventFilter(QObject *watched, QEvent *event)
 {
+    if (watched == qApp && event->type() == QEvent::ApplicationPaletteChange) {
+        // Qt does not propagate application palette changes to stylesheet
+        // children. Repolish after the application's palette update finishes.
+        QMetaObject::invokeMethod(this, [this] {
+            setStyleSheet(styleSheet());
+        }, Qt::QueuedConnection);
+    }
     if (watched == titleDragArea_) {
         if (event->type() == QEvent::MouseButtonPress) {
             const auto *const mouseEvent = static_cast<QMouseEvent *>(event);

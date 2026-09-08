@@ -304,7 +304,10 @@ bool TabController::cancelAppLaunch()
     if (workerSurface_ != nullptr) workerSurface_->hide();
     currentSurface_ = nullptr;
     surfaceKind_ = HostSurfaceKind::TrustedError;
-    transitionTo(BrowserTabLifecycle::Dormant);
+    // Dormant descriptors start automatically on activation. A user-stopped
+    // tab must remain idle until an explicit reload or navigation.
+    transitionTo(active_ ? BrowserTabLifecycle::Active
+                         : BrowserTabLifecycle::Background);
     updateVisibility();
     return true;
 }

@@ -1,3 +1,4 @@
+#include "AppTabRuntimeController.h"
 #include "BrowserChrome.h"
 #include "BrowserSessionStore.h"
 #include "BrowserTabModel.h"
@@ -245,6 +246,8 @@ private slots:
     void immediateShellRejectsLateSessionApplicationWithoutChangingModel();
     void startupHasOneTrustedHostTabWithoutWorkerOrWebPage();
     void tabCommandsUseStableIdsAndReplaceTheLastClosedTab();
+    void stoppedAppTabDoesNotRestartOnActivation_data();
+    void stoppedAppTabDoesNotRestartOnActivation();
     void tabMutationsRejectDirectReentrantCommands();
     void webTitleCallbackRejectsReentrantClose();
     void webLoadingCallbackRejectsReentrantShutdown();
@@ -1466,6 +1469,83 @@ void BrowserShellTest::tabCommandsUseStableIdsAndReplaceTheLastClosedTab()
     QVERIFY(removalSawCompleteControllerMap);
     QVERIFY(insertionSawCompleteControllerMap);
     QVERIFY(activationSawCompleteControllerMap);
+}
+
+void BrowserShellTest::stoppedAppTabDoesNotRestartOnActivation_data()
+{
+    QTest::addColumn<QString>("activation");
+    QTest::newRow("switch-away-and-back") << QStringLiteral("switch");
+    QTest::newRow("reorder-active-tab") << QStringLiteral("reorder");
+    QTest::newRow("select-current-tab-shortcut") << QStringLiteral("shortcut");
+}
+
+void BrowserShellTest::stoppedAppTabDoesNotRestartOnActivation()
+{
+    QFETCH(QString, activation);
+    BrowserServer server;
+    QVERIFY(server.listen());
+    MainWindow window(browserRoutes(server), server.origin());
+    window.setPackageRuntimeEnabled(true);
+    BrowserTabModel *const model = window.tabModel();
+    BrowserChrome *const chrome = window.browserChrome();
+    const QString appId = model->activeId();
+    chrome->dispatchCommand(BrowserCommand::NewTab);
+    const QString siblingId = model->activeId();
+    activateTab(window, appId);
+    QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+
+    TabController *const controller = window.tabController(appId);
+    QVERIFY(controller != nullptr);
+    // Exercise cancellation before any worker attaches. This runtime has no
+    // launch authority, so the shell commands cannot start a worker process.
+    controller->adoptAppRuntimeController(
+        std::make_unique<AppTabRuntimeController>(
+            appId, controller, &window, nullptr, nullptr,
+            std::shared_ptr<RuntimePackageAuthority>{}, SandboxApprovedRoots{},
+            QString{}, QString{}, server.origin(), QString{}, quintptr(0),
+            AppTabRuntimeController::AdmissionCallback{},
+            std::shared_ptr<std::atomic_bool>{},
+            std::shared_ptr<std::mutex>{}));
+    QSignalSpy launchSpy(&window, &MainWindow::appLaunchRequested);
+    QSignalSpy reloadSpy(&window, &MainWindow::appReloadRequested);
+    QSignalSpy stopSpy(&window, &MainWindow::appStopRequested);
+    QVERIFY(window.navigate(QStringLiteral("app://pilot/orders")));
+    QCOMPARE(launchSpy.count(), 1);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::Loading);
+    const quint64 loadingIncarnation = controller->incarnation();
+    const BrowserTabSnapshot snapshot = model->snapshotAt(model->indexOfId(appId));
+
+    chrome->dispatchCommand(BrowserCommand::Stop);
+    QCOMPARE(stopSpy.count(), 1);
+    QCOMPARE(stopSpy.first().at(1).toULongLong(), loadingIncarnation);
+    const quint64 stoppedIncarnation = controller->incarnation();
+    QVERIFY(stoppedIncarnation > loadingIncarnation);
+    QVERIFY(!model->presentationAt(model->indexOfId(appId)).loading);
+    QCOMPARE(controller->currentSurface(), nullptr);
+
+    if (activation == QStringLiteral("switch")) {
+        activateTab(window, siblingId);
+        activateTab(window, appId);
+    } else if (activation == QStringLiteral("reorder")) {
+        chrome->tabBar()->moveTab(model->indexOfId(appId),
+                                 model->indexOfId(siblingId));
+    } else {
+        chrome->dispatchCommand(BrowserCommand::SelectTab1);
+    }
+    QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+    QCOMPARE(model->activeId(), appId);
+    QCOMPARE(launchSpy.count(), 1);
+    QCOMPARE(reloadSpy.count(), 0);
+    QCOMPARE(controller->incarnation(), stoppedIncarnation);
+    QCOMPARE(model->snapshotAt(model->indexOfId(appId)), snapshot);
+    QVERIFY(!model->presentationAt(model->indexOfId(appId)).loading);
+
+    chrome->dispatchCommand(BrowserCommand::Reload);
+    QCOMPARE(reloadSpy.count(), 1);
+    QCOMPARE(launchSpy.count(), 1);
+    QVERIFY(controller->incarnation() > stoppedIncarnation);
+    QCOMPARE(controller->lifecycle(), BrowserTabLifecycle::Loading);
+    QCOMPARE(model->snapshotAt(model->indexOfId(appId)), snapshot);
 }
 
 void BrowserShellTest::tabMutationsRejectDirectReentrantCommands()

@@ -12,6 +12,7 @@
 #include <QLineEdit>
 #include <QLayout>
 #include <QMouseEvent>
+#include <QScopeGuard>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTabBar>
@@ -279,7 +280,9 @@ class BrowserChromeTest final : public QObject
 private slots:
     void initTestCase();
     void tabRowUsesBrowserSizingAndOverflow();
+    void paletteChangesRefreshTabBackgrounds();
     void titleBarContentInsetsAdjustRowMargins();
+    void tabOverflowKeepsNewTabAvailable_data();
     void tabOverflowKeepsNewTabAvailable();
     void emptyTitleAreaOwnsOnlyWindowGestures();
     void titleDragStartsAfterSystemThreshold();
@@ -345,6 +348,8 @@ void BrowserChromeTest::tabRowUsesBrowserSizingAndOverflow()
     QVERIFY(tabBar->documentMode());
     QVERIFY(tabBar->usesScrollButtons());
     QVERIFY(!tabBar->drawBase());
+    QCOMPARE(tabBar->mapTo(&chrome, QPoint(0, tabBar->height())).y(),
+             chrome.navigationBar()->mapTo(&chrome, QPoint(0, 0)).y());
 
     QWidget *closeButton = tabBar->tabButton(0, QTabBar::RightSide);
     if (closeButton == nullptr) {
@@ -374,6 +379,45 @@ void BrowserChromeTest::tabRowUsesBrowserSizingAndOverflow()
     }
 }
 
+void BrowserChromeTest::paletteChangesRefreshTabBackgrounds()
+{
+    const QPalette original = QApplication::palette();
+    const auto restorePalette = qScopeGuard([&] {
+        QApplication::setPalette(original);
+    });
+    QWidget window;
+    BrowserChrome chrome(&window);
+    BrowserTabModel model;
+    QVERIFY(!model.createTab(BrowserTabKind::Host, QStringLiteral("New tab"),
+                              QStringLiteral("qbrowser://newtab")).isEmpty());
+    QVERIFY(chrome.synchronizeTabs(model));
+    chrome.resize(900, chrome.sizeHint().height());
+    window.resize(chrome.size());
+    window.show();
+    QCoreApplication::processEvents();
+
+    // Use distinguishable roles to catch stale stylesheet palette caches.
+    QPalette changed = original;
+    changed.setColor(QPalette::Window, QColor(32, 33, 36));
+    changed.setColor(QPalette::WindowText, QColor(232, 234, 237));
+    changed.setColor(QPalette::Base, QColor(53, 54, 58));
+    changed.setColor(QPalette::Text, QColor(232, 234, 237));
+    for (const QPalette &palette : {changed, original}) {
+        QApplication::setPalette(palette);
+        QCoreApplication::processEvents();
+        const QImage rendered = chrome.grab().toImage();
+        const qreal scale = rendered.devicePixelRatio();
+        const QRect activeTab = chrome.tabBar()->tabRect(0);
+        const QPoint activeBackground = chrome.tabBar()->mapTo(
+            &chrome, QPoint(activeTab.center().x(), activeTab.bottom() - 2));
+        QCOMPARE(rendered.pixelColor(qRound(activeBackground.x() * scale),
+                                      qRound(activeBackground.y() * scale)),
+                 palette.color(QPalette::Base));
+        QCOMPARE(rendered.pixelColor(qRound(2 * scale), qRound(2 * scale)),
+                 palette.color(QPalette::Window));
+    }
+}
+
 void BrowserChromeTest::titleBarContentInsetsAdjustRowMargins()
 {
     BrowserChrome chrome;
@@ -381,17 +425,31 @@ void BrowserChromeTest::titleBarContentInsetsAdjustRowMargins()
         QStringLiteral("browser-tab-row"));
     QVERIFY(tabRow != nullptr);
     QVERIFY(tabRow->layout() != nullptr);
-    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 3, 8, 3));
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 6, 8, 0));
 
     chrome.setTitleBarSafeAreaMargins(QMargins(3, 11, 37, 13));
-    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(11, 3, 45, 3));
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(11, 6, 45, 0));
 
     chrome.setTitleBarSafeAreaMargins(QMargins(-1, -2, -3, -4));
-    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 3, 8, 3));
+    QCOMPARE(tabRow->layout()->contentsMargins(), QMargins(8, 6, 8, 0));
+}
+
+void BrowserChromeTest::tabOverflowKeepsNewTabAvailable_data()
+{
+    QTest::addColumn<int>("windowWidth");
+    QTest::addColumn<QString>("title");
+    QTest::newRow("narrow-long")
+        << 360 << QStringLiteral("Overflow tab with a long title");
+    QTest::newRow("narrow-short") << 360 << QStringLiteral("Tab");
+    QTest::newRow("wide-long")
+        << 900 << QStringLiteral("Overflow tab with a long title");
+    QTest::newRow("wide-short") << 900 << QStringLiteral("Tab");
 }
 
 void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()
 {
+    QFETCH(int, windowWidth);
+    QFETCH(QString, title);
     BrowserChrome chrome;
     QVector<BrowserTabSnapshot> tabs;
     QVector<BrowserTabPresentation> presentations;
@@ -403,14 +461,15 @@ void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()
             .rightJustified(32, QLatin1Char('0'));
         tabs.append(tab(
             id, BrowserTabKind::App,
-            QStringLiteral("Overflow tab with a long title %1").arg(index + 1),
+            QStringLiteral("%1 %2").arg(title).arg(index + 1),
             {QStringLiteral("app://pilot/orders/%1").arg(index + 1)}, 0));
         presentations.append(
             presentation(BrowserContentIdentity::SignedApplication));
     }
     QVERIFY(synchronizeChrome(chrome, tabs, presentations, tabs.first().id));
 
-    chrome.resize(360, 160);
+    chrome.setTitleBarSafeAreaMargins(QMargins(0, 0, 132, 0));
+    chrome.resize(windowWidth, 160);
     chrome.show();
     QCoreApplication::processEvents();
 
@@ -433,6 +492,24 @@ void BrowserChromeTest::tabOverflowKeepsNewTabAvailable()
         }
     }
     QVERIFY(hasVisibleScrollButton);
+
+    QWidget *const dragArea = chrome.findChild<QWidget *>(
+        QStringLiteral("browser-title-drag-area"));
+    QVERIFY(dragArea != nullptr);
+    QVERIFY2(dragArea->width() >= 48,
+             qPrintable(QStringLiteral("Overflow left only %1 pixels to drag the window")
+                            .arg(dragArea->width())));
+    QVERIFY(newTab->geometry().right() < dragArea->geometry().left());
+    QVERIFY(dragArea->geometry().right() < chrome.width() - 132);
+    for (int index = 0; index < tabBar->count(); ++index) {
+        QVERIFY(tabBar->tabRect(index).width() >= 120);
+        QVERIFY(tabBar->tabRect(index).width() <= 240);
+    }
+
+    QSignalSpy maximizeRequests(
+        &chrome, &BrowserChrome::windowMaximizeRestoreRequested);
+    QTest::mouseDClick(dragArea, Qt::LeftButton);
+    QCOMPARE(maximizeRequests.count(), 1);
 }
 
 void BrowserChromeTest::emptyTitleAreaOwnsOnlyWindowGestures()
