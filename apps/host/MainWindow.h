@@ -134,6 +134,9 @@ signals:
 
 protected:
     void showEvent(QShowEvent *event) override;
+    void changeEvent(QEvent *event) override;
+    bool nativeEvent(const QByteArray &eventType, void *message,
+                     qintptr *result) override;
 
 private:
     MainWindow(RouteRegistry routeRegistry,
@@ -192,7 +195,6 @@ private:
     void moveStableTab(const QString &stableTabId, int destinationIndex);
     void handleCommand(BrowserCommand command);
     void synchronizeChrome();
-    void synchronizeTitleBarSafeArea();
 
     [[nodiscard]] QString activeStableId() const;
     [[nodiscard]] BrowserTabSnapshot activeSnapshot() const;
@@ -204,8 +206,6 @@ private:
     std::unique_ptr<WebSessionProfile> webSessionProfile_;
     std::unique_ptr<BrowserTabModel> tabModel_;
     BrowserChrome *browserChrome_ = nullptr;
-    QPointer<QWindow> titleBarWindow_;
-    QMetaObject::Connection titleBarSafeAreaConnection_;
     QStackedWidget *surfaceStack_ = nullptr;
     QHash<QString, TabController *> controllers_;
     QHash<QString, TabController *> retiringControllers_;

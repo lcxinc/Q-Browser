@@ -25,6 +25,8 @@ public:
 
     [[nodiscard]] bool synchronizeTabs(const BrowserTabModel &model);
     void setTitleBarSafeAreaMargins(const QMargins &margins);
+    void setWindowMaximized(bool maximized);
+    [[nodiscard]] bool isWindowDragPosition(const QPoint &position) const;
 
     [[nodiscard]] QTabBar *tabBar() const noexcept;
     [[nodiscard]] NavigationBar *navigationBar() const noexcept;
@@ -40,7 +42,10 @@ signals:
     void tabMoveRequested(const QString &tabId, int from, int to);
     void tabCloseRequested(const QString &tabId);
     void windowMoveRequested();
+    void windowMinimizeRequested();
+    void windowCloseRequested();
     void windowMaximizeRestoreRequested();
+    void performanceMonitorToggled(bool visible);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -93,6 +98,7 @@ private:
     QTabBar *tabBar_ = nullptr;
     QHBoxLayout *titleLayout_ = nullptr;
     QToolButton *newTabButton_ = nullptr;
+    QToolButton *maximizeButton_ = nullptr;
     QWidget *titleDragArea_ = nullptr;
     NavigationBar *navigationBar_ = nullptr;
     QVector<CommandAction> commandActions_;

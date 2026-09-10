@@ -277,7 +277,58 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
     titleLayout_->addWidget(tabBar_);
     titleLayout_->addWidget(newTabButton_);
     titleLayout_->addWidget(titleDragArea_, 1);
-    layout->addWidget(tabRow);
+    auto *performance = new QToolButton(tabRow);
+    performance->setObjectName(QStringLiteral("browser-performance"));
+    performance->setText(QStringLiteral("性能"));
+    performance->setAccessibleName(QStringLiteral("性能监测"));
+    performance->setToolTip(QStringLiteral("性能监测 (Ctrl+Shift+P)"));
+    performance->setCheckable(true);
+    performance->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")));
+    performance->setFixedHeight(30);
+    titleLayout_->addWidget(performance);
+    connect(performance, &QToolButton::toggled,
+            this, &BrowserChrome::performanceMonitorToggled);
+    auto *const controls = new QWidget(this);
+    controls->setObjectName(QStringLiteral("browser-window-controls"));
+    auto *const controlsLayout = new QHBoxLayout(controls);
+    controlsLayout->setContentsMargins(0, 0, 0, 0);
+    controlsLayout->setSpacing(0);
+    const auto addCaptionButton = [this, controls, controlsLayout](
+        const QString &name, const QString &label, QStyle::StandardPixmap icon) {
+        auto *const button = new QToolButton(controls);
+        button->setObjectName(name);
+        button->setAccessibleName(label);
+        button->setToolTip(label);
+        button->setIcon(style()->standardIcon(icon));
+        button->setFixedSize(46, BrowserTitleRowHeight);
+        button->setFocusPolicy(Qt::StrongFocus);
+        controlsLayout->addWidget(button);
+        return button;
+    };
+    auto *const minimize = addCaptionButton(
+        QStringLiteral("browser-window-minimize"), QStringLiteral("Minimize"),
+        QStyle::SP_TitleBarMinButton);
+    maximizeButton_ = addCaptionButton(
+        QStringLiteral("browser-window-maximize"), QStringLiteral("Maximize"),
+        QStyle::SP_TitleBarMaxButton);
+    auto *const close = addCaptionButton(
+        QStringLiteral("browser-window-close"), QStringLiteral("Close window"),
+        QStyle::SP_TitleBarCloseButton);
+    connect(minimize, &QToolButton::clicked,
+            this, &BrowserChrome::windowMinimizeRequested);
+    connect(maximizeButton_, &QToolButton::clicked,
+            this, &BrowserChrome::windowMaximizeRestoreRequested);
+    connect(close, &QToolButton::clicked,
+            this, &BrowserChrome::windowCloseRequested);
+    // Caption controls reach the top/right edge; tabs keep their top inset.
+    auto *const titleRow = new QWidget(this);
+    titleRow->setFixedHeight(BrowserTitleRowHeight);
+    auto *const titleRowLayout = new QHBoxLayout(titleRow);
+    titleRowLayout->setContentsMargins(0, 0, 0, 0);
+    titleRowLayout->setSpacing(0);
+    titleRowLayout->addWidget(tabRow, 1);
+    titleRowLayout->addWidget(controls);
+    layout->addWidget(titleRow);
 
     navigationBar_ = new NavigationBar(this);
     layout->addWidget(navigationBar_);
@@ -343,6 +394,20 @@ BrowserChrome::BrowserChrome(QWidget *parent) : QWidget(parent)
         QWidget#browser-chrome QToolButton#browser-new-tab:focus {
             border-color: palette(highlight);
         }
+        QWidget#browser-window-controls QToolButton {
+            border: none;
+            border-radius: 0;
+            background: transparent;
+        }
+        QWidget#browser-window-controls QToolButton:hover {
+            background: palette(midlight);
+        }
+        QWidget#browser-window-controls QToolButton:focus {
+            background: palette(midlight);
+        }
+        QWidget#browser-window-controls QToolButton#browser-window-close:hover {
+            background: #e81123;
+        }
     )"));
     qApp->installEventFilter(this);
 
@@ -383,6 +448,24 @@ void BrowserChrome::setTitleBarSafeAreaMargins(const QMargins &margins)
     titleLayout_->setContentsMargins(
         titleMarginWithSafeInset(margins.left()), BrowserTitleTopMargin,
         titleMarginWithSafeInset(margins.right()), 0);
+}
+
+void BrowserChrome::setWindowMaximized(const bool maximized)
+{
+    const QString label = maximized ? QStringLiteral("Restore")
+                                    : QStringLiteral("Maximize");
+    maximizeButton_->setAccessibleName(label);
+    maximizeButton_->setToolTip(label);
+    maximizeButton_->setIcon(style()->standardIcon(maximized
+        ? QStyle::SP_TitleBarNormalButton : QStyle::SP_TitleBarMaxButton));
+}
+
+bool BrowserChrome::isWindowDragPosition(const QPoint &position) const
+{
+    const QWidget *const child = childAt(position);
+    if (child == titleDragArea_ || child == tabBar_->parentWidget()) return true;
+    return child == tabBar_
+        && tabBar_->tabAt(tabBar_->mapFrom(this, position)) < 0;
 }
 
 bool BrowserChrome::eventFilter(QObject *watched, QEvent *event)

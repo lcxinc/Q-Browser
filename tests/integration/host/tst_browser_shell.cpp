@@ -5,6 +5,7 @@
 #include "MainWindow.h"
 #include "NavigationBar.h"
 #include "NewTabPage.h"
+#include "PerformancePanel.h"
 #include "RouteRegistry.h"
 #include "TabController.h"
 #include "WebSessionProfile.h"
@@ -19,6 +20,7 @@
 #include <QLineEdit>
 #include <QLayout>
 #include <QPointer>
+#include <QScreen>
 #include <QSignalSpy>
 #include <QStackedWidget>
 #include <QTabBar>
@@ -30,6 +32,12 @@
 #include <QWebEngineProfile>
 #include <QWebEngineView>
 #include <QWindow>
+#include <QToolButton>
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
+#endif
 
 #include <memory>
 #include <optional>
@@ -220,7 +228,8 @@ class BrowserShellTest final : public QObject
 
 private slots:
     void deferredSessionShellStartsHiddenEmptyAndResourceFree();
-    void mainWindowUsesExpandedNativeTitleArea();
+    void mainWindowIsFramelessWithNativeWindowBehavior();
+    void performancePanelTracksTabsAndClosesCleanly();
     void loadedSessionAppliesAtomicallyWithoutSaveAndStartsOnlyActive();
     void missingSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
     void corruptSessionCreatesExactlyOneCleanNewTabWithoutInitializationSave();
@@ -268,50 +277,53 @@ private slots:
     void windowShutdownBeforeQueuedRendererCleanupCancelsIt();
 };
 
-void BrowserShellTest::mainWindowUsesExpandedNativeTitleArea()
+void BrowserShellTest::mainWindowIsFramelessWithNativeWindowBehavior()
 {
     MainWindow window(RouteRegistry{}, QUrl(QStringLiteral("http://127.0.0.1/")));
-    window.resize(900, 650);
+    const QRect available = window.screen()->availableGeometry();
+    window.setGeometry(QRect(available.topLeft() + QPoint(20, 20),
+        QSize(900, 650).boundedTo(available.size() - QSize(40, 40))));
     window.show();
     QTRY_VERIFY(window.isVisible());
 
+    QVERIFY(window.windowFlags().testFlag(Qt::FramelessWindowHint));
+    QVERIFY(!window.windowFlags().testFlag(Qt::ExpandedClientAreaHint));
+    QCOMPARE(window.centralWidget()->geometry(), window.rect());
 #ifdef Q_OS_WIN
-    QWindow *const nativeWindow = window.windowHandle();
-    QVERIFY(nativeWindow != nullptr);
-    QTRY_VERIFY(nativeWindow->safeAreaMargins().top() > 0);
-    const int titleBarHeight = nativeWindow->safeAreaMargins().top();
-    const int captionButtonWidth = static_cast<int>(titleBarHeight * 1.5);
-    const int captionControlsWidth = 3 * captionButtonWidth;
-    QVERIFY(captionControlsWidth > 0);
-
-    QWidget *const tabRow = window.findChild<QWidget *>(
-        QStringLiteral("browser-tab-row"));
-    QVERIFY(tabRow != nullptr);
-    QVERIFY(tabRow->layout() != nullptr);
-    const QRect rowContentRect = tabRow->layout()->contentsRect();
-    const QRect windowContentRect(tabRow->mapTo(&window,
-                                                 rowContentRect.topLeft()),
-                                  rowContentRect.size());
-    const QRect captionControlsRect(window.width() - captionControlsWidth,
-                                    0,
-                                    captionControlsWidth,
-                                    titleBarHeight);
-    QVERIFY2(windowContentRect.right() < captionControlsRect.left(),
-             qPrintable(QStringLiteral("contentRight=%1 captionLeft=%2")
-                            .arg(windowContentRect.right())
-                            .arg(captionControlsRect.left())));
+    const HWND handle = reinterpret_cast<HWND>(window.winId());
+    RECT outer{}, client{};
+    QVERIFY(GetWindowRect(handle, &outer));
+    QVERIFY(GetClientRect(handle, &client));
+    QCOMPARE(client.right, outer.right - outer.left);
+    QCOMPARE(client.bottom, outer.bottom - outer.top);
+    POINT origin{};
+    QVERIFY(ClientToScreen(handle, &origin));
+    QCOMPARE(origin.x, outer.left);
+    QCOMPARE(origin.y, outer.top);
+    const LONG_PTR style = GetWindowLongPtrW(handle, GWL_STYLE);
+    QCOMPARE(style & WS_CAPTION, LONG_PTR(0));
+    QVERIFY((style & WS_THICKFRAME) != 0);
+    const auto hitTest = [handle](const POINT point) {
+        return SendMessageW(handle, WM_NCHITTEST, 0,
+                            MAKELPARAM(point.x, point.y));
+    };
+    const LONG midX = (outer.left + outer.right) / 2;
+    const LONG midY = (outer.top + outer.bottom) / 2;
+    QCOMPARE(hitTest({outer.left, outer.top}), LRESULT(HTTOPLEFT));
+    QCOMPARE(hitTest({outer.right - 1, outer.top}), LRESULT(HTTOPRIGHT));
+    QCOMPARE(hitTest({outer.left, outer.bottom - 1}), LRESULT(HTBOTTOMLEFT));
+    QCOMPARE(hitTest({outer.right - 1, outer.bottom - 1}), LRESULT(HTBOTTOMRIGHT));
+    QCOMPARE(hitTest({midX, outer.top}), LRESULT(HTTOP));
+    QCOMPARE(hitTest({midX, outer.bottom - 1}), LRESULT(HTBOTTOM));
+    QCOMPARE(hitTest({outer.left, midY}), LRESULT(HTLEFT));
+    QCOMPARE(hitTest({outer.right - 1, midY}), LRESULT(HTRIGHT));
+    QCOMPARE(hitTest({midX, midY}), LRESULT(HTCLIENT));
+    COLORREF border = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(handle, DWMWA_BORDER_COLOR,
+                                        &border, sizeof(border)))) {
+        QCOMPARE(border, COLORREF(DWMWA_COLOR_NONE));
+    }
 #endif
-
-    const Qt::WindowFlags flags = window.windowFlags();
-    QVERIFY(flags.testFlag(Qt::ExpandedClientAreaHint));
-    QVERIFY(flags.testFlag(Qt::NoTitleBarBackgroundHint));
-    QVERIFY(!flags.testFlag(Qt::FramelessWindowHint));
-    QVERIFY(flags.testFlag(Qt::CustomizeWindowHint));
-    QVERIFY(!flags.testFlag(Qt::WindowTitleHint));
-    QVERIFY(flags.testFlag(Qt::WindowSystemMenuHint));
-    QVERIFY(flags.testFlag(Qt::WindowMinimizeButtonHint));
-    QVERIFY(flags.testFlag(Qt::WindowMaximizeButtonHint));
-    QVERIFY(flags.testFlag(Qt::WindowCloseButtonHint));
 
     BrowserChrome *const chrome = window.browserChrome();
     BrowserTabModel *const model = window.tabModel();
@@ -320,19 +332,205 @@ void BrowserShellTest::mainWindowUsesExpandedNativeTitleArea()
     const int tabCount = model->count();
     const QString activeId = model->activeId();
 
-    QVERIFY(!window.isMaximized());
-    QVERIFY(QMetaObject::invokeMethod(
-        chrome, "windowMaximizeRestoreRequested", Qt::DirectConnection));
-    QTRY_VERIFY(window.isMaximized());
-    QVERIFY(QMetaObject::invokeMethod(
-        chrome, "windowMaximizeRestoreRequested", Qt::DirectConnection));
-    QTRY_VERIFY(!window.isMaximized());
+    auto *const maximize = window.findChild<QToolButton *>(
+        QStringLiteral("browser-window-maximize"));
+    auto *const minimize = window.findChild<QToolButton *>(
+        QStringLiteral("browser-window-minimize"));
+    auto *const close = window.findChild<QToolButton *>(
+        QStringLiteral("browser-window-close"));
+    QVERIFY(maximize != nullptr);
+    QVERIFY(minimize != nullptr);
+    QVERIFY(close != nullptr);
+    QCOMPARE(close->mapTo(&window, QPoint(close->width(), 0)).x(), window.width());
+    QCOMPARE(close->mapTo(&window, QPoint(0, 0)).y(), 0);
+    auto *const dragArea = window.findChild<QWidget *>(
+        QStringLiteral("browser-title-drag-area"));
+    QVERIFY(dragArea != nullptr);
+    QVERIFY(chrome->isWindowDragPosition(dragArea->mapTo(chrome, dragArea->rect().center())));
+    QVERIFY(!chrome->isWindowDragPosition(maximize->mapTo(chrome, maximize->rect().center())));
+    QVERIFY(!chrome->isWindowDragPosition(chrome->tabBar()->mapTo(
+        chrome, chrome->tabBar()->tabRect(0).center())));
+#ifdef Q_OS_WIN
+    const auto widgetHitTest = [&window, &hitTest, handle](QWidget *widget) {
+        const QPoint local = widget->mapTo(&window, widget->rect().center());
+        const qreal scale = window.devicePixelRatioF();
+        POINT point{qRound(local.x() * scale), qRound(local.y() * scale)};
+        if (!ClientToScreen(handle, &point)) return LRESULT(HTERROR);
+        return hitTest(point);
+    };
+    QCOMPARE(widgetHitTest(dragArea), LRESULT(HTCAPTION));
+    QCOMPARE(widgetHitTest(maximize), LRESULT(HTCLIENT));
+    QCOMPARE(widgetHitTest(minimize), LRESULT(HTCLIENT));
+    QCOMPARE(widgetHitTest(close), LRESULT(HTCLIENT));
+#endif
+    const QString screenshot = qEnvironmentVariable("Q_BROWSER_TEST_SCREENSHOT");
+    if (!screenshot.isEmpty()) {
+        QCoreApplication::processEvents();
+        QVERIFY(window.grab().save(screenshot));
+    }
 
-    QVERIFY(QMetaObject::invokeMethod(
-        chrome, "windowMoveRequested", Qt::DirectConnection));
+    const QRect normalGeometry = window.geometry();
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    QCOMPARE(maximize->accessibleName(), QStringLiteral("Restore"));
+#ifdef Q_OS_WIN
+    QVERIFY(IsZoomed(handle));
+    MONITORINFO monitor{sizeof(MONITORINFO), {}, {}, 0};
+    QVERIFY(GetMonitorInfoW(MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST), &monitor));
+    POINT maximizedOrigin{};
+    QVERIFY(ClientToScreen(handle, &maximizedOrigin));
+    QVERIFY(GetClientRect(handle, &client));
+    QCOMPARE(maximizedOrigin.x, monitor.rcWork.left);
+    QCOMPARE(maximizedOrigin.y, monitor.rcWork.top);
+    QCOMPARE(client.right, monitor.rcWork.right - monitor.rcWork.left);
+    QCOMPARE(client.bottom, monitor.rcWork.bottom - monitor.rcWork.top);
+    QCOMPARE(hitTest({monitor.rcWork.left, monitor.rcWork.bottom - 1}),
+             LRESULT(HTCLIENT));
+#endif
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(!window.isMaximized());
+    QTRY_COMPARE(window.geometry(), normalGeometry);
+    QCOMPARE(maximize->accessibleName(), QStringLiteral("Maximize"));
+#ifdef Q_OS_WIN
+    const auto clientMatchesWindow = [handle] {
+        RECT bounds{}, area{};
+        POINT topLeft{};
+        const bool matches = GetWindowRect(handle, &bounds) && GetClientRect(handle, &area)
+            && ClientToScreen(handle, &topLeft)
+            && topLeft.x == bounds.left && topLeft.y == bounds.top
+            && area.right == bounds.right - bounds.left
+            && area.bottom == bounds.bottom - bounds.top;
+        if (!matches) {
+            qWarning() << "Window bounds:" << bounds.left << bounds.top
+                       << bounds.right << bounds.bottom
+                       << "Client origin/size:" << topLeft.x << topLeft.y
+                       << area.right << area.bottom;
+        }
+        return matches;
+    };
+    QVERIFY(clientMatchesWindow());
+    // Native title-bar double clicks, system menu and snapping can enter a
+    // different maximize/restore path from the custom Qt window buttons.
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        SendMessageW(handle, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
+        QTRY_VERIFY(window.isMaximized());
+        SendMessageW(handle, WM_SYSCOMMAND, SC_RESTORE, 0);
+        QTRY_VERIFY(!window.isMaximized());
+        QVERIFY(clientMatchesWindow());
+        QTRY_COMPARE(window.geometry(), normalGeometry);
+
+        SendMessageW(handle, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
+        QTRY_VERIFY(window.isMaximized());
+        QTest::mouseClick(maximize, Qt::LeftButton);
+        QTRY_VERIFY(!window.isMaximized());
+        QVERIFY(clientMatchesWindow());
+        QTRY_COMPARE(window.geometry(), normalGeometry);
+
+        QTest::mouseClick(maximize, Qt::LeftButton);
+        QTRY_VERIFY(window.isMaximized());
+        SendMessageW(handle, WM_SYSCOMMAND, SC_RESTORE, 0);
+        QTRY_VERIFY(!window.isMaximized());
+        QVERIFY(clientMatchesWindow());
+        QTRY_COMPARE(window.geometry(), normalGeometry);
+    }
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    QTest::mouseClick(minimize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMinimized());
+    SendMessageW(handle, WM_SYSCOMMAND, SC_RESTORE, 0);
+    QTRY_VERIFY(!window.isMinimized() && window.isMaximized());
+    QVERIFY(IsZoomed(handle));
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(!window.isMaximized());
+    QVERIFY(clientMatchesWindow());
+    QTRY_COMPARE(window.geometry(), normalGeometry);
+#endif
+    QTest::mouseClick(minimize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMinimized());
+    window.showNormal();
+    QTRY_VERIFY(!window.isMinimized());
+    window.showFullScreen();
+    QTRY_VERIFY(window.isFullScreen());
+#ifdef Q_OS_WIN
+    QVERIFY(GetClientRect(handle, &client));
+    QCOMPARE(client.right, monitor.rcMonitor.right - monitor.rcMonitor.left);
+    QCOMPARE(client.bottom, monitor.rcMonitor.bottom - monitor.rcMonitor.top);
+    QCOMPARE(widgetHitTest(dragArea), LRESULT(HTCLIENT));
+#endif
+    window.showNormal();
+    QTRY_VERIFY(!window.isFullScreen());
+    QTRY_COMPARE(window.geometry(), normalGeometry);
+#ifdef Q_OS_WIN
+    QVERIFY(clientMatchesWindow());
+    // Fullscreen entered from native maximization must also retain the normal
+    // placement, rather than a stale Qt-emulated maximized rectangle.
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    window.showFullScreen();
+    QTRY_VERIFY(window.isFullScreen());
+    window.showNormal();
+    QTRY_VERIFY(!window.isFullScreen() && !window.isMaximized());
+    QVERIFY(clientMatchesWindow());
+    QTRY_COMPARE(window.geometry(), normalGeometry);
+    QCOMPARE(widgetHitTest(dragArea), LRESULT(HTCAPTION));
+    QCOMPARE(widgetHitTest(close), LRESULT(HTCLIENT));
+#endif
     QCoreApplication::processEvents();
+    QCOMPARE(window.centralWidget()->geometry(), window.rect());
+    QCOMPARE(close->mapTo(&window, QPoint(close->width(), 0)).x(), window.width());
+    QCOMPARE(close->mapTo(&window, QPoint(0, 0)).y(), 0);
+    if (!screenshot.isEmpty()) {
+        window.raise();
+        window.activateWindow();
+        QTest::qWait(100);
+        QVERIFY(window.screen()->grabWindow(window.winId()).save(
+            screenshot + QStringLiteral(".restored.png")));
+    }
     QCOMPARE(model->count(), tabCount);
     QCOMPARE(model->activeId(), activeId);
+    QTest::mouseClick(close, Qt::LeftButton);
+    QTRY_VERIFY(!window.isVisible());
+
+}
+
+void BrowserShellTest::performancePanelTracksTabsAndClosesCleanly()
+{
+    MainWindow window(RouteRegistry{}, QUrl(QStringLiteral("http://127.0.0.1/")));
+    window.resize(1100, 720);
+    window.show();
+    auto *toggle = window.findChild<QToolButton *>(QStringLiteral("browser-performance"));
+    auto *panel = window.findChild<PerformancePanel *>();
+    QVERIFY(toggle && panel);
+    QVERIFY(!panel->isVisible());
+    QTest::mouseClick(toggle, Qt::LeftButton);
+    QTRY_VERIFY(panel->isVisible());
+    auto *counts = panel->findChild<QLabel *>(QStringLiteral("performance-resources"));
+    QVERIFY(counts);
+    QTRY_VERIFY(counts->text().contains(QStringLiteral("1 个标签页")));
+    const auto activeId = window.tabModel()->activeId();
+    window.browserChrome()->dispatchCommand(BrowserCommand::NewTab);
+    QTRY_VERIFY(counts->text().contains(QStringLiteral("2 个标签页")));
+    QTest::mouseClick(window.findChild<QToolButton *>(QStringLiteral("browser-window-maximize")), Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    QTest::mouseClick(window.findChild<QToolButton *>(QStringLiteral("browser-window-maximize")), Qt::LeftButton);
+    QTRY_VERIFY(!window.isMaximized());
+    QTRY_VERIFY(panel->isVisible());
+    const QString screenshot = qEnvironmentVariable("Q_BROWSER_PERFORMANCE_WINDOW_SCREENSHOT");
+    if (!screenshot.isEmpty()) {
+        QTest::qWait(2200);
+        QVERIFY(window.grab().save(screenshot));
+    }
+    QTest::mouseClick(panel->findChild<QToolButton *>(QStringLiteral("performance-close")), Qt::LeftButton);
+    QTRY_VERIFY(!panel->isVisible());
+    QVERIFY(!toggle->isChecked());
+    QCOMPARE(window.tabModel()->count(), 2);
+    QVERIFY(window.tabModel()->indexOfId(activeId) >= 0);
+    window.activateWindow();
+    QTRY_VERIFY(window.isActiveWindow());
+    QTest::keyClick(&window, Qt::Key_P, Qt::ControlModifier | Qt::ShiftModifier);
+    QTRY_VERIFY(panel->isVisible());
+    QVERIFY(window.shutdown());
+    QVERIFY(!panel->isVisible());
 }
 
 void BrowserShellTest::deferredSessionShellStartsHiddenEmptyAndResourceFree()

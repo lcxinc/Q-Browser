@@ -2,6 +2,7 @@
 
 #include "BrowserAddress.h"
 #include "BrowserTabModel.h"
+#include "DemoGallery.h"
 
 #include <QKeySequence>
 #include <QLabel>
@@ -10,6 +11,8 @@
 #include <QScopedValueRollback>
 #include <QSet>
 #include <QTimer>
+#include <QTabWidget>
+#include <QScrollArea>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -142,7 +145,22 @@ NewTabPage::NewTabPage(QWidget *parent)
     setAccessibleName(QStringLiteral("Q-Browser New Tab"));
     setFocusPolicy(Qt::NoFocus);
 
-    auto *pageLayout = new QVBoxLayout(this);
+    auto *rootLayout = new QVBoxLayout(this);
+    rootLayout->setContentsMargins(0, 0, 0, 0);
+    sections_ = new QTabWidget(this);
+    sections_->setObjectName(QStringLiteral("new-tab-sections"));
+    sections_->setDocumentMode(true);
+    demoGallery_ = new DemoGallery(sections_);
+    sections_->addTab(demoGallery_, QStringLiteral("示例中心"));
+    auto *pilotScroll = new QScrollArea(sections_);
+    pilotScroll->setWidgetResizable(true);
+    pilotScroll->setFrameShape(QFrame::NoFrame);
+    auto *pilotPage = new QWidget;
+    pilotPage->setObjectName(QStringLiteral("new-tab-pilot-page"));
+    pilotScroll->setWidget(pilotPage);
+    sections_->addTab(pilotScroll, QStringLiteral("Pilot 应用"));
+    rootLayout->addWidget(sections_);
+    auto *pageLayout = new QVBoxLayout(pilotPage);
     pageLayout->setContentsMargins(24, 24, 24, 24);
     pageLayout->setSpacing(12);
 
@@ -200,6 +218,17 @@ NewTabPage::~NewTabPage()
     for (QPushButton *const routeButton : childButtons) {
         QObject::disconnect(routeButton, nullptr, this, nullptr);
     }
+}
+
+void NewTabPage::showExamples()
+{
+    demoGallery_->showGallery();
+    sections_->setCurrentIndex(0);
+}
+
+void NewTabPage::showPilotRoutes()
+{
+    sections_->setCurrentIndex(1);
 }
 
 void NewTabPage::setRecentRoutes(const QVector<NewTabEntry> &validatedRoutes)

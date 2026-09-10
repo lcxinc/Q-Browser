@@ -6,6 +6,19 @@ provides an isolated WebEngine fallback, and recovers failed updates to a
 last-known-good version. The repository includes the ten-route Pilot, package
 CLI, HTML/CSS migrator, security tests, and repeatable Release deployment.
 
+## Built-in examples
+
+New tabs open a searchable, categorized demo gallery with six interactive
+examples: widget controls, sortable/filterable tables, line and bar charts,
+easing animations, a drag-and-drop task board, and a drawing canvas. Open a
+card to try it and use the back button to return to the gallery.
+The Pilot application tab keeps the existing application and recent-route shortcuts.
+
+These compiled Qt Widgets examples use in-memory sample data and work in
+`--trusted-shell` mode without the mock API or a signed package. Returning to
+the gallery disposes the active example; animations stop while hidden. Pilot
+package routes still require the normal package runtime and trust configuration.
+
 ## Audited Windows toolchain
 
 The development preset and commands use the audited tools directly; no global `PATH` configuration is required.
@@ -90,6 +103,19 @@ the [threat model](docs/security/threat-model.md), and
 [developer setup](docs/development/getting-started.md). Operations guidance
 covers [updates and rollback](docs/operations/update-rollback.md) and
 [safe diagnostics](docs/operations/diagnostics.md).
+
+## Performance monitor
+
+Click **性能** in the title bar (or press **Ctrl+Shift+P**) to open the in-app
+performance panel. It samples the Host and readable descendant processes once
+per second on a background thread. It shows CPU normalized across all logical
+processors, working-set memory, private committed memory, process details,
+60-sample CPU/memory trends, tab/page/Worker-view counts, and UI heartbeat delay.
+Working-set totals may count shared pages more than once; UI delay is not FPS.
+New processes need a second sample before CPU is available. Unreadable processes
+are reported as missing rather than zero. Process CPU/memory sampling currently
+supports Windows. Pause or close the panel to stop sampling; resuming starts a
+new trend interval. Measurements stay in memory and are not uploaded.
 
 ## Generated directories
 

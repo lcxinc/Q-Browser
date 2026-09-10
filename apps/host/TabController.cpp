@@ -136,6 +136,7 @@ bool TabController::startHost(const quint64 navigationIncarnation)
         surfaceStack_->addWidget(hostSurface_);
     }
     connectHostSignals();
+    hostSurface_->showExamples();
     currentSurface_ = hostSurface_;
     surfaceKind_ = HostSurfaceKind::Host;
     workerPackageId_.clear();

@@ -5,6 +5,7 @@
 #include "BrowserChrome.h"
 #include "BrowserWindowGeometry.h"
 #include "NavigationBar.h"
+#include "PerformancePanel.h"
 #include "WebSessionProfile.h"
 #include "WebSurface.h"
 #include "WorkerSurface.h"
@@ -19,28 +20,20 @@
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
 
-#include <limits>
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
+#endif
 #include <utility>
 
 namespace {
 
 constexpr int BrowserSessionSaveDebounceMilliseconds = 200;
-
-#ifdef Q_OS_WIN
-int windowsCaptionControlsInset(const int titleBarHeight) noexcept
-{
-    if (titleBarHeight <= 0) return 0;
-    const qint64 captionButtonWidth =
-        (static_cast<qint64>(titleBarHeight) * 3) / 2;
-    const qint64 captionControlsWidth = captionButtonWidth * 3;
-    return static_cast<int>(qMin(
-        captionControlsWidth,
-        static_cast<qint64>(std::numeric_limits<int>::max())));
-}
-#endif
 
 QVariantMap variantParameters(const QHash<QString, QString> &parameters)
 {
@@ -83,20 +76,9 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     , webSessionProfile_(std::make_unique<WebSessionProfile>(mockOrigin_))
     , tabModel_(std::make_unique<BrowserTabModel>())
 {
-    Qt::WindowFlags titleAreaFlags = windowFlags();
-    titleAreaFlags |= Qt::ExpandedClientAreaHint
-        | Qt::NoTitleBarBackgroundHint
-        | Qt::CustomizeWindowHint
-        | Qt::WindowSystemMenuHint
-        | Qt::WindowMinimizeButtonHint
-        | Qt::WindowMaximizeButtonHint
-        | Qt::WindowCloseButtonHint;
-    titleAreaFlags &= ~Qt::WindowTitleHint;
-    titleAreaFlags &= ~Qt::FramelessWindowHint;
-    // QWidget's normal flag adjustment restores WindowTitleHint when caption
-    // buttons are requested. No native handle exists yet, so preserve this
-    // complete, explicit flag set for the QWindow that will be created.
-    overrideWindowFlags(titleAreaFlags);
+    setWindowFlags(Qt::Window | Qt::FramelessWindowHint
+                   | Qt::WindowSystemMenuHint | Qt::WindowMinimizeButtonHint
+                   | Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint);
     setObjectName(QStringLiteral("qbrowser-main-window"));
     setWindowTitle(QStringLiteral("Q-Browser"));
 
@@ -108,7 +90,27 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
     surfaceStack_ = new QStackedWidget(central);
     surfaceStack_->setObjectName(QStringLiteral("surface-stack"));
     layout->addWidget(browserChrome_);
-    layout->addWidget(surfaceStack_, 1);
+    auto *content = new QHBoxLayout;
+    content->setContentsMargins(0, 0, 0, 0);
+    content->setSpacing(0);
+    content->addWidget(surfaceStack_, 1);
+    auto *performance = new PerformancePanel([this] {
+        int workers = 0;
+        for (auto *controller : controllers_) {
+            if (controller->workerSurface()) ++workers;
+        }
+        return BrowserResourceCounts{tabModel_->count(),
+            webSessionProfile_->registeredPageCount(), workers};
+    }, central);
+    content->addWidget(performance);
+    performance->hide();
+    connect(browserChrome_, &BrowserChrome::performanceMonitorToggled,
+            performance, &QWidget::setVisible);
+    connect(performance, &PerformancePanel::closeRequested, this, [this] {
+        browserChrome_->findChild<QToolButton *>(
+            QStringLiteral("browser-performance"))->setChecked(false);
+    });
+    layout->addLayout(content, 1);
     setCentralWidget(central);
 
     browserSessionSaveTimer_ = new QTimer(this);
@@ -208,8 +210,20 @@ MainWindow::MainWindow(RouteRegistry routeRegistry,
             &BrowserChrome::windowMaximizeRestoreRequested,
             this,
             [this] {
+#ifdef Q_OS_WIN
+                // Use the same native state/restore geometry as title-bar
+                // double clicks and the system menu. Qt emulates maximization
+                // of frameless windows by moving them without WS_MAXIMIZE.
+                const HWND handle = reinterpret_cast<HWND>(winId());
+                ShowWindow(handle, IsZoomed(handle) ? SW_RESTORE : SW_MAXIMIZE);
+#else
                 isMaximized() ? showNormal() : showMaximized();
+#endif
             });
+    connect(browserChrome_, &BrowserChrome::windowMinimizeRequested,
+            this, &QWidget::showMinimized);
+    connect(browserChrome_, &BrowserChrome::windowCloseRequested,
+            this, &QWidget::close);
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
             this, [this] { (void)shutdown(); });
 
@@ -234,41 +248,114 @@ MainWindow::~MainWindow()
 void MainWindow::showEvent(QShowEvent *event)
 {
     QMainWindow::showEvent(event);
-    synchronizeTitleBarSafeArea();
+#ifdef Q_OS_WIN
+    const HWND handle = reinterpret_cast<HWND>(winId());
+    const LONG_PTR style = GetWindowLongPtrW(handle, GWL_STYLE);
+    // Keep native resizing, snapping and system-menu commands, but let the
+    // client cover the complete window rectangle (see WM_NCCALCSIZE below).
+    const LONG_PTR framelessStyle = (style | WS_THICKFRAME | WS_SYSMENU
+        | WS_MINIMIZEBOX | WS_MAXIMIZEBOX) & ~static_cast<LONG_PTR>(WS_CAPTION);
+    if (style != framelessStyle) {
+        SetWindowLongPtrW(handle, GWL_STYLE, framelessStyle);
+        SetWindowPos(handle, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                         | SWP_FRAMECHANGED);
+    }
+    // Windows 11 otherwise adds a one-pixel DWM outline even to custom frames.
+    // Older Windows versions ignore this unsupported attribute.
+    const COLORREF border = DWMWA_COLOR_NONE;
+    (void)DwmSetWindowAttribute(handle, DWMWA_BORDER_COLOR,
+                                &border, sizeof(border));
+#endif
+    browserChrome_->setWindowMaximized(isMaximized());
 }
 
-void MainWindow::synchronizeTitleBarSafeArea()
+void MainWindow::changeEvent(QEvent *event)
 {
-    QWindow *const currentWindow = windowHandle();
-    if (titleBarWindow_ != currentWindow) {
-        QObject::disconnect(titleBarSafeAreaConnection_);
-        titleBarSafeAreaConnection_ = {};
-        titleBarWindow_ = currentWindow;
-        if (currentWindow != nullptr) {
-            titleBarSafeAreaConnection_ = connect(
-                currentWindow, &QWindow::safeAreaMarginsChanged,
-                this, [this](const QMargins &) {
-                    synchronizeTitleBarSafeArea();
-                });
-        }
+    QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange && browserChrome_ != nullptr) {
+        browserChrome_->setWindowMaximized(isMaximized());
     }
-    if (browserChrome_ != nullptr) {
-        QMargins contentInsets = currentWindow != nullptr
-            ? currentWindow->safeAreaMargins() : QMargins{};
+}
+
+bool MainWindow::nativeEvent(const QByteArray &eventType, void *message,
+                             qintptr *result)
+{
 #ifdef Q_OS_WIN
-        if (windowFlags().testFlag(Qt::ExpandedClientAreaHint)) {
-            // Qt 6.11's Windows platform plugin exposes the title-bar height
-            // as a logical top safe inset and draws three child caption
-            // buttons, each 1.5 times that height. Match that observable
-            // qwindowswindow.cpp geometry without DPR scaling; these are Qt
-            // child controls, not DWMWA_CAPTION_BUTTON_BOUNDS.
-            contentInsets.setRight(qMax(
-                contentInsets.right(),
-                windowsCaptionControlsInset(contentInsets.top())));
+    const auto *const native = static_cast<MSG *>(message);
+    if (native->message == WM_NCCALCSIZE && native->wParam != 0) {
+        auto *const parameters = reinterpret_cast<NCCALCSIZE_PARAMS *>(
+            native->lParam);
+        // Qt's state still describes the previous window during a native
+        // restore. Using isMaximized() here would replace the restored client
+        // rectangle with the entire monitor, offsetting and clipping its UI.
+        // Native maximization needs its invisible resize frame trimmed; Qt's
+        // frameless showMaximized() already proposes the work-area rectangle.
+        if (IsZoomed(native->hwnd) && !isFullScreen()) {
+            MONITORINFO monitor{sizeof(MONITORINFO), {}, {}, 0};
+            if (GetMonitorInfoW(MonitorFromWindow(native->hwnd,
+                                                  MONITOR_DEFAULTTONEAREST),
+                                &monitor)) {
+                parameters->rgrc[0] = monitor.rcWork;
+            }
         }
-#endif
-        browserChrome_->setTitleBarSafeAreaMargins(contentInsets);
+        *result = 0;
+        return true;
     }
+    if (native->message == WM_NCHITTEST) {
+        RECT bounds{};
+        if (GetWindowRect(native->hwnd, &bounds)) {
+            const POINT cursor{GET_X_LPARAM(native->lParam),
+                               GET_Y_LPARAM(native->lParam)};
+            if (!isMaximized() && !IsZoomed(native->hwnd) && !isFullScreen()) {
+                const UINT dpi = GetDpiForWindow(native->hwnd);
+                const int border = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+                    + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                const bool left = cursor.x >= bounds.left
+                    && cursor.x < bounds.left + border;
+                const bool right = cursor.x < bounds.right
+                    && cursor.x >= bounds.right - border;
+                const bool top = cursor.y >= bounds.top
+                    && cursor.y < bounds.top + border;
+                const bool bottom = cursor.y < bounds.bottom
+                    && cursor.y >= bounds.bottom - border;
+                const bool horizontal = minimumWidth() != maximumWidth();
+                const bool vertical = minimumHeight() != maximumHeight();
+                if (vertical && top) {
+                    *result = horizontal && left ? HTTOPLEFT
+                        : horizontal && right ? HTTOPRIGHT : HTTOP;
+                    return true;
+                }
+                if (vertical && bottom) {
+                    *result = horizontal && left ? HTBOTTOMLEFT
+                        : horizontal && right ? HTBOTTOMRIGHT : HTBOTTOM;
+                    return true;
+                }
+                if (horizontal && (left || right)) {
+                    *result = left ? HTLEFT : HTRIGHT;
+                    return true;
+                }
+            }
+            // Convert native physical client coordinates to Qt logical pixels;
+            // this also works on monitors left of the primary screen.
+            POINT client = cursor;
+            if (ScreenToClient(native->hwnd, &client) && browserChrome_ != nullptr
+                && !isFullScreen()) {
+                const qreal scale = devicePixelRatioF();
+                const QPoint local(qRound(client.x / scale),
+                                   qRound(client.y / scale));
+                if (browserChrome_->isWindowDragPosition(
+                        browserChrome_->mapFrom(this, local))) {
+                    *result = HTCAPTION;
+                    return true;
+                }
+            }
+            *result = HTCLIENT;
+            return true;
+        }
+    }
+#endif
+    return QMainWindow::nativeEvent(eventType, message, result);
 }
 
 bool MainWindow::shutdown()

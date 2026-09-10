@@ -162,6 +162,7 @@ private slots:
 void NewTabPageTest::exposesFixedPilotEntries()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     QSignalSpy activated(&page, &NewTabPage::addressActivated);
     const std::optional<RouteRegistry> registry = createPilotRouteRegistry(
         QUrl(QStringLiteral("http://127.0.0.1:4180/")));
@@ -189,6 +190,7 @@ void NewTabPageTest::exposesFixedPilotEntries()
 void NewTabPageTest::recentCandidateInspectionAndRawTitlesAreBounded()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     constexpr int maximumInspectedCandidates = 64;
 
     QVector<NewTabEntry> invalidFirst;
@@ -259,6 +261,7 @@ void NewTabPageTest::recentCandidateInspectionAndRawTitlesAreBounded()
 void NewTabPageTest::recentRoutesPreserveOrderAndFirstDuplicate()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     const QVector<NewTabEntry> routes{
         {QStringLiteral("Orders first"), QStringLiteral("app://pilot/orders")},
         {QStringLiteral("Dashboard"), QStringLiteral("app://pilot/dashboard")},
@@ -296,6 +299,7 @@ void NewTabPageTest::recentRoutesPreserveOrderAndFirstDuplicate()
 void NewTabPageTest::recentRoutesAreBoundedAndReplacePriorState()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     QVector<NewTabEntry> routes;
     for (int index = 0; index < 20; ++index) {
         routes.append({QStringLiteral("Order %1").arg(index),
@@ -318,13 +322,14 @@ void NewTabPageTest::recentRoutesAreBoundedAndReplacePriorState()
     QCOMPARE(button(page, QStringLiteral("new-tab-recent-0"))->text(),
              QStringLiteral("Files"));
     QVERIFY(button(page, QStringLiteral("new-tab-recent-1")) == nullptr);
-    QVERIFY(page.findChildren<QAbstractButton *>().size()
+    QVERIFY(page.findChild<QWidget *>(QStringLiteral("new-tab-pilot-page"))->findChildren<QAbstractButton *>().size()
             <= static_cast<qsizetype>(fixedEntries().size()) + 16);
 }
 
 void NewTabPageTest::excludesExternalHostAndNonCanonicalAddresses()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     const QString overlong = QStringLiteral("app://pilot/orders/")
         + QString(2048, QLatin1Char('x'));
     page.setRecentRoutes({
@@ -357,6 +362,7 @@ void NewTabPageTest::excludesExternalHostAndNonCanonicalAddresses()
 void NewTabPageTest::sanitizesAndBoundsUntrustedTitlesAsOrdinaryText()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     const QString emoji = QString::fromUtf8("\xF0\x9F\x98\x80");
     QString loneSurrogate = QStringLiteral("invalid");
     loneSurrogate.append(QChar(0xd800));
@@ -390,6 +396,7 @@ void NewTabPageTest::sanitizesAndBoundsUntrustedTitlesAsOrdinaryText()
 void NewTabPageTest::rendersAmpersandsLiterallyWithoutMnemonics()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("R&D"), QStringLiteral("app://pilot/orders/1")},
         {QStringLiteral("A&&B"), QStringLiteral("app://pilot/orders/2")},
@@ -426,6 +433,7 @@ void NewTabPageTest::rendersAmpersandsLiterallyWithoutMnemonics()
 void NewTabPageTest::providesStableNamesPlainLabelsAndFocusOrder()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     QCOMPARE(page.objectName(), QStringLiteral("new-tab-page"));
     QCOMPARE(page.accessibleName(), QStringLiteral("Q-Browser New Tab"));
 
@@ -470,6 +478,7 @@ void NewTabPageTest::providesStableNamesPlainLabelsAndFocusOrder()
 void NewTabPageTest::destroyedButtonReentryIsSafe()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
     });
@@ -501,6 +510,7 @@ void NewTabPageTest::destroyedButtonReentryIsSafe()
 void NewTabPageTest::synchronousCleanupReentryIsCoalesced()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
     });
@@ -566,6 +576,7 @@ void NewTabPageTest::nestedEventLoopDoesNotSpinPendingDispatch()
     qbrowser_host_testing::setNewTabPageTestHooks(std::move(hooks));
 
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
     });
@@ -652,6 +663,7 @@ void NewTabPageTest::nestedEventLoopDoesNotSpinPendingDispatch()
 void NewTabPageTest::synchronousActivationRefreshKeepsTheSenderAlive()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
     });
@@ -684,6 +696,7 @@ void NewTabPageTest::synchronousActivationRefreshKeepsTheSenderAlive()
 void NewTabPageTest::populatedEmptyRepopulatedStateIsDeterministic()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
         {QStringLiteral("Help"), QStringLiteral("app://pilot/web/help")},
@@ -740,6 +753,7 @@ void NewTabPageTest::populatedEmptyRepopulatedStateIsDeterministic()
 void NewTabPageTest::activatesFocusedEntriesFromTheKeyboard()
 {
     NewTabPage page;
+    page.showPilotRoutes();
     page.setRecentRoutes({
         {QStringLiteral("Orders"), QStringLiteral("app://pilot/orders")},
     });
@@ -767,6 +781,7 @@ void NewTabPageTest::constructionCreatesNoWebOrWorkerResources()
 #endif
 
     NewTabPage page;
+    page.showPilotRoutes();
     QCoreApplication::processEvents();
 
     QCOMPARE(page.findChildren<QWebEnginePage *>().size(), 0);

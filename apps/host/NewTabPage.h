@@ -11,6 +11,8 @@
 
 class QPushButton;
 class QVBoxLayout;
+class QTabWidget;
+class DemoGallery;
 
 #ifdef Q_BROWSER_HOST_TESTING
 namespace qbrowser_host_testing
@@ -41,6 +43,8 @@ public:
     ~NewTabPage() override;
 
     void setRecentRoutes(const QVector<NewTabEntry> &validatedRoutes);
+    void showExamples();
+    void showPilotRoutes();
 
 signals:
     void addressActivated(const QString &canonicalAddress);
@@ -64,6 +68,8 @@ private:
     void rebuildFocusOrder();
 
     QVBoxLayout *recentRoutesLayout_ = nullptr;
+    QTabWidget *sections_ = nullptr;
+    DemoGallery *demoGallery_ = nullptr;
     QVector<QPushButton *> fixedButtons_;
     QVector<QPointer<QPushButton>> recentButtons_;
     QVector<QPointer<QPushButton>> reusableRecentButtons_;

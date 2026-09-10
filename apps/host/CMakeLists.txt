@@ -15,6 +15,10 @@ add_library(q_browser_host STATIC
   BrowserTabModel.h
   BrowserWindowGeometry.cpp
   BrowserWindowGeometry.h
+  DemoGallery.cpp
+  DemoGallery.h
+  DemoExamples.cpp
+  DemoExamples.h
   HostApplication.cpp
   HostApplication.h
   HostCapabilityRuntime.cpp
@@ -48,6 +52,10 @@ add_library(q_browser_host STATIC
   MainWindow.h
   NavigationBar.cpp
   NavigationBar.h
+  PerformanceSampler.cpp
+  PerformanceSampler.h
+  PerformancePanel.cpp
+  PerformancePanel.h
   NewTabPage.cpp
   NewTabPage.h)
 
@@ -68,7 +76,7 @@ target_link_libraries(q_browser_host
     Qt6::Widgets)
 
 if(WIN32)
-  target_link_libraries(q_browser_host PRIVATE bcrypt)
+  target_link_libraries(q_browser_host PRIVATE bcrypt dwmapi psapi)
 endif()
 
 q_browser_enable_strict_warnings(q_browser_host)

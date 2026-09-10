@@ -66,6 +66,16 @@ target_link_libraries(tst_new_tab_page
 q_browser_enable_strict_warnings(tst_new_tab_page)
 q_browser_add_qt_test(NAME new_tab_page TARGET tst_new_tab_page)
 
+add_executable(tst_demo_gallery tst_demo_gallery.cpp)
+target_link_libraries(tst_demo_gallery PRIVATE q_browser_host Qt6::Test Qt6::Widgets)
+q_browser_enable_strict_warnings(tst_demo_gallery)
+q_browser_add_qt_test(NAME demo_gallery TARGET tst_demo_gallery)
+
+add_executable(tst_performance_monitor tst_performance_monitor.cpp)
+target_link_libraries(tst_performance_monitor PRIVATE q_browser_host Qt6::Test Qt6::Widgets)
+q_browser_enable_strict_warnings(tst_performance_monitor)
+q_browser_add_qt_test(NAME performance_monitor TARGET tst_performance_monitor)
+
 add_executable(tst_browser_chrome tst_browser_chrome.cpp)
 target_link_libraries(tst_browser_chrome
   PRIVATE
